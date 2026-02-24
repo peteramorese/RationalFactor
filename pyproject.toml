@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rational-factor"
+version = "0.1.0"
+description = "Rational Factor Form modeling toolbox"
+
+[tool.setuptools.packages.find]
+where = ["src"]
