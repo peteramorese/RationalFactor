@@ -37,14 +37,15 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 600
-    n_epochs = 500
+    n_basis = 1000
+    n_epochs = 200
     batch_size = 256
     learning_rate = 2e-2
     n_timesteps_train = 10
     n_timesteps_prop = 10
     n_trajectories_train = 4000
-    reg_strength = 10.0
+    var_reg_strength = 0.1
+    bomega_reg_strength = 0.02
     ###
 
     # Create system
@@ -62,31 +63,36 @@ if __name__ == "__main__":
     x_k, x_kp1 = create_transition_data_matrix(traj_data, separate=True)
     xp_data = TensorDataset(x_k, x_kp1)
 
-    x0_dataloader = DataLoader(x0_data, batch_size=256, shuffle=True, pin_memory=use_gpu)
-    xp_dataloader = DataLoader(xp_data, batch_size=512, shuffle=True, pin_memory=use_gpu)
+    x0_dataloader = DataLoader(x0_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    xp_dataloader = DataLoader(xp_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
-    psi_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
-    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
+    phi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
+    psi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
+    psi0_basis = GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
 
     # Create and train the transition model
     tran_model = LinearRFF(phi_basis, psi_basis)
     print("Training transition model")
-    loss_fn = lambda model, x, xp : loss.rff_mle_loss(model, x, xp) + reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, 1.0) + loss.gaussian_basis_var_reg_loss(model.psi_basis, 1.0))
+    mle_loss_fn = loss.rff_mle_loss
+    var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
+    #bomega_eval_loss_fn = lambda model, x, xp : reg_strength * loss.BOmega_eval_loss(model)
+    #bomega_trace_loss_fn = lambda model, x, xp : bomega_reg_strength * loss.BOmega_trace_loss(model)
     tran_model = train.train(tran_model, 
         xp_dataloader, 
-        loss_fn, 
+        #{"mle": mle_loss_fn, "var_reg": var_reg_loss_fn, "bomega_trace": bomega_trace_loss_fn}, 
+        {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
         torch.optim.Adam(tran_model.parameters(), lr=learning_rate), epochs=n_epochs)
     print("Done! \n")
 
 
-    loss_fn = lambda model, x : loss.ff_mle_loss(model, x) + reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, 1.0)
+    mle_loss_fn = loss.ff_mle_loss
+    var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
     init_model = LinearFF.from_rff(tran_model, psi0_basis)
     print("Training initial model")
     init_model = train.train(init_model, 
         x0_dataloader, 
-        loss_fn, 
+        {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
         torch.optim.Adam(init_model.parameters(), lr=learning_rate), epochs=n_epochs)
     print("Done! \n")
 

@@ -51,6 +51,11 @@ class GaussianBasis(SeparableBasis):
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(torch.randn(d, n_basis, 2) + offsets)
 
+    @classmethod
+    def set_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2)):
+        offsets = offsets.repeat(d, n_basis, 1)
+        return cls(offsets)
+
     @classmethod 
     def freeze_params(cls, other : 'GaussianBasis'):
         return cls(other.params.detach().clone(), trainable=False)

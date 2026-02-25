@@ -8,6 +8,9 @@ def propagate(belief : LinearFF, transition_model : LinearRFF, n_steps : int):
     BOmega0 = B.unsqueeze(1) * Omega0
     BOmega = B.unsqueeze(1) * Omega
 
+    print("BOmega0: evals: ", torch.linalg.eigvals(BOmega0))
+    print("BOmega: evals: ", torch.linalg.eigvals(BOmega))
+
     C0 = belief.get_C0(Omega0=Omega0)
 
     C_seq = [C0]
