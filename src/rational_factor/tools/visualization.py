@@ -1,10 +1,10 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from ..models.ration_factor import LinearFF
+from ..models.rational_factor import LinearFF
 
 def plot_belief(ax: plt.Axes, belief: LinearFF, x_range: tuple[float, float], y_range: tuple[float, float], n_points: int = 100, contour_levels: int = 10, contourf_kwargs: dict = None):
-    """Plot a 2D heat map of the density from LinearFF.forward using contourf with white contour overlay."""
+    ax.set_aspect("equal")
     x_lin = np.linspace(x_range[0], x_range[1], n_points)
     y_lin = np.linspace(y_range[0], y_range[1], n_points)
     X, Y = np.meshgrid(x_lin, y_lin)

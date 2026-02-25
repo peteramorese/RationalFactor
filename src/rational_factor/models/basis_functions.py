@@ -55,16 +55,16 @@ class GaussianBasis(SeparableBasis):
     def freeze_params(cls, other : 'GaussianBasis'):
         return cls(other.params.detach().clone(), trainable=False)
 
-    def __means_stds(self):
+    def means_stds(self):
         return self.params[..., 0], torch.nn.functional.softplus(self.params[..., 1]) + 1e-8
     
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
         y = y[:, :, None]  # (n_data, d, n_basis)
-        mu, std = self.__means_stds()
+        mu, std = self.means_stds()
 
         log_dim_factors = (
-            -0.5 * torch.log(torch.tensor(2.0) * torch.pi)
+            -0.5 * torch.log(y.new_tensor(2.0 * torch.pi))
             - torch.log(std)
             - (y - mu) ** 2 / (2 * std ** 2)
         )
@@ -78,8 +78,8 @@ class GaussianBasis(SeparableBasis):
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
         # (d, n1), (d, n2)
-        mu1, std1 = self.__means_stds()
-        mu2, std2 = other.__means_stds()
+        mu1, std1 = self.means_stds()
+        mu2, std2 = other.means_stds()
 
         # Broadcast to (d, n1, n2)
         diff = mu1[:, :, None] - mu2[:, None, :]

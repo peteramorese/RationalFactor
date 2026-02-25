@@ -24,7 +24,7 @@ class LinearRFF(torch.nn.Module):
         self.numerical_tolerance = numerical_tolerance
 
     def get_A(self):
-        return torch.nn.functional.softplus(self.__Au)
+        return torch.nn.functional.softmax(self.__Au)
 
     def get_B(self, A : torch.Tensor = None, Omega : torch.Tensor = None):
         if Omega is None:
@@ -33,7 +33,7 @@ class LinearRFF(torch.nn.Module):
         if A is None:
             A = self.get_A()
 
-        B = A / (Omega @ A.T)
+        B = A / (Omega.T @ A + self.numerical_tolerance)
 
         return B
     
@@ -56,46 +56,66 @@ class LinearRFF(torch.nn.Module):
         # Calculate f(x, x')
         log_f = torch.log((phi_x * psi_xp) @ B + self.numerical_tolerance) # (n_data)
 
+        if torch.isnan(log_g_xp + log_f - log_g_x).any():
+            print("NaN in forward pass")
+            print("log g(x'):", log_g_xp)
+            print("log f(x, x'):", log_f)
+            print("log g(x):", log_g_x)
+            print("phi(x):", phi_x)
+            print("phi(x'):", phi_xp)
+            print("psi(x'):", psi_xp)
+            print("B:", B)
+            raise ValueError("NaN in forward pass")
         return torch.exp(log_g_xp + log_f - log_g_x)
-    
+
 class LinearFF(torch.nn.Module):
-    def __init__(self, rff : LinearRFF, psi0_basis : SeparableBasis = None):
+    #def __init__(self, rff : LinearRFF, psi0_basis : SeparableBasis = None):
+    def __init__(self, A : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis = None, numerical_tolerance : float = 1e-10, C0_fixed : torch.Tensor = None):
         super().__init__()
-        assert isinstance(rff, LinearRFF), "Must pass in a trained rational rational factor model"
+        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
+        assert A.shape[0] == phi_basis.n_basis_functions(), "A must have n_phi elements"
 
         if psi0_basis is not None:
             assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
-            assert psi0_basis.dim() == rff.d, "psi0_basis and rff must have the same dimension"
+            assert psi0_basis.dim() == phi_basis.dim(), "psi0_basis and phi_basis must have the same dimension"
             self.psi0_basis = psi0_basis
         else:
-            self.psi0_basis = deepcopy(rff.psi_basis)
+            self.psi0_basis = deepcopy(phi_basis)
             
             # If using the psi basis from the rff, fix the parameters (not trainable)
             for p in self.psi0_basis.params:
                 p.requires_grad = False
 
-        basis_type = type(rff.phi_basis)
-        self.phi_basis = basis_type.freeze_params(rff.phi_basis)
+        self.phi_basis = phi_basis 
         
-        # Disable training of phi (g factor function) basis functions
-        for p in self.phi_basis.params:
-            p.requires_grad = False
-
-        self.n_phi = rff.n_phi
+        self.n_phi = phi_basis.n_basis_functions()
         self.n_psi0 = self.psi0_basis.n_basis_functions()
 
-        self.register_buffer("A", rff.get_A().detach().clone()) 
-        self.__C0u = torch.nn.Parameter(torch.randn(self.n_psi0))
+        self.register_buffer("A", A) 
+        if C0_fixed is not None:
+            self.register_buffer("C0_fixed", C0_fixed)
+        else:
+            self.__C0u = torch.nn.Parameter(torch.randn(self.n_psi0))
         
-        self.numerical_tolerance = rff.numerical_tolerance
+        self.numerical_tolerance = numerical_tolerance
+    
+    @classmethod
+    def from_rff(cls, rff : LinearRFF, psi0_basis : SeparableBasis = None):
+        basis_type = type(rff.phi_basis)
+        phi_basis = basis_type.freeze_params(rff.phi_basis)
+        A = rff.get_A().detach().clone()
+        return cls(A, phi_basis, psi0_basis, rff.numerical_tolerance)
 
-    def get_C0(self, Omega : torch.Tensor = None):
-        if Omega is None:
-            Omega = self.phi_basis.inner_prod_matrix(self.psi0_basis)
+    def get_C0(self, Omega0 : torch.Tensor = None):
+        if hasattr(self, "C0_fixed"):
+            return self.C0_fixed
+
+        if Omega0 is None:
+            Omega0 = self.phi_basis.inner_prod_matrix(self.psi0_basis)
         
         C0_unnormalized = torch.nn.functional.softplus(self.__C0u)
         
-        norm_constant = 1.0 / (self.A.T @ Omega @ C0_unnormalized)
+        norm_constant = 1.0 / (self.A.T @ Omega0 @ C0_unnormalized)
         
         return norm_constant * C0_unnormalized
         
@@ -108,7 +128,18 @@ class LinearFF(torch.nn.Module):
         log_g_x = torch.log(phi_x @ self.A + self.numerical_tolerance) # (n_data)
         log_h0_x = torch.log(psi0_x @ C0 + self.numerical_tolerance)
 
+        if torch.isnan(log_g_x + log_h0_x).any():
+            print("NaN in forward pass")
+            print("log g(x):", log_g_x)
+            print("log h0(x):", log_h0_x)
+            print("phi(x):", phi_x)
+            print("psi0(x):", psi0_x)
+            print("C0:", C0)
+            raise ValueError("NaN in forward pass")
+
         return torch.exp(log_g_x + log_h0_x)
     
-    #def marginal(self, )
+    def marginal(self, marginal_dims : tuple[int, ...]):
+        return LinearFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
+    
     
