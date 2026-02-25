@@ -37,13 +37,13 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 100
-    n_epochs = 200
+    n_basis = 600
+    n_epochs = 500
     batch_size = 256
-    learning_rate = 3e-2
+    learning_rate = 2e-2
     n_timesteps_train = 10
     n_timesteps_prop = 10
-    n_trajectories_train = 1000
+    n_trajectories_train = 4000
     reg_strength = 10.0
     ###
 
@@ -66,9 +66,9 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(xp_data, batch_size=512, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 2.0]))
-    psi_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 2.0]))
-    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 2.0]))
+    phi_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
+    psi_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
+    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
 
     # Create and train the transition model
     tran_model = LinearRFF(phi_basis, psi_basis)
@@ -92,8 +92,8 @@ if __name__ == "__main__":
 
     # Analysis
 
-    box_lows = (-10.0, -10.0)
-    box_highs = (10.0, 10.0)
+    box_lows = (-5.0, -5.0)
+    box_highs = (5.0, 5.0)
 
     belief_seq = propagate.propagate(init_model, tran_model, n_steps=n_timesteps_prop)
 
@@ -108,7 +108,7 @@ if __name__ == "__main__":
     
     # Compute empirical AUC of each belief
     for i in range(n_timesteps_prop):
-        auc = mc_integral_box(belief_seq[i], domain_bounds=(box_lows, box_highs), n_samples=1000000)
+        auc = mc_integral_box(belief_seq[i], domain_bounds=(box_lows, box_highs), n_samples=10000)
         print("AUC of belief at time ", i, ": ", auc)
 
     plt.show()
