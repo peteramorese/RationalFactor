@@ -16,6 +16,6 @@ def propagate(belief : LinearFF, transition_model : LinearRFF, n_steps : int):
         C_seq.append(BOmega @ C_seq[-1])
     
     #print("C_seq:", C_seq)
-    belief_seq = [LinearFF(belief.A, belief.phi_basis, belief.psi0_basis, C0_fixed=C_seq[i + 1]) for i in range(n_steps)]
+    belief_seq = [LinearFF(belief.A, belief.phi_basis, transition_model.psi_basis, C0_fixed=C_seq[i + 1]) for i in range(n_steps)]
     belief_seq.insert(0, belief) # Add the initial belief
     return belief_seq

@@ -40,7 +40,7 @@ if __name__ == "__main__":
     n_basis = 100
     n_epochs = 200
     batch_size = 256
-    learning_rate = 1e-2
+    learning_rate = 3e-2
     n_timesteps_train = 10
     n_timesteps_prop = 10
     n_trajectories_train = 1000
@@ -92,8 +92,8 @@ if __name__ == "__main__":
 
     # Analysis
 
-    box_lows = (-5.0, -5.0)
-    box_highs = (5.0, 5.0)
+    box_lows = (-10.0, -10.0)
+    box_highs = (10.0, 10.0)
 
     belief_seq = propagate.propagate(init_model, tran_model, n_steps=n_timesteps_prop)
 
@@ -108,7 +108,7 @@ if __name__ == "__main__":
     
     # Compute empirical AUC of each belief
     for i in range(n_timesteps_prop):
-        auc = mc_integral_box(belief_seq[i], domain_bounds=(box_lows, box_highs), n_samples=100000)
+        auc = mc_integral_box(belief_seq[i], domain_bounds=(box_lows, box_highs), n_samples=1000000)
         print("AUC of belief at time ", i, ": ", auc)
 
     plt.show()
