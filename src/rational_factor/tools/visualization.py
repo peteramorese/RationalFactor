@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ..models.rational_factor import LinearFF
 
-def plot_belief(ax: plt.Axes, belief: LinearFF, x_range: tuple[float, float], y_range: tuple[float, float], n_points: int = 100, contour_levels: int = 10, contourf_kwargs: dict = None):
+def plot_belief(ax: plt.Axes, belief, x_range: tuple[float, float], y_range: tuple[float, float], n_points: int = 100, contour_levels: int = 10, contourf_kwargs: dict = None):
     ax.set_aspect("equal")
     x_lin = np.linspace(x_range[0], x_range[1], n_points)
     y_lin = np.linspace(y_range[0], y_range[1], n_points)
