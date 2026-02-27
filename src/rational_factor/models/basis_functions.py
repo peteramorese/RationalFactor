@@ -30,6 +30,15 @@ class SeparableBasis(torch.nn.Module):
             n_basis x other.n_basis matrix of inner product values
         '''
         pass
+
+    def inner_prod_tensor(self, other: 'SeparableBasis'):
+        '''
+        Computes the 4D quadratic function inner product tensor with another basis function vector. The argument `other` occupies the last two indices
+        
+        Returns:
+            n_basis x b_basis x other.n_basis x other.n_basis tensor of inner product values
+        '''
+        pass
     
     @abstractmethod
     def marginal(self, marginal_dims : tuple[int, ...]):
@@ -40,6 +49,7 @@ class SeparableBasis(torch.nn.Module):
             A new SeparableBasis object with the marginalized dimensions
         '''
         pass
+
 
 class GaussianBasis(SeparableBasis):
     def __init__(self, params_init : torch.Tensor, trainable : bool = True):
@@ -75,10 +85,7 @@ class GaussianBasis(SeparableBasis):
         )
         return torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
 
-    def inner_prod_matrix(self, other: 'GaussianBasis') -> torch.Tensor:
-        """
-        Returns inner product matrix with another basis function vector
-        """
+    def inner_prod_matrix(self, other: 'GaussianBasis'):
         assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
@@ -94,6 +101,56 @@ class GaussianBasis(SeparableBasis):
         log_dim_ip = -0.5 * (torch.log(2 * torch.pi * var_sum) + (diff * diff) / var_sum)
 
         log_Omega = log_dim_ip.sum(dim=0)
+        return torch.exp(log_Omega)
+
+    def inner_prod_tensor(self, other: "GaussianBasis"):
+        assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
+        assert self.dim() == other.dim(), "Basis functions must have the same dimension"
+
+        # (d, nf), (d, ng)
+        mu_f, std_f = self.means_stds()
+        mu_g, std_g = other.means_stds()
+
+        var_f = std_f * std_f
+        var_g = std_g * std_g
+        inv_var_f = 1.0 / var_f
+        inv_var_g = 1.0 / var_g
+
+        # Broadcast everything to (d, nf, nf, ng, ng)
+        mu_i = mu_f[:, :, None, None, None]
+        mu_j = mu_f[:, None, :, None, None]
+        mu_k = mu_g[:, None, None, :, None]
+        mu_l = mu_g[:, None, None, None, :]
+
+        inv_i = inv_var_f[:, :, None, None, None]
+        inv_j = inv_var_f[:, None, :, None, None]
+        inv_k = inv_var_g[:, None, None, :, None]
+        inv_l = inv_var_g[:, None, None, None, :]
+
+        var_i = var_f[:, :, None, None, None]
+        var_j = var_f[:, None, :, None, None]
+        var_k = var_g[:, None, None, :, None]
+        var_l = var_g[:, None, None, None, :]
+
+        S = inv_i + inv_j + inv_k + inv_l
+        T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k + mu_l * inv_l
+        U = (mu_i * mu_i) * inv_i + (mu_j * mu_j) * inv_j + (mu_k * mu_k) * inv_k + (mu_l * mu_l) * inv_l
+
+        log_pref = -0.5 * (
+            4.0 * torch.log(torch.tensor(2.0 * torch.pi, device=mu_f.device, dtype=mu_f.dtype))
+            + torch.log(var_i) + torch.log(var_j) + torch.log(var_k) + torch.log(var_l)
+        )
+
+        log_gauss_int = 0.5 * (
+            torch.log(torch.tensor(2.0 * torch.pi, device=mu_f.device, dtype=mu_f.dtype))
+            - torch.log(S)
+        )
+
+        quad = -0.5 * (U - (T * T) / S)
+
+        log_dim = log_pref + log_gauss_int + quad              # (d, nf, nf, ng, ng)
+        log_Omega = log_dim.sum(dim=0)                         # (nf, nf, ng, ng)
+
         return torch.exp(log_Omega)
 
     def marginal(self, marginal_dims: tuple[int, ...]) -> 'GaussianBasis':
