@@ -137,7 +137,7 @@ class LinearFF(torch.nn.Module):
     
     
 class QuadraticRFF(torch.nn.Module):
-    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-10):
+    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-6):
         super().__init__()
 
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
@@ -168,7 +168,6 @@ class QuadraticRFF(torch.nn.Module):
             A = self.get_A()
 
         den = torch.einsum('klij,kl->ij', Omega, A) 
-
         B = A / (den + self.numerical_tolerance)
 
         return B
@@ -185,10 +184,10 @@ class QuadraticRFF(torch.nn.Module):
         A = self.get_A()
         B = self.get_B(A=A)
 
-        log_g_x = torch.log(phi_x @ A @ phi_x + self.numerical_tolerance) # (n_data)
-        log_g_xp = torch.log(phi_xp @ A @ phi_xp + self.numerical_tolerance) # (n_data)
+        log_g_x = torch.log(phi_x @ A @ phi_x.T + self.numerical_tolerance) # (n_data)
+        log_g_xp = torch.log(phi_xp @ A @ phi_xp.T + self.numerical_tolerance) # (n_data)
 
-        log_f = torch.log((phi_x * psi_xp) @ B @ (phi_x * psi_xp) + self.numerical_tolerance) # (n_data)
+        log_f = torch.log((phi_x * psi_xp) @ B @ (phi_x * psi_xp).T + self.numerical_tolerance) # (n_data)
 
         return torch.exp(log_g_xp + log_f - log_g_x)
 
@@ -228,7 +227,7 @@ class QuadraticFF(torch.nn.Module):
             return self.C0_fixed
 
         if Omega0 is None:
-            Omega0 = self.phi_basis.inner_prod_matrix(self.psi0_basis)
+            Omega0 = self.phi_basis.inner_prod_tensor(self.psi0_basis)
         
         C0_unnormalized = self.__LC0u.T @ self.__LC0u
         

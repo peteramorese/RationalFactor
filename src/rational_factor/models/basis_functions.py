@@ -108,41 +108,41 @@ class GaussianBasis(SeparableBasis):
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
         # (d, nf), (d, ng)
-        mu_f, std_f = self.means_stds()
-        mu_g, std_g = other.means_stds()
+        mu1, std1 = self.means_stds()
+        mu2, std2 = other.means_stds()
 
-        var_f = std_f * std_f
-        var_g = std_g * std_g
-        inv_var_f = 1.0 / var_f
-        inv_var_g = 1.0 / var_g
+        var1 = std1 * std1
+        var2 = std2 * std2
+        inv_var1 = 1.0 / var1
+        inv_var2 = 1.0 / var2
 
         # Broadcast everything to (d, nf, nf, ng, ng)
-        mu_i = mu_f[:, :, None, None, None]
-        mu_j = mu_f[:, None, :, None, None]
-        mu_k = mu_g[:, None, None, :, None]
-        mu_l = mu_g[:, None, None, None, :]
+        mu_i = mu1[:, :, None, None, None]
+        mu_j = mu1[:, None, :, None, None]
+        mu_k = mu2[:, None, None, :, None]
+        mu_l = mu2[:, None, None, None, :]
 
-        inv_i = inv_var_f[:, :, None, None, None]
-        inv_j = inv_var_f[:, None, :, None, None]
-        inv_k = inv_var_g[:, None, None, :, None]
-        inv_l = inv_var_g[:, None, None, None, :]
+        inv_i = inv_var1[:, :, None, None, None]
+        inv_j = inv_var1[:, None, :, None, None]
+        inv_k = inv_var2[:, None, None, :, None]
+        inv_l = inv_var2[:, None, None, None, :]
 
-        var_i = var_f[:, :, None, None, None]
-        var_j = var_f[:, None, :, None, None]
-        var_k = var_g[:, None, None, :, None]
-        var_l = var_g[:, None, None, None, :]
+        var_i = var1[:, :, None, None, None]
+        var_j = var1[:, None, :, None, None]
+        var_k = var2[:, None, None, :, None]
+        var_l = var2[:, None, None, None, :]
 
         S = inv_i + inv_j + inv_k + inv_l
         T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k + mu_l * inv_l
         U = (mu_i * mu_i) * inv_i + (mu_j * mu_j) * inv_j + (mu_k * mu_k) * inv_k + (mu_l * mu_l) * inv_l
 
         log_pref = -0.5 * (
-            4.0 * torch.log(torch.tensor(2.0 * torch.pi, device=mu_f.device, dtype=mu_f.dtype))
+            4.0 * torch.log(torch.tensor(2.0 * torch.pi, device=mu1.device, dtype=mu1.dtype))
             + torch.log(var_i) + torch.log(var_j) + torch.log(var_k) + torch.log(var_l)
         )
 
         log_gauss_int = 0.5 * (
-            torch.log(torch.tensor(2.0 * torch.pi, device=mu_f.device, dtype=mu_f.dtype))
+            torch.log(torch.tensor(2.0 * torch.pi, device=mu1.device, dtype=mu1.dtype))
             - torch.log(S)
         )
 
@@ -151,6 +151,15 @@ class GaussianBasis(SeparableBasis):
         log_dim = log_pref + log_gauss_int + quad              # (d, nf, nf, ng, ng)
         log_Omega = log_dim.sum(dim=0)                         # (nf, nf, ng, ng)
 
+        if torch.isnan(log_Omega).any():
+            print("log_Omega: ", log_Omega)
+            print("log_pref: ", log_pref)
+            print("log_gauss_int: ", log_gauss_int)
+            print("quad: ", quad)
+            print("mu1: ", mu1)
+            print("std1: ", std1)
+            print("mu2: ", mu2)
+            print("std2: ", std2)
         return torch.exp(log_Omega)
 
     def marginal(self, marginal_dims: tuple[int, ...]) -> 'GaussianBasis':
