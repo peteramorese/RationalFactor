@@ -38,9 +38,9 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     n_basis = 10
-    n_epochs = 200
+    n_epochs = 5
     batch_size = 256
-    learning_rate = 2e-3
+    learning_rate = 1e-3
     n_timesteps_train = 10
     n_timesteps_prop = 10
     n_trajectories_train = 1000
@@ -82,6 +82,18 @@ if __name__ == "__main__":
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn, "psd": psd_loss_fn}, 
         torch.optim.Adam(tran_model.parameters(), lr=learning_rate), epochs=n_epochs)
     print("Done! \n")
+    print("PSD: ", tran_model.is_psd())
+
+    for x_test in [-1.0, 0.0, 1.0]:
+        x_test = torch.tensor([[x_test, x_test]])
+        def cd(xp):
+            x_ = x_test * torch.ones_like(xp)
+            print("xp shape: ", xp.shape, " x_ shape: ", x_.shape)
+            return tran_model(x_, xp)
+        auc = mc_integral_box(cd, domain_bounds=((-10.0, -10.0), (10.0, 10.0)), n_samples=100000)
+        #auc = mc_integral_box(cd, domain_bounds=((-4.0, -4.0), (4.0, 4.0)), n_samples=50000)
+        #auc = mc_integral_box(cd, domain_bounds=((-40.0, -40.0), (40.0, 40.0)), n_samples=10000)
+        print("AUC of cd at x = ", x_test, ": ", auc)
 
 
     mle_loss_fn = loss.mle_loss

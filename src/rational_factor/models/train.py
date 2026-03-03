@@ -5,6 +5,8 @@ import time
 
 def train(model, data_loader : DataLoader, labeled_loss_fns : dict[str, callable], optimizer, epochs=100, verbose=True):
     
+    torch.autograd.set_detect_anomaly(True)
+
     model.train()
 
     loss_labels = list(labeled_loss_fns.keys())

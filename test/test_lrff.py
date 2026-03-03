@@ -37,7 +37,7 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 100
+    n_basis = 200
     n_epochs = 200
     batch_size = 256
     learning_rate = 2e-2
@@ -67,9 +67,9 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(xp_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
-    psi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
-    psi0_basis = GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
+    phi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 100.0]))
+    psi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 100.0]))
+    psi0_basis = GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 100.0]))
 
     # Create and train the transition model
     tran_model = LinearRFF(phi_basis, psi_basis)
@@ -84,7 +84,6 @@ if __name__ == "__main__":
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
         torch.optim.Adam(tran_model.parameters(), lr=learning_rate), epochs=n_epochs)
     print("Done! \n")
-
 
     mle_loss_fn = loss.mle_loss
     var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)

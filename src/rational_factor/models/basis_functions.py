@@ -52,26 +52,27 @@ class SeparableBasis(torch.nn.Module):
 
 
 class GaussianBasis(SeparableBasis):
-    def __init__(self, params_init : torch.Tensor, trainable : bool = True):
+    def __init__(self, params_init : torch.Tensor, trainable : bool = True, min_std : float = 1e-5):
         assert params_init.shape[2] == 2, "params_init must have shape (d, n_basis, 2)"
         super().__init__(params_init, trainable)
+        self.min_std = min_std
 
     @classmethod
-    def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2)):
+    def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5):
         offsets = offsets.repeat(d, n_basis, 1)
-        return cls(torch.randn(d, n_basis, 2) + offsets)
+        return cls(torch.randn(d, n_basis, 2) + offsets, min_std=min_std)
 
     @classmethod
-    def set_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2)):
+    def set_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5):
         offsets = offsets.repeat(d, n_basis, 1)
-        return cls(offsets)
+        return cls(offsets, min_std=min_std)
 
     @classmethod 
     def freeze_params(cls, other : 'GaussianBasis'):
-        return cls(other.params.detach().clone(), trainable=False)
+        return cls(other.params.detach().clone(), trainable=False, min_std=other.min_std)
 
     def means_stds(self):
-        return self.params[..., 0], torch.nn.functional.softplus(self.params[..., 1]) + 1e-8
+        return self.params[..., 0], torch.nn.functional.softplus(self.params[..., 1] - 1.0) + self.min_std
     
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
@@ -107,7 +108,7 @@ class GaussianBasis(SeparableBasis):
         assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
-        # (d, nf), (d, ng)
+        # (d, n_phi), (d, n_psi)
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
 
@@ -116,7 +117,7 @@ class GaussianBasis(SeparableBasis):
         inv_var1 = 1.0 / var1
         inv_var2 = 1.0 / var2
 
-        # Broadcast everything to (d, nf, nf, ng, ng)
+        # Broadcast everything to (d, n_phi, n_phi, n_psi, n_psi)
         mu_i = mu1[:, :, None, None, None]
         mu_j = mu1[:, None, :, None, None]
         mu_k = mu2[:, None, None, :, None]
@@ -134,17 +135,13 @@ class GaussianBasis(SeparableBasis):
 
         S = inv_i + inv_j + inv_k + inv_l
         T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k + mu_l * inv_l
-        U = (mu_i * mu_i) * inv_i + (mu_j * mu_j) * inv_j + (mu_k * mu_k) * inv_k + (mu_l * mu_l) * inv_l
+        U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k + mu_l.square() * inv_l
 
-        log_pref = -0.5 * (
-            4.0 * torch.log(torch.tensor(2.0 * torch.pi, device=mu1.device, dtype=mu1.dtype))
-            + torch.log(var_i) + torch.log(var_j) + torch.log(var_k) + torch.log(var_l)
-        )
+        two_pi = mu1.new_tensor(2.0 * torch.pi)
+        log2pi = torch.log(two_pi)
 
-        log_gauss_int = 0.5 * (
-            torch.log(torch.tensor(2.0 * torch.pi, device=mu1.device, dtype=mu1.dtype))
-            - torch.log(S)
-        )
+        log_pref = -0.5 * (4.0 * log2pi + torch.log(var_i) + torch.log(var_j) + torch.log(var_k) + torch.log(var_l))
+        log_gauss_int = 0.5 * (log2pi - torch.log(S))
 
         quad = -0.5 * (U - (T * T) / S)
 
@@ -152,10 +149,10 @@ class GaussianBasis(SeparableBasis):
         log_Omega = log_dim.sum(dim=0)                         # (nf, nf, ng, ng)
 
         if torch.isnan(log_Omega).any():
-            print("log_Omega: ", log_Omega)
-            print("log_pref: ", log_pref)
-            print("log_gauss_int: ", log_gauss_int)
-            print("quad: ", quad)
+            #print("log_Omega: ", log_Omega)
+            #print("log_pref: ", log_pref)
+            #print("log_gauss_int: ", log_gauss_int)
+            #print("quad: ", quad)
             print("mu1: ", mu1)
             print("std1: ", std1)
             print("mu2: ", mu2)

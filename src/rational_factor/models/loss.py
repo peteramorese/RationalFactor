@@ -5,6 +5,13 @@ from .basis_functions import GaussianBasis
 #### General ####
 
 def conditional_mle_loss(model, x : torch.Tensor, xp : torch.Tensor):
+    #return -torch.log(torch.relu(model(x, xp) + 1e-15)).mean()
+    #if torch.isnan(model(x, xp).log()).any():
+    #    print("NaN in conditional_mle_loss")
+    #    print("min model(x, xp): ", model(x, xp).min())
+    #    #print("model basis functions: ", model.phi_basis.means_stds())
+    #    print("B: ", model.get_B())
+    #    raise ValueError("NaN in conditional_mle_loss")
     return -model(x, xp).log().mean()
 
 def mle_loss(model, x : torch.Tensor):
@@ -28,14 +35,23 @@ def lrff_bOmega_trace_loss(model : LinearRFF):
 
 #### Quadratic models ####
 
-def B_psd_loss(model : QuadraticRFF, min_eigval : float = 1e-8, penalty_offset : float = 1e0, eval_condition : float = 1e-8):
+def B_psd_loss(model : QuadraticRFF, min_eigval : float = 0.0, penalty_offset : float = 2e0, eval_condition : float = 1e-8):
     B = model.get_B()
-    print("B: ", B)
+    #print("B: ", B)
     eigvals = torch.linalg.eigvalsh(B) + eval_condition * torch.eye(B.shape[0])
     if torch.all(eigvals > min_eigval):
-        return torch.prod(eigvals).log()
+        #print("torch.min(eigvals): ", torch.min(eigvals))
+        #print("torch.max(eigvals): ", torch.max(eigvals))
+        #print("torch.prod(eigvals): ", torch.prod(eigvals))
+        #print("eigvals: ", eigvals, " loss: ", torch.sum(torch.log(eigvals + eval_condition)))
+
+        #print("eigvals: ", eigvals, " loss: ", torch.min(eigvals).log())
+        return -torch.sum(torch.log(eigvals))
+        #return torch.min(eigvals).log()
     else:
-        return torch.sum(torch.relu(-eigvals + penalty_offset)**2)
+        print("invalid evals", eigvals.min(), eigvals.max())
+        penalty = torch.relu(-eigvals + penalty_offset)
+        return 10.0 * torch.sum(penalty**2 + penalty)
 
 
 #### Regularization ####
