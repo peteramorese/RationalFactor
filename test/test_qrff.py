@@ -37,15 +37,15 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 10
-    n_epochs = 5
+    n_basis = 13
+    n_epochs = 100
     batch_size = 256
     learning_rate = 1e-3
     n_timesteps_train = 10
     n_timesteps_prop = 10
     n_trajectories_train = 1000
-    var_reg_strength = 0.1
-    psd_reg_strength = 0.02
+    var_reg_strength = 0.0 #0.01
+    psd_reg_strength = 1e-5 #0.002
     ###
 
     # Create system
@@ -67,9 +67,12 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(xp_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
-    psi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
-    psi0_basis = GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
+    #phi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
+    #psi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
+    #psi0_basis = GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 5.0]))
+    phi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0]))
+    psi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0]))
+    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0]))
 
     # Create and train the transition model
     tran_model = QuadraticRFF(phi_basis, psi_basis)
@@ -77,12 +80,16 @@ if __name__ == "__main__":
     mle_loss_fn = loss.conditional_mle_loss
     var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
     psd_loss_fn = lambda model, x, xp : psd_reg_strength * loss.B_psd_loss(model)
+    print("phi basis params b4: ", tran_model.phi_basis.params)
+    print("psi basis params b4: ", tran_model.psi_basis.params)
     tran_model = train.train(tran_model, 
         xp_dataloader, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn, "psd": psd_loss_fn}, 
         torch.optim.Adam(tran_model.parameters(), lr=learning_rate), epochs=n_epochs)
     print("Done! \n")
     print("PSD: ", tran_model.is_psd())
+    print("phi basis params af: ", tran_model.phi_basis.params)
+    print("psi basis params af: ", tran_model.psi_basis.params)
 
     for x_test in [-1.0, 0.0, 1.0]:
         x_test = torch.tensor([[x_test, x_test]])
@@ -124,7 +131,7 @@ if __name__ == "__main__":
     
     # Compute empirical AUC of each belief
     for i in range(n_timesteps_prop):
-        auc = mc_integral_box(belief_seq[i], domain_bounds=(box_lows, box_highs), n_samples=10000)
+        auc = mc_integral_box(belief_seq[i], domain_bounds=(box_lows, box_highs), n_samples=100000)
         print("AUC of belief at time ", i, ": ", auc)
 
     plt.show()

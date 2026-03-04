@@ -159,6 +159,7 @@ class QuadraticRFF(torch.nn.Module):
     
     def get_A(self):
         bounded_A = torch.tanh(self.__LAu)
+        #bounded_A = self.__LAu
         return bounded_A @ bounded_A.T
     
     def get_B(self, A : torch.Tensor = None, Omega : torch.Tensor = None):
@@ -171,8 +172,8 @@ class QuadraticRFF(torch.nn.Module):
         #den = torch.einsum('klij,ij->kl', Omega, A) 
         #den = torch.einsum('klij,kl->ij', Omega, A) 
 
-        #den = torch.einsum('ij,ijkl->kl', A, Omega) 
-        den = torch.einsum('ij,klij->kl', A, Omega) 
+        den = torch.einsum('ij,ijkl->kl', A, Omega) 
+        #den = torch.einsum('ij,klij->kl', A, Omega) 
 
         #print("omega: ", Omega.min(), Omega.max())
         #print("A: ", A.min(), A.max())

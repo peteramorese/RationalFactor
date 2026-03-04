@@ -46,12 +46,12 @@ def B_psd_loss(model : QuadraticRFF, min_eigval : float = 0.0, penalty_offset : 
         #print("eigvals: ", eigvals, " loss: ", torch.sum(torch.log(eigvals + eval_condition)))
 
         #print("eigvals: ", eigvals, " loss: ", torch.min(eigvals).log())
-        return -torch.sum(torch.log(eigvals))
+        return -torch.log(eigvals).mean()
         #return torch.min(eigvals).log()
     else:
         print("invalid evals", eigvals.min(), eigvals.max())
         penalty = torch.relu(-eigvals + penalty_offset)
-        return 10.0 * torch.sum(penalty**2 + penalty)
+        return torch.sum(penalty**2 + penalty)
 
 
 #### Regularization ####
