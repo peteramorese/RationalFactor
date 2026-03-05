@@ -15,7 +15,6 @@ def train(model, data_loader : DataLoader, labeled_loss_fns : dict[str, callable
 
     def train_step(*args):
         optimizer.zero_grad()
-        #loss = loss_fn(model, *args)
         losses = [loss_fn(model, *args) for loss_fn in loss_fns]
         total_loss = sum(losses)
         total_loss.backward()
@@ -34,9 +33,6 @@ def train(model, data_loader : DataLoader, labeled_loss_fns : dict[str, callable
             total_sum_loss += total_loss
             for i, loss in enumerate(losses):
                 sum_losses[i] += loss.item()
-
-
-
 
         end_time = time.time()
         avg_total_loss = total_sum_loss / len(data_loader)

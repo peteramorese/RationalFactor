@@ -148,15 +148,6 @@ class GaussianBasis(SeparableBasis):
         log_dim = log_pref + log_gauss_int + quad              # (d, nf, nf, ng, ng)
         log_Omega = log_dim.sum(dim=0)                         # (nf, nf, ng, ng)
 
-        if torch.isnan(log_Omega).any():
-            #print("log_Omega: ", log_Omega)
-            #print("log_pref: ", log_pref)
-            #print("log_gauss_int: ", log_gauss_int)
-            #print("quad: ", quad)
-            print("mu1: ", mu1)
-            print("std1: ", std1)
-            print("mu2: ", mu2)
-            print("std2: ", std2)
         return torch.exp(log_Omega)
 
     def marginal(self, marginal_dims: tuple[int, ...]) -> 'GaussianBasis':

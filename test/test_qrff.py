@@ -70,9 +70,6 @@ if __name__ == "__main__":
     phi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.5]))
     psi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.5]))
     psi0_basis = GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.5]))
-    #phi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
-    #psi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
-    #psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.0]))
 
     # Create and train the transition model
     tran_model = QuadraticRFF(phi_basis, psi_basis)
@@ -94,8 +91,6 @@ if __name__ == "__main__":
             print("xp shape: ", xp.shape, " x_ shape: ", x_.shape)
             return tran_model(x_, xp)
         auc = mc_integral_box(cd, domain_bounds=((-10.0, -10.0), (10.0, 10.0)), n_samples=100000)
-        #auc = mc_integral_box(cd, domain_bounds=((-4.0, -4.0), (4.0, 4.0)), n_samples=50000)
-        #auc = mc_integral_box(cd, domain_bounds=((-40.0, -40.0), (40.0, 40.0)), n_samples=10000)
         print("AUC of cd at x = ", x_test, ": ", auc)
 
 
@@ -110,7 +105,6 @@ if __name__ == "__main__":
     print("Done! \n")
 
     # Analysis
-
     box_lows = (-5.0, -5.0)
     box_highs = (5.0, 5.0)
 

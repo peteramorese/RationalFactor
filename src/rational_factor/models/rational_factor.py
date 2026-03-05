@@ -56,16 +56,6 @@ class LinearRFF(torch.nn.Module):
         # Calculate f(x, x')
         log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
 
-        if torch.isnan(log_g_xp + log_f - log_g_x).any():
-            print("NaN in forward pass")
-            print("log g(x'):", log_g_xp)
-            print("log f(x, x'):", log_f)
-            print("log g(x):", log_g_x)
-            print("phi(x):", phi_x)
-            print("phi(x'):", phi_xp)
-            print("psi(x'):", psi_xp)
-            print("b:", b)
-            raise ValueError("NaN in forward pass")
         return torch.exp(log_g_xp + log_f - log_g_x)
     
     def valid(self):
@@ -124,15 +114,6 @@ class LinearFF(torch.nn.Module):
         log_g_x = torch.log(phi_x @ self.a + self.numerical_tolerance) # (n_data)
         log_h0_x = torch.log(psi0_x @ c0 + self.numerical_tolerance)
 
-        if torch.isnan(log_g_x + log_h0_x).any():
-            print("NaN in forward pass")
-            print("log g(x):", log_g_x)
-            print("log h0(x):", log_h0_x)
-            print("phi(x):", phi_x)
-            print("psi0(x):", psi0_x)
-            print("c0:", c0)
-            raise ValueError("NaN in forward pass")
-
         return torch.exp(log_g_x + log_h0_x)
     
     def valid(self):
@@ -165,7 +146,6 @@ class QuadraticRFF(torch.nn.Module):
     
     def get_A(self):
         bounded_A = torch.tanh(self.__LAu)
-        #bounded_A = self.__LAu
         return bounded_A @ bounded_A.T
     
     def get_B(self, A : torch.Tensor = None, Omega : torch.Tensor = None):
@@ -175,15 +155,8 @@ class QuadraticRFF(torch.nn.Module):
         if A is None:
             A = self.get_A()
 
-        #den = torch.einsum('klij,ij->kl', Omega, A) 
-        #den = torch.einsum('klij,kl->ij', Omega, A) 
-
         den = torch.einsum('ij,ijkl->kl', A, Omega) 
-        #den = torch.einsum('ij,klij->kl', A, Omega) 
 
-        #print("omega: ", Omega.min(), Omega.max())
-        #print("A: ", A.min(), A.max())
-        #print("den: ", den.min(), den.max())
         B = A / (den + self.numerical_tolerance)
 
         return B
@@ -201,27 +174,11 @@ class QuadraticRFF(torch.nn.Module):
         B = self.get_B(A=A)
 
         log_g_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", phi_x, A, phi_x)) + self.numerical_tolerance) # (n_data)
-        #log_g_x = torch.log(torch.relu(phi_x @ A @ phi_x.T) + self.numerical_tolerance) # (n_data)
         log_g_xp = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", phi_xp, A, phi_xp)) + self.numerical_tolerance) # (n_data)
-        #log_g_xp = torch.log(torch.relu(phi_xp @ A @ phi_xp.T) + self.numerical_tolerance) # (n_data)
 
         f_quad = torch.einsum("pi,ij,pj->p", phi_x * psi_xp, B, phi_x * psi_xp)
-        #f_quad = (phi_x * psi_xp) @ B @ (phi_x * psi_xp).T
         f = torch.relu(f_quad - self.numerical_tolerance) + self.numerical_tolerance # (n_data)
 
-        #print("B: ", B.min(), B.max())
-        #print("f_quad: ", f_quad.min(), f_quad.max())
-        #print("f: ", f.min(), f.max())
-
-        #if torch.isnan(f * torch.exp(log_g_xp - log_g_x)).any():
-        #    print("NaN in forward pass")
-        #    print("log g(x'):", log_g_xp.min())
-        #    print("log g(x):", log_g_x.min())
-        #    print("f:", f.min())
-        #    print("phi(x):", phi_x.min())
-        #    print("phi(x'):", phi_xp.min())
-        #    print("psi(x'):", psi_xp.min())
-        #    print("B:", B.min())
         return f * torch.exp(log_g_xp - log_g_x)
     
     def valid(self):
@@ -282,18 +239,7 @@ class QuadraticFF(torch.nn.Module):
         C0 = self.get_C0()
 
         log_g_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", phi_x, self.A, phi_x)) + self.numerical_tolerance) # (n_data)
-        #log_g_x = torch.log(phi_x @ self.A @ phi_x + self.numerical_tolerance) # (n_data)
         log_h0_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", psi0_x, C0, psi0_x)) + self.numerical_tolerance)
-        #log_h0_x = torch.log(psi0_x @ C0 @ psi0_x + self.numerical_tolerance)
-
-        if torch.isnan(log_g_x + log_h0_x).any():
-            print("NaN in forward pass")
-            print("log g(x):", log_g_x)
-            print("log h0(x):", log_h0_x)
-            print("phi(x):", phi_x)
-            print("psi0(x):", psi0_x)
-            print("C0:", C0)
-            raise ValueError("NaN in forward pass")
 
         return torch.exp(log_g_x + log_h0_x)
 
