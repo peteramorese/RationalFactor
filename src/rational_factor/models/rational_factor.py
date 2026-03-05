@@ -67,6 +67,9 @@ class LinearRFF(torch.nn.Module):
             print("b:", b)
             raise ValueError("NaN in forward pass")
         return torch.exp(log_g_xp + log_f - log_g_x)
+    
+    def valid(self):
+        return True
 
 
 class LinearFF(torch.nn.Module):
@@ -131,6 +134,9 @@ class LinearFF(torch.nn.Module):
             raise ValueError("NaN in forward pass")
 
         return torch.exp(log_g_x + log_h0_x)
+    
+    def valid(self):
+        return True
     
     def marginal(self, marginal_dims : tuple[int, ...]):
         return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
@@ -218,6 +224,9 @@ class QuadraticRFF(torch.nn.Module):
         #    print("B:", B.min())
         return f * torch.exp(log_g_xp - log_g_x)
     
+    def valid(self):
+        return self.is_psd()
+    
     def is_psd(self):
         B = self.get_B()
         return torch.all(torch.linalg.eigvalsh(B) > 0)
@@ -287,6 +296,9 @@ class QuadraticFF(torch.nn.Module):
             raise ValueError("NaN in forward pass")
 
         return torch.exp(log_g_x + log_h0_x)
+
+    def valid(self):
+        return True
 
     def marginal(self, marginal_dims : tuple[int, ...]):
         return LinearFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
