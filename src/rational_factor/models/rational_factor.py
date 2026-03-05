@@ -63,7 +63,6 @@ class LinearRFF(torch.nn.Module):
 
 
 class LinearFF(torch.nn.Module):
-    #def __init__(self, rff : LinearRFF, psi0_basis : SeparableBasis = None):
     def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
         super().__init__()
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
