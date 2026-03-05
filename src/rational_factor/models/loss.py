@@ -1,10 +1,10 @@
 import torch
-from .rational_factor import LinearRFF, LinearFF, QuadraticRFF, QuadraticFF
+from .density_model import DensityModel, ConditionalDensityModel, LinearRFF, QuadraticRFF
 from .basis_functions import GaussianBasis
 
 #### General ####
 
-def conditional_mle_loss(model, x : torch.Tensor, xp : torch.Tensor):
+def conditional_mle_loss(model : ConditionalDensityModel, x : torch.Tensor, xp : torch.Tensor):
     #return -torch.log(torch.relu(model(x, xp) + 1e-15)).mean()
     #if torch.isnan(model(x, xp).log()).any():
     #    print("NaN in conditional_mle_loss")
@@ -12,10 +12,10 @@ def conditional_mle_loss(model, x : torch.Tensor, xp : torch.Tensor):
     #    #print("model basis functions: ", model.phi_basis.means_stds())
     #    print("B: ", model.get_B())
     #    raise ValueError("NaN in conditional_mle_loss")
-    return -model(x, xp).log().mean()
+    return -model.log_density(x, xp).mean()
 
-def mle_loss(model, x : torch.Tensor):
-    return -model(x).log().mean()
+def mle_loss(model : DensityModel, x : torch.Tensor):
+    return -model.log_density(x).mean()
 
 #### Linear models ####
 

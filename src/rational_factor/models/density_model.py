@@ -2,15 +2,54 @@ import torch
 from copy import deepcopy
 from .basis_functions import SeparableBasis
 
-class LinearRFF(torch.nn.Module):
-    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-10):
-        super().__init__()
+#### Base Classes ####
 
+class DensityModel(torch.nn.Module):
+    def __init__(self, dim : int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x : torch.Tensor, xp : torch.Tensor):    
+        return torch.exp(self.log_density(x, xp))
+
+    def log_density(self, x : torch.Tensor):
+        raise NotImplementedError("log_density not implemented")
+
+    def valid(self):
+        raise NotImplementedError("valid not implemented")
+    
+    def marginal(self, marginal_dims : tuple[int, ...]):
+        raise NotImplementedError("marginal not implemented")
+    
+    def sample(self, n_samples : int):
+        raise NotImplementedError("sample not implemented")
+
+class ConditionalDensityModel(torch.nn.Module):
+    def __init__(self, dim : int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x : torch.Tensor, xp : torch.Tensor):
+        return torch.exp(self.log_density(x, xp))
+
+    def log_density(self, x : torch.Tensor, xp : torch.Tensor):
+        raise NotImplementedError("log_density not implemented")
+
+    def valid(self):
+        raise NotImplementedError("valid not implemented")
+    
+    def sample(self, x : torch.Tensor, n_samples : int):
+        raise NotImplementedError("sample not implemented")
+
+######################
+
+
+class LinearRFF(ConditionalDensityModel):
+    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-10):
+        assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
-
-        assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
-        self.d = phi_basis.dim()
+        super().__init__(phi_basis.dim())
 
         self.n_phi = phi_basis.n_basis_functions()
         self.n_psi = psi_basis.n_basis_functions()
@@ -37,9 +76,9 @@ class LinearRFF(torch.nn.Module):
 
         return b
     
-    def forward(self, x : torch.Tensor, xp : torch.Tensor):    
-        assert x.shape[1] == self.d, "x must have shape (n_data, d)"
-        assert xp.shape[1] == self.d, "xp must have shape (n_data, d)"
+    def log_density(self, x : torch.Tensor, xp : torch.Tensor):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        assert xp.shape[1] == self.dim, "xp must have shape (n_data, dim)"
         assert x.shape[0] == xp.shape[0], "x and xp must have the same number of data points"
         
         phi_x = self.phi_basis(x) # (n_data, n_phi)
@@ -56,20 +95,19 @@ class LinearRFF(torch.nn.Module):
         # Calculate f(x, x')
         log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
 
-        return torch.exp(log_g_xp + log_f - log_g_x)
+        return log_g_xp + log_f - log_g_x
     
     def valid(self):
         return True
 
 
-class LinearFF(torch.nn.Module):
+class LinearFF(DensityModel):
     def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
-        super().__init__()
+        assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert a.shape[0] == phi_basis.n_basis_functions(), "a must have n_phi elements"
+        super().__init__(phi_basis.dim())
 
-        assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
-        assert psi0_basis.dim() == phi_basis.dim(), "psi0_basis and phi_basis must have the same dimension"
         self.phi_basis = phi_basis 
         self.psi0_basis = psi0_basis
         
@@ -104,7 +142,8 @@ class LinearFF(torch.nn.Module):
         
         return norm_constant * c0_unnormalized
         
-    def forward(self, x : torch.Tensor):
+    def log_density(self, x : torch.Tensor):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, d)"
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         psi0_x = self.psi0_basis(x) # (n_data, n_psi)
 
@@ -113,8 +152,8 @@ class LinearFF(torch.nn.Module):
         log_g_x = torch.log(phi_x @ self.a + self.numerical_tolerance) # (n_data)
         log_h0_x = torch.log(psi0_x @ c0 + self.numerical_tolerance)
 
-        return torch.exp(log_g_x + log_h0_x)
-    
+        return log_g_x + log_h0_x
+
     def valid(self):
         return True
     
@@ -122,15 +161,12 @@ class LinearFF(torch.nn.Module):
         return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
     
     
-class QuadraticRFF(torch.nn.Module):
+class QuadraticRFF(ConditionalDensityModel):
     def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-8):
-        super().__init__()
-
+        assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
-
-        assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
-        self.d = phi_basis.dim()
+        super().__init__(phi_basis.dim())
 
         self.n_phi = phi_basis.n_basis_functions()
         self.n_psi = psi_basis.n_basis_functions()
@@ -160,9 +196,10 @@ class QuadraticRFF(torch.nn.Module):
 
         return B
 
-    def forward(self, x : torch.Tensor, xp : torch.Tensor):
-        assert x.shape[1] == self.d, "x must have shape (n_data, d)"
-        assert xp.shape[1] == self.d, "xp must have shape (n_data, d)"
+    def log_density(self, x : torch.Tensor, xp : torch.Tensor):
+
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        assert xp.shape[1] == self.dim, "xp must have shape (n_data, dim)"
         assert x.shape[0] == xp.shape[0], "x and xp must have the same number of data points"
 
         phi_x = self.phi_basis(x) # (n_data, n_phi)
@@ -176,9 +213,9 @@ class QuadraticRFF(torch.nn.Module):
         log_g_xp = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", phi_xp, A, phi_xp)) + self.numerical_tolerance) # (n_data)
 
         f_quad = torch.einsum("pi,ij,pj->p", phi_x * psi_xp, B, phi_x * psi_xp)
-        f = torch.relu(f_quad - self.numerical_tolerance) + self.numerical_tolerance # (n_data)
+        log_f = torch.log(torch.relu(f_quad - self.numerical_tolerance) + self.numerical_tolerance) # (n_data)
 
-        return f * torch.exp(log_g_xp - log_g_x)
+        return log_g_xp + log_f - log_g_x
     
     def valid(self):
         return self.is_psd()
@@ -188,15 +225,15 @@ class QuadraticRFF(torch.nn.Module):
         return torch.all(torch.linalg.eigvalsh(B) > 0)
 
 
-class QuadraticFF(torch.nn.Module):
+class QuadraticFF(DensityModel):
     def __init__(self, A : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis = None, numerical_tolerance : float = 1e-10, C0_fixed : torch.Tensor = None):
-        super().__init__()
+        assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
+        assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
         assert A.shape[0] == phi_basis.n_basis_functions(), "A must have n_phi rows"
         assert A.shape[1] == phi_basis.n_basis_functions(), "A must have n_phi columns"
+        super().__init__(phi_basis.dim())
 
-        assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
-        assert psi0_basis.dim() == phi_basis.dim(), "psi0_basis and phi_basis must have the same dimension"
         self.phi_basis = phi_basis 
         self.psi0_basis = psi0_basis
         
@@ -231,7 +268,8 @@ class QuadraticFF(torch.nn.Module):
         
         return norm_constant * C0_unnormalized
     
-    def forward(self, x : torch.Tensor):
+    def log_density(self, x : torch.Tensor):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
         phi_x = self.phi_basis(x)
         psi0_x = self.psi0_basis(x) # (n_data, n_psi)
 
@@ -240,7 +278,7 @@ class QuadraticFF(torch.nn.Module):
         log_g_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", phi_x, self.A, phi_x)) + self.numerical_tolerance) # (n_data)
         log_h0_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", psi0_x, C0, psi0_x)) + self.numerical_tolerance)
 
-        return torch.exp(log_g_x + log_h0_x)
+        return log_g_x + log_h0_x
 
     def valid(self):
         return True

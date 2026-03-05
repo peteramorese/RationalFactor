@@ -3,6 +3,7 @@ from nflows.transforms.base import CompositeTransform
 from nflows.transforms.permutations import RandomPermutation
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 
+
 class DomainTF(torch.nn.Module):
     def __init__(self, dim : int):
         super().__init__()

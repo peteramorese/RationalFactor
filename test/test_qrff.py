@@ -3,7 +3,7 @@ import rational_factor.systems.truth_models as truth_models
 from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix
 from torch.utils.data import DataLoader, TensorDataset
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.rational_factor import QuadraticRFF, QuadraticFF
+from rational_factor.models.density_model import QuadraticRFF, QuadraticFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.models.propagate as propagate

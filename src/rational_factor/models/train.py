@@ -1,10 +1,10 @@
 import torch
 from torch.utils.data import DataLoader
-from .rational_factor import LinearRFF
+from .density_model import DensityModel, ConditionalDensityModel
 import time
 from copy import deepcopy
 
-def train(model, data_loader : DataLoader, labeled_loss_fns : dict[str, callable], optimizer, epochs=100, verbose=True, use_best=True):
+def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoader, labeled_loss_fns : dict[str, callable], optimizer, epochs=100, verbose=True, use_best=True):
     
     torch.autograd.set_detect_anomaly(True)
 

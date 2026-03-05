@@ -1,5 +1,5 @@
 import torch
-from .rational_factor import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF
+from .density_model import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF
 
 def propagate(belief : LinearFF | QuadraticFF, transition_model : LinearRFF | QuadraticRFF, n_steps : int):
     if isinstance(transition_model, LinearRFF):
