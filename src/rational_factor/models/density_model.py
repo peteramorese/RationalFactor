@@ -16,7 +16,7 @@ class DensityModel(torch.nn.Module):
         raise NotImplementedError("log_density not implemented")
 
     def valid(self):
-        raise NotImplementedError("valid not implemented")
+        return True
     
     def marginal(self, marginal_dims : tuple[int, ...]):
         raise NotImplementedError("marginal not implemented")
@@ -36,7 +36,7 @@ class ConditionalDensityModel(torch.nn.Module):
         raise NotImplementedError("log_density not implemented")
 
     def valid(self):
-        raise NotImplementedError("valid not implemented")
+        return True
     
     def sample(self, x : torch.Tensor, n_samples : int):
         raise NotImplementedError("sample not implemented")
@@ -97,9 +97,6 @@ class LinearRFF(ConditionalDensityModel):
 
         return log_g_xp + log_f - log_g_x
     
-    def valid(self):
-        return True
-
 
 class LinearFF(DensityModel):
     def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
@@ -154,9 +151,6 @@ class LinearFF(DensityModel):
 
         return log_g_x + log_h0_x
 
-    def valid(self):
-        return True
-    
     def marginal(self, marginal_dims : tuple[int, ...]):
         return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
     
@@ -279,9 +273,6 @@ class QuadraticFF(DensityModel):
         log_h0_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", psi0_x, C0, psi0_x)) + self.numerical_tolerance)
 
         return log_g_x + log_h0_x
-
-    def valid(self):
-        return True
 
     def marginal(self, marginal_dims : tuple[int, ...]):
         return LinearFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)

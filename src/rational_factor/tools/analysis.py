@@ -1,4 +1,6 @@
 import torch
+from ..models.loss import mle_loss
+from ..models.density_model import DensityModel
 
 def mc_integral_box(f, domain_bounds, n_samples=1000):
     lows = torch.as_tensor(domain_bounds[0])
@@ -10,3 +12,8 @@ def mc_integral_box(f, domain_bounds, n_samples=1000):
 
     vol = torch.prod(highs - lows)
     return vol * y.mean()
+
+def avg_log_likelihood(belief : DensityModel, test_data : torch.Tensor):
+    with torch.no_grad():
+        belief.eval()
+        return -mle_loss(belief, test_data).mean()
