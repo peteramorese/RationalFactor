@@ -34,30 +34,47 @@ class DomainTF(torch.nn.Module):
 class ErfSeparableTF(DomainTF):
     """Maps x to z via a parameterized Gaussian CDF per dimension: z_d = Phi((x_d - loc_d) / scale_d)."""
 
-    def __init__(self, dim : int, trainable : bool = True):
+    def __init__(self, dim : int, loc : torch.Tensor, scale : torch.Tensor, trainable : bool = True):
         super().__init__(dim)
         # (dim, 2): column 0 = location, column 1 = raw scale (softplus applied in forward)
+        self.trainable = trainable
         if trainable:
-            self.params = torch.nn.Parameter(torch.randn(dim, 2))
+            scale_params = torch.sqrt(scale)
+            self.params = torch.nn.Parameter(torch.hstack([loc.unsqueeze(1), scale_params.unsqueeze(1)]))
         else:
-            self.register_buffer("params", torch.randn(dim, 2))
+            self.register_buffer("params", torch.hstack([loc.unsqueeze(1), scale.unsqueeze(1)]))
+
+    @classmethod
+    def from_data(cls, x_data : torch.Tensor, trainable : bool = True):
+        dim = x_data.shape[1]
+        mean = x_data.mean(dim=0)
+        std = x_data.std(dim=0)
+        return cls(dim, mean, std, trainable)
+
+    def _loc_scale(self):
+        if self.trainable:
+            loc = self.params[:, 0]   # (dim,)
+            scale = torch.square(self.params[:, 1])  # (dim,)
+            return loc, scale
+        else:
+            loc = self.params[:, 0]   # (dim,)
+            scale = self.params[:, 1]  # (dim,)
+            return loc, scale
 
     def forward(self, x : torch.Tensor):
-        loc = self.params[:, 0]   # (dim,)
-        scale = torch.softplus(self.params[:, 1])  # (dim,)
+        loc, scale = self._loc_scale()
         sqrt_2 = torch.sqrt(x.new_tensor(2.0))
         u = (x - loc) / (scale * sqrt_2)
         z = 0.5 * (1.0 + torch.special.erf(u))
-        ladj = (-torch.log(scale) - 0.5 * torch.log(2 * torch.pi) - u ** 2).sum(dim=-1)
+        ladj = (-torch.log(scale) - 0.5 * torch.log(x.new_tensor(2.0 * torch.pi)) - u ** 2).sum(dim=-1)
         return z, ladj
 
     def inverse(self, z : torch.Tensor):
-        loc = self.params[:, 0]
-        scale = torch.softplus(self.params[:, 1])
+        loc, scale = self._loc_scale()
         sqrt_2 = torch.sqrt(z.new_tensor(2.0))
         u = torch.special.erfinv(2.0 * z.clamp(1e-6, 1.0 - 1e-6) - 1.0)
         x = loc + scale * sqrt_2 * u
-        ladj = (torch.log(scale) + 0.5 * (torch.log(2 * torch.pi) + u ** 2)).sum(dim=-1) 
+        ladj = (torch.log(scale) + 0.5 * (torch.log(z.new_tensor(2.0 * torch.pi)) + u ** 2)).sum(dim=-1) 
         return x, ladj
 
 

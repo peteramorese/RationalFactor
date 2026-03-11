@@ -18,7 +18,8 @@ class CompositeDensityModel(DensityModel):
     
     def sample(self, n_samples : int):
         z_samples = self.density_model.sample(n_samples)
-        return self.domain_tf.inverse(z_samples)
+        x, _ = self.domain_tf.inverse(z_samples)
+        return x
 
 class CompositeConditionalModel(ConditionalDensityModel):
     def __init__(self, domain_tf : DomainTF, conditional_density_model : ConditionalDensityModel):
@@ -29,7 +30,9 @@ class CompositeConditionalModel(ConditionalDensityModel):
 
     def log_density(self, x : torch.Tensor, xp : torch.Tensor):
         z, _ = self.domain_tf(x)
+        #print("z: ", z)
         zp, ladj = self.domain_tf(xp)
+        #print("zp: ", zp)
         return self.conditional_density_model.log_density(z, zp) + ladj
     
     def valid(self):
@@ -37,4 +40,6 @@ class CompositeConditionalModel(ConditionalDensityModel):
     
     def sample(self, x : torch.Tensor, n_samples : int):
         z, _ = self.domain_tf(x)
-        return self.domain_tf.inverse(self.conditional_density_model.sample(z, n_samples))
+        zp = self.conditional_density_model.sample(z, n_samples)
+        xp, _ = self.domain_tf.inverse(zp)
+        return xp

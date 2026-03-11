@@ -161,14 +161,14 @@ class GaussianBasis(SeparableBasis):
 
 
 class BetaBasis(SeparableBasis):
-    def __init__(self, params_init: torch.Tensor, trainable: bool = True, min_concentration: float = 1e-5, eps: float = 1e-8):
+    def __init__(self, params_init: torch.Tensor, trainable: bool = True, min_concentration: float = 1e-5, eps: float = 1e-6):
         assert params_init.shape[2] == 2, "params_init must have shape (d, n_basis, 2)"
         super().__init__(params_init, trainable)
         self.min_concentration = min_concentration
         self.eps = eps
 
     @classmethod
-    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1e-5, eps: float = 1e-8):
+    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1e-5, eps: float = 1e-6):
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(
             torch.randn(d, n_basis, 2) + offsets,
@@ -177,7 +177,7 @@ class BetaBasis(SeparableBasis):
         )
 
     @classmethod
-    def set_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1e-5, eps: float = 1e-8):
+    def set_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1e-5, eps: float = 1e-6):
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(
             offsets,
@@ -216,6 +216,13 @@ class BetaBasis(SeparableBasis):
             + (beta - 1.0) * torch.log1p(-y)
             - self._log_beta_fn(alpha, beta)
         )
+
+        if torch.isnan(log_dim_factors).any():
+            print("log_dim_factors: ", log_dim_factors)
+            print("alpha: ", alpha)
+            print("beta: ", beta)
+            print("y: ", y)
+            raise ValueError("log_dim_factors is nan")
 
         return torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
 

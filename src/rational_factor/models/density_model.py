@@ -9,8 +9,8 @@ class DensityModel(torch.nn.Module):
         super().__init__()
         self.dim = dim
 
-    def forward(self, x : torch.Tensor, xp : torch.Tensor):    
-        return torch.exp(self.log_density(x, xp))
+    def forward(self, x : torch.Tensor):    
+        return torch.exp(self.log_density(x))
 
     def log_density(self, x : torch.Tensor):
         raise NotImplementedError("log_density not implemented")
