@@ -45,6 +45,10 @@ class ErfSeparableTF(DomainTF):
             self.register_buffer("params", torch.hstack([loc.unsqueeze(1), scale.unsqueeze(1)]))
 
     @classmethod
+    def copy_from_trainable(cls, other : 'ErfSeparableTF'):
+        return cls(other.dim, other.params[:, 0].detach().clone(), torch.square(other.params[:, 1]).detach().clone(), trainable=False)
+
+    @classmethod
     def from_data(cls, x_data : torch.Tensor, trainable : bool = True):
         dim = x_data.shape[1]
         mean = x_data.mean(dim=0)

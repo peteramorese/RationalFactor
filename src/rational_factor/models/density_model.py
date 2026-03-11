@@ -186,6 +186,8 @@ class QuadraticRFF(ConditionalDensityModel):
 
         den = torch.einsum('ij,ijkl->kl', A, Omega) 
 
+        #print("den min max: ", den.min(), den.max())
+
         B = A / (den + self.numerical_tolerance)
 
         return B

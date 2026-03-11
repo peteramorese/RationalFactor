@@ -58,9 +58,9 @@ class GaussianBasis(SeparableBasis):
         self.min_std = min_std
 
     @classmethod
-    def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5):
+    def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5, variance: float = 1.0):
         offsets = offsets.repeat(d, n_basis, 1)
-        return cls(torch.randn(d, n_basis, 2) + offsets, min_std=min_std)
+        return cls(torch.randn(d, n_basis, 2) * torch.sqrt(torch.tensor(variance)) + offsets, min_std=min_std)
 
     @classmethod
     def set_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5):
@@ -168,10 +168,10 @@ class BetaBasis(SeparableBasis):
         self.eps = eps
 
     @classmethod
-    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1e-5, eps: float = 1e-6):
+    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1e-5, eps: float = 1e-6, variance: float = 1.0):
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(
-            torch.randn(d, n_basis, 2) + offsets,
+            torch.randn(d, n_basis, 2) * torch.sqrt(torch.tensor(variance)) + offsets,
             min_concentration=min_concentration,
             eps=eps,
         )
@@ -205,6 +205,13 @@ class BetaBasis(SeparableBasis):
 
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
+
+        #if (y < 0.0).any() or (y > 1.0).any():
+        #    print("y: ", y)
+        #    print("min y: ", y.min())
+        #    print("max y: ", y.max())
+        #    print("eps: ", self.eps)
+        #    raise ValueError("y must be in [0, 1]")
 
         y = y.clamp(self.eps, 1.0 - self.eps)
         y = y[:, :, None]  # (n_data, d, n_basis)

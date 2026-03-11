@@ -3,7 +3,7 @@ import rational_factor.systems.truth_models as truth_models
 from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix
 from torch.utils.data import DataLoader, TensorDataset
 from rational_factor.models.basis_functions import BetaBasis
-from rational_factor.models.density_model import QuadraticRFF, QuadraticFF
+from rational_factor.models.density_model import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.models.propagate as propagate
@@ -31,11 +31,12 @@ if __name__ == "__main__":
     n_basis = 20
     n_epochs = 100
     batch_size = 512
-    learning_rate = 5e-3
+    learning_rate = 5e-2
     n_timesteps_train = 10
     n_timesteps_prop = 10
     n_trajectories_train = 2000
-    var_reg_strength = 5e-3
+    #var_reg_strength = 5e-3
+    var_reg_strength = 0.0
     psd_reg_strength = 1e-1 #0.002
     ###
 
@@ -58,15 +59,21 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(xp_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis =  BetaBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([5.0, 5.0]), min_concentration=1.0)
-    psi_basis =  BetaBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([5.0, 5.0]), min_concentration=1.0)
-    psi0_basis = BetaBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([5.0, 5.0]), min_concentration=1.0)
+    phi_basis =  BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0]), min_concentration=1.0, variance=10.0)
+    psi_basis =  BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0]), min_concentration=1.0, variance=10.0)
+    psi0_basis = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0]), min_concentration=1.0, variance=10.0)
+
+    print("alpha beta b4: ", phi_basis.alphas_betas())
+
 
     # Create separable domain transformation
     domain_tf = ErfSeparableTF.from_data(x_k, trainable=True)
+    print("domain tf loc: ", domain_tf.params[:, 0])
+    print("domain tf scale: ", torch.square(domain_tf.params[:, 1]))
 
     # Create and train the transition model
     tran_model = CompositeConditionalModel(domain_tf, QuadraticRFF(phi_basis, psi_basis))
+    #tran_model = CompositeConditionalModel(domain_tf, LinearRFF(phi_basis, psi_basis))
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.beta_basis_concentration_reg_loss(model.conditional_density_model.phi_basis) + loss.beta_basis_concentration_reg_loss(model.conditional_density_model.psi_basis))
@@ -74,11 +81,17 @@ if __name__ == "__main__":
     tran_model = train.train(tran_model, 
         xp_dataloader, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn, "psd": psd_loss_fn}, 
+        #{"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
         torch.optim.Adam(tran_model.parameters(), lr=learning_rate), epochs=n_epochs, use_best="mle")
     print("Done! \n")
-    print("PSD: ", tran_model.conditional_density_model.is_psd())
+    print("Valid: ", tran_model.valid())
+
+    print("alpha beta: ", phi_basis.alphas_betas())
+    print("domain tf loc: ", domain_tf.params[:, 0])
+    print("domain tf scale: ", torch.square(domain_tf.params[:, 1]))
 
     init_model = CompositeDensityModel(domain_tf, QuadraticFF.from_rff(tran_model.conditional_density_model, psi0_basis))
+    #init_model = CompositeDensityModel(ErfSeparableTF.copy_from_trainable(domain_tf), LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis))
     print("Training initial model")
     mle_loss_fn = loss.mle_loss
     var_reg_loss_fn = lambda model, x : var_reg_strength * loss.beta_basis_concentration_reg_loss(model.density_model.psi0_basis)
