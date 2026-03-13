@@ -35,7 +35,7 @@ def lrff_bOmega_trace_loss(model : LinearRFF):
 
 #### Quadratic models ####
 
-def B_psd_loss(model : QuadraticRFF, min_eigval : float = 0.0, penalty_offset : float = 2e0, eval_condition : float = 1e-8):
+def B_psd_loss(model : QuadraticRFF, min_eigval : float = 0.0, penalty_offset : float = 2e0, eval_condition : float = 1e-8, exponent : float = 2.0):
     B = model.get_B()
     #print("B: ", B)
     eigvals = torch.linalg.eigvalsh(B) + eval_condition * torch.eye(B.shape[0])
@@ -46,12 +46,12 @@ def B_psd_loss(model : QuadraticRFF, min_eigval : float = 0.0, penalty_offset : 
         #print("eigvals: ", eigvals, " loss: ", torch.sum(torch.log(eigvals + eval_condition)))
 
         #print("eigvals: ", eigvals, " loss: ", torch.min(eigvals).log())
-        return -torch.log(eigvals).mean()
+        return -exponent * torch.log(eigvals).mean()
         #return torch.min(eigvals).log()
     else:
         #print("invalid evals", eigvals.min(), eigvals.max())
         penalty = torch.relu(-eigvals + penalty_offset)
-        return torch.sum(penalty**2 + penalty)
+        return torch.sum(penalty**exponent + penalty)
 
 
 #### Regularization ####

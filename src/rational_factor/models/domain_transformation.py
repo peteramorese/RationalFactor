@@ -1,3 +1,5 @@
+import copy
+
 import torch
 from nflows.transforms.base import CompositeTransform
 from nflows.transforms.permutations import RandomPermutation
@@ -86,29 +88,34 @@ class MaskedAffineNFTF(DomainTF):
     def __init__(self, dim : int, n_layers : int = 5, hidden_features : int = 128, trainable : bool = True):
         super().__init__(dim)
 
-        if trainable:
-            self.params = torch.nn.Parameter(torch.randn(dim, 2))
-
-            transforms = []
-            for _ in range(n_layers):
-                transforms.append(RandomPermutation(features=dim))
-                transforms.append(
-                    MaskedAffineAutoregressiveTransform(
-                        features=dim,
-                        hidden_features=hidden_features,
-                        num_blocks=2,
-                        use_residual_blocks=True,
-                        random_mask=False,
-                        activation=torch.relu,
-                        dropout_probability=0.0,
-                        use_batch_norm=False,
-                    )
+        transforms = []
+        for _ in range(n_layers):
+            transforms.append(RandomPermutation(features=dim))
+            transforms.append(
+                MaskedAffineAutoregressiveTransform(
+                    features=dim,
+                    hidden_features=hidden_features,
+                    num_blocks=2,
+                    use_residual_blocks=True,
+                    random_mask=False,
+                    activation=torch.nn.functional.silu,
+                    dropout_probability=0.0,
+                    use_batch_norm=False,
                 )
+            )
 
-            self.T = CompositeTransform(transforms)
+        self.T = CompositeTransform(transforms)
 
-        else:
-            raise NotImplementedError("Non-trainable MaskedAffineNFTF is not implemented")
+        if not trainable:
+            for p in self.parameters():
+                p.requires_grad_(False)
+    
+    @classmethod
+    def copy_from_trainable(cls, other : 'MaskedAffineNFTF'):
+        new_module = copy.deepcopy(other)
+        for p in new_module.parameters():
+            p.requires_grad_(False)
+        return new_module
     
     def forward(self, x : torch.Tensor):
         assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"

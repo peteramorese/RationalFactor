@@ -45,7 +45,7 @@ class ConditionalDensityModel(torch.nn.Module):
 
 
 class LinearRFF(ConditionalDensityModel):
-    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-10):
+    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-7):
         assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
@@ -218,6 +218,8 @@ class QuadraticRFF(ConditionalDensityModel):
     
     def is_psd(self):
         B = self.get_B()
+        #if not torch.all(torch.linalg.eigvalsh(B) > 0):
+        #    print("Min eigval: ", torch.min(torch.linalg.eigvalsh(B)))
         return torch.all(torch.linalg.eigvalsh(B) > 0)
 
 
