@@ -63,7 +63,7 @@ class LinearRFF(ConditionalDensityModel):
         self.numerical_tolerance = numerical_tolerance
 
     def get_a(self):
-        return torch.nn.functional.softmax(self.__au)
+        return torch.nn.functional.softmax(self.__au, dim=0)
 
     def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
         if Omega is None:
@@ -154,6 +154,8 @@ class LinearFF(DensityModel):
     def marginal(self, marginal_dims : tuple[int, ...]):
         return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
     
+#class LinearRF(ConditionalDensityModel):
+
     
 class QuadraticRFF(ConditionalDensityModel):
     def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-8):

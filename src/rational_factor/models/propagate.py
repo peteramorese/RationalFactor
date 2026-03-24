@@ -13,7 +13,7 @@ def propagate(belief : LinearFF | QuadraticFF, transition_model : LinearRFF | Qu
 
         c0 = belief.get_c0(Omega0=Omega0)
 
-        print("bOmega eigvals: ", torch.linalg.eigvals(bOmega))
+        #print("bOmega eigvals: ", torch.linalg.eigvals(bOmega))
 
         c_seq = [c0]
         c_seq.append(bOmega0 @ c0)

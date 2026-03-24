@@ -1,6 +1,6 @@
 import torch
 import rational_factor.systems.truth_models as truth_models
-from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix
+from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix, sample_io_pairs
 from torch.utils.data import DataLoader, TensorDataset
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.density_model import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
@@ -9,7 +9,7 @@ import rational_factor.models.loss as loss
 import rational_factor.models.propagate as propagate
 from rational_factor.tools.visualization import plot_belief
 from rational_factor.tools.analysis import mc_integral_box
-from rational_factor.models.domain_transformation import MaskedAffineNFTF
+from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSeparableTF
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 import matplotlib.pyplot as plt
 
@@ -29,14 +29,15 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     n_basis = 1000
-    n_epochs_tran = 200
+    n_epochs_tran = 100
     n_epochs_init = 800
-    batch_size = 512
+    batch_size = 1024
     lr_tran = 1e-3
     lr_init = 1e-2
     n_timesteps_train = 10
     n_timesteps_prop = 10
     n_trajectories_train = 3000
+    n_pairs_train = n_timesteps_train * n_trajectories_train
     #var_reg_strength = 5e-3
     var_reg_strength = 0.0
     psd_reg_strength = 1e-2 #0.002
@@ -45,16 +46,28 @@ if __name__ == "__main__":
     # Create system
     system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1*torch.eye(2))
 
-    # Generate data set from trajectories
     mean = torch.tensor([0.2, 0.1])
     cov = torch.diag(torch.tensor([0.2, 0.2]))
     dist = torch.distributions.MultivariateNormal(mean, cov)
     def init_state_sampler(n_samples : int):
         return dist.sample((n_samples,))
 
+    ## Generate data set from trajectories
     traj_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_train, n_trajectories=n_trajectories_train)
-    x0_data = TensorDataset(traj_data[0])
-    x_k, x_kp1 = create_transition_data_matrix(traj_data, separate=True)
+    #x0 = traj_data[0]
+    #x_k, x_kp1 = create_transition_data_matrix(traj_data, separate=True)
+
+    # Generate data as input output pairs
+    mean = torch.zeros(system.dim())
+    cov = torch.diag(4.0 * torch.ones(system.dim()))
+    dist = torch.distributions.MultivariateNormal(mean, cov)
+    def prev_state_sampler(n_samples : int):
+        return dist.sample((n_samples,))
+
+    x0 = init_state_sampler(n_pairs_train)
+    x_k, x_kp1 = sample_io_pairs(system, prev_state_sampler, n_pairs=n_pairs_train)
+
+    x0_data = TensorDataset(x0)
     xp_data = TensorDataset(x_k, x_kp1)
 
     x0_dataloader = DataLoader(x0_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
@@ -69,11 +82,11 @@ if __name__ == "__main__":
     #psi0_basis = GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.5]))
 
     # Create separable domain transformation
-    domain_tf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=64, n_layers=3)
+    nftf_tf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5)
 
     # Create and train the transition model
     #tran_model = CompositeConditionalModel(domain_tf, QuadraticRFF(phi_basis, psi_basis))
-    tran_model = CompositeConditionalModel(domain_tf, LinearRFF(phi_basis, psi_basis))
+    tran_model = CompositeConditionalModel([nftf_tf], LinearRFF(phi_basis, psi_basis))
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.conditional_density_model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.conditional_density_model.psi_basis, mean=True))
@@ -99,10 +112,10 @@ if __name__ == "__main__":
 
 
     # Copy the domain transformation to fix it for training the initial state model
-    trained_domain_tf = MaskedAffineNFTF.copy_from_trainable(domain_tf)
+    trained_nftf_tf = MaskedAffineNFTF.copy_from_trainable(nftf_tf)
 
     #init_model = CompositeDensityModel(trained_domain_tf, QuadraticFF.from_rff(tran_model.conditional_density_model, psi0_basis))
-    init_model = CompositeDensityModel(trained_domain_tf, LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis))
+    init_model = CompositeDensityModel([trained_nftf_tf], LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis))
     print("Training initial model")
     mle_loss_fn = loss.mle_loss
     var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.density_model.psi0_basis, mean=True)
@@ -117,7 +130,7 @@ if __name__ == "__main__":
     box_highs = (5.0, 5.0)
 
     base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=n_timesteps_prop)
-    belief_seq = [CompositeDensityModel(domain_tf, belief) for belief in base_belief_seq]
+    belief_seq = [CompositeDensityModel([trained_nftf_tf], belief) for belief in base_belief_seq]
 
     fig, axes = plt.subplots(2, n_timesteps_prop)
     fig.suptitle("Beliefs at each time step")

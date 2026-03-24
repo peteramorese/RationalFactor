@@ -72,7 +72,7 @@ def sample_io_pairs(system : DiscreteTimeStochasticSystem, prev_state_sampler, n
     for i in range(n_pairs):
         xp_data[i, :] = system(x_data[i, :])
     
-    return torch.hstack((x_data, xp_data))
+    return x_data, xp_data
 
 def create_transition_data_matrix(trajectory_data, separate=False):
     """

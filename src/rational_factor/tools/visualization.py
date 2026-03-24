@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from ..models.density_model import DensityModel
 
 def plot_belief(ax: plt.Axes, belief : DensityModel, x_range: tuple[float, float], y_range: tuple[float, float], n_points: int = 100, contour_levels: int = 10, contourf_kwargs: dict = None):
+    assert belief.dim == 2, "Belief must be 2D"
     ax.set_aspect("equal")
     x_lin = np.linspace(x_range[0], x_range[1], n_points)
     y_lin = np.linspace(y_range[0], y_range[1], n_points)

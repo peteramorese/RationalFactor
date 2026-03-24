@@ -98,7 +98,7 @@ class MaskedAffineNFTF(DomainTF):
                     num_blocks=2,
                     use_residual_blocks=True,
                     random_mask=False,
-                    activation=torch.nn.functional.silu,
+                    activation=torch.tanh,
                     dropout_probability=0.0,
                     use_batch_norm=False,
                 )

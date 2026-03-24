@@ -20,6 +20,7 @@ def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoad
         losses = [loss_fn(model, *args) for loss_fn in loss_fns]
         total_loss = sum(losses)
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
         return total_loss.item(), losses
 
