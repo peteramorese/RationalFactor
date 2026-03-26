@@ -1,0 +1,13 @@
+services:
+  ws:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    volumes:
+      - .:/root/RationalFactor
+    user: "${UID}:${GID}"
+    command: tail -f /dev/null 
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility

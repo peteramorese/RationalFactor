@@ -28,8 +28,8 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 1000
-    n_epochs_tran = 100
+    n_basis = 300
+    n_epochs_tran = 200
     n_epochs_init = 800
     batch_size = 1024
     lr_tran = 1e-3
