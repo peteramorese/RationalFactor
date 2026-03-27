@@ -58,9 +58,11 @@ class GaussianBasis(SeparableBasis):
         self.min_std = min_std
 
     @classmethod
-    def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5, variance: float = 1.0):
+    def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5, variance: float = 1.0, device = None):
+        if device is None:
+            device = offsets.device
         offsets = offsets.repeat(d, n_basis, 1)
-        return cls(torch.randn(d, n_basis, 2) * torch.sqrt(torch.tensor(variance)) + offsets, min_std=min_std)
+        return cls(torch.randn(d, n_basis, 2, device=device) * torch.sqrt(torch.tensor(variance, device=device)) + offsets, min_std=min_std)
 
     @classmethod
     def set_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5):

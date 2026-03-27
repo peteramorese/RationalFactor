@@ -28,9 +28,10 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 300
-    n_epochs_tran = 200
-    n_epochs_init = 800
+    use_dtf = False
+    n_basis = 2000
+    n_epochs_tran = 350
+    n_epochs_init = 500
     batch_size = 1024
     lr_tran = 1e-3
     lr_init = 1e-2
@@ -39,9 +40,12 @@ if __name__ == "__main__":
     n_trajectories_train = 3000
     n_pairs_train = n_timesteps_train * n_trajectories_train
     #var_reg_strength = 5e-3
-    var_reg_strength = 0.0
-    psd_reg_strength = 1e-2 #0.002
+    var_reg_strength = 1e-2
     ###
+
+    device = torch.device("cuda" if use_gpu else "cpu")
+    print("Using GPU: ", use_gpu)
+    print("Device: ", device)
 
     # Create system
     system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1*torch.eye(2))
@@ -66,6 +70,8 @@ if __name__ == "__main__":
 
     x0 = init_state_sampler(n_pairs_train)
     x_k, x_kp1 = sample_io_pairs(system, prev_state_sampler, n_pairs=n_pairs_train)
+    x_k = x_k
+    x_kp1 = x_kp1
 
     x0_data = TensorDataset(x0)
     xp_data = TensorDataset(x_k, x_kp1)
@@ -74,32 +80,26 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(xp_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0]), variance=50.0, min_std=1e-3)
-    psi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0]), variance=50.0, min_std=1e-3)
-    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0]), variance=50.0, min_std=1e-3)
-    #phi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.5]))
-    #psi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.5]))
-    #psi0_basis = GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.5]))
+    phi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=50.0, min_std=1e-3).to(device)
+    psi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=50.0, min_std=1e-3).to(device)
+    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=50.0, min_std=1e-3).to(device)
 
     # Create separable domain transformation
-    nftf_tf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5)
+    nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device) if use_dtf else None
 
     # Create and train the transition model
-    #tran_model = CompositeConditionalModel(domain_tf, QuadraticRFF(phi_basis, psi_basis))
-    tran_model = CompositeConditionalModel([nftf_tf], LinearRFF(phi_basis, psi_basis))
+    if use_dtf:
+        tran_model = CompositeConditionalModel([nftf], LinearRFF(phi_basis, psi_basis)).to(device)
+    else:
+        tran_model = LinearRFF(phi_basis, psi_basis).to(device)
+
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
-    var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.conditional_density_model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.conditional_density_model.psi_basis, mean=True))
-    #lrff_bOmega_eval_loss_fn = lambda model, x, xp : 1.0 * loss.lrff_bOmega_eval_loss(model.conditional_density_model)
-    #psd_loss_fn = lambda model, x, xp : psd_reg_strength * loss.B_psd_loss(model.conditional_density_model, penalty_offset=10.0, exponent=4.0)
-
-    ## Train model to feasible region
-    #vld_psd_loss_fn = lambda model: psd_reg_strength * loss.B_psd_loss(model.conditional_density_model, penalty_offset=10.0, exponent=4.0)
-    #tran_model = train.train_to_valid(tran_model, 
-    #    {"psd": vld_psd_loss_fn}, 
-    #    torch.optim.Adam(tran_model.parameters(), lr=1.0), epochs=10000, use_best="psd")
-
-    #print("Valid before training?: ", tran_model.valid())
+    
+    if use_dtf:
+        var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.conditional_density_model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.conditional_density_model.psi_basis, mean=True))
+    else:
+        var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
 
     tran_model = train.train(tran_model, 
         xp_dataloader, 
@@ -112,13 +112,22 @@ if __name__ == "__main__":
 
 
     # Copy the domain transformation to fix it for training the initial state model
-    trained_nftf_tf = MaskedAffineNFTF.copy_from_trainable(nftf_tf)
+    trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
 
     #init_model = CompositeDensityModel(trained_domain_tf, QuadraticFF.from_rff(tran_model.conditional_density_model, psi0_basis))
-    init_model = CompositeDensityModel([trained_nftf_tf], LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis))
+    if use_dtf:
+        init_model = CompositeDensityModel([trained_nftf], LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis)).to(device)
+    else:
+        init_model = LinearFF.from_rff(tran_model, psi0_basis).to(device)
+
     print("Training initial model")
     mle_loss_fn = loss.mle_loss
-    var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.density_model.psi0_basis, mean=True)
+
+    if use_dtf:
+        var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.conditional_density_model.psi0_basis, mean=True)
+    else:
+        var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
+
     init_model = train.train(init_model, 
         x0_dataloader, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
@@ -129,10 +138,13 @@ if __name__ == "__main__":
     box_lows = (-5.0, -5.0)
     box_highs = (5.0, 5.0)
 
-    base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=n_timesteps_prop)
-    belief_seq = [CompositeDensityModel([trained_nftf_tf], belief) for belief in base_belief_seq]
+    if use_dtf:
+        base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=n_timesteps_prop)
+        belief_seq = [CompositeDensityModel([trained_nftf], belief) for belief in base_belief_seq]
+    else:
+        belief_seq = propagate.propagate(init_model, tran_model, n_steps=n_timesteps_prop)
 
-    fig, axes = plt.subplots(2, n_timesteps_prop)
+    fig, axes = plt.subplots(2, n_timesteps_prop, figsize=(20, 10))
     fig.suptitle("Beliefs at each time step")
     for i in range(n_timesteps_prop):
         #print("Printing belief: ", i)
@@ -142,24 +154,21 @@ if __name__ == "__main__":
         axes[0, i].set_xlim(box_lows[0], box_highs[0])
         axes[0, i].set_ylim(box_lows[1], box_highs[1])
     
-    # Compute empirical AUC of each belief
-    for i in range(n_timesteps_prop):
-        auc = mc_integral_box(belief_seq[i], domain_bounds=(box_lows, box_highs), n_samples=100000)
-        print("AUC of belief at time ", i, ": ", auc)
 
-    box_lows = (-20.0, -20.0)
-    box_highs = (20.0, 20.0)
+    #box_lows = (-20.0, -20.0)
+    #box_highs = (20.0, 20.0)
 
-    fig, axes = plt.subplots(2, n_timesteps_prop)
-    fig.suptitle("Base beliefs at each time step")
-    for i in range(n_timesteps_prop):
-        #print("Printing belief: ", i)
-        plot_belief(axes[1, i], base_belief_seq[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-        axes[0, i].scatter(traj_data[i][:, 0], traj_data[i][:, 1], s=1)
-        axes[0, i].set_aspect("equal")
-        axes[0, i].set_xlim(box_lows[0], box_highs[0])
-        axes[0, i].set_ylim(box_lows[1], box_highs[1])
+    #fig, axes = plt.subplots(2, n_timesteps_prop)
+    #fig.suptitle("Base beliefs at each time step")
+    #for i in range(n_timesteps_prop):
+    #    #print("Printing belief: ", i)
+    #    plot_belief(axes[1, i], base_belief_seq[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+    #    axes[0, i].scatter(traj_data[i][:, 0], traj_data[i][:, 1], s=1)
+    #    axes[0, i].set_aspect("equal")
+    #    axes[0, i].set_xlim(box_lows[0], box_highs[0])
+    #    axes[0, i].set_ylim(box_lows[1], box_highs[1])
 
-    plt.show()
+    plt.savefig("figures/vdp_nfdf_gaussian_beliefs.pdf", dpi=1000)
+    #plt.show()
 
 

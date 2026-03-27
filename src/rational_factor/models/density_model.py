@@ -40,7 +40,7 @@ class ConditionalDensityModel(torch.nn.Module):
     
     def sample(self, x : torch.Tensor, n_samples : int):
         raise NotImplementedError("sample not implemented")
-
+    
 ######################
 
 
@@ -61,20 +61,6 @@ class LinearRFF(ConditionalDensityModel):
         self.__au = torch.nn.Parameter(torch.randn(self.n_phi)) # g
 
         self.numerical_tolerance = numerical_tolerance
-
-    def get_a(self):
-        return torch.nn.functional.softmax(self.__au, dim=0)
-
-    def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
-        if Omega is None:
-            Omega = self.phi_basis.inner_prod_matrix(self.psi_basis)
-
-        if a is None:
-            a = self.get_a()
-
-        b = a / (Omega.T @ a + self.numerical_tolerance)
-
-        return b
     
     def log_density(self, x : torch.Tensor, xp : torch.Tensor):
         assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
@@ -96,8 +82,28 @@ class LinearRFF(ConditionalDensityModel):
         log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
 
         return log_g_xp + log_f - log_g_x
-    
 
+    def get_a(self):
+        return torch.nn.functional.softmax(self.__au, dim=0)
+
+    def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
+        if Omega is None:
+            Omega = self.phi_basis.inner_prod_matrix(self.psi_basis)
+
+        if a is None:
+            a = self.get_a()
+
+        b = a / (Omega.T @ a + self.numerical_tolerance)
+
+        return b
+
+    def weight_params(self):
+        return self.__au
+    
+    def basis_params(self):
+        return [self.phi_basis.params, self.psi_basis.params]
+
+    
 class LinearFF(DensityModel):
     def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
