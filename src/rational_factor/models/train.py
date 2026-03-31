@@ -34,12 +34,12 @@ class TrainingTimer:
         self.completed_epochs[self.curr_group] += 1
         self.curr_date_time = time.time()
 
-    def update_group(self, time_taken : float = None):
+    def update_group(self):
+        assert self.curr_group < self.n_groups, "Exceeded number of groups"
         self.curr_group += 1
         self.curr_epoch = 0
-        assert self.curr_group < self.n_groups, "Exceeded number of groups"
 
-    def update_iteration(self, time_taken : float = None):
+    def update_iteration(self):
         self.curr_iter += 1
         if self.curr_iter > self.iterations:
             print("Exceeded number of iterations (predicted time will be wrong)")
@@ -49,7 +49,7 @@ class TrainingTimer:
     
     def get_predicted_time(self):
         avg_times = [
-            elapsed / total_epochs if total_epochs > 0 else float('inf')
+            elapsed / total_epochs if total_epochs > 0 else 0.0
             for elapsed, total_epochs in zip(self.times, self.completed_epochs)
         ]
         remaining_epochs = [self.iterations * epochs_per_group - total_epochs for total_epochs, epochs_per_group in zip(self.completed_epochs, self.epochs_per_group)]
@@ -235,11 +235,16 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
     best_loss = float('inf')
     best_state = None
 
+    if isinstance(epochs_per_group, list):
+        assert len(epochs_per_group) == len(labeled_optimizers), "epochs_per_group must be a list of the same length as n_groups"
+    else:
+        epochs_per_group = [epochs_per_group for _ in range(len(labeled_optimizers))]
+
     training_timer = TrainingTimer(n_groups=len(optimizers), iterations=iterations, epochs_per_group=epochs_per_group)
     training_timer.initialize()
 
     for iteration in range(iterations):
-        for optimizer, optimizer_label in zip(optimizers, optimizer_labels):
+        for optimizer, optimizer_label, epochs in zip(optimizers, optimizer_labels, epochs_per_group):
 
             # Set the gradient capabilities of current parameters
             set_requires_grad(model.parameters(), False)
@@ -249,7 +254,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
                 set_requires_grad(params, True)
 
 
-            for epoch in range(epochs_per_group):
+            for epoch in range(epochs):
                 start_time = time.time()
                 total_sum_loss = 0.0
                 sum_losses = [0.0 for _ in loss_fns]
@@ -260,7 +265,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
                     else:
                         batch = batch.to(next(model.parameters()).device)
 
-                    total_loss, losses = train_step(*batch, optimizer, param_groups)
+                    total_loss, losses = train_step(*batch, optimizer=optimizer, param_groups=param_groups)
                     total_sum_loss += total_loss
                     for i, loss in enumerate(losses):
                         sum_losses[i] += loss.item()

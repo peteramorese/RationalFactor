@@ -98,7 +98,7 @@ class LinearRFF(ConditionalDensityModel):
         return b
 
     def weight_params(self):
-        return self.__au
+        return [self.__au]
     
     def basis_params(self):
         return [self.phi_basis.params, self.psi_basis.params]
@@ -159,9 +159,16 @@ class LinearFF(DensityModel):
 
     def marginal(self, marginal_dims : tuple[int, ...]):
         return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
-    
-#class LinearRF(ConditionalDensityModel):
 
+    def weight_params(self):
+        if hasattr(self, "c0_fixed"):
+            return [self.c0_fixed]
+        else:
+            return [self.__c0u]
+    
+    def basis_params(self):
+        return [self.psi0_basis.params]
+    
     
 class QuadraticRFF(ConditionalDensityModel):
     def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-8):
@@ -230,6 +237,12 @@ class QuadraticRFF(ConditionalDensityModel):
         #    print("Min eigval: ", torch.min(torch.linalg.eigvalsh(B)))
         return torch.all(torch.linalg.eigvalsh(B) > 0)
 
+    def weight_params(self):
+        return [self.__LAu]
+    
+    def basis_params(self):
+        return [self.phi_basis.params, self.psi_basis.params]
+
 
 class QuadraticFF(DensityModel):
     def __init__(self, A : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis = None, numerical_tolerance : float = 1e-10, C0_fixed : torch.Tensor = None):
@@ -288,3 +301,12 @@ class QuadraticFF(DensityModel):
 
     def marginal(self, marginal_dims : tuple[int, ...]):
         return LinearFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
+
+    def weight_params(self):
+        if hasattr(self, "C0_fixed"):
+            return [self.C0_fixed]
+        else:
+            return [self.__LC0u]
+    
+    def basis_params(self):
+        return [self.psi0_basis.params]
