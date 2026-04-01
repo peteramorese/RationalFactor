@@ -46,3 +46,5 @@ def propagate(belief : LinearFF | QuadraticFF, transition_model : LinearRFF | Qu
         belief_seq = [QuadraticFF(belief.A, belief.phi_basis, transition_model.psi_basis, C0_fixed=C_seq[i + 1]) for i in range(n_steps)]
         belief_seq.insert(0, belief) # Add the initial belief
         return belief_seq
+    else:
+        raise ValueError("Transition model must be LinearRFF or QuadraticRFF")

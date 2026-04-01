@@ -2,17 +2,22 @@ import torch
 from abc import abstractmethod
 
 class Basis(torch.nn.Module):
-    def __init__(self, params_init : torch.Tensor, dim : int, n_basis : int, trainable : bool = True):
+    def __init__(self, dim : int, n_basis : int, params_init : torch.Tensor = None, trainable : bool = True):
         '''
         Args:
-            params_init : torch.Tensor of initial parameters
             dim : int, number of dimensions
             n_basis : int, number of basis functions
+            params_init : torch.Tensor of initial parameters
             trainable : bool indicating if parameters are trainable
         '''
         super().__init__()
         self._dim = dim
         self._n_basis = n_basis
+
+        if params_init is not None:
+            self._init_params(params_init, trainable)
+        
+    def _init_params(self, params_init : torch.Tensor, trainable : bool):
         if trainable:
             self.params = torch.nn.Parameter(params_init)
         else:
@@ -24,35 +29,45 @@ class Basis(torch.nn.Module):
     def n_basis_functions(self):
         return self._n_basis
 
-    @abstractmethod
-    def integral(self):
+    def Omega1(self):
         '''
         Computes the integral of the basis functions.
+        omega[i] = <this_i, 1>
 
         Returns:
-            Integral of the basis functions
+            Tensor of shape (n_basis,)
         '''
-        pass
+        raise NotImplementedError("Omega1 is not implemented for this basis function")
 
-    @abstractmethod
-    def inner_prod_matrix(self, other: 'SeparableBasis'):
+    def Omega2(self, other: 'Basis'):
         '''
-        Computes the function inner product matrix with another basis function vector. The argument `other` occupies the column index
+        Computes the function inner product matrix with another basis function vector. 
+        omega[i, j] = <this_i, other_j>
         
         Returns:
-            n_basis x other.n_basis matrix of inner product values
+            Tensor of shape (n_basis, other.n_basis)
         '''
-        pass
+        raise NotImplementedError("Omega2 is not implemented for this basis function")
 
-    @abstractmethod
-    def inner_prod_tensor(self, other: 'SeparableBasis'):
+    def Omega3(self, other: 'Basis'):
         '''
-        Computes the 4D quadratic function inner product tensor with another basis function vector. The argument `other` occupies the last two indices
+        Computes the 3D quadratic function inner product tensor with another basis function vector. 
+        omega[i, j, k] = <this_i * this_j, other_k>
         
         Returns:
-            n_basis x b_basis x other.n_basis x other.n_basis tensor of inner product values
+            Tensor of shape (n_basis, n_basis, other.n_basis)
         '''
-        pass
+        raise NotImplementedError("Omega3 is not implemented for this basis function")
+
+    def Omega4(self, other: 'Basis'):
+        '''
+        Computes the 4D quadratic function inner product tensor with another basis function vector. 
+        omega[i, j, k, l] = <this_i * this_j, other_k * other_l>
+        
+        Returns:
+            Tensor of shape (n_basis, n_basis, other.n_basis, other.n_basis)
+        '''
+        raise NotImplementedError("Omega4 is not implemented for this basis function")
     
     @abstractmethod
     def marginal(self, marginal_dims : tuple[int, ...]):
@@ -67,7 +82,7 @@ class Basis(torch.nn.Module):
 class SeparableBasis(Basis):
     def __init__(self, params_init : torch.Tensor, trainable : bool = True):
         assert params_init.dim() == 3, "params_init must have shape (d, n_basis, n_params_per_basis)"
-        super().__init__(params_init, params_init.shape[0], params_init.shape[1], trainable)
+        super().__init__(params_init.shape[0], params_init.shape[1], params_init, trainable)
 
     def n_params_per_basis(self):
         return self.params.shape[2]
@@ -115,7 +130,14 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         )
         return torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
 
-    def inner_prod_matrix(self, other: 'GaussianBasis'):
+    def Omega1(self):
+        return torch.ones(
+            self.n_basis_functions(),
+            dtype=self.params.dtype,
+            device=self.params.device,
+        )
+
+    def Omega2(self, other: 'GaussianBasis'):
         assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
@@ -133,7 +155,58 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         log_Omega = log_dim_ip.sum(dim=0)
         return torch.exp(log_Omega)
 
-    def inner_prod_tensor(self, other: "GaussianBasis"):
+    def Omega3(self, other: "GaussianBasis"):
+        assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
+        assert self.dim() == other.dim(), "Basis functions must have the same dimension"
+
+        # (d, n_phi), (d, n_psi)
+        mu1, std1 = self.means_stds()
+        mu2, std2 = other.means_stds()
+
+        var1 = std1 * std1
+        var2 = std2 * std2
+        inv_var1 = 1.0 / var1
+        inv_var2 = 1.0 / var2
+
+        # Broadcast to (d, n_phi, n_phi, n_psi)
+        mu_i = mu1[:, :, None, None]
+        mu_j = mu1[:, None, :, None]
+        mu_k = mu2[:, None, None, :]
+
+        inv_i = inv_var1[:, :, None, None]
+        inv_j = inv_var1[:, None, :, None]
+        inv_k = inv_var2[:, None, None, :]
+
+        var_i = var1[:, :, None, None]
+        var_j = var1[:, None, :, None]
+        var_k = var2[:, None, None, :]
+
+        # Product of 3 Gaussians integrated over x
+        S = inv_i + inv_j + inv_k
+        T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k
+        U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k
+
+        two_pi = mu1.new_tensor(2.0 * torch.pi)
+        log2pi = torch.log(two_pi)
+
+        # normalization constants from the 3 Gaussian pdfs
+        log_pref = -0.5 * (
+            3.0 * log2pi
+            + torch.log(var_i)
+            + torch.log(var_j)
+            + torch.log(var_k)
+        )
+
+        # Gaussian integral after completing the square
+        log_gauss_int = 0.5 * (log2pi - torch.log(S))
+        quad = -0.5 * (U - (T * T) / S)
+
+        log_dim = log_pref + log_gauss_int + quad   # (d, nf, nf, ng)
+        log_Omega = log_dim.sum(dim=0)              # (nf, nf, ng)
+
+        return torch.exp(log_Omega)
+
+    def Omega4(self, other: "GaussianBasis"):
         assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
@@ -182,22 +255,23 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
     def marginal(self, marginal_dims: tuple[int, ...]) -> 'GaussianBasis':
         marginal_dims = tuple(marginal_dims)
         assert all(0 <= i < self.dim() for i in marginal_dims), "marginal_dims must be in [0, d)"
-        d_new = len(marginal_dims)
-        n_basis = self.n_basis_functions()
-        out = GaussianBasis(d_new, n_basis)
-        out.params.data.copy_(self.params[marginal_dims, :, :].detach())
-        return out
+        return GaussianBasis(
+            self.params[marginal_dims, :, :].detach().clone(),
+            trainable=self.params.requires_grad,
+            min_std=self.min_std,
+        )
 
 
 class BetaBasis(SeparableBasis, NonnegativeBasis):
-    def __init__(self, params_init: torch.Tensor, trainable: bool = True, min_concentration: float = 1e-5, eps: float = 1e-6):
+    def __init__(self, params_init: torch.Tensor, trainable: bool = True, min_concentration: float = 1.0, eps: float = 1e-6):
+        assert min_concentration > 0.0, "min_concentration must be positive"
         assert params_init.shape[2] == 2, "params_init must have shape (d, n_basis, 2)"
         super().__init__(params_init, trainable)
         self.min_concentration = min_concentration
         self.eps = eps
 
     @classmethod
-    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1e-5, eps: float = 1e-6, variance: float = 1.0):
+    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), variance: float = 1.0, min_concentration: float = 1.0, eps: float = 1e-6):
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(
             torch.randn(d, n_basis, 2) * torch.sqrt(torch.tensor(variance)) + offsets,
@@ -206,7 +280,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         )
 
     @classmethod
-    def set_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1e-5, eps: float = 1e-6):
+    def set_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1.0, eps: float = 1e-6):
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(
             offsets,
@@ -235,6 +309,8 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
 
+        #y_input = y.clone()
+
         y = y.clamp(self.eps, 1.0 - self.eps)
         y = y[:, :, None]  # (n_data, d, n_basis)
 
@@ -251,11 +327,19 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
             print("alpha: ", alpha)
             print("beta: ", beta)
             print("y: ", y)
+            #print("y_input: ", y_input)
             raise ValueError("log_dim_factors is nan")
 
         return torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
 
-    def inner_prod_matrix(self, other: "BetaBasis"):
+    def Omega1(self):
+        return torch.ones(
+            self.n_basis_functions(),
+            dtype=self.params.dtype,
+            device=self.params.device,
+        )
+
+    def Omega2(self, other: "BetaBasis"):
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
@@ -275,7 +359,39 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         log_Omega = log_dim_ip.sum(dim=0)  # (n1, n2)
         return torch.exp(log_Omega)
 
-    def inner_prod_tensor(self, other: "BetaBasis"):
+    def Omega3(self, other: "BetaBasis"):
+        assert isinstance(other, BetaBasis), "other must be BetaBasis"
+        assert self.dim() == other.dim(), "Basis functions must have the same dimension"
+
+        a1, b1 = self.alphas_betas()   # (d, n_phi)
+        a2, b2 = other.alphas_betas()  # (d, n_psi)
+
+        # Broadcast to (d, n_phi, n_phi, n_psi)
+        a_i = a1[:, :, None, None]
+        a_j = a1[:, None, :, None]
+        a_k = a2[:, None, None, :]
+
+        b_i = b1[:, :, None, None]
+        b_j = b1[:, None, :, None]
+        b_k = b2[:, None, None, :]
+
+        # Product of 3 Beta pdfs:
+        # x^(a_i+a_j+a_k-3) (1-x)^(b_i+b_j+b_k-3)
+        # integral = B(a_sum, b_sum), where:
+        a_sum = a_i + a_j + a_k - 2.0
+        b_sum = b_i + b_j + b_k - 2.0
+
+        log_dim = (
+            self._log_beta_fn(a_sum, b_sum)
+            - self._log_beta_fn(a_i, b_i)
+            - self._log_beta_fn(a_j, b_j)
+            - self._log_beta_fn(a_k, b_k)
+        )
+
+        log_Omega = log_dim.sum(dim=0)   # (n_phi, n_phi, n_psi)
+        return torch.exp(log_Omega)
+
+    def Omega4(self, other: "BetaBasis"):
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
@@ -320,5 +436,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
 
 #class ExpolyBasis(SeparableBasis):
 
-#class MaskedAffineNFBasis(Basis):
+class NFBasis(Basis):
+    def __init__(self, dim : int, n_basis : int, trainable : bool = True):
+        super().__init__(dim, n_basis, trainable=trainable)
 

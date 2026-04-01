@@ -216,7 +216,7 @@ def set_requires_grad(params : list[torch.nn.Parameter], requires_grad : bool):
 
 def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : DataLoader, labeled_loss_fns : dict[str, callable], labeled_optimizers : dict[str, torch.optim.Optimizer], epochs_per_group=10, iterations=10, verbose=True, use_best : str = "total"):
     
-    torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(False)
 
     model.train()
 
