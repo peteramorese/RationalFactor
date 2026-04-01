@@ -128,7 +128,7 @@ if __name__ == "__main__":
         var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
         optimizers ={"basis": torch.optim.Adam(tran_model.basis_params(), lr=tran_params["lr_basis"]), "weights": torch.optim.Adam(tran_model.weight_params(), lr=tran_params["lr_weights"])} 
 
-    tran_model = train.train_iterate(tran_model,
+    tran_model, best_loss_tran, training_time_tran = train.train_iterate(tran_model,
         xp_dataloader,
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
         optimizers,
@@ -159,7 +159,7 @@ if __name__ == "__main__":
         var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
         optimizers = {"basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]), "weights": torch.optim.Adam(init_model.weight_params(), lr=init_params["lr_weights"])}
 
-    init_model = train.train_iterate(init_model, 
+    init_model, best_loss_init, training_time_init = train.train_iterate(init_model, 
         x0_dataloader, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
         optimizers,
@@ -168,6 +168,9 @@ if __name__ == "__main__":
         verbose=True,
         use_best="mle")
     print("Done! \n")
+
+    print(f"Transition model loss: {best_loss_tran:.4f}, training time: {training_time_tran:.2f} seconds")
+    print(f"Initial model loss: {best_loss_init:.4f}, training time: {training_time_init:.2f} seconds")
 
     # Analysis
     box_lows = (-5.0, -5.0)

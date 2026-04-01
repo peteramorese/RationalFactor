@@ -1,6 +1,6 @@
 import torch
 from copy import deepcopy
-from .basis_functions import SeparableBasis
+from .basis_functions import SeparableBasis, NonnegativeBasis
 
 #### Base Classes ####
 
@@ -49,6 +49,8 @@ class LinearRFF(ConditionalDensityModel):
         assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
+        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
+        assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
         super().__init__(phi_basis.dim())
 
         self.n_phi = phi_basis.n_basis_functions()
@@ -58,7 +60,7 @@ class LinearRFF(ConditionalDensityModel):
         self.phi_basis = phi_basis
         self.psi_basis = psi_basis
 
-        self.__au = torch.nn.Parameter(torch.randn(self.n_phi)) # g
+        self.__au = torch.nn.Parameter(torch.ones(self.n_phi)) # g
 
         self.numerical_tolerance = numerical_tolerance
     
@@ -108,6 +110,9 @@ class LinearFF(DensityModel):
     def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
+        assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
+        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
+        assert isinstance(psi0_basis, NonnegativeBasis), "psi0_basis must be a NonnegativeBasis"
         assert a.shape[0] == phi_basis.n_basis_functions(), "a must have n_phi elements"
         super().__init__(phi_basis.dim())
 
@@ -121,7 +126,7 @@ class LinearFF(DensityModel):
         if c0_fixed is not None:
             self.register_buffer("c0_fixed", c0_fixed)
         else:
-            self.__c0u = torch.nn.Parameter(torch.randn(self.n_psi0))
+            self.__c0u = torch.nn.Parameter(torch.ones(self.n_psi0))
         
         self.numerical_tolerance = numerical_tolerance
     

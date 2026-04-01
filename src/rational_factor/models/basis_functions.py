@@ -1,26 +1,39 @@
 import torch
 from abc import abstractmethod
 
-class SeparableBasis(torch.nn.Module):
-    def __init__(self, params_init : torch.Tensor, trainable : bool = True):
+class Basis(torch.nn.Module):
+    def __init__(self, params_init : torch.Tensor, dim : int, n_basis : int, trainable : bool = True):
         '''
         Args:
-            params_init : torch.Tensor of shape (d, n_basis, n_params_per_basis)
+            params_init : torch.Tensor of initial parameters
+            dim : int, number of dimensions
+            n_basis : int, number of basis functions
             trainable : bool indicating if parameters are trainable
         '''
         super().__init__()
-        #self.params = torch.nn.Parameter(torch.randn(d, n_basis, n_params_per_basis))
+        self._dim = dim
+        self._n_basis = n_basis
         if trainable:
             self.params = torch.nn.Parameter(params_init)
         else:
             self.register_buffer("params", params_init)
 
     def dim(self):
-        return self.params.shape[0]
+        return self._dim
     
     def n_basis_functions(self):
-        return self.params.shape[1]
-    
+        return self._n_basis
+
+    @abstractmethod
+    def integral(self):
+        '''
+        Computes the integral of the basis functions.
+
+        Returns:
+            Integral of the basis functions
+        '''
+        pass
+
     @abstractmethod
     def inner_prod_matrix(self, other: 'SeparableBasis'):
         '''
@@ -31,6 +44,7 @@ class SeparableBasis(torch.nn.Module):
         '''
         pass
 
+    @abstractmethod
     def inner_prod_tensor(self, other: 'SeparableBasis'):
         '''
         Computes the 4D quadratic function inner product tensor with another basis function vector. The argument `other` occupies the last two indices
@@ -50,8 +64,21 @@ class SeparableBasis(torch.nn.Module):
         '''
         pass
 
+class SeparableBasis(Basis):
+    def __init__(self, params_init : torch.Tensor, trainable : bool = True):
+        assert params_init.dim() == 3, "params_init must have shape (d, n_basis, n_params_per_basis)"
+        super().__init__(params_init, params_init.shape[0], params_init.shape[1], trainable)
 
-class GaussianBasis(SeparableBasis):
+    def n_params_per_basis(self):
+        return self.params.shape[2]
+    
+# Nonnegative basis functions 
+class NonnegativeBasis:
+    pass
+
+
+
+class GaussianBasis(SeparableBasis, NonnegativeBasis):
     def __init__(self, params_init : torch.Tensor, trainable : bool = True, min_std : float = 1e-5):
         assert params_init.shape[2] == 2, "params_init must have shape (d, n_basis, 2)"
         super().__init__(params_init, trainable)
@@ -162,7 +189,7 @@ class GaussianBasis(SeparableBasis):
         return out
 
 
-class BetaBasis(SeparableBasis):
+class BetaBasis(SeparableBasis, NonnegativeBasis):
     def __init__(self, params_init: torch.Tensor, trainable: bool = True, min_concentration: float = 1e-5, eps: float = 1e-6):
         assert params_init.shape[2] == 2, "params_init must have shape (d, n_basis, 2)"
         super().__init__(params_init, trainable)
@@ -208,13 +235,6 @@ class BetaBasis(SeparableBasis):
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
 
-        #if (y < 0.0).any() or (y > 1.0).any():
-        #    print("y: ", y)
-        #    print("min y: ", y.min())
-        #    print("max y: ", y.max())
-        #    print("eps: ", self.eps)
-        #    raise ValueError("y must be in [0, 1]")
-
         y = y.clamp(self.eps, 1.0 - self.eps)
         y = y[:, :, None]  # (n_data, d, n_basis)
 
@@ -256,10 +276,6 @@ class BetaBasis(SeparableBasis):
         return torch.exp(log_Omega)
 
     def inner_prod_tensor(self, other: "BetaBasis"):
-        """
-        Omega[i,j,k,l] = <phi_i phi_j, psi_k psi_l>
-                       = \int phi_i(x)phi_j(x)psi_k(x)psi_l(x) dx
-        """
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
@@ -301,3 +317,8 @@ class BetaBasis(SeparableBasis):
             min_concentration=self.min_concentration,
             eps=self.eps,
         )
+
+#class ExpolyBasis(SeparableBasis):
+
+#class MaskedAffineNFBasis(Basis):
+

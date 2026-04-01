@@ -29,7 +29,7 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     use_dtf = True
-    n_basis = 5000
+    n_basis = 2000
     n_epochs_tran = 500
     n_epochs_init = 500
     batch_size = 1024
@@ -99,7 +99,7 @@ if __name__ == "__main__":
     else:
         var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
 
-    tran_model = train.train(tran_model, 
+    tran_model, best_loss_tran, training_time_tran = train.train(tran_model, 
         xp_dataloader, 
         #{"mle": mle_loss_fn, "var_reg": var_reg_loss_fn, "psd": psd_loss_fn}, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
@@ -126,11 +126,14 @@ if __name__ == "__main__":
     else:
         var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
 
-    init_model = train.train(init_model, 
+    init_model, best_loss_init, training_time_init = train.train(init_model, 
         x0_dataloader, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
         torch.optim.Adam(init_model.parameters(), lr=lr_init), epochs=n_epochs_init, use_best="mle")
     print("Done! \n")
+
+    print(f"Transition model loss: {best_loss_tran:.4f}, training time: {training_time_tran:.2f} seconds")
+    print(f"Initial model loss: {best_loss_init:.4f}, training time: {training_time_init:.2f} seconds")
 
     # Analysis
     box_lows = (-5.0, -5.0)

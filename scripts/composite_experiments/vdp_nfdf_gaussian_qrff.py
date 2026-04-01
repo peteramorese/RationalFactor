@@ -29,36 +29,12 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     use_dtf = False
-    n_basis = 60
-    if use_dtf:
-        tran_params = {
-            "n_epochs_per_group": [10, 20, 10], # dtf_params, basis, weights
-            "iterations": 60,
-            "lr_basis": 5e-2,
-            "lr_weights": 1e-2,
-            "lr_dtf": 1e-3,
-        }
-        init_params = {
-            "n_epochs_per_group": [20, 10], # basis, weights
-            "iterations": 80,
-            "lr_basis": 1e-2,
-            "lr_weights": 1e-2,
-        }
-    else:
-        tran_params = {
-            "n_epochs_per_group": [30, 10], # basis, dtf_params, weights
-            "iterations": 100,
-            "lr_basis": 1e-1,
-            "lr_weights": 5e-2,
-        }
-        init_params = {
-            "n_epochs_per_group": [20, 20], # basis, weights
-            "iterations": 30,
-            "lr_basis": 1e-2,
-            "lr_weights": 5e-2,
-        }
-
+    n_basis = 80
+    n_epochs_tran = 600
+    n_epochs_init = 500
     batch_size = 1024
+    lr_tran = 1e-1
+    lr_init = 1e-2
     n_timesteps_train = 10
     n_timesteps_prop = 10
     n_trajectories_train = 1000
@@ -95,8 +71,6 @@ if __name__ == "__main__":
 
     x0 = init_state_sampler(n_init_train)
     x_k, x_kp1 = sample_io_pairs(system, prev_state_sampler, n_pairs=n_pairs_train)
-    x_k = x_k
-    x_kp1 = x_kp1
 
     x0_data = TensorDataset(x0)
     xp_data = TensorDataset(x_k, x_kp1)
@@ -105,9 +79,9 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(xp_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    psi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
+    phi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
+    psi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
+    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
 
     # Create separable domain transformation
     nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device) if use_dtf else None
@@ -124,22 +98,14 @@ if __name__ == "__main__":
     if use_dtf:
         var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.conditional_density_model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.conditional_density_model.psi_basis, mean=True))
         psd_loss_fn = lambda model, x, xp : psd_strength * loss.B_psd_loss(model.conditional_density_model)
-        optimizers ={"dtf_params": torch.optim.Adam([p for p in tran_model.domain_tfs.parameters()] , lr=tran_params["lr_dtf"]),
-            "basis": torch.optim.Adam(tran_model.conditional_density_model.basis_params(), lr=tran_params["lr_basis"]), 
-            "weights": torch.optim.Adam(tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"])} 
     else:
         var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
         psd_loss_fn = lambda model, x, xp : psd_strength * loss.B_psd_loss(model)
-        optimizers ={"basis": torch.optim.Adam(tran_model.basis_params(), lr=tran_params["lr_basis"]), "weights": torch.optim.Adam(tran_model.weight_params(), lr=tran_params["lr_weights"])} 
 
-    tran_model, best_loss_tran, training_time_tran = train.train_iterate(tran_model,
-        xp_dataloader,
+    tran_model, best_loss_tran, training_time_tran = train.train(tran_model, 
+        xp_dataloader, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn, "psd": psd_loss_fn}, 
-        optimizers,
-        epochs_per_group=tran_params["n_epochs_per_group"],
-        iterations=tran_params["iterations"],
-        verbose=True,
-        use_best="mle")
+        torch.optim.Adam(tran_model.parameters(), lr=lr_tran), epochs=n_epochs_tran, use_best="mle")
     print("Done! \n")
     print("Valid: ", tran_model.valid())
 
@@ -158,19 +124,13 @@ if __name__ == "__main__":
 
     if use_dtf:
         var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.density_model.psi0_basis, mean=True)
-        optimizers = {"basis": torch.optim.Adam(init_model.density_model.basis_params(), lr=init_params["lr_basis"]), "weights": torch.optim.Adam(init_model.density_model.weight_params(), lr=init_params["lr_weights"])}
     else:
         var_reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
-        optimizers = {"basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]), "weights": torch.optim.Adam(init_model.weight_params(), lr=init_params["lr_weights"])}
 
-    init_model, best_loss_init, training_time_init = train.train_iterate(init_model, 
+    init_model, best_loss_init, training_time_init = train.train(init_model, 
         x0_dataloader, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
-        optimizers,
-        epochs_per_group=init_params["n_epochs_per_group"],
-        iterations=init_params["iterations"],
-        verbose=True,
-        use_best="mle")
+        torch.optim.Adam(init_model.parameters(), lr=lr_init), epochs=n_epochs_init, use_best="mle")
     print("Done! \n")
 
     print(f"Transition model loss: {best_loss_tran:.4f}, training time: {training_time_tran:.2f} seconds")
@@ -196,6 +156,19 @@ if __name__ == "__main__":
         axes[0, i].set_xlim(box_lows[0], box_highs[0])
         axes[0, i].set_ylim(box_lows[1], box_highs[1])
     
+
+    #box_lows = (-20.0, -20.0)
+    #box_highs = (20.0, 20.0)
+
+    #fig, axes = plt.subplots(2, n_timesteps_prop)
+    #fig.suptitle("Base beliefs at each time step")
+    #for i in range(n_timesteps_prop):
+    #    #print("Printing belief: ", i)
+    #    plot_belief(axes[1, i], base_belief_seq[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+    #    axes[0, i].scatter(traj_data[i][:, 0], traj_data[i][:, 1], s=1)
+    #    axes[0, i].set_aspect("equal")
+    #    axes[0, i].set_xlim(box_lows[0], box_highs[0])
+    #    axes[0, i].set_ylim(box_lows[1], box_highs[1])
 
     plt.savefig("figures/vdp_nfdf_gaussian_beliefs.pdf", dpi=1000)
     #plt.show()

@@ -65,6 +65,9 @@ class TrainingTimer:
         h, r = divmod(total, 3600)
         m, s = divmod(r, 60)
         return f"{h}:{m:02d}:{s:02d}"
+    
+    def total_since_start(self):
+        return sum(self.times)
 
 def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoader, labeled_loss_fns : dict[str, callable], optimizer, epochs=100, verbose=True, use_best : str = "total"):
     
@@ -136,11 +139,13 @@ def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoad
         else:
             print(f"Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")
         
+    if verbose:
+        print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
     if use_best and best_state is not None:
         model.load_state_dict(best_state)
         print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
 
-    return model
+    return model, best_loss, training_timer.total_since_start()
 
 def train_to_valid(model : DensityModel | ConditionalDensityModel, labeled_loss_fns : dict[str, callable], optimizer, epochs=100, verbose=True, use_best : str = "total"):
     
@@ -303,8 +308,10 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
             
         training_timer.update_iteration()
         
+    if verbose:
+        print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
     if use_best and best_state is not None:
         model.load_state_dict(best_state)
         print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
 
-    return model
+    return model, best_loss, training_timer.total_since_start()
