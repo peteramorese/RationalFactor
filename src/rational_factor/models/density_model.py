@@ -1,6 +1,6 @@
 import torch
 from copy import deepcopy
-from .basis_functions import SeparableBasis, NonnegativeBasis
+from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 
 #### Base Classes ####
 
@@ -10,6 +10,7 @@ class DensityModel(torch.nn.Module):
         self.dim = dim
 
     def forward(self, x : torch.Tensor):    
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
         return torch.exp(self.log_density(x))
 
     def log_density(self, x : torch.Tensor):
@@ -25,20 +26,29 @@ class DensityModel(torch.nn.Module):
         raise NotImplementedError("sample not implemented")
 
 class ConditionalDensityModel(torch.nn.Module):
-    def __init__(self, dim : int):
+    def __init__(self, dim : int, conditioner_dim : int):
         super().__init__()
         self.dim = dim
+        self.conditioner_dim = conditioner_dim
 
-    def forward(self, x : torch.Tensor, xp : torch.Tensor):
-        return torch.exp(self.log_density(x, xp))
+    def forward(self, x : torch.Tensor, y : torch.Tensor):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        assert y.shape[1] == self.conditioner_dim, "y must have shape (n_data, conditioner_dim)"
+        assert x.shape[0] == y.shape[0], "x and y must have the same number of data points"
+        
+        return torch.exp(self.log_density(x, y))
 
-    def log_density(self, x : torch.Tensor, xp : torch.Tensor):
+    def log_density(self, x : torch.Tensor, y : torch.Tensor):
         raise NotImplementedError("log_density not implemented")
 
     def valid(self):
         return True
     
-    def sample(self, x : torch.Tensor, n_samples : int):
+    def sample(self, x : torch.Tensor, y : torch.Tensor, n_samples : int):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        assert y.shape[1] == self.conditioner_dim, "y must have shape (n_data, conditioner_dim)"
+        assert x.shape[0] == y.shape[0], "x and y must have the same number of data points"
+        
         raise NotImplementedError("sample not implemented")
     
 ######################
@@ -71,10 +81,6 @@ class LinearRFF(ConditionalDensityModel):
         self.numerical_tolerance = numerical_tolerance
     
     def log_density(self, x : torch.Tensor, xp : torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        assert xp.shape[1] == self.dim, "xp must have shape (n_data, dim)"
-        assert x.shape[0] == xp.shape[0], "x and xp must have the same number of data points"
-        
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
         psi_xp = self.psi_basis(xp) # (n_data, n_psi)
@@ -109,7 +115,7 @@ class LinearRFF(ConditionalDensityModel):
         return [self.__au]
     
     def basis_params(self):
-        return [self.phi_basis.params, self.psi_basis.params]
+        return [self.phi_basis.parameters(), self.psi_basis.parameters()]
 
     
 class LinearFF(DensityModel):
@@ -143,7 +149,7 @@ class LinearFF(DensityModel):
         self.numerical_tolerance = numerical_tolerance
     
     @classmethod
-    def from_rff(cls, rff : LinearRFF, psi0_basis : SeparableBasis = None):
+    def from_rff(cls, rff : LinearRFF, psi0_basis : SeparableBasis):
         basis_type = type(rff.phi_basis)
         phi_basis = basis_type.freeze_params(rff.phi_basis)
         a = rff.get_a().detach().clone()
@@ -163,7 +169,6 @@ class LinearFF(DensityModel):
         return norm_constant * c0_unnormalized
         
     def log_density(self, x : torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, d)"
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         psi0_x = self.psi0_basis(x) # (n_data, n_psi)
 
@@ -184,7 +189,7 @@ class LinearFF(DensityModel):
             return [self.__c0u]
     
     def basis_params(self):
-        return [self.psi0_basis.params]
+        return [self.psi0_basis.parameters()]
 
     
 class LinearRF(ConditionalDensityModel):
@@ -193,7 +198,54 @@ class LinearRF(ConditionalDensityModel):
 
     Used for time-invariant observation distribution for filtering models
     """
-    def __init__(self, xi_basis : SeparableBasis)
+    def __init__(self, xi_basis : SeparableBasis, zeta_basis : Basis, numerical_tolerance : float = 1e-7):
+        assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
+        assert isinstance(zeta_basis, Basis), "zeta_basis must be a Basis"
+        assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
+        assert isinstance(zeta_basis, NonnegativeBasis), "zeta_basis must be a NonnegativeBasis"
+        super().__init__(xi_basis.dim(), zeta_basis.dim())
+
+        self.xi_basis = xi_basis
+        self.zeta_basis = zeta_basis
+
+        self.n_xi = xi_basis.n_basis_functions()
+        self.n_zeta = zeta_basis.n_basis_functions()
+        assert self.n_xi == self.n_zeta, "Currently only supported for n_xi == n_zeta"
+
+        self.__du = torch.nn.Parameter(torch.ones(self.n_xi))
+
+        self.numerical_tolerance = numerical_tolerance
+    
+    def get_d(self):
+        return torch.nn.functional.softmax(self.__du, dim=0)
+    
+    def get_e(self, d : torch.Tensor = None):
+        if d is None:
+            d = self.get_d()
+
+        if not self.zeta_basis.normalized():
+            Omega = self.zeta_basis.Omega1()
+            e = d / (Omega + self.numerical_tolerance) 
+        else:
+            return d
+        
+    def log_density(self, x : torch.Tensor, o : torch.Tensor):
+        xi_x = self.xi_basis(x)
+        zeta_o = self.zeta_basis(o)
+
+        d = self.get_d()
+        e = self.get_e(d=d)
+
+        log_r = torch.log(xi_x @ d + self.numerical_tolerance) # (n_data)
+        log_l = torch.log((zeta_o * xi_x) @ e + self.numerical_tolerance) # (n_data)
+
+        return log_l - log_r
+    
+    def weight_params(self):
+        return [self.__du]
+    
+    def basis_params(self):
+        return [self.xi_basis.parameters(), self.zeta_basis.parameters()]
 
 
 class LinearR2FF(ConditionalDensityModel):
@@ -212,7 +264,7 @@ class LinearR2FF(ConditionalDensityModel):
         assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
         assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
         assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
-        super().__init__(phi_basis.dim())
+        super().__init__(phi_basis.dim(), psi_basis.dim())
 
 
         self.n_xi = xi_basis.n_basis_functions()
@@ -229,11 +281,12 @@ class LinearR2FF(ConditionalDensityModel):
 
         self.numerical_tolerance = numerical_tolerance
     
+    @classmethod
+    def from_rf(cls, rf : LinearRF, phi_basis : SeparableBasis):
+        #TODO
+        pass
+    
     def log_density(self, x : torch.Tensor, xp : torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        assert xp.shape[1] == self.dim, "xp must have shape (n_data, dim)"
-        assert x.shape[0] == xp.shape[0], "x and xp must have the same number of data points"
-        
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
         psi_xp = self.psi_basis(xp) # (n_data, n_psi)
@@ -270,7 +323,7 @@ class LinearR2FF(ConditionalDensityModel):
         return [self.__au]
     
     def basis_params(self):
-        return [self.phi_basis.params, self.psi_basis.params]
+        return [self.phi_basis.parameters(), self.psi_basis.parameters()]
 
 
 class Linear2FF(DensityModel):
@@ -279,7 +332,80 @@ class Linear2FF(DensityModel):
 
     Used for belief representation for filtering models
     """
-    pass
+    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
+        assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
+        assert not phi_basis.trainable(), "phi_basis must be non-trainable"
+        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
+        assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
+        assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
+        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
+        assert isinstance(psi0_basis, NonnegativeBasis), "psi0_basis must be a NonnegativeBasis"
+        assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
+        assert a.shape[0] == phi_basis.n_basis_functions(), "a must have n_phi elements"
+        super().__init__(phi_basis.dim())
+
+        self.xi_basis = xi_basis 
+        self.phi_basis = phi_basis 
+        self.psi0_basis = psi0_basis
+        
+        self.n_xi = xi_basis.n_basis_functions()
+        self.n_phi = phi_basis.n_basis_functions()
+        self.n_psi0 = self.psi0_basis.n_basis_functions()
+
+        self.register_buffer("d", d) 
+        self.register_buffer("a", a) 
+        if c0_fixed is not None:
+            self.register_buffer("c0_fixed", c0_fixed)
+        else:
+            self.__c0u = torch.nn.Parameter(torch.ones(self.n_psi0))
+        
+        self.numerical_tolerance = numerical_tolerance
+    
+    @classmethod
+    def from_r2ff(cls, rff : LinearRFF, psi0_basis : SeparableBasis):
+        #TODO
+        pass
+        #basis_type = type(rff.phi_basis)
+        #phi_basis = basis_type.freeze_params(rff.phi_basis)
+        #a = rff.get_a().detach().clone()
+        #return cls(a, phi_basis, psi0_basis, rff.numerical_tolerance)
+
+    def get_c0(self, Omega0 : torch.Tensor = None):
+        if hasattr(self, "c0_fixed"):
+            return self.c0_fixed
+
+        if Omega0 is None:
+            Omega0 = self.xi_basis.Omega3(self.phi_basis, self.psi0_basis)
+        
+        c0_unnormalized = torch.nn.functional.softplus(self.__c0u)
+        
+        #TODO
+        norm_constant = 1.0 / (self.a @ Omega0 @ c0_unnormalized)
+        
+        return norm_constant * c0_unnormalized
+        
+    def log_density(self, x : torch.Tensor):
+        phi_x = self.phi_basis(x) # (n_data, n_phi)
+        psi0_x = self.psi0_basis(x) # (n_data, n_psi)
+
+        c0 = self.get_c0()
+
+        log_g_x = torch.log(phi_x @ self.a + self.numerical_tolerance) # (n_data)
+        log_h0_x = torch.log(psi0_x @ c0 + self.numerical_tolerance)
+
+        return log_g_x + log_h0_x
+
+    def marginal(self, marginal_dims : tuple[int, ...]):
+        return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
+
+    def weight_params(self):
+        if hasattr(self, "c0_fixed"):
+            return [self.c0_fixed]
+        else:
+            return [self.__c0u]
+    
+    def basis_params(self):
+        return [self.psi0_basis.parameters()]
 
 
 # Quadratic models #
@@ -289,7 +415,7 @@ class QuadraticRFF(ConditionalDensityModel):
         assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
-        super().__init__(phi_basis.dim())
+        super().__init__(phi_basis.dim(), psi_basis.dim())
 
         self.n_phi = phi_basis.n_basis_functions()
         self.n_psi = psi_basis.n_basis_functions()
@@ -322,11 +448,6 @@ class QuadraticRFF(ConditionalDensityModel):
         return B
 
     def log_density(self, x : torch.Tensor, xp : torch.Tensor):
-
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        assert xp.shape[1] == self.dim, "xp must have shape (n_data, dim)"
-        assert x.shape[0] == xp.shape[0], "x and xp must have the same number of data points"
-
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
         psi_xp = self.psi_basis(xp) # (n_data, n_psi)
@@ -355,7 +476,7 @@ class QuadraticRFF(ConditionalDensityModel):
         return [self.__LAu]
     
     def basis_params(self):
-        return [self.phi_basis.params, self.psi_basis.params]
+        return [self.phi_basis.parameters(), self.psi_basis.parameters()]
 
 
 class QuadraticFF(DensityModel):
@@ -402,7 +523,6 @@ class QuadraticFF(DensityModel):
         return norm_constant * C0_unnormalized
     
     def log_density(self, x : torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
         phi_x = self.phi_basis(x)
         psi0_x = self.psi0_basis(x) # (n_data, n_psi)
 
@@ -423,4 +543,4 @@ class QuadraticFF(DensityModel):
             return [self.__LC0u]
     
     def basis_params(self):
-        return [self.psi0_basis.params]
+        return [self.psi0_basis.parameters()]

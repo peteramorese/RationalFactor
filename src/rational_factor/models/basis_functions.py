@@ -41,6 +41,9 @@ class Basis(torch.nn.Module):
     def trainable(self):
         return self.trainable
     
+    def normalized(self):
+        raise NotImplementedError("normalized is not implemented for this basis function")
+    
     def Omega1(self):
         '''
         Computes the integral of the basis functions.
@@ -141,6 +144,9 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
             - (y - mu) ** 2 / (2 * std ** 2)
         )
         return torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
+
+    def normalized(self):
+        return True
 
     def Omega1(self):
         return torch.ones(
@@ -345,6 +351,9 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
 
         return torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
 
+    def normalized(self):
+        return True
+
     def Omega1(self):
         return torch.ones(
             self.n_basis_functions(),
@@ -448,7 +457,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
 
 #class ExpolyBasis(SeparableBasis):
 
-class NFBasis(Basis):
+class NFBasis(Basis, NonnegativeBasis):
     def __init__(self, dim : int, n_basis : int, n_layers : int = 5, hidden_features : int = 128, embedding_dim : int = 16, trainable : bool = True):
         super().__init__(dim, n_basis, trainable=trainable)
 
@@ -481,6 +490,9 @@ class NFBasis(Basis):
     def forward(self, y: torch.Tensor):
         index_embeddings = self.index_embedding(self.indices)
         return torch.exp(self.flow.log_prob(y, context=index_embeddings))
+
+    def normalized(self):
+        return True
 
     def Omega1(self):
         return torch.ones(
