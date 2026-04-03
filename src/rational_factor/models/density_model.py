@@ -43,8 +43,14 @@ class ConditionalDensityModel(torch.nn.Module):
     
 ######################
 
+# Linear models #
 
 class LinearRFF(ConditionalDensityModel):
+    """
+    Linear Rational Factor Form
+
+    Used for Markov transition distribution for propagation only models
+    """
     def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-7):
         assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
@@ -90,7 +96,7 @@ class LinearRFF(ConditionalDensityModel):
 
     def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
         if Omega is None:
-            Omega = self.phi_basis.inner_prod_matrix(self.psi_basis)
+            Omega = self.phi_basis.Omega2(self.psi_basis)
 
         if a is None:
             a = self.get_a()
@@ -107,8 +113,14 @@ class LinearRFF(ConditionalDensityModel):
 
     
 class LinearFF(DensityModel):
+    """
+    Linear Factor Form
+
+    Used for belief representation for propagation only models
+    """
     def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
+        assert not phi_basis.trainable(), "phi_basis must be non-trainable"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
         assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
@@ -142,7 +154,7 @@ class LinearFF(DensityModel):
             return self.c0_fixed
 
         if Omega0 is None:
-            Omega0 = self.phi_basis.inner_prod_matrix(self.psi0_basis)
+            Omega0 = self.phi_basis.Omega2(self.psi0_basis)
         
         c0_unnormalized = torch.nn.functional.softplus(self.__c0u)
         
@@ -173,7 +185,104 @@ class LinearFF(DensityModel):
     
     def basis_params(self):
         return [self.psi0_basis.params]
+
     
+class LinearRF(ConditionalDensityModel):
+    """
+    Linear Rational Form
+
+    Used for time-invariant observation distribution for filtering models
+    """
+    def __init__(self, xi_basis : SeparableBasis)
+
+
+class LinearR2FF(ConditionalDensityModel):
+    """
+    Linear Rational Two-Factor Form 
+
+    Used for Markov transition distribution for filtering models
+    """
+    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-7):
+        assert phi_basis.dim() == psi_basis.dim(), "Input bases must have the same dimension"
+        assert phi_basis.dim() == xi_basis.dim(), "Input bases must have the same dimension"
+        assert not xi_basis.trainable(), "xi_basis must be non-trainable"
+        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
+        assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
+        assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
+        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
+        assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
+        assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
+        super().__init__(phi_basis.dim())
+
+
+        self.n_xi = xi_basis.n_basis_functions()
+        self.n_phi = phi_basis.n_basis_functions()
+        self.n_psi = psi_basis.n_basis_functions()
+        assert self.n_phi == self.n_psi, "Currently only supported for n_phi == n_psi"
+
+        self.xi_basis = xi_basis
+        self.phi_basis = phi_basis
+        self.psi_basis = psi_basis
+
+        self.register_buffer("d", d)
+        self.__au = torch.nn.Parameter(torch.ones(self.n_phi)) # g
+
+        self.numerical_tolerance = numerical_tolerance
+    
+    def log_density(self, x : torch.Tensor, xp : torch.Tensor):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        assert xp.shape[1] == self.dim, "xp must have shape (n_data, dim)"
+        assert x.shape[0] == xp.shape[0], "x and xp must have the same number of data points"
+        
+        phi_x = self.phi_basis(x) # (n_data, n_phi)
+        phi_xp = self.phi_basis(xp) # (n_data, n_phi)
+        psi_xp = self.psi_basis(xp) # (n_data, n_psi)
+        
+        a = self.get_a()
+        b = self.get_b(a=a)
+        
+        # Calculate g(x)
+        log_g_x = torch.log(phi_x @ a + self.numerical_tolerance) # (n_data)
+        log_g_xp = torch.log(phi_xp @ a + self.numerical_tolerance) # (n_data)
+
+        # Calculate f(x, x')
+        log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
+
+        return log_g_xp + log_f - log_g_x
+
+    def get_a(self):
+        return torch.nn.functional.softmax(self.__au, dim=0)
+
+    def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
+        if Omega is None:
+            Omega = self.xi_basis.Omega3(self.phi_basis, self.psi_basis)
+
+        if a is None:
+            a = self.get_a()
+
+        denom = torch.einsum('i,ijk->k', self.d, Omega, a) 
+
+        b = a / (denom + self.numerical_tolerance)
+
+        return b
+
+    def weight_params(self):
+        return [self.__au]
+    
+    def basis_params(self):
+        return [self.phi_basis.params, self.psi_basis.params]
+
+
+class Linear2FF(DensityModel):
+    """
+    Linear Two-Factor Form 
+
+    Used for belief representation for filtering models
+    """
+    pass
+
+
+# Quadratic models #
     
 class QuadraticRFF(ConditionalDensityModel):
     def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-8):
@@ -199,7 +308,7 @@ class QuadraticRFF(ConditionalDensityModel):
     
     def get_B(self, A : torch.Tensor = None, Omega : torch.Tensor = None):
         if Omega is None:
-            Omega = self.phi_basis.inner_prod_tensor(self.psi_basis)
+            Omega = self.phi_basis.Omega22(self.psi_basis)
         
         if A is None:
             A = self.get_A()
@@ -284,7 +393,7 @@ class QuadraticFF(DensityModel):
             return self.C0_fixed
 
         if Omega0 is None:
-            Omega0 = self.phi_basis.inner_prod_tensor(self.psi0_basis)
+            Omega0 = self.phi_basis.Omega22(self.psi0_basis)
         
         C0_unnormalized = torch.tanh(self.__LC0u) @ torch.tanh(self.__LC0u).T
         
