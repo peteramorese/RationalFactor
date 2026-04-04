@@ -1,5 +1,6 @@
 import torch
 from copy import deepcopy
+import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 
 #### Base Classes ####
@@ -67,7 +68,7 @@ class LinearRFF(ConditionalDensityModel):
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
         assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
         assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
-        super().__init__(phi_basis.dim())
+        super().__init__(phi_basis.dim(), psi_basis.dim())
 
         self.n_phi = phi_basis.n_basis_functions()
         self.n_psi = psi_basis.n_basis_functions()
@@ -115,7 +116,7 @@ class LinearRFF(ConditionalDensityModel):
         return [self.__au]
     
     def basis_params(self):
-        return [self.phi_basis.parameters(), self.psi_basis.parameters()]
+        return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
 
     
 class LinearFF(DensityModel):
@@ -124,7 +125,7 @@ class LinearFF(DensityModel):
 
     Used for belief representation for propagation only models
     """
-    def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
+    def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert not phi_basis.trainable(), "phi_basis must be non-trainable"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
@@ -155,16 +156,16 @@ class LinearFF(DensityModel):
         a = rff.get_a().detach().clone()
         return cls(a, phi_basis, psi0_basis, rff.numerical_tolerance)
 
-    def get_c0(self, Omega0 : torch.Tensor = None):
+    def get_c0(self, Omega_0 : torch.Tensor = None):
         if hasattr(self, "c0_fixed"):
             return self.c0_fixed
 
-        if Omega0 is None:
-            Omega0 = self.phi_basis.Omega2(self.psi0_basis)
+        if Omega_0 is None:
+            Omega_0 = self.phi_basis.Omega2(self.psi0_basis)
         
         c0_unnormalized = torch.nn.functional.softplus(self.__c0u)
         
-        norm_constant = 1.0 / (self.a @ Omega0 @ c0_unnormalized)
+        norm_constant = 1.0 / (self.a @ Omega_0 @ c0_unnormalized)
         
         return norm_constant * c0_unnormalized
         
@@ -180,7 +181,12 @@ class LinearFF(DensityModel):
         return log_g_x + log_h0_x
 
     def marginal(self, marginal_dims : tuple[int, ...]):
-        return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
+        if hasattr(self, "c0_fixed"):
+            return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), c0_fixed=self.c0_fixed, numerical_tolerance=self.numerical_tolerance)
+        else:
+            new_ff = LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), numerical_tolerance=self.numerical_tolerance)
+            new_ff.__c0u = self.__c0u
+            return new_ff
 
     def weight_params(self):
         if hasattr(self, "c0_fixed"):
@@ -189,7 +195,7 @@ class LinearFF(DensityModel):
             return [self.__c0u]
     
     def basis_params(self):
-        return [self.psi0_basis.parameters()]
+        return self.psi0_basis.parameters()
 
     
 class LinearRF(ConditionalDensityModel):
@@ -236,16 +242,16 @@ class LinearRF(ConditionalDensityModel):
         d = self.get_d()
         e = self.get_e(d=d)
 
-        log_r = torch.log(xi_x @ d + self.numerical_tolerance) # (n_data)
-        log_l = torch.log((zeta_o * xi_x) @ e + self.numerical_tolerance) # (n_data)
+        log_r_x = torch.log(xi_x @ d + self.numerical_tolerance) # (n_data)
+        log_l_o_x = torch.log((zeta_o * xi_x) @ e + self.numerical_tolerance) # (n_data)
 
-        return log_l - log_r
+        return log_l_o_x - log_r_x
     
     def weight_params(self):
         return [self.__du]
     
     def basis_params(self):
-        return [self.xi_basis.parameters(), self.zeta_basis.parameters()]
+        return itertools.chain(self.xi_basis.parameters(), self.zeta_basis.parameters())
 
 
 class LinearR2FF(ConditionalDensityModel):
@@ -282,12 +288,15 @@ class LinearR2FF(ConditionalDensityModel):
         self.numerical_tolerance = numerical_tolerance
     
     @classmethod
-    def from_rf(cls, rf : LinearRF, phi_basis : SeparableBasis):
-        #TODO
-        pass
+    def from_rf(cls, rf : LinearRF, phi_basis : SeparableBasis, psi_basis : SeparableBasis):
+        xi_basis_type = type(rf.xi_basis)
+        xi_basis = xi_basis_type.freeze_params(rf.xi_basis)
+        d = rf.get_d().detach().clone()
+        return cls(d, xi_basis, phi_basis, psi_basis, rf.numerical_tolerance)
     
     def log_density(self, x : torch.Tensor, xp : torch.Tensor):
         phi_x = self.phi_basis(x) # (n_data, n_phi)
+        xi_xp = self.xi_basis(x) # (n_data, n_xi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
         psi_xp = self.psi_basis(xp) # (n_data, n_psi)
         
@@ -298,10 +307,13 @@ class LinearR2FF(ConditionalDensityModel):
         log_g_x = torch.log(phi_x @ a + self.numerical_tolerance) # (n_data)
         log_g_xp = torch.log(phi_xp @ a + self.numerical_tolerance) # (n_data)
 
+        # Calculate r(x')
+        log_r_xp = torch.log(xi_xp @ self.d + self.numerical_tolerance) # (n_data)
+
         # Calculate f(x, x')
         log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
 
-        return log_g_xp + log_f - log_g_x
+        return log_r_xp + log_g_xp + log_f - log_g_x
 
     def get_a(self):
         return torch.nn.functional.softmax(self.__au, dim=0)
@@ -323,7 +335,7 @@ class LinearR2FF(ConditionalDensityModel):
         return [self.__au]
     
     def basis_params(self):
-        return [self.phi_basis.parameters(), self.psi_basis.parameters()]
+        return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
 
 
 class Linear2FF(DensityModel):
@@ -332,7 +344,7 @@ class Linear2FF(DensityModel):
 
     Used for belief representation for filtering models
     """
-    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, numerical_tolerance : float = 1e-10, c0_fixed : torch.Tensor = None):
+    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert not phi_basis.trainable(), "phi_basis must be non-trainable"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
@@ -362,41 +374,51 @@ class Linear2FF(DensityModel):
         self.numerical_tolerance = numerical_tolerance
     
     @classmethod
-    def from_r2ff(cls, rff : LinearRFF, psi0_basis : SeparableBasis):
-        #TODO
-        pass
-        #basis_type = type(rff.phi_basis)
-        #phi_basis = basis_type.freeze_params(rff.phi_basis)
-        #a = rff.get_a().detach().clone()
-        #return cls(a, phi_basis, psi0_basis, rff.numerical_tolerance)
+    def from_r2ff(cls, r2ff : LinearRFF, psi0_basis : SeparableBasis):
+        # g(x)
+        phi_basis_type = type(r2ff.phi_basis)
+        phi_basis = phi_basis_type.freeze_params(r2ff.phi_basis)
+        a = r2ff.get_a().detach().clone()
 
-    def get_c0(self, Omega0 : torch.Tensor = None):
+        # r(x)
+        xi_basis_type = type(r2ff.xi_basis)
+        xi_basis = xi_basis_type.freeze_params(r2ff.xi_basis)
+        d = r2ff.get_d().detach().clone()
+        return cls(d, xi_basis, a, phi_basis, psi0_basis, r2ff.numerical_tolerance)
+
+    def get_c0(self, Omega3_0 : torch.Tensor = None):
         if hasattr(self, "c0_fixed"):
             return self.c0_fixed
 
-        if Omega0 is None:
-            Omega0 = self.xi_basis.Omega3(self.phi_basis, self.psi0_basis)
+        if Omega3_0 is None:
+            Omega3_0 = self.xi_basis.Omega3(self.phi_basis, self.psi0_basis)
         
         c0_unnormalized = torch.nn.functional.softplus(self.__c0u)
         
-        #TODO
-        norm_constant = 1.0 / (self.a @ Omega0 @ c0_unnormalized)
-        
+        norm_constant = 1.0 / torch.einsum("i,j,k,ijk->", self.d, self.a, c0_unnormalized, Omega3_0)
+
         return norm_constant * c0_unnormalized
         
     def log_density(self, x : torch.Tensor):
+        xi_x = self.xi_basis(x) # (n_data, n_xi)
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         psi0_x = self.psi0_basis(x) # (n_data, n_psi)
 
         c0 = self.get_c0()
 
+        log_r_x = torch.log(xi_x @ self.d + self.numerical_tolerance) # (n_data)
         log_g_x = torch.log(phi_x @ self.a + self.numerical_tolerance) # (n_data)
         log_h0_x = torch.log(psi0_x @ c0 + self.numerical_tolerance)
 
-        return log_g_x + log_h0_x
+        return log_r_x + log_g_x + log_h0_x
 
     def marginal(self, marginal_dims : tuple[int, ...]):
-        return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
+        if hasattr(self, "c0_fixed"):
+            return Linear2FF(self.d, self.xi_basis.marginal(marginal_dims), self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), c0_fixed=self.c0_fixed, numerical_tolerance=self.numerical_tolerance)
+        else:
+            new_2ff = Linear2FF(self.d, self.xi_basis.marginal(marginal_dims), self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), numerical_tolerance=self.numerical_tolerance)
+            new_2ff.__c0u = self.__c0u
+            return new_2ff
 
     def weight_params(self):
         if hasattr(self, "c0_fixed"):
@@ -405,7 +427,7 @@ class Linear2FF(DensityModel):
             return [self.__c0u]
     
     def basis_params(self):
-        return [self.psi0_basis.parameters()]
+        return self.psi0_basis.parameters()
 
 
 # Quadratic models #
@@ -476,11 +498,11 @@ class QuadraticRFF(ConditionalDensityModel):
         return [self.__LAu]
     
     def basis_params(self):
-        return [self.phi_basis.parameters(), self.psi_basis.parameters()]
+        return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
 
 
 class QuadraticFF(DensityModel):
-    def __init__(self, A : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis = None, numerical_tolerance : float = 1e-10, C0_fixed : torch.Tensor = None):
+    def __init__(self, A : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis = None, C0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
@@ -509,16 +531,16 @@ class QuadraticFF(DensityModel):
         A = rff.get_A().detach().clone()
         return cls(A, phi_basis, psi0_basis, rff.numerical_tolerance)
 
-    def get_C0(self, Omega0 : torch.Tensor = None):
+    def get_C0(self, Omega_0 : torch.Tensor = None):
         if hasattr(self, "C0_fixed"):
             return self.C0_fixed
 
-        if Omega0 is None:
-            Omega0 = self.phi_basis.Omega22(self.psi0_basis)
+        if Omega_0 is None:
+            Omega_0 = self.phi_basis.Omega22(self.psi0_basis)
         
         C0_unnormalized = torch.tanh(self.__LC0u) @ torch.tanh(self.__LC0u).T
         
-        norm_constant = 1.0 / torch.einsum('ij,ijkl,kl->', self.A, Omega0, C0_unnormalized)
+        norm_constant = 1.0 / torch.einsum('ij,ijkl,kl->', self.A, Omega_0, C0_unnormalized)
         
         return norm_constant * C0_unnormalized
     
@@ -534,7 +556,12 @@ class QuadraticFF(DensityModel):
         return log_g_x + log_h0_x
 
     def marginal(self, marginal_dims : tuple[int, ...]):
-        return LinearFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), self.numerical_tolerance)
+        if hasattr(self, "C0_fixed"):
+            return QuadraticFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), C0_fixed=self.C0_fixed, numerical_tolerance=self.numerical_tolerance)
+        else:
+            new_ff = QuadraticFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), numerical_tolerance=self.numerical_tolerance)
+            new_ff.__LC0u = self.__LC0u
+            return new_ff
 
     def weight_params(self):
         if hasattr(self, "C0_fixed"):
@@ -543,4 +570,4 @@ class QuadraticFF(DensityModel):
             return [self.__LC0u]
     
     def basis_params(self):
-        return [self.psi0_basis.parameters()]
+        return self.psi0_basis.parameters()

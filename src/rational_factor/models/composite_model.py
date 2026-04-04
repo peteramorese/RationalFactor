@@ -34,7 +34,7 @@ class CompositeConditionalModel(ConditionalDensityModel):
     def __init__(self, domain_tfs: DomainTF | Sequence[DomainTF], conditional_density_model: ConditionalDensityModel):
         domain_tfs = _as_transform_sequence(domain_tfs)
         _validate_transform_sequence(domain_tfs, conditional_density_model.dim)
-        super().__init__(conditional_density_model.dim)
+        super().__init__(conditional_density_model.dim, conditional_density_model.conditioner_dim)
         self.domain_tfs = torch.nn.ModuleList(domain_tfs)
         self.conditional_density_model = conditional_density_model
 
