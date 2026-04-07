@@ -1,5 +1,5 @@
 import torch
-from particle_filter.models.particle_set import WeightedParticleSet
+from particle_filter.particle_set import WeightedParticleSet
 from rational_factor.models.density_model import ConditionalDensityModel
 
 @torch.no_grad()

@@ -1,5 +1,6 @@
 import torch
 from abc import ABC, abstractmethod
+from rational_factor.models.density_model import ConditionalDensityModel
 
 class DiscreteTimeStochasticSystem(ABC):
     def __init__(self, dim : int, v_dist = None):
@@ -28,6 +29,57 @@ class DiscreteTimeStochasticSystem(ABC):
     def dim(self):
         return self._dim
 
+class PartiallyObservableSystem(DiscreteTimeStochasticSystem):
+    def __init__(self, state_dim : int, observation_dim : int, v_dist = None, w_dist = None):
+        super().__init__(state_dim, v_dist)
+        self._observation_dim = observation_dim
+
+        if w_dist is not None:
+            self._w_dist = w_dist
+        else:
+            def uniform():
+                return torch.rand(self._observation_dim)
+            self._w_dist = uniform
+
+    @abstractmethod
+    def observe(self, x : torch.Tensor):
+        pass
+
+    @abstractmethod
+    def log_observation_likelihood(self, x : torch.Tensor, o : torch.Tensor):
+        pass
+
+    def observation_dim(self):
+        return self._observation_dim
+
+class SystemTransitionDistribution(ConditionalDensityModel):
+    """
+    Conditional distribution representation of the stochastic system
+    """
+    def __init__(self, system : DiscreteTimeStochasticSystem):
+        super().__init__(system.dim(), system.dim())
+        self._system = system
+
+    def sample(self, x : torch.Tensor):
+        if x.ndim == 1:
+            return self._system(x)
+        if x.ndim == 2:
+            return torch.stack([self._system(xi) for xi in x], dim=0)
+        raise ValueError("x must have shape (dim,) or (n_samples, dim)")
+
+class SystemObservationDistribution(ConditionalDensityModel):
+    """
+    Conditional distribution representation of the observation model
+    """
+    def __init__(self, system : PartiallyObservableSystem):
+        super().__init__(system.observation_dim(), system.dim())
+        self._system = system
+
+    def log_density(self, x : torch.Tensor, o : torch.Tensor):
+        return self._system.log_observation_likelihood(x, o)
+    
+    def sample(self, x : torch.Tensor):
+        return self._system.observe(x)
 
 
 def sample_trajectories(system : DiscreteTimeStochasticSystem, initial_state_sampler, n_timesteps : int, n_trajectories : int):
