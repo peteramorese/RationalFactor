@@ -68,7 +68,8 @@ class LinearRFF(ConditionalDensityModel):
 
         self.numerical_tolerance = numerical_tolerance
     
-    def log_density(self, x : torch.Tensor, xp : torch.Tensor):
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+        x = conditioner
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
         psi_xp = self.psi_basis(xp) # (n_data, n_psi)
@@ -217,7 +218,8 @@ class LinearRF(ConditionalDensityModel):
         else:
             return d
         
-    def log_density(self, x : torch.Tensor, o : torch.Tensor):
+    def log_density(self, o : torch.Tensor, *, conditioner : torch.Tensor):
+        x = conditioner
         xi_x = self.xi_basis(x)
         zeta_o = self.zeta_basis(o)
 
@@ -276,7 +278,8 @@ class LinearR2FF(ConditionalDensityModel):
         d = rf.get_d().detach().clone()
         return cls(d, xi_basis, phi_basis, psi_basis, rf.numerical_tolerance)
     
-    def log_density(self, x : torch.Tensor, xp : torch.Tensor):
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+        x = conditioner
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         xi_xp = self.xi_basis(x) # (n_data, n_xi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
@@ -451,7 +454,8 @@ class QuadraticRFF(ConditionalDensityModel):
 
         return B
 
-    def log_density(self, x : torch.Tensor, xp : torch.Tensor):
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+        x = conditioner
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
         psi_xp = self.psi_basis(xp) # (n_data, n_psi)

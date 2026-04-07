@@ -13,7 +13,7 @@ def conditional_mle_loss(model : ConditionalDensityModel, x : torch.Tensor, xp :
     #    #print("model basis functions: ", model.phi_basis.means_stds())
     #    print("B: ", model.get_B())
     #    raise ValueError("NaN in conditional_mle_loss")
-    return -model.log_density(x, xp).mean()
+    return -model.log_density(xp, conditioner=x).mean()
 
 def mle_loss(model : DensityModel, x : torch.Tensor):
     return -model.log_density(x).mean()

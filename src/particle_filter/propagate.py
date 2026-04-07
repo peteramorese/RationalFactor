@@ -48,7 +48,7 @@ def update(
         raise ValueError("observation must have shape (obs_dim,) or (1, obs_dim)")
 
     # likelihoods[i] = p(o | x_i)
-    likelihoods = observation_model(obs, belief_next.particles).reshape(-1)
+    likelihoods = observation_model(obs, conditioner=belief_next.particles).reshape(-1)
 
     assert likelihoods.shape[0] == N, "observation_model must return one likelihood per particle"
 

@@ -75,10 +75,12 @@ class SystemObservationDistribution(ConditionalDensityModel):
         super().__init__(system.observation_dim(), system.dim())
         self._system = system
 
-    def log_density(self, x : torch.Tensor, o : torch.Tensor):
+    def log_density(self, o : torch.Tensor, *, conditioner : torch.Tensor):
+        x = conditioner
         return self._system.log_observation_likelihood(x, o)
     
-    def sample(self, x : torch.Tensor):
+    def sample(self, conditioner : torch.Tensor):
+        x = conditioner
         return self._system.observe(x)
 
 
