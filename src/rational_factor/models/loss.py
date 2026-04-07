@@ -1,5 +1,6 @@
 import torch
-from .density_model import DensityModel, ConditionalDensityModel, LinearRFF, QuadraticRFF
+from .density_model import DensityModel, ConditionalDensityModel
+from .factor_forms import LinearRFF, QuadraticRFF
 from .basis_functions import GaussianBasis, BetaBasis
 
 #### General ####

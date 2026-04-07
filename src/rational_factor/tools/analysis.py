@@ -18,14 +18,15 @@ def avg_log_likelihood(belief : DensityModel, test_data : torch.Tensor):
         belief.eval()
         return -mle_loss(belief, test_data).mean()
 
-def check_pdf_valid(pdf : DensityModel | ConditionalDensityModel, domain_bounds, n_samples=1000):
+def check_pdf_valid(pdf : DensityModel | ConditionalDensityModel, domain_bounds, n_samples=1000, atol=0.2):
     assert isinstance(pdf, DensityModel)
     print("Testing density model...")
     integral = mc_integral_box(pdf.forward, domain_bounds, n_samples)
-    print(f"   Integral over x (MC): {integral}")
-    #err = abs(float(integral) - 1.0)
-    #if err > atol:
-    #    raise AssertionError(f"PDF integrates to {float(integral):.6f}, expected ~1 (|error|={err:.6f}, atol={atol})")
+    err = abs(float(integral) - 1.0)
+    if err < atol:
+        print(f"   Integral over x (MC): {integral}")
+    else:
+        print(f"   Integral over x (MC): {integral} (INVALID PDF)")
 
 def check_conditional_pdf_valid(pdf : ConditionalDensityModel, domain_bounds, conditioner_domain_bounds, n_samples=1000, n_conditioner_samples=10):
     assert isinstance(pdf, ConditionalDensityModel)

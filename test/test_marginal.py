@@ -22,7 +22,7 @@ from typing import Callable, Sequence, Type
 import torch
 
 from rational_factor.models.basis_functions import BetaBasis, GaussianBasis, QuadraticExpBasis
-from rational_factor.models.density_model import Linear2FF, LinearFF, LinearR2FF, LinearRFF, QuadraticFF, QuadraticRFF
+from rational_factor.models.factor_forms import Linear2FF, LinearFF, LinearR2FF, LinearRFF, QuadraticFF, QuadraticRFF
 from rational_factor.tools.analysis import check_pdf_valid
 
 # --- edit these -------------------------------------------------------------

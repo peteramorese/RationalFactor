@@ -1,8 +1,9 @@
+from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
 import torch
 from copy import deepcopy
-from .density_model import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
+from rational_factor.models.factor_forms import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
 
-def propagate(belief, transition_model, n_steps : int):
+def propagate(belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int):
     if isinstance(transition_model, LinearRFF):
         assert isinstance(belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
 
@@ -81,7 +82,7 @@ def propagate(belief, transition_model, n_steps : int):
         raise ValueError(f"Unrecognized transition model type '{type(transition_model)}'")
 
 
-def update(belief, observation_model, observation : torch.Tensor):
+def update(belief : DensityModel, observation_model : ConditionalDensityModel, observation : torch.Tensor):
     if isinstance(observation_model, LinearRF):
         assert isinstance(belief, Linear2FF), "Belief must be Linear2FF for LinearRF observation model"
 
@@ -98,7 +99,7 @@ def update(belief, observation_model, observation : torch.Tensor):
         raise ValueError(f"Unrecognized observation model type '{type(observation_model)}'")
 
     
-def propagate_and_update(belief, transition_model, observation_model, observations : list[torch.Tensor]):
+def propagate_and_update(belief : DensityModel, transition_model : ConditionalDensityModel, observation_model : ConditionalDensityModel, observations : list[torch.Tensor]):
     """
     Propagate and update the belief given observation data
 
