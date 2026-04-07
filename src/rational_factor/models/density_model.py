@@ -56,6 +56,43 @@ class ConditionalDensityModel(torch.nn.Module):
 
 # Linear models #
 
+class LinearForm(DensityModel):
+    def __init__(self, basis : SeparableBasis, w_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-7):
+        super().__init__(basis.dim())
+
+        self.basis = basis
+        self.numerical_tolerance = numerical_tolerance
+
+        if w_fixed is not None:
+            self.register_buffer("w_fixed", w_fixed)
+        else:
+            self.__wu = torch.nn.Parameter(torch.ones(basis.n_basis_functions()))
+    
+    def get_w(self, Omega : torch.Tensor = None):
+        if hasattr(self, "w_fixed"):
+            return self.w_fixed
+
+        if Omega is None:
+            Omega = self.basis.Omega1()
+
+        w = self.__wu / (Omega @ self.__wu + self.numerical_tolerance)
+        return w
+    
+    def log_density(self, x : torch.Tensor):
+        w = self.get_w()
+        log_g_x = torch.log(self.basis(x) @ w + self.numerical_tolerance) # (n_data)
+        return log_g_x
+    
+    def weight_params(self):
+        if hasattr(self, "w_fixed"):
+            return [self.w_fixed]
+        else:
+            return [self.__wu]
+    
+    def basis_params(self):
+        return self.basis.parameters()
+
+
 class LinearRFF(ConditionalDensityModel):
     """
     Linear Rational Factor Form

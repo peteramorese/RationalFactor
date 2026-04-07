@@ -21,7 +21,7 @@ class Basis(torch.nn.Module):
         super().__init__()
         self._dim = dim
         self._n_basis = n_basis
-        self.trainable = trainable
+        self._trainable = trainable
 
         if params_init is not None:
             self._init_params(params_init, trainable)
@@ -39,7 +39,7 @@ class Basis(torch.nn.Module):
         return self._n_basis
     
     def trainable(self):
-        return self.trainable
+        return self._trainable
     
     def normalized(self):
         raise NotImplementedError("normalized is not implemented for this basis function")
@@ -84,6 +84,16 @@ class Basis(torch.nn.Module):
         '''
         raise NotImplementedError("Omega4 is not implemented for this basis function")
     
+    def product_basis(self, other : 'Basis'):
+        '''
+        Returns the set of basis functions in the outter product
+        product[i, j] = this_i * other_j
+        
+        Returns:
+            Tensor of shape (n_basis, other.n_basis)
+        '''
+        raise NotImplementedError("product_basis is not implemented for this basis function")
+    
     @abstractmethod
     def marginal(self, marginal_dims : tuple[int, ...]):
         '''
@@ -105,7 +115,6 @@ class SeparableBasis(Basis):
 # Nonnegative basis functions 
 class NonnegativeBasis:
     pass
-
 
 
 class GaussianBasis(SeparableBasis, NonnegativeBasis):
@@ -280,6 +289,191 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
             min_std=self.min_std,
         )
 
+class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
+    """
+    Separable basis with 1D factors of the form exp(a x^2 + b x + c)
+    """
+
+    def __init__(self, params_init: torch.Tensor, trainable: bool = True, eps: float = 1e-6):
+        assert params_init.shape[2] == 3, "params_init must have shape (d, n_basis, 3)"
+        super().__init__(params_init, trainable)
+        self.eps = eps
+
+    @classmethod
+    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(3), variance: float = 1.0, eps: float = 1e-6, device=None):
+        if device is None:
+            device = offsets.device
+        offsets = offsets.repeat(d, n_basis, 1)
+        params_init = (
+            torch.randn(d, n_basis, 3, device=device)
+            * torch.sqrt(torch.tensor(variance, device=device))
+            + offsets
+        )
+        return cls(params_init, eps=eps)
+
+    @classmethod
+    def set_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(3), eps: float = 1e-6):
+        offsets = offsets.repeat(d, n_basis, 1)
+        return cls(offsets, eps=eps)
+
+    @classmethod
+    def freeze_params(cls, other: "QuadraticExpBasis"):
+        return cls(other.params.detach().clone(), trainable=False, eps=other.eps)
+
+    def abc(self):
+        raw_a = self.params[..., 0]
+        b = self.params[..., 1]
+        c = self.params[..., 2]
+        a = -torch.nn.functional.softplus(raw_a) - self.eps
+        return a, b, c
+
+    def normalized(self):
+        return False
+
+    def forward(self, y: torch.Tensor):
+        assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
+        y = y[:, :, None]  # (n_data, d, n_basis)
+
+        a, b, c = self.abc()  # (d, n_basis)
+
+        log_dim_factors = a * y.square() + b * y + c
+        return torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
+
+    def Omega1(self):
+        a, b, c = self.abc()
+
+        log_dim_int = c - b.square() / (4.0 * a) + 0.5 * (
+            torch.log(torch.tensor(torch.pi, dtype=a.dtype, device=a.device)) - torch.log(-a)
+        )
+        return torch.exp(log_dim_int.sum(dim=0))  # (n_basis,)
+    
+    def Omega2(self, other: "QuadraticExpBasis"):
+        assert isinstance(other, QuadraticExpBasis), "other must be QuadraticExpBasis"
+        assert self.dim() == other.dim(), "Basis functions must have the same dimension"
+
+        a1, b1, c1 = self.abc()
+        a2, b2, c2 = other.abc()
+
+        # broadcast to (d, n1, n2)
+        a = a1[:, :, None] + a2[:, None, :]
+        b = b1[:, :, None] + b2[:, None, :]
+        c = c1[:, :, None] + c2[:, None, :]
+
+        log_dim_int = c - b.square() / (4.0 * a) + 0.5 * (
+            torch.log(torch.tensor(torch.pi, dtype=a.dtype, device=a.device)) - torch.log(-a)
+        )
+        return torch.exp(log_dim_int.sum(dim=0))  # (n1, n2)
+    
+    def Omega3(self, other1: "QuadraticExpBasis", other2: "QuadraticExpBasis"):
+        assert isinstance(other1, QuadraticExpBasis), "other1 must be QuadraticExpBasis"
+        assert isinstance(other2, QuadraticExpBasis), "other2 must be QuadraticExpBasis"
+        assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
+
+        a0, b0, c0 = self.abc()     # (d, n0)
+        a1, b1, c1 = other1.abc()   # (d, n1)
+        a2, b2, c2 = other2.abc()   # (d, n2)
+
+        # Broadcast to (d, n0, n1, n2)
+        A = a0[:, :, None, None] + a1[:, None, :, None] + a2[:, None, None, :]
+        B = b0[:, :, None, None] + b1[:, None, :, None] + b2[:, None, None, :]
+        C = c0[:, :, None, None] + c1[:, None, :, None] + c2[:, None, None, :]
+
+        log_pi = torch.log(torch.tensor(torch.pi, dtype=A.dtype, device=A.device))
+        log_dim_int = C - (B * B) / (4.0 * A) + 0.5 * (log_pi - torch.log(-A))
+
+        log_Omega = log_dim_int.sum(dim=0)   # (n0, n1, n2)
+        return torch.exp(log_Omega)
+    
+    def Omega22(self, other: "QuadraticExpBasis"):
+        """
+        omega[i, j, k, l] = ∫ self_i(x) self_j(x) other_k(x) other_l(x) dx
+
+        Returns:
+            Tensor of shape (n_self, n_self, n_other, n_other)
+        """
+        assert isinstance(other, QuadraticExpBasis), "other must be QuadraticExpBasis"
+        assert self.dim() == other.dim(), "Basis functions must have the same dimension"
+
+        a1, b1, c1 = self.abc()    # (d, n_self)
+        a2, b2, c2 = other.abc()   # (d, n_other)
+
+        # Broadcast to (d, n_self, n_self, n_other, n_other)
+        A = (
+            a1[:, :, None, None, None]
+            + a1[:, None, :, None, None]
+            + a2[:, None, None, :, None]
+            + a2[:, None, None, None, :]
+        )
+        B = (
+            b1[:, :, None, None, None]
+            + b1[:, None, :, None, None]
+            + b2[:, None, None, :, None]
+            + b2[:, None, None, None, :]
+        )
+        C = (
+            c1[:, :, None, None, None]
+            + c1[:, None, :, None, None]
+            + c2[:, None, None, :, None]
+            + c2[:, None, None, None, :]
+        )
+
+        log_pi = torch.log(torch.tensor(torch.pi, dtype=A.dtype, device=A.device))
+        log_dim_int = C - (B * B) / (4.0 * A) + 0.5 * (log_pi - torch.log(-A))
+
+        log_Omega = log_dim_int.sum(dim=0)   # (n_self, n_self, n_other, n_other)
+        return torch.exp(log_Omega)
+    
+    def marginal(self, marginal_dims: tuple[int, ...]) -> "QuadraticExpBasis":
+        marginal_dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim() for i in marginal_dims), "marginal_dims must be in [0, d)"
+
+        keep_dims = tuple(i for i in range(self.dim()) if i not in marginal_dims)
+
+        a, b, c = self.abc()  # (d, n_basis)
+
+        # --- compute log integral contribution from marginalized dims ---
+        if len(marginal_dims) > 0:
+            a_m = a[marginal_dims, :]
+            b_m = b[marginal_dims, :]
+            c_m = c[marginal_dims, :]
+
+            log_pi = torch.log(torch.tensor(torch.pi, dtype=a.dtype, device=a.device))
+
+            log_int_m = (
+                c_m
+                - (b_m * b_m) / (4.0 * a_m)
+                + 0.5 * (log_pi - torch.log(-a_m))
+            )  # (|M|, n_basis)
+
+            log_int_sum = log_int_m.sum(dim=0)  # (n_basis,)
+        else:
+            log_int_sum = torch.zeros(
+                self.n_basis_functions(),
+                dtype=a.dtype,
+                device=a.device,
+            )
+
+        # --- keep remaining dims ---
+        a_k = a[keep_dims, :]
+        b_k = b[keep_dims, :]
+        c_k = c[keep_dims, :]
+
+        # --- add marginalized contribution into c ---
+        c_new = c_k + log_int_sum[None, :]
+
+        # --- convert back to raw parameterization ---
+        # a = -softplus(raw_a) - eps  => invert
+        s = (-a_k - self.eps).clamp_min(1e-12)
+        raw_a = torch.log(torch.expm1(s))
+
+        params = torch.stack([raw_a, b_k, c_new], dim=-1)
+
+        return QuadraticExpBasis(
+            params.detach().clone(),
+            trainable=self.params.requires_grad,
+            eps=self.eps,
+    )
+    
 
 class BetaBasis(SeparableBasis, NonnegativeBasis):
     def __init__(self, params_init: torch.Tensor, trainable: bool = True, min_concentration: float = 1.0, eps: float = 1e-6):
@@ -455,7 +649,6 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
             eps=self.eps,
         )
 
-#class ExpolyBasis(SeparableBasis):
 
 class NFBasis(Basis, NonnegativeBasis):
     def __init__(self, dim : int, n_basis : int, n_layers : int = 5, hidden_features : int = 128, embedding_dim : int = 16, trainable : bool = True):

@@ -45,20 +45,9 @@ def propagate(belief, transition_model, n_steps : int):
         belief_seq = [QuadraticFF(belief.A, belief.phi_basis, transition_model.psi_basis, C0_fixed=C_seq[i + 1]) for i in range(n_steps)]
         belief_seq.insert(0, belief) # Add the initial belief
         return belief_seq
-    
-    def propagate_and_update(belief, transition_model, observation_model, observations : list[torch.Tensor]):
-        """
-        Propagate and update the belief given observation data
 
-        Args:
-            belief : LinearFF | Linear2FF starting belief (k=0)
-            transition_model : LinearR2FF transition model
-            observations : list[torch.Tensor] sequential observation data for timesteps k=1, ..., k=len(observations)-1. If observations[k] is None, no observation is available and the belief is propagated without update
-        """
-        if isinstance(transition_model, LinearR2FF):
-            assert isinstance(observation_model, LinearRF), "Observation model must be LinearRF for LinearR2FF transition model"
-            assert isinstance(belief, LinearFF) or isinstance(belief, Linear2FF), "Belief must be LinearFF or Linear2FF"
-
+    elif isinstance(transition_model, LinearR2FF):
+        def _prop(curr_belief : LinearFF | Linear2FF):
             # Compute first belief propagation
             if isinstance(belief, LinearFF):
                 Omega_0 = belief.phi_basis.Omega2(belief.psi0_basis)
@@ -77,29 +66,62 @@ def propagate(belief, transition_model, n_steps : int):
                 
                 c1 = torch.einsum("i,j,k,ijk->k", d, b, c0, Omega3_0)
 
+                return Linear2FF(transition_model.d, transition_model.xi_basis, 
+                    transition_model.a, transition_model.phi_basis, 
+                    transition_model.psi_basis, c0_fixed=c1, 
+                    numerical_tolerance=curr_belief.numerical_tolerance)
             else:
                 raise ValueError(f"Unrecognized belief type '{type(belief)}'")
+        belief_seq = [belief]
+        for _ in range(1, n_steps):
+            belief_seq.append(_prop(belief_seq[-1]))
+        return belief_seq
 
-            def update(belief : Linear2FF, observation : torch.Tensor) -> LinearFF:
-                # Evaluate likelihood numerator to get updated coefficients d
-                zeta_o = observation_model.zeta_basis(observation)
-                d_updated = observation_model.get_e() * zeta_o
+    else:
+        raise ValueError(f"Unrecognized transition model type '{type(transition_model)}'")
 
-                # All other factors of the belief remain the same since c automatically accounts for normalization constant
-                belief_posterior = deepcopy(belief)
-                belief_posterior.d = d_updated
 
-                return belief_posterior
+def update(belief, observation_model, observation : torch.Tensor):
+    if isinstance(observation_model, LinearRF):
+        assert isinstance(belief, Linear2FF), "Belief must be Linear2FF for LinearRF observation model"
 
-            belief_1_prior = Linear2FF(transition_model.d,
-                transition_model.xi_basis, 
-                transition_model.a,
-                transition_model.phi_basis,
-                transition_model.psi_basis,
-                c0_fixed=c1,
-                numerical_tolerance=belief.numerical_tolerance)
-            
+        # Evaluate likelihood numerator to get updated coefficients d
+        zeta_o = observation_model.zeta_basis(observation)
+        d_updated = observation_model.get_e() * zeta_o
 
-                
+        # All other factors of the belief remain the same since c automatically accounts for normalization constant
+        belief_posterior = deepcopy(belief)
+        belief_posterior.d = d_updated
+
+        return belief_posterior
+    else:
+        raise ValueError(f"Unrecognized observation model type '{type(observation_model)}'")
+
+    
+def propagate_and_update(belief, transition_model, observation_model, observations : list[torch.Tensor]):
+    """
+    Propagate and update the belief given observation data
+
+    Args:
+        belief : LinearFF | Linear2FF starting belief (k=0)
+        transition_model : LinearR2FF transition model
+        observations : list[torch.Tensor] sequential observation data for timesteps k=1, ..., k=len(observations)-1. If observations[k] is None, no observation is available and the belief is propagated without update
+    """
+
+    priors = []
+    posteriors = [belief]
+
+    for observation in observations:
+        
+        # Propagate the previous posterior belief to get the prior for the current timestep
+        prior = propagate(posteriors[-1], transition_model, 1)
+        
+        if observation is not None:
+            posterior = update(prior, observation_model, observation)
         else:
-            raise ValueError(f"Unrecognized transition model type '{type(transition_model)}'")
+            posterior = prior
+
+        priors.append(prior)
+        posteriors.append(posterior)
+    
+    return priors, posteriors
