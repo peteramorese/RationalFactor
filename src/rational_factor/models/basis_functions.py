@@ -84,13 +84,9 @@ class Basis(torch.nn.Module):
         '''
         raise NotImplementedError("Omega4 is not implemented for this basis function")
     
-    def product_basis(self, other : 'Basis'):
+    def product_basis(self, other_basis_factors : list['Basis']):
         '''
-        Returns the set of basis functions in the outter product
-        product[i, j] = this_i * other_j
-        
-        Returns:
-            Tensor of shape (n_basis, other.n_basis)
+        Returns the broadcasted (flattened) product of the basis functions in the other_basis_factors list.
         '''
         raise NotImplementedError("product_basis is not implemented for this basis function")
     
@@ -279,6 +275,9 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         log_Omega = log_dim.sum(dim=0)                         # (nf, nf, ng, ng)
 
         return torch.exp(log_Omega)
+
+    def product_basis(self, other_basis_factors : list['Basis']) -> 'QuadraticExpBasis':
+        pass
 
     def marginal(self, marginal_dims: tuple[int, ...]) -> 'GaussianBasis':
         marginal_dims = tuple(marginal_dims)

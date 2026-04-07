@@ -45,7 +45,7 @@ class ConditionalDensityModel(torch.nn.Module):
     def valid(self):
         return True
     
-    def sample(self, x : torch.Tensor, y : torch.Tensor, n_samples : int):
+    def sample(self, y : torch.Tensor, num_samples_per : int = 1):
         raise NotImplementedError("sample not implemented")
     
 ######################

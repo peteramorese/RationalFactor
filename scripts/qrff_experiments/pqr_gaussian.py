@@ -12,15 +12,7 @@ from rational_factor.tools.analysis import mc_integral_box, avg_log_likelihood
 
 import matplotlib.pyplot as plt
 
-def make_mvnormal_init_sampler(mean: torch.Tensor, covariance: torch.Tensor):
-    mean = torch.as_tensor(mean, dtype=torch.float32)
-    covariance = torch.as_tensor(covariance, dtype=torch.float32)
-    dist = torch.distributions.MultivariateNormal(mean, covariance)
-
-    def sampler(n_samples: int) -> torch.Tensor:
-        return dist.sample((n_samples,))
-
-    return sampler
+from rational_factor.tools.misc import make_mvnormal_init_sampler
 
 
 if __name__ == "__main__":
@@ -59,11 +51,7 @@ if __name__ == "__main__":
 
     # Generate data set from trajectories
     #mean = torch.tensor([0.0, 0.0, 0.1, 50.0, 0.0, 0.0])
-    mean = torch.tensor([0.0, 0.0, 0.1, 0.0, 0.0, 0.0])
-    cov = torch.diag(torch.tensor([0.1, 0.1, 0.05, 0.1, 0.1, 0.05]))
-    dist = torch.distributions.MultivariateNormal(mean, cov)
-    def init_state_sampler(n_samples : int):
-        return dist.sample((n_samples,))
+    init_state_sampler = make_mvnormal_init_sampler(mean=torch.tensor([0.0, 0.0, 0.1, 0.0, 0.0, 0.0]), covariance=torch.diag(torch.tensor([0.1, 0.1, 0.05, 0.1, 0.1, 0.05])))
 
     traj_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_train, n_trajectories=n_trajectories_train)
     test_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_train, n_trajectories=n_trajectories_test)
@@ -97,7 +85,7 @@ if __name__ == "__main__":
     mle_loss_fn = loss.conditional_mle_loss
     var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
     psd_loss_fn = lambda model, x, xp : psd_reg_strength * loss.B_psd_loss(model)
-    tran_model = train.train(tran_model, 
+    tran_model, _, _ = train.train(tran_model, 
         xp_dataloader, 
         #{"mle": mle_loss_fn, "psd": psd_loss_fn}, 
         {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn, "psd": psd_loss_fn}, 

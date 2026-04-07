@@ -141,7 +141,7 @@ class LinearFF(DensityModel):
         basis_type = type(rff.phi_basis)
         phi_basis = basis_type.freeze_params(rff.phi_basis)
         a = rff.get_a().detach().clone()
-        return cls(a, phi_basis, psi0_basis, rff.numerical_tolerance)
+        return cls(a, phi_basis, psi0_basis, numerical_tolerance=rff.numerical_tolerance)
 
     def get_c0(self, Omega_0 : torch.Tensor = None):
         if hasattr(self, "c0_fixed"):
@@ -167,13 +167,8 @@ class LinearFF(DensityModel):
 
         return log_g_x + log_h0_x
 
-    def marginal(self, marginal_dims : tuple[int, ...]):
-        if hasattr(self, "c0_fixed"):
-            return LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), c0_fixed=self.c0_fixed, numerical_tolerance=self.numerical_tolerance)
-        else:
-            new_ff = LinearFF(self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), numerical_tolerance=self.numerical_tolerance)
-            new_ff.__c0u = self.__c0u
-            return new_ff
+    def expand():
+        pass
 
     def weight_params(self):
         if hasattr(self, "c0_fixed"):
@@ -371,7 +366,7 @@ class Linear2FF(DensityModel):
         xi_basis_type = type(r2ff.xi_basis)
         xi_basis = xi_basis_type.freeze_params(r2ff.xi_basis)
         d = r2ff.get_d().detach().clone()
-        return cls(d, xi_basis, a, phi_basis, psi0_basis, r2ff.numerical_tolerance)
+        return cls(d, xi_basis, a, phi_basis, psi0_basis, numerical_tolerance=r2ff.numerical_tolerance)
 
     def get_c0(self, Omega3_0 : torch.Tensor = None):
         if hasattr(self, "c0_fixed"):
@@ -516,7 +511,7 @@ class QuadraticFF(DensityModel):
         basis_type = type(rff.phi_basis)
         phi_basis = basis_type.freeze_params(rff.phi_basis)
         A = rff.get_A().detach().clone()
-        return cls(A, phi_basis, psi0_basis, rff.numerical_tolerance)
+        return cls(A, phi_basis, psi0_basis, numerical_tolerance=rff.numerical_tolerance)
 
     def get_C0(self, Omega_0 : torch.Tensor = None):
         if hasattr(self, "C0_fixed"):

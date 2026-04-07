@@ -13,15 +13,7 @@ from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSe
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 import matplotlib.pyplot as plt
 
-def make_mvnormal_init_sampler(mean: torch.Tensor, covariance: torch.Tensor):
-    mean = torch.as_tensor(mean, dtype=torch.float32)
-    covariance = torch.as_tensor(covariance, dtype=torch.float32)
-    dist = torch.distributions.MultivariateNormal(mean, covariance)
-
-    def sampler(n_samples: int) -> torch.Tensor:
-        return dist.sample((n_samples,))
-
-    return sampler
+from rational_factor.tools.misc import make_mvnormal_init_sampler
 
 
 if __name__ == "__main__":

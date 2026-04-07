@@ -106,7 +106,8 @@ def propagate_and_update(belief : DensityModel, transition_model : ConditionalDe
     Args:
         belief : LinearFF | Linear2FF starting belief (k=0)
         transition_model : LinearR2FF transition model
-        observations : list[torch.Tensor] sequential observation data for timesteps k=1, ..., k=len(observations)-1. If observations[k] is None, no observation is available and the belief is propagated without update
+        observations : list[torch.Tensor] sequential observation data for timesteps k=1, ..., k=len(observations)-1. 
+            If observations[k] is None, no observation is available and the belief is propagated without update
     """
 
     priors = []
