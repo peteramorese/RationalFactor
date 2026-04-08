@@ -232,6 +232,62 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
 
         return torch.exp(log_Omega)
 
+    #def Omega3(self, other1: "GaussianBasis", other2: "GaussianBasis"):
+    #    assert isinstance(other1, GaussianBasis), "other1 must be GaussianBasis"
+    #    assert isinstance(other2, GaussianBasis), "other2 must be GaussianBasis"
+    #    assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
+
+    #    mu0, std0 = self.means_stds()   # (d, n0)
+    #    mu1, std1 = other1.means_stds() # (d, n1)
+    #    mu2, std2 = other2.means_stds() # (d, n2)
+
+    #    var0 = std0.square()
+    #    var1 = std1.square()
+    #    var2 = std2.square()
+
+    #    inv0 = var0.reciprocal()
+    #    inv1 = var1.reciprocal()
+    #    inv2 = var2.reciprocal()
+
+    #    n0 = self.n_basis_functions()
+    #    n1 = other1.n_basis_functions()
+    #    n2 = other2.n_basis_functions()
+
+    #    log_Omega = torch.zeros(
+    #        (n0, n1, n2),
+    #        dtype=mu0.dtype,
+    #        device=mu0.device,
+    #    )
+
+    #    log2pi = torch.log(mu0.new_tensor(2.0 * torch.pi))
+
+    #    for r in range(self.dim()):
+    #        # Shapes: (n0,1,1), (1,n1,1), (1,1,n2)
+    #        mu_i  = mu0[r, :, None, None]
+    #        mu_j  = mu1[r, None, :, None]
+    #        mu_k  = mu2[r, None, None, :]
+
+    #        inv_i = inv0[r, :, None, None]
+    #        inv_j = inv1[r, None, :, None]
+    #        inv_k = inv2[r, None, None, :]
+
+    #        var_i = var0[r, :, None, None]
+    #        var_j = var1[r, None, :, None]
+    #        var_k = var2[r, None, None, :]
+
+    #        S = inv_i + inv_j + inv_k
+    #        T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k
+    #        U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k
+
+    #        log_Omega += (
+    #            -0.5 * (3.0 * log2pi + torch.log(var_i) + torch.log(var_j) + torch.log(var_k))
+    #            + 0.5 * (log2pi - torch.log(S))
+    #            - 0.5 * (U - T.square() / S)
+    #        )
+
+    #    return torch.exp(log_Omega)
+
+
     def Omega22(self, other: "GaussianBasis"):
         assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"

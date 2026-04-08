@@ -1,53 +1,66 @@
 import torch
-from abc import ABC, abstractmethod
 from rational_factor.models.density_model import ConditionalDensityModel
 
-class DiscreteTimeStochasticSystem(ABC):
-    def __init__(self, dim : int, v_dist = None):
+class DiscreteTimeStochasticSystem(torch.nn.Module):
+    def __init__(self, dim : int, v_dist : torch.distributions.Distribution | None = None):
+        super().__init__()
         self._dim = dim
 
         if v_dist is not None:
             self._v_dist = v_dist
         else:
-            def uniform():
-                return torch.rand(self._dim)
-            self._v_dist = uniform
+            self._v_dist = torch.distributions.Uniform(
+                low=torch.zeros(self._dim),
+                high=torch.ones(self._dim),
+            )
 
-    @abstractmethod
+    def _sample_v(self):
+        if isinstance(self._v_dist, torch.distributions.Distribution):
+            return self._v_dist.sample()
+        if callable(self._v_dist):
+            return self._v_dist()
+        raise TypeError("v_dist must be a torch.distributions.Distribution or callable")
+
     def next_state(self, x : torch.Tensor, v : torch.Tensor):
         """
         Args:
             x : current state
             v : realization of the noise parameters
         """
-        pass
+        raise NotImplementedError("next_state not implemented")
 
-    def __call__(self, x : torch.Tensor):
-        v = self._v_dist()  # Sample a random v to be plugged into the difference function
-        return self.next_state(x, v)
+    def forward(self, x : torch.Tensor):
+        v = self._sample_v()  # Sample a random v to be plugged into the difference function
+        return self.next_state(x, v.to(device=x.device, dtype=x.dtype))
 
     def dim(self):
         return self._dim
 
 class PartiallyObservableSystem(DiscreteTimeStochasticSystem):
-    def __init__(self, state_dim : int, observation_dim : int, v_dist = None, w_dist = None):
+    def __init__(self, state_dim : int, observation_dim : int, v_dist : torch.distributions.Distribution | None = None, w_dist : torch.distributions.Distribution | None = None):
         super().__init__(state_dim, v_dist)
         self._observation_dim = observation_dim
 
         if w_dist is not None:
             self._w_dist = w_dist
         else:
-            def uniform():
-                return torch.rand(self._observation_dim)
-            self._w_dist = uniform
+            self._w_dist = torch.distributions.Uniform(
+                low=torch.zeros(self._observation_dim),
+                high=torch.ones(self._observation_dim),
+            )
 
-    @abstractmethod
+    def _sample_w(self):
+        if isinstance(self._w_dist, torch.distributions.Distribution):
+            return self._w_dist.sample()
+        if callable(self._w_dist):
+            return self._w_dist()
+        raise TypeError("w_dist must be a torch.distributions.Distribution or callable")
+
     def observe(self, x : torch.Tensor):
-        pass
+        raise NotImplementedError("observe not implemented")
 
-    @abstractmethod
     def log_observation_likelihood(self, x : torch.Tensor, o : torch.Tensor):
-        pass
+        raise NotImplementedError("log_observation_likelihood not implemented")
 
     def observation_dim(self):
         return self._observation_dim
@@ -84,7 +97,7 @@ class SystemObservationDistribution(ConditionalDensityModel):
         return self._system.observe(x)
 
 
-def simulate(system, initial_state_sampler, n_timesteps: int):
+def simulate(system, initial_state_sampler, n_timesteps: int, device : torch.device = None):
     assert isinstance(system, (DiscreteTimeStochasticSystem, PartiallyObservableSystem)), "System must be a DiscreteTimeStochasticSystem or PartiallyObservableSystem"
     true_states = []
 
@@ -97,12 +110,12 @@ def simulate(system, initial_state_sampler, n_timesteps: int):
     
     if isinstance(system, PartiallyObservableSystem):
         observations = []
-        observations.append(system.observe(x).clone())
-        for true_state in true_states:
+        # (no observation for the initial state x_0).
+        for true_state in true_states[1:]:
             observations.append(system.observe(true_state).clone())
-        return torch.stack(true_states), torch.stack(observations)
+        return torch.stack(true_states).to(device=device), torch.stack(observations).to(device=device)
     else:
-        return torch.stack(true_states)
+        return torch.stack(true_states).to(device=device)
 
 def sample_trajectories(system : DiscreteTimeStochasticSystem, initial_state_sampler, n_timesteps : int, n_trajectories : int):
     """

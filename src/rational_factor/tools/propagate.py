@@ -4,6 +4,9 @@ from copy import deepcopy
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
 
 def propagate(belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
+    if device is None:
+        device = next(belief.parameters()).device
+
     if isinstance(transition_model, LinearRFF):
         assert isinstance(belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
 
@@ -21,7 +24,7 @@ def propagate(belief : DensityModel, transition_model : ConditionalDensityModel,
             c_seq.append(bOmega @ c_seq[-1])
         
         #print("C_seq:", C_seq)
-        belief_seq = [LinearFF(belief.a, belief.phi_basis, transition_model.psi_basis, c0_fixed=c_seq[i + 1]) for i in range(n_steps)]
+        belief_seq = [LinearFF(belief.a, belief.phi_basis, transition_model.psi_basis, c0_fixed=c_seq[i + 1]).to(device=device) for i in range(n_steps)]
         belief_seq.insert(0, belief) # Add the initial belief
         return belief_seq
     
@@ -43,7 +46,7 @@ def propagate(belief : DensityModel, transition_model : ConditionalDensityModel,
         for _ in range(1, n_steps):
             C_seq.append(torch.einsum("ij,klij->kl", C_seq[-1], BOmega))
         
-        belief_seq = [QuadraticFF(belief.A, belief.phi_basis, transition_model.psi_basis, C0_fixed=C_seq[i + 1]) for i in range(n_steps)]
+        belief_seq = [QuadraticFF(belief.A, belief.phi_basis, transition_model.psi_basis, C0_fixed=C_seq[i + 1]).to(device=device) for i in range(n_steps)]
         belief_seq.insert(0, belief) # Add the initial belief
         return belief_seq
 
@@ -73,7 +76,7 @@ def propagate(belief : DensityModel, transition_model : ConditionalDensityModel,
             return Linear2FF(transition_model.d, transition_model.xi_basis, 
                 transition_model.get_a(), transition_model.phi_basis, 
                 transition_model.psi_basis, c0_fixed=c1, 
-                numerical_tolerance=curr_belief.numerical_tolerance)
+                numerical_tolerance=curr_belief.numerical_tolerance).to(device=device)
         belief_seq = [belief]
         for _ in range(0, n_steps):
             belief_seq.append(_prop(belief_seq[-1]))
@@ -83,25 +86,33 @@ def propagate(belief : DensityModel, transition_model : ConditionalDensityModel,
         raise ValueError(f"Unrecognized transition model type '{type(transition_model)}'")
 
 
-def update(belief : DensityModel, observation_model : ConditionalDensityModel, observation : torch.Tensor):
+def update(belief : DensityModel, observation_model : ConditionalDensityModel, observation : torch.Tensor, device : torch.device = None):
+    if device is None:
+        device = next(belief.parameters()).device
+
     if isinstance(observation_model, LinearRF):
         assert isinstance(belief, Linear2FF), "Belief must be Linear2FF for LinearRF observation model"
 
         if observation.dim() == 1:
             observation = observation.unsqueeze(0)
 
-        #print("observation device: ", observation.device)
-        #print("observation_model device: ", observation_model.device)
-
         # Evaluate likelihood numerator to get updated coefficients d
-        zeta_o = observation_model.zeta_basis(observation)
-        d_updated = observation_model.get_e() * zeta_o
+        zeta_o = observation_model.zeta_basis(observation).squeeze(0)
+        d_unnormalized = observation_model.get_e() * zeta_o
 
-        # All other factors of the belief remain the same since c automatically accounts for normalization constant
-        belief_posterior = deepcopy(belief)
-        belief_posterior.d = d_updated
+        c0_fixed = belief.c0_fixed
+        Omega3_0 = belief.xi_basis.Omega3(belief.phi_basis, belief.psi0_basis)
+        norm_constant = 1.0 / torch.einsum("i,j,k,ijk->", d_unnormalized, belief.a, c0_fixed, Omega3_0)
+        d_updated = norm_constant * d_unnormalized
 
-        return belief_posterior.to(device=belief.device())
+        belief_posterior = Linear2FF(d_updated, 
+            belief.xi_basis, 
+            belief.a, 
+            belief.phi_basis, 
+            belief.psi0_basis, 
+            c0_fixed=belief.c0_fixed, 
+            numerical_tolerance=belief.numerical_tolerance).to(device=device)
+        return belief_posterior
     else:
         raise ValueError(f"Unrecognized observation model type '{type(observation_model)}'")
 
@@ -124,7 +135,6 @@ def propagate_and_update(belief : DensityModel, transition_model : ConditionalDe
         
         # Propagate the previous posterior belief to get the prior for the current timestep
         prior = propagate(posteriors[-1], transition_model, 1)[1]
-        print("prior type: ", type(prior))
         
         if observation is not None:
             posterior = update(prior, observation_model, observation)

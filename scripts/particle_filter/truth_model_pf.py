@@ -66,9 +66,9 @@ def main():
             y_range=(box_lows[1], box_highs[1]),
             scatter_kwargs={"cmap": "viridis", "alpha": 0.9},
         )
-        axes[i].scatter(true_states[i, 0].item(), true_states[i, 1].item(), marker="o", s=80, c="red")
+        axes[i].scatter(true_states[i, 0].item(), true_states[i, 1].item(), marker="o", s=10, c="red")
         if i > 0:
-            axes[i].scatter(observations[i-1, 0].item(), observations[i-1, 1].item(), marker="o", s=80, c="blue")
+            axes[i].scatter(observations[i-1, 0].item(), observations[i-1, 1].item(), marker="o", s=10, c="blue")
         axes[i].set_title(f"Posterior at k={i}")
         axes[i].set_xlabel("x1")
         axes[i].set_ylabel("x2")

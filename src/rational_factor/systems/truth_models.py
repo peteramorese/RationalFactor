@@ -18,11 +18,7 @@ class VanDerPol(DiscreteTimeStochasticSystem):
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
         dist = torch.distributions.MultivariateNormal(torch.zeros(2), covariance)
-
-        def additive_gaussian():
-            return dist.sample()
-
-        super().__init__(dim=2, v_dist=additive_gaussian)
+        super().__init__(dim=2, v_dist=dist)
 
         self.dt = dt
         self.mu = mu
@@ -107,11 +103,7 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
         dist = torch.distributions.MultivariateNormal(torch.zeros(6), covariance)
-
-        def additive_gaussian():
-            return dist.sample()
-
-        super().__init__(dim=6, v_dist=additive_gaussian)
+        super().__init__(dim=6, v_dist=dist)
 
         self.dt = dt
         self.m, self.I, self.ell, self.g = m, I, ell, g

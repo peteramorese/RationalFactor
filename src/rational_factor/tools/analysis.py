@@ -2,12 +2,13 @@ import torch
 from ..models.loss import mle_loss
 from ..models.density_model import DensityModel, ConditionalDensityModel
 
-def mc_integral_box(f, domain_bounds, n_samples=1000):
-    lows = torch.as_tensor(domain_bounds[0])
-    highs = torch.as_tensor(domain_bounds[1])
+def mc_integral_box(f, domain_bounds, n_samples=1000, device=None):
+    lows = torch.as_tensor(domain_bounds[0], device=device)
+    highs = torch.as_tensor(domain_bounds[1], device=device)
+
 
     d = lows.numel()
-    x = torch.rand(n_samples, d, device=lows.device, dtype=lows.dtype) * (highs - lows) + lows
+    x = torch.rand(n_samples, d, device=device) * (highs - lows) + lows
     y = f(x).squeeze(-1)  # if needed
 
     vol = torch.prod(highs - lows)
@@ -18,20 +19,20 @@ def avg_log_likelihood(belief : DensityModel, test_data : torch.Tensor):
         belief.eval()
         return -mle_loss(belief, test_data).mean()
 
-def check_pdf_valid(pdf : DensityModel | ConditionalDensityModel, domain_bounds, n_samples=1000, atol=0.2):
+def check_pdf_valid(pdf : DensityModel | ConditionalDensityModel, domain_bounds, n_samples=1000, atol=0.2, device=None):
     assert isinstance(pdf, DensityModel)
-    print("Testing density model...")
-    integral = mc_integral_box(pdf.forward, domain_bounds, n_samples)
+    integral = mc_integral_box(pdf.forward, domain_bounds, n_samples, device=device)
     err = abs(float(integral) - 1.0)
     if err < atol:
-        print(f"   Integral over x (MC): {integral}")
+        print(f"   Check PDF:  Integral over x (MC): {integral}")
     else:
-        print(f"   Integral over x (MC): {integral} (INVALID PDF)")
+        print(f"   Check PDF:  Integral over x (MC): {integral} (INVALID PDF)")
 
-def check_conditional_pdf_valid(pdf : ConditionalDensityModel, domain_bounds, conditioner_domain_bounds, n_samples=1000, n_conditioner_samples=10):
+def check_conditional_pdf_valid(pdf : ConditionalDensityModel, domain_bounds, conditioner_domain_bounds, n_samples=1000, n_conditioner_samples=10, device=None):
     assert isinstance(pdf, ConditionalDensityModel)
     print("Testing conditional density model...")
-    device = next(pdf.parameters()).device
+    if device is None:
+        device = next(pdf.parameters()).device
     domain_lows = torch.as_tensor(domain_bounds[0], device=device)
     domain_highs = torch.as_tensor(domain_bounds[1], device=device)
     domain_bounds_dev = (domain_lows, domain_highs)
@@ -47,10 +48,10 @@ def check_conditional_pdf_valid(pdf : ConditionalDensityModel, domain_bounds, co
 
             def log_density_cond(x, conditioner=c):
                 y = conditioner.unsqueeze(0).expand(x.shape[0], -1)
-                return pdf.log_density(x, y)
+                return pdf.log_density(x, conditioner=y)
 
-            integral = mc_integral_box(log_density_cond, domain_bounds_dev, n_samples)
+            integral = mc_integral_box(log_density_cond, domain_bounds_dev, n_samples, device=device)
             integrals.append(integral)
 
     stacked = torch.stack(integrals)
-    print(f"   Integral over x (MC) — mean: {stacked.mean().item()}, std: {stacked.std(unbiased=False).item()}")
+    print(f"   Check Conditional PDF:  Integral over x (MC) — mean: {stacked.mean().item()}, std: {stacked.std(unbiased=False).item()}")

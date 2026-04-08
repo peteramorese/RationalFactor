@@ -25,17 +25,11 @@ class PartiallyObservableVanDerPol(PartiallyObservableSystem):
         process_dist = torch.distributions.MultivariateNormal(torch.zeros(2), process_covariance)
         observation_dist = torch.distributions.MultivariateNormal(torch.zeros(2), observation_covariance)
 
-        def process_additive_gaussian():
-            return process_dist.sample()
-
-        def observation_additive_gaussian():
-            return observation_dist.sample()
-
         super().__init__(
             state_dim=2,
             observation_dim=2,
-            v_dist=process_additive_gaussian,
-            w_dist=observation_additive_gaussian,
+            v_dist=process_dist,
+            w_dist=observation_dist,
         )
 
         self.dt = dt
@@ -54,11 +48,12 @@ class PartiallyObservableVanDerPol(PartiallyObservableSystem):
         return torch.stack([x1_next, x2_next]) + v
 
     def observe(self, x : torch.Tensor):
-        w = self._w_dist()
-        return x + w
+        w = self._sample_w()
+        return x + w.to(device=x.device, dtype=x.dtype)
     
     def log_observation_likelihood(self, x : torch.Tensor, o : torch.Tensor):
-        return torch.distributions.MultivariateNormal(x, self.observation_cov).log_prob(o)
+        observation_cov = self.observation_cov.to(device=x.device, dtype=x.dtype)
+        return torch.distributions.MultivariateNormal(x, observation_cov).log_prob(o)
 
     def observation_likelihood(self, x : torch.Tensor, o : torch.Tensor):
         return torch.exp(self.log_observation_likelihood(x, o))

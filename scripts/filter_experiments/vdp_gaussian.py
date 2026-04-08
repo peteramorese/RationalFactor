@@ -8,7 +8,7 @@ import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
 from rational_factor.tools.visualization import plot_belief, plot_particle_belief
-from rational_factor.tools.analysis import mc_integral_box
+from rational_factor.tools.analysis import mc_integral_box, check_pdf_valid, check_conditional_pdf_valid
 from particle_filter.particle_set import WeightedParticleSet
 from particle_filter.propagate import propagate_and_update
 import matplotlib.pyplot as plt
@@ -22,20 +22,20 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     n_basis = 200
     obs_params = {
-        "n_epochs_per_group": [2, 1], # basis, weights
+        "n_epochs_per_group": [20, 5], # basis, weights
         "iterations": 1,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
     tran_params = {
-        "n_epochs_per_group": [2, 5], # basis, weights
+        "n_epochs_per_group": [20, 5], # basis, weights
         "iterations": 2,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
     init_params = {
-        "n_epochs_per_group": [2, 1], # basis, weights
-        "iterations": 2,
+        "n_epochs_per_group": [20, 5], # basis, weights
+        "iterations": 6,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
@@ -47,7 +47,7 @@ if __name__ == "__main__":
     n_data_obs = 30000
 
     n_timesteps_prop = 10
-    n_particles_test = 5000
+    n_particles_test = 3000
     var_reg_strength = 0 
     ###
 
@@ -148,19 +148,19 @@ if __name__ == "__main__":
     print(f"Initial model loss     : {best_loss_init:.4f}, training time: {training_time_init:.2f} seconds")
 
     # Simulate the true trajectory
-    sim_true_states, sim_observations = simulate(system, init_state_sampler, n_timesteps=n_timesteps_prop)
-    sim_true_states.to(device)
-    sim_observations.to(device)
+    sim_true_states, sim_observations = simulate(system, init_state_sampler, n_timesteps=n_timesteps_prop, device=device)
 
     # Run the filter
     priors, posteriors = propagate.propagate_and_update(init_model, tran_model, obs_model, sim_observations)
+    print("length of priors: ", len(priors))
+    print("length of posteriors: ", len(posteriors))
 
     # Run the comparison truth model WPF
-    t_dist = SystemTransitionDistribution(system)
-    o_dist = SystemObservationDistribution(system)
+    t_dist = SystemTransitionDistribution(system).to(device=device)
+    o_dist = SystemObservationDistribution(system).to(device=device)
     initial_particle_belief = WeightedParticleSet(
-        particles=init_state_sampler(n_particles_test),
-        weights=torch.ones(n_particles_test) / n_particles_test,
+        particles=init_state_sampler(n_particles_test).to(device=device),
+        weights=torch.ones(n_particles_test).to(device=device) / n_particles_test,
     )
     wpf_priors, wpf_posteriors = propagate_and_update(
         belief=initial_particle_belief, 
@@ -172,22 +172,46 @@ if __name__ == "__main__":
     box_lows = (-5.0, -5.0)
     box_highs = (5.0, 5.0)
 
-    fig, axes = plt.subplots(n_timesteps_prop, 2, figsize=(20, max(8*n_timesteps_prop, 40)))
+    check_conditional_pdf_valid(obs_model, domain_bounds=(box_lows, box_highs), conditioner_domain_bounds=(box_lows, box_highs), n_samples=100000, n_conditioner_samples=100, device=device)
+    check_conditional_pdf_valid(tran_model, domain_bounds=(box_lows, box_highs), conditioner_domain_bounds=(box_lows, box_highs), n_samples=100000, n_conditioner_samples=100, device=device)
+
+
+    fig, axes = plt.subplots(n_timesteps_prop, 3, figsize=(10, max(3*n_timesteps_prop, 15)))
+    fig.delaxes(axes[0, 0])  # no prior exists at k=0
     fig.suptitle("Beliefs at each time step")
     for i in range(n_timesteps_prop):
-        #print("Printing belief: ", i)
-        plot_belief(axes[i, 0], posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-        plot_particle_belief(axes[i, 1], wpf_posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-        for j in [0, 1]:
-            axes[i, j].scatter(sim_true_states[i, 0].item(), sim_true_states[i, 1].item(), marker="o", s=80, c="red")
+        if i > 0:
+            print("Testing prior ", i)
+            check_pdf_valid(priors[i-1], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
+
+            plot_belief(axes[i, 0], priors[i-1], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+            axes[i, 0].set_title(f"Prior at k={i}", fontsize=8)
+
+        print("Testing posterior", i)
+        check_pdf_valid(posteriors[i], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
+
+        plot_belief(axes[i, 1], posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+        axes[i, 1].set_title(f"Posterior at k={i}", fontsize=8)
+
+        plot_particle_belief(axes[i, 2], wpf_posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+        axes[i, 2].set_title(f"WPF Posterior at k={i}", fontsize=8)
+        cols = [1, 2] if i == 0 else [0, 1, 2]
+        for j in cols:
+            if j > 0: # Skip first prior plot
+                axes[i, j].scatter(sim_true_states[i, 0].item(), sim_true_states[i, 1].item(), marker="o", s=10, c="red")
             if i > 0:
-                axes[i, j].scatter(sim_observations[i-1, 0].item(), sim_observations[i-1, 1].item(), marker="o", s=80, c="blue")
-            axes[i, j].set_xlabel("x1")
-            axes[i, j].set_ylabel("x2")
+                axes[i, j].scatter(sim_observations[i-1, 0].item(), sim_observations[i-1, 1].item(), marker="o", s=10, c="blue")
+            axes[i, j].set_xlabel("")
+            axes[i, j].set_ylabel("")
+            axes[i, j].tick_params(
+                axis="both",
+                which="both",
+                labelbottom=False,
+                labelleft=False,
+                bottom=False,
+                left=False,
+            )
             axes[i, j].grid(alpha=0.25)
-    
-        axes[i, 0].set_title(f"Posterior at k={i}")
-        axes[i, 1].set_title(f"WPF Posterior at k={i}")
 
 
     plt.savefig("figures/vdp_filter_gaussian.jpg", dpi=1000)
