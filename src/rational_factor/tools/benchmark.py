@@ -2,6 +2,7 @@ import torch
 import enum
 import os
 import json
+import traceback
 from datetime import datetime
 
 class ResultType(enum.Enum):
@@ -16,6 +17,7 @@ class Benchmark:
         self.result_info = list()
         self.__ran = False
         self.__n_trials = 0
+        self.trial_errors = []
 
     def set_experiment_fn(self, experiment_fn):
         self.experiment_fn = experiment_fn
@@ -30,6 +32,8 @@ class Benchmark:
         # One list per declared return index, each storing flat trial outputs
         # in context-major order: [c0t0, c0t1, ..., c1t0, ...].
         self.results = []
+        # Parallel to each (context, trial): None if success, else {"error": str, "traceback": str}
+        self.trial_errors = []
     
     def _fit_results_to_size(self, return_idx : int):
         assert not self.__ran, "Cannot set results after benchmark has been run"
@@ -76,14 +80,21 @@ class Benchmark:
         }
 
     def run(self, trials : int = 1, verbose : bool = True):
-        for context in self.contexts:
+        for context_idx, context in enumerate(self.contexts):
+            if verbose:
+                print(f" ===== Running experiment {self.name} for context {context_idx + 1} of {len(self.contexts)} ===== ")
             for trial in range(trials):
+                if verbose:
+                    print(f"Running trial {trial + 1} of {trials}")
                 try:
                     result = self.experiment_fn(**context)
                     for return_idx, r in enumerate(result):
                         self.results[return_idx].append(r)
+                    self.trial_errors.append(None)
                 except Exception as e:
-                    print(f"Error in experiment {self.name} with context {context}: {e}")
+                    tb = traceback.format_exc()
+                    print(f"Error in experiment {self.name} with context {context_idx + 1} of {len(self.contexts)}: {e}")
+                    self.trial_errors.append({"error": repr(e), "traceback": tb})
                     for return_idx in range(len(self.results)):
                         self.results[return_idx].append(None)
         self.__ran = True
@@ -91,7 +102,7 @@ class Benchmark:
     
     def process_and_save_results(self, root_dir : str = "benchmark_data"):
         assert self.__ran, "Benchmark has not been run"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("y%Y-m%m-d%d_H%H-M%M-S%S")
         run_dir = os.path.join(root_dir, f"benchmark_{timestamp}")
         os.makedirs(run_dir, exist_ok=True)
 
@@ -117,18 +128,42 @@ class Benchmark:
         figures_root = os.path.join(run_dir, "figures")
         has_figures = False
 
-        if len(self.results) > 0:
-            reference_data = self.results[0]
-            assert len(reference_data) == expected_flat_len, (
-                f"Result index 0 has {len(reference_data)} items, expected {expected_flat_len}"
-            )
-            for context_idx in range(n_contexts):
-                start = context_idx * n_trials
-                end = start + n_trials
-                context_ref_data = reference_data[start:end]
-                processed_results[f"context_{context_idx}"]["n_trials_valid"] = sum(
-                    1 for d in context_ref_data if d is not None
+        assert len(self.trial_errors) == expected_flat_len, (
+            f"trial_errors has {len(self.trial_errors)} items, expected {expected_flat_len}"
+        )
+
+        for context_idx in range(n_contexts):
+            start = context_idx * n_trials
+            end = start + n_trials
+            context_err_chunk = self.trial_errors[start:end]
+            if len(self.results) > 0:
+                reference_data = self.results[0]
+                assert len(reference_data) == expected_flat_len, (
+                    f"Result index 0 has {len(reference_data)} items, expected {expected_flat_len}"
                 )
+                context_ref_data = reference_data[start:end]
+                # Prefer explicit error log: success iff no recorded exception for that trial.
+                n_ok_from_errors = sum(1 for e in context_err_chunk if e is None)
+                n_ok_from_results = sum(1 for d in context_ref_data if d is not None)
+                assert n_ok_from_errors == n_ok_from_results, (
+                    "trial_errors and results disagree on success count"
+                )
+                processed_results[f"context_{context_idx}"]["n_trials_valid"] = n_ok_from_errors
+            else:
+                processed_results[f"context_{context_idx}"]["n_trials_valid"] = sum(
+                    1 for e in context_err_chunk if e is None
+                )
+
+            trial_error_entries = []
+            for err in context_err_chunk:
+                if err is None:
+                    trial_error_entries.append(None)
+                else:
+                    trial_error_entries.append(
+                        {"error": err["error"], "traceback": err["traceback"]}
+                    )
+            if any(e is not None for e in trial_error_entries):
+                processed_results[f"context_{context_idx}"]["trial_errors"] = trial_error_entries
 
         for return_idx, info in enumerate(self.result_info):
             if "type" not in info:
@@ -231,5 +266,21 @@ class Benchmark:
         processed_path = os.path.join(run_dir, "processed_results.json")
         with open(processed_path, "w", encoding="utf-8") as f:
             json.dump(processed_results, f, indent=2)
+
+        printed_any = False
+        for context_key, payload in processed_results.items():
+            trial_errs = payload.get("trial_errors")
+            if not trial_errs:
+                continue
+            for trial_idx, entry in enumerate(trial_errs):
+                if entry is None:
+                    continue
+                printed_any = True
+                print(
+                    f"\n--- Benchmark error: {context_key} trial {trial_idx} ---\n"
+                    f"{entry['error']}\n{entry['traceback']}"
+                )
+        if printed_any:
+            print(f"\n(Full error records are in {processed_path})")
 
         return run_dir

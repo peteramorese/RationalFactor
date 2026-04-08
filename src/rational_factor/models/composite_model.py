@@ -46,7 +46,7 @@ class CompositeConditionalModel(ConditionalDensityModel):
             z, _ = tf(z)
             zp, ladj = tf(zp)
             total_ladj = total_ladj + ladj
-        return self.conditional_density_model.log_density(z, zp) + total_ladj
+        return self.conditional_density_model.log_density(zp, conditioner=z) + total_ladj
     
     def valid(self):
         return self.conditional_density_model.valid()
