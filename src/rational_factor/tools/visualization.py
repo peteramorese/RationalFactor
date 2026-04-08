@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 from rational_factor.models.density_model import DensityModel
 from particle_filter.particle_set import WeightedParticleSet
 
@@ -33,16 +34,27 @@ def plot_particle_belief(ax: plt.Axes, belief : WeightedParticleSet, x_range: tu
     weights = belief.weights.detach().cpu()
     w_min = torch.min(weights)
     w_max = torch.max(weights)
-    w_span = torch.clamp(w_max - w_min, min=1e-12)
-    w_norm = (weights - w_min) / w_span
-    default_sizes = (1.0 + 10.0 * w_norm).numpy()
+    w_range = w_max - w_min
+    # Raw weights with vmin==vmax (e.g. uniform prior) makes ScalarMappable put every point at one colormap end.
+    nearly_uniform = w_range <= 1e-12 * torch.clamp(w_max, min=1e-300)
+    if nearly_uniform:
+        w_norm = torch.full_like(weights, 0.5)
+        default_sizes = np.full(weights.shape[0], 5.5, dtype=np.float64)
+    else:
+        w_norm = (weights - w_min) / w_range
+        default_sizes = (1.0 + 10.0 * w_norm).numpy()
 
-    default_scatter_kwargs = dict(cmap="viridis", s=default_sizes, alpha=0.9)
+    default_scatter_kwargs = dict(
+        cmap="viridis",
+        s=default_sizes,
+        alpha=0.9,
+        norm=Normalize(vmin=0.0, vmax=1.0),
+        c=w_norm.numpy(),
+    )
     default_scatter_kwargs.update(scatter_kwargs)
     sc = ax.scatter(
         belief.particles[:, 0].detach().cpu().numpy(),
         belief.particles[:, 1].detach().cpu().numpy(),
-        c=weights.numpy(),
         **default_scatter_kwargs,
     )
     return sc

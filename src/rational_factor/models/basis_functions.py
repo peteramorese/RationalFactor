@@ -41,6 +41,9 @@ class Basis(torch.nn.Module):
     def trainable(self):
         return self._trainable
     
+    def freeze_params(self):
+        raise NotImplementedError("freeze_params is not implemented for this basis function")
+    
     def normalized(self):
         raise NotImplementedError("normalized is not implemented for this basis function")
     
@@ -131,9 +134,8 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(offsets, min_std=min_std)
 
-    @classmethod 
-    def freeze_params(cls, other : 'GaussianBasis'):
-        return cls(other.params.detach().clone(), trainable=False, min_std=other.min_std)
+    def freeze_params(self):
+        return GaussianBasis(self.params.detach().clone(), trainable=False, min_std=self.min_std)
 
     def means_stds(self):
         return self.params[..., 0], torch.nn.functional.softplus(self.params[..., 1] - 1.0) + self.min_std
@@ -315,9 +317,8 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(offsets, eps=eps)
 
-    @classmethod
-    def freeze_params(cls, other: "QuadraticExpBasis"):
-        return cls(other.params.detach().clone(), trainable=False, eps=other.eps)
+    def freeze_params(self):
+        return QuadraticExpBasis(self.params.detach().clone(), trainable=False, eps=self.eps)
 
     def abc(self):
         raw_a = self.params[..., 0]
@@ -500,13 +501,12 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
             eps=eps,
         )
 
-    @classmethod
-    def freeze_params(cls, other: "BetaBasis"):
-        return cls(
-            other.params.detach().clone(),
+    def freeze_params(self):
+        return BetaBasis(
+            self.params.detach().clone(),
             trainable=False,
-            min_concentration=other.min_concentration,
-            eps=other.eps,
+            min_concentration=self.min_concentration,
+            eps=self.eps,
         )
 
     def alphas_betas(self):

@@ -5,15 +5,8 @@ from .basis_functions import GaussianBasis, BetaBasis
 
 #### General ####
 
-def conditional_mle_loss(model : ConditionalDensityModel, x : torch.Tensor, xp : torch.Tensor):
-    #return -torch.log(torch.relu(model(x, xp) + 1e-15)).mean()
-    #if torch.isnan(model(x, xp).log()).any():
-    #    print("NaN in conditional_mle_loss")
-    #    print("min model(x, xp): ", model(x, xp).min())
-    #    #print("model basis functions: ", model.phi_basis.means_stds())
-    #    print("B: ", model.get_B())
-    #    raise ValueError("NaN in conditional_mle_loss")
-    return -model.log_density(xp, conditioner=x).mean()
+def conditional_mle_loss(model : ConditionalDensityModel, x : torch.Tensor, conditioner : torch.Tensor):
+    return -model.log_density(x, conditioner=conditioner).mean()
 
 def mle_loss(model : DensityModel, x : torch.Tensor):
     return -model.log_density(x).mean()

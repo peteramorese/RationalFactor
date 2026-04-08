@@ -6,27 +6,12 @@ import torch
 
 from particle_filter.particle_set import WeightedParticleSet
 from particle_filter.propagate import propagate_and_update
-from rational_factor.systems.base import SystemObservationDistribution, SystemTransitionDistribution
+from rational_factor.systems.base import SystemObservationDistribution, SystemTransitionDistribution, simulate
 from rational_factor.systems.po_truth_models import PartiallyObservableVanDerPol
 from rational_factor.tools.misc import make_mvnormal_init_sampler
 from rational_factor.tools.visualization import plot_particle_belief
 
 
-
-def simulate_truth(system, initial_state_sampler, n_timesteps: int):
-    true_states = []
-    observations = []
-
-    x = initial_state_sampler(1)[0]
-    true_states.append(x.clone())
-    #observations.append(system.observe(x).clone())
-
-    for _ in range(n_timesteps):
-        x = system(x)
-        true_states.append(x.clone())
-        observations.append(system.observe(x).clone())
-
-    return torch.stack(true_states), torch.stack(observations)
 
 
 def main():
@@ -58,11 +43,7 @@ def main():
         weights=torch.ones(n_particles) / n_particles,
     )
 
-    true_states, observations = simulate_truth(
-        truth_system,
-        initial_state_sampler,
-        n_timesteps=timesteps,
-    )
+    true_states, observations = simulate(truth_system, initial_state_sampler, n_timesteps=timesteps)
 
     _, posteriors = propagate_and_update(
         belief=initial_belief,

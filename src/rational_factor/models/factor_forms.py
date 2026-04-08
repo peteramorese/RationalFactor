@@ -115,7 +115,6 @@ class LinearFF(DensityModel):
     """
     def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
-        assert not phi_basis.trainable(), "phi_basis must be non-trainable"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
         assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
@@ -123,7 +122,7 @@ class LinearFF(DensityModel):
         assert a.shape[0] == phi_basis.n_basis_functions(), "a must have n_phi elements"
         super().__init__(phi_basis.dim())
 
-        self.phi_basis = phi_basis 
+        self.phi_basis = phi_basis.freeze_params() 
         self.psi0_basis = psi0_basis
         
         self.n_phi = phi_basis.n_basis_functions()
@@ -139,8 +138,7 @@ class LinearFF(DensityModel):
     
     @classmethod
     def from_rff(cls, rff : LinearRFF, psi0_basis : SeparableBasis):
-        basis_type = type(rff.phi_basis)
-        phi_basis = basis_type.freeze_params(rff.phi_basis)
+        phi_basis = rff.phi_basis.freeze_params()
         a = rff.get_a().detach().clone()
         return cls(a, phi_basis, psi0_basis, numerical_tolerance=rff.numerical_tolerance)
 
@@ -197,11 +195,9 @@ class LinearRF(ConditionalDensityModel):
         self.xi_basis = xi_basis
         self.zeta_basis = zeta_basis
 
-        self.n_xi = xi_basis.n_basis_functions()
-        self.n_zeta = zeta_basis.n_basis_functions()
-        assert self.n_xi == self.n_zeta, "Currently only supported for n_xi == n_zeta"
+        assert xi_basis.n_basis_functions() == zeta_basis.n_basis_functions(), "xi_basis and zeta_basis must have the same number of basis functions"
 
-        self.__du = torch.nn.Parameter(torch.ones(self.n_xi))
+        self.__du = torch.nn.Parameter(torch.ones(xi_basis.n_basis_functions()))
 
         self.numerical_tolerance = numerical_tolerance
     
@@ -247,7 +243,6 @@ class LinearR2FF(ConditionalDensityModel):
     def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-7):
         assert phi_basis.dim() == psi_basis.dim(), "Input bases must have the same dimension"
         assert phi_basis.dim() == xi_basis.dim(), "Input bases must have the same dimension"
-        assert not xi_basis.trainable(), "xi_basis must be non-trainable"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
         assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
@@ -257,24 +252,20 @@ class LinearR2FF(ConditionalDensityModel):
         super().__init__(phi_basis.dim(), psi_basis.dim())
 
 
-        self.n_xi = xi_basis.n_basis_functions()
-        self.n_phi = phi_basis.n_basis_functions()
-        self.n_psi = psi_basis.n_basis_functions()
-        assert self.n_phi == self.n_psi, "Currently only supported for n_phi == n_psi"
+        assert phi_basis.n_basis_functions() == psi_basis.n_basis_functions(), "phi_basis and psi_basis must have the same number of basis functions"
 
-        self.xi_basis = xi_basis
+        self.xi_basis = xi_basis.freeze_params()
         self.phi_basis = phi_basis
         self.psi_basis = psi_basis
 
         self.register_buffer("d", d)
-        self.__au = torch.nn.Parameter(torch.ones(self.n_phi)) # g
+        self.__au = torch.nn.Parameter(torch.ones(phi_basis.n_basis_functions())) # g
 
         self.numerical_tolerance = numerical_tolerance
     
     @classmethod
     def from_rf(cls, rf : LinearRF, phi_basis : SeparableBasis, psi_basis : SeparableBasis):
-        xi_basis_type = type(rf.xi_basis)
-        xi_basis = xi_basis_type.freeze_params(rf.xi_basis)
+        xi_basis = rf.xi_basis.freeze_params()
         d = rf.get_d().detach().clone()
         return cls(d, xi_basis, phi_basis, psi_basis, rf.numerical_tolerance)
     
@@ -310,7 +301,7 @@ class LinearR2FF(ConditionalDensityModel):
         if a is None:
             a = self.get_a()
 
-        denom = torch.einsum('i,ijk->k', self.d, Omega, a) 
+        denom = torch.einsum('i,j,ijk->k', self.d, a, Omega) 
 
         b = a / (denom + self.numerical_tolerance)
 
@@ -331,7 +322,6 @@ class Linear2FF(DensityModel):
     """
     def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
-        assert not phi_basis.trainable(), "phi_basis must be non-trainable"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
         assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
@@ -341,34 +331,28 @@ class Linear2FF(DensityModel):
         assert a.shape[0] == phi_basis.n_basis_functions(), "a must have n_phi elements"
         super().__init__(phi_basis.dim())
 
-        self.xi_basis = xi_basis 
-        self.phi_basis = phi_basis 
+        self.xi_basis = xi_basis.freeze_params()
+        self.phi_basis = phi_basis.freeze_params()
         self.psi0_basis = psi0_basis
         
-        self.n_xi = xi_basis.n_basis_functions()
-        self.n_phi = phi_basis.n_basis_functions()
-        self.n_psi0 = self.psi0_basis.n_basis_functions()
-
         self.register_buffer("d", d) 
         self.register_buffer("a", a) 
         if c0_fixed is not None:
             self.register_buffer("c0_fixed", c0_fixed)
         else:
-            self.__c0u = torch.nn.Parameter(torch.ones(self.n_psi0))
+            self.__c0u = torch.nn.Parameter(torch.ones(psi0_basis.n_basis_functions()))
         
         self.numerical_tolerance = numerical_tolerance
     
     @classmethod
     def from_r2ff(cls, r2ff : LinearRFF, psi0_basis : SeparableBasis):
         # g(x)
-        phi_basis_type = type(r2ff.phi_basis)
-        phi_basis = phi_basis_type.freeze_params(r2ff.phi_basis)
+        phi_basis = r2ff.phi_basis.freeze_params()
         a = r2ff.get_a().detach().clone()
 
         # r(x)
-        xi_basis_type = type(r2ff.xi_basis)
-        xi_basis = xi_basis_type.freeze_params(r2ff.xi_basis)
-        d = r2ff.get_d().detach().clone()
+        xi_basis = r2ff.xi_basis.freeze_params()
+        d = r2ff.d.detach().clone()
         return cls(d, xi_basis, a, phi_basis, psi0_basis, numerical_tolerance=r2ff.numerical_tolerance)
 
     def get_c0(self, Omega3_0 : torch.Tensor = None):
@@ -424,14 +408,12 @@ class QuadraticRFF(ConditionalDensityModel):
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
         super().__init__(phi_basis.dim(), psi_basis.dim())
 
-        self.n_phi = phi_basis.n_basis_functions()
-        self.n_psi = psi_basis.n_basis_functions()
-        assert self.n_phi == self.n_psi, "Currently only supported for n_phi == n_psi"
+        assert phi_basis.n_basis_functions() == psi_basis.n_basis_functions(), "phi_basis and psi_basis must have the same number of basis functions"
 
         self.phi_basis = phi_basis
         self.psi_basis = psi_basis
 
-        self.__LAu = torch.nn.Parameter(torch.randn(self.n_phi, self.n_phi)) # g
+        self.__LAu = torch.nn.Parameter(torch.randn(phi_basis.n_basis_functions(), phi_basis.n_basis_functions())) # g
 
         self.numerical_tolerance = numerical_tolerance
     
@@ -496,24 +478,20 @@ class QuadraticFF(DensityModel):
         assert A.shape[1] == phi_basis.n_basis_functions(), "A must have n_phi columns"
         super().__init__(phi_basis.dim())
 
-        self.phi_basis = phi_basis 
+        self.phi_basis = phi_basis.freeze_params()
         self.psi0_basis = psi0_basis
         
-        self.n_phi = phi_basis.n_basis_functions()
-        self.n_psi0 = self.psi0_basis.n_basis_functions()
-
         self.register_buffer("A", A) 
         if C0_fixed is not None:
             self.register_buffer("C0_fixed", C0_fixed)
         else:
-            self.__LC0u = torch.nn.Parameter(torch.randn(self.n_psi0, self.n_psi0))
+            self.__LC0u = torch.nn.Parameter(torch.randn(psi0_basis.n_basis_functions(), psi0_basis.n_basis_functions()))
         
         self.numerical_tolerance = numerical_tolerance
 
     @classmethod
     def from_rff(cls, rff : QuadraticRFF, psi0_basis : SeparableBasis = None):
-        basis_type = type(rff.phi_basis)
-        phi_basis = basis_type.freeze_params(rff.phi_basis)
+        phi_basis = rff.phi_basis.freeze_params()
         A = rff.get_A().detach().clone()
         return cls(A, phi_basis, psi0_basis, numerical_tolerance=rff.numerical_tolerance)
 

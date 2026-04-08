@@ -84,6 +84,26 @@ class SystemObservationDistribution(ConditionalDensityModel):
         return self._system.observe(x)
 
 
+def simulate(system, initial_state_sampler, n_timesteps: int):
+    assert isinstance(system, (DiscreteTimeStochasticSystem, PartiallyObservableSystem)), "System must be a DiscreteTimeStochasticSystem or PartiallyObservableSystem"
+    true_states = []
+
+    x = initial_state_sampler(1)[0]
+    true_states.append(x.clone())
+
+    for _ in range(n_timesteps):
+        x = system(x)
+        true_states.append(x.clone())
+    
+    if isinstance(system, PartiallyObservableSystem):
+        observations = []
+        observations.append(system.observe(x).clone())
+        for true_state in true_states:
+            observations.append(system.observe(true_state).clone())
+        return torch.stack(true_states), torch.stack(observations)
+    else:
+        return torch.stack(true_states)
+
 def sample_trajectories(system : DiscreteTimeStochasticSystem, initial_state_sampler, n_timesteps : int, n_trajectories : int):
     """
     Sample trajectory data from a system under an initial state distribution
@@ -127,6 +147,22 @@ def sample_io_pairs(system : DiscreteTimeStochasticSystem, prev_state_sampler, n
         xp_data[i, :] = system(x_data[i, :])
     
     return x_data, xp_data
+
+def sample_observation_pairs(system : PartiallyObservableSystem, state_sampler, n_pairs : int):
+    """
+    Sample observation (o, x) pairs from a system model, where the state x is sampled uniformly from a specified region
+
+    Args:
+        system : system model
+        state_sampler : callable that takes in an integer n and returns n randomly sampled states
+        n_pairs : number of observation (o, x) pairs to sample
+    """
+    x_data = state_sampler(n_pairs)
+    o_data = torch.zeros_like(x_data)
+    for i in range(n_pairs):
+        o_data[i, :] = system.observe(x_data[i, :])
+    
+    return x_data, o_data
 
 def create_transition_data_matrix(trajectory_data, separate=False):
     """
