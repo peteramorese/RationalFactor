@@ -3,7 +3,7 @@ import copy
 import torch
 from nflows.transforms.base import CompositeTransform
 from nflows.transforms.permutations import RandomPermutation
-from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
+from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform, MaskedPiecewiseRationalQuadraticAutoregressiveTransform
 
 
 class DomainTF(torch.nn.Module):
@@ -147,5 +147,51 @@ class MaskedAffineNFTF(DomainTF):
         return self.T(x)
 
     def inverse(self, z : torch.Tensor):
+        assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
+        return self.T.inverse(z)
+
+
+class MaskedRQSNFTF(DomainTF):
+    def __init__(self, dim: int, n_layers: int = 5, hidden_features: int = 128, trainable: bool = True, num_bins: int = 8, tails: str = "linear", tail_bound: float = 3.0):
+        super().__init__(dim)
+
+        transforms = []
+        for _ in range(n_layers):
+            transforms.append(RandomPermutation(features=dim))
+            transforms.append(
+                MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
+                    features=dim,
+                    hidden_features=hidden_features,
+                    context_features=None,
+                    num_bins=num_bins,
+                    tails=tails,
+                    tail_bound=tail_bound,
+                    num_blocks=2,
+                    use_residual_blocks=True,
+                    random_mask=False,
+                    activation=torch.tanh,
+                    dropout_probability=0.0,
+                    use_batch_norm=False,
+                )
+            )
+
+        self.T = CompositeTransform(transforms)
+
+        if not trainable:
+            for p in self.parameters():
+                p.requires_grad_(False)
+
+    @classmethod
+    def copy_from_trainable(cls, other: "MaskedRQSNFTF"):
+        new_module = copy.deepcopy(other)
+        for p in new_module.parameters():
+            p.requires_grad_(False)
+        return new_module
+
+    def forward(self, x: torch.Tensor):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        return self.T(x)
+
+    def inverse(self, z: torch.Tensor):
         assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
         return self.T.inverse(z)
