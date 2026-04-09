@@ -21,14 +21,14 @@ CONTEXT_USE_DTF_FALSE = {
     "use_dtf": False,
     "n_basis": 1000,
     "tran_params": {
-        "n_epochs_per_group": [5, 5],
-        "iterations": 2, # 20
+        "n_epochs_per_group": [10, 5],
+        "iterations": 20,
         "lr_basis": 5e-2,
         "lr_weights": 1e-2,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 1, # 15
+        "iterations": 30,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     },
@@ -41,15 +41,15 @@ CONTEXT_USE_DTF_TRUE = {
     "use_dtf": True,
     "n_basis": 1000,
     "tran_params": {
-        "n_epochs_per_group": [5, 5],
-        "iterations": 2, # 20
+        "n_epochs_per_group": [10, 5],
+        "iterations": 20,
         "lr_basis": 5e-2,
         "lr_weights": 1e-2,
         "lr_dtf": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 1, # 15
+        "iterations": 30,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     },
