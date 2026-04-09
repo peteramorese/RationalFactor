@@ -18,7 +18,7 @@ class CompositeDensityModel(DensityModel):
         for tf in self.domain_tfs:
             z_i, ladj = tf(z_i)
             total_ladj = total_ladj + ladj
-        return self.density_model.log_density(z_i) + total_ladj
+        return self._clip_log_density(self.density_model.log_density(z_i) + total_ladj)
     
     def valid(self):
         return self.density_model.valid()
@@ -46,7 +46,7 @@ class CompositeConditionalModel(ConditionalDensityModel):
             z, _ = tf(z)
             zp, ladj = tf(zp)
             total_ladj = total_ladj + ladj
-        return self.conditional_density_model.log_density(zp, conditioner=z) + total_ladj
+        return self._clip_log_density(self.conditional_density_model.log_density(zp, conditioner=z) + total_ladj)
     
     def valid(self):
         return self.conditional_density_model.valid()

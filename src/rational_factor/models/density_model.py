@@ -9,7 +9,11 @@ class DensityModel(torch.nn.Module):
     def __init__(self, dim : int):
         super().__init__()
         self.dim = dim
+        self.min_log_density = -30
 
+    def _clip_log_density(self, log_density : torch.Tensor):
+        return torch.nan_to_num(log_density, nan=self.min_log_density, neginf=self.min_log_density)
+    
     def forward(self, x : torch.Tensor):    
         assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
         return torch.exp(self.log_density(x))
@@ -31,6 +35,10 @@ class ConditionalDensityModel(torch.nn.Module):
         super().__init__()
         self.dim = dim
         self.conditioner_dim = conditioner_dim
+        self.min_log_density = -30
+
+    def _clip_log_density(self, log_density : torch.Tensor):
+        return torch.nan_to_num(log_density, nan=self.min_log_density, neginf=self.min_log_density)
 
     def forward(self, x : torch.Tensor, *, conditioner : torch.Tensor):
         """

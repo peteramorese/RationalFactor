@@ -103,7 +103,7 @@ class Benchmark:
     def process_and_save_results(self, root_dir : str = "benchmark_data"):
         assert self.__ran, "Benchmark has not been run"
         timestamp = datetime.now().strftime("y%Y-m%m-d%d_H%H-M%M-S%S")
-        run_dir = os.path.join(root_dir, f"benchmark_{timestamp}")
+        run_dir = os.path.join(root_dir, f"{self.name}_{timestamp}")
         os.makedirs(run_dir, exist_ok=True)
 
         n_contexts = len(self.contexts)
@@ -111,13 +111,16 @@ class Benchmark:
         expected_flat_len = n_contexts * n_trials
 
         processed_results = {
-            f"context_{context_idx}": {
-                "params": self.contexts[context_idx],
-                "n_trials_total": n_trials,
-                "n_trials_valid": 0,
-                "results": {},
-            }
-            for context_idx in range(n_contexts)
+            "name": self.name,
+            "contexts": {
+                f"context_{context_idx}": {
+                    "params": self.contexts[context_idx],
+                    "n_trials_total": n_trials,
+                    "n_trials_valid": 0,
+                    "results": {},
+                }
+                for context_idx in range(n_contexts)
+            },
         }
 
         raw_numerical = {
@@ -148,9 +151,9 @@ class Benchmark:
                 assert n_ok_from_errors == n_ok_from_results, (
                     "trial_errors and results disagree on success count"
                 )
-                processed_results[f"context_{context_idx}"]["n_trials_valid"] = n_ok_from_errors
+                processed_results["contexts"][f"context_{context_idx}"]["n_trials_valid"] = n_ok_from_errors
             else:
-                processed_results[f"context_{context_idx}"]["n_trials_valid"] = sum(
+                processed_results["contexts"][f"context_{context_idx}"]["n_trials_valid"] = sum(
                     1 for e in context_err_chunk if e is None
                 )
 
@@ -163,7 +166,7 @@ class Benchmark:
                         {"error": err["error"], "traceback": err["traceback"]}
                     )
             if any(e is not None for e in trial_error_entries):
-                processed_results[f"context_{context_idx}"]["trial_errors"] = trial_error_entries
+                processed_results["contexts"][f"context_{context_idx}"]["trial_errors"] = trial_error_entries
 
         for return_idx, info in enumerate(self.result_info):
             if "type" not in info:
@@ -217,7 +220,7 @@ class Benchmark:
                         ]
 
                     if len(context_payload) > 0:
-                        processed_results[f"context_{context_idx}"]["results"][tag] = context_payload
+                        processed_results["contexts"][f"context_{context_idx}"]["results"][tag] = context_payload
 
                 elif info["type"] == ResultType.VISUAL:
                     if not info.get("save_fig", True):
@@ -268,7 +271,7 @@ class Benchmark:
             json.dump(processed_results, f, indent=2)
 
         printed_any = False
-        for context_key, payload in processed_results.items():
+        for context_key, payload in processed_results["contexts"].items():
             trial_errs = payload.get("trial_errors")
             if not trial_errs:
                 continue

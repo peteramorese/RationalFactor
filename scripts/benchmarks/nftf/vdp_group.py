@@ -1,4 +1,5 @@
 from __future__ import annotations
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -28,7 +29,7 @@ CONTEXT_USE_DTF_FALSE = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 30,
+        "iterations": 50,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     },
@@ -49,7 +50,7 @@ CONTEXT_USE_DTF_TRUE = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 30,
+        "iterations": 50,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     },
@@ -58,7 +59,7 @@ CONTEXT_USE_DTF_TRUE = {
     "verbose": True,
 }
 
-TRIALS = 2
+TRIALS = 15
 BENCHMARK_ROOT = "benchmark_data"
 
 N_DATA_TRAN = 20000
@@ -241,15 +242,15 @@ def main() -> None:
 
     contexts = [CONTEXT_USE_DTF_FALSE, CONTEXT_USE_DTF_TRUE]
 
-    benchmark = Benchmark(name="vdp_nftf_gaussian_iterate_group")
+    benchmark = Benchmark(name=Path(__file__).stem)
     benchmark.set_experiment_fn(experiment)
     benchmark.set_contexts(contexts)
 
     benchmark.set_numerical_result(0, "avg_log_likelihood_per_timestep", json_raw_data=False)
     benchmark.set_numerical_result(1, "best_loss_transition", json_raw_data=False)
     benchmark.set_numerical_result(2, "best_loss_initial", json_raw_data=False)
-    benchmark.set_numerical_result(3, "training_time_transition_s", json_raw_data=False)
-    benchmark.set_numerical_result(4, "training_time_initial_s", json_raw_data=False)
+    benchmark.set_numerical_result(3, "training_time_transition", json_raw_data=False)
+    benchmark.set_numerical_result(4, "training_time_initial", json_raw_data=False)
 
     print(f"Running benchmark ({len(contexts)} contexts, {TRIALS} trial(s) each)...")
     benchmark.run(trials=TRIALS, verbose=True)

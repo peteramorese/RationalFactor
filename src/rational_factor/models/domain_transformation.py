@@ -96,30 +96,44 @@ class ErfSeparableTF(DomainTF):
 
 
 class MaskedAffineNFTF(DomainTF):
-    def __init__(self, dim : int, n_layers : int = 5, hidden_features : int = 128, trainable : bool = True):
+    def __init__(self, dim : int, n_layers : int = 5, hidden_features : int = 128, trainable : bool = True, init_wo_warping : bool = False):
         super().__init__(dim)
 
         transforms = []
         for _ in range(n_layers):
             transforms.append(RandomPermutation(features=dim))
-            transforms.append(
-                MaskedAffineAutoregressiveTransform(
-                    features=dim,
-                    hidden_features=hidden_features,
-                    num_blocks=2,
-                    use_residual_blocks=True,
-                    random_mask=False,
-                    activation=torch.tanh,
-                    dropout_probability=0.0,
-                    use_batch_norm=False,
-                )
+            maf = MaskedAffineAutoregressiveTransform(
+                features=dim,
+                hidden_features=hidden_features,
+                num_blocks=2,
+                use_residual_blocks=True,
+                random_mask=False,
+                activation=torch.tanh,
+                dropout_probability=0.0,
+                use_batch_norm=False,
             )
+            if init_wo_warping:
+                self._init_maf_wo_warping(maf)
+            transforms.append(maf)
 
         self.T = CompositeTransform(transforms)
 
+
         if not trainable:
-            for p in self.parameters():
-                p.requires_grad_(False)
+            raise NotImplementedError("Initializing as non trainable is not implemented")
+
+    @staticmethod
+    def _init_maf_wo_warping(maf):
+        last_linear = None
+        for m in maf.modules():
+            if isinstance(m, torch.nn.Linear):
+                last_linear = m
+
+        if last_linear is None:
+            raise RuntimeError("Could not find final Linear layer in MAF.")
+
+        torch.nn.init.zeros_(last_linear.weight)
+        torch.nn.init.zeros_(last_linear.bias)
     
     @classmethod
     def copy_from_trainable(cls, other : 'MaskedAffineNFTF'):
