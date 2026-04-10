@@ -240,7 +240,10 @@ def main() -> None:
             torch.tensor([float(training_time_init)], dtype=torch.float32),
         )
 
-    contexts = [CONTEXT_USE_DTF_FALSE, CONTEXT_USE_DTF_TRUE]
+    contexts = [
+        {"name": "wo_dtf", "params": CONTEXT_USE_DTF_FALSE},
+        {"name": "w_dtf", "params": CONTEXT_USE_DTF_TRUE},
+    ]
 
     benchmark = Benchmark(name=Path(__file__).stem)
     benchmark.set_experiment_fn(experiment)

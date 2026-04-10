@@ -1,9 +1,16 @@
+import re
 import torch
 import enum
 import os
 import json
 import traceback
 from datetime import datetime
+
+
+def _safe_figures_dir_segment(name: str) -> str:
+    """Filesystem-safe subdirectory name under run_dir/figures/."""
+    s = re.sub(r"[^\w.\-]+", "_", name.strip())
+    return s if s else "context"
 
 class ResultType(enum.Enum):
     NUMERICAL = "numerical"
@@ -25,8 +32,16 @@ class Benchmark:
     def set_contexts(self, contexts):
         assert isinstance(contexts, list)
         assert not self.__ran, "Cannot set contexts after benchmark has been run"
+        seen_names: set[str] = set()
         for context in contexts:
             assert isinstance(context, dict)
+            assert "name" in context, 'each context must have a "name" string'
+            assert "params" in context, 'each context must have a "params" dict'
+            assert isinstance(context["name"], str), "context name must be a string"
+            assert isinstance(context["params"], dict), "context params must be a dict"
+            n = context["name"]
+            assert n not in seen_names, f"duplicate context name: {n!r}"
+            seen_names.add(n)
 
         self.contexts = contexts
         # One list per declared return index, each storing flat trial outputs
@@ -81,19 +96,26 @@ class Benchmark:
 
     def run(self, trials : int = 1, verbose : bool = True):
         for context_idx, context in enumerate(self.contexts):
+            ctx_name = context["name"]
             if verbose:
-                print(f" ===== Running experiment {self.name} for context {context_idx + 1} of {len(self.contexts)} ===== ")
+                print(
+                    f" ===== Running experiment {self.name} ({ctx_name!r}), "
+                    f"context {context_idx + 1} of {len(self.contexts)} ===== "
+                )
             for trial in range(trials):
                 if verbose:
                     print(f"Running trial {trial + 1} of {trials}")
                 try:
-                    result = self.experiment_fn(**context)
+                    result = self.experiment_fn(**context["params"])
                     for return_idx, r in enumerate(result):
                         self.results[return_idx].append(r)
                     self.trial_errors.append(None)
                 except Exception as e:
                     tb = traceback.format_exc()
-                    print(f"Error in experiment {self.name} with context {context_idx + 1} of {len(self.contexts)}: {e}")
+                    print(
+                        f"Error in experiment {self.name} ({ctx_name!r}), "
+                        f"context {context_idx + 1} of {len(self.contexts)}: {e}"
+                    )
                     self.trial_errors.append({"error": repr(e), "traceback": tb})
                     for return_idx in range(len(self.results)):
                         self.results[return_idx].append(None)
@@ -113,8 +135,9 @@ class Benchmark:
         processed_results = {
             "name": self.name,
             "contexts": {
-                f"context_{context_idx}": {
-                    "params": self.contexts[context_idx],
+                self.contexts[context_idx]["name"]: {
+                    "name": self.contexts[context_idx]["name"],
+                    "params": self.contexts[context_idx]["params"],
                     "n_trials_total": n_trials,
                     "n_trials_valid": 0,
                     "results": {},
@@ -123,10 +146,7 @@ class Benchmark:
             },
         }
 
-        raw_numerical = {
-            f"context_{context_idx}": {}
-            for context_idx in range(n_contexts)
-        }
+        raw_numerical = {self.contexts[i]["name"]: {} for i in range(n_contexts)}
 
         figures_root = os.path.join(run_dir, "figures")
         has_figures = False
@@ -136,6 +156,7 @@ class Benchmark:
         )
 
         for context_idx in range(n_contexts):
+            ctx_key = self.contexts[context_idx]["name"]
             start = context_idx * n_trials
             end = start + n_trials
             context_err_chunk = self.trial_errors[start:end]
@@ -151,9 +172,9 @@ class Benchmark:
                 assert n_ok_from_errors == n_ok_from_results, (
                     "trial_errors and results disagree on success count"
                 )
-                processed_results["contexts"][f"context_{context_idx}"]["n_trials_valid"] = n_ok_from_errors
+                processed_results["contexts"][ctx_key]["n_trials_valid"] = n_ok_from_errors
             else:
-                processed_results["contexts"][f"context_{context_idx}"]["n_trials_valid"] = sum(
+                processed_results["contexts"][ctx_key]["n_trials_valid"] = sum(
                     1 for e in context_err_chunk if e is None
                 )
 
@@ -166,7 +187,7 @@ class Benchmark:
                         {"error": err["error"], "traceback": err["traceback"]}
                     )
             if any(e is not None for e in trial_error_entries):
-                processed_results["contexts"][f"context_{context_idx}"]["trial_errors"] = trial_error_entries
+                processed_results["contexts"][ctx_key]["trial_errors"] = trial_error_entries
 
         for return_idx, info in enumerate(self.result_info):
             if "type" not in info:
@@ -179,6 +200,7 @@ class Benchmark:
             )
 
             for context_idx in range(n_contexts):
+                ctx_key = self.contexts[context_idx]["name"]
                 start = context_idx * n_trials
                 end = start + n_trials
                 context_data = data[start:end]
@@ -198,7 +220,7 @@ class Benchmark:
 
                     if len(valid_data) > 0:
                         data_stack = torch.stack(valid_data, dim=0)
-                        raw_numerical[f"context_{context_idx}"][tag] = data_stack
+                        raw_numerical[ctx_key][tag] = data_stack
 
                         if info.get("calc_mean", True):
                             mean = data_stack.mean(dim=0)
@@ -208,7 +230,7 @@ class Benchmark:
                             context_payload["std"] = std.tolist()
                     else:
                         empty_tensor = torch.empty((0,), dtype=torch.float32)
-                        raw_numerical[f"context_{context_idx}"][tag] = empty_tensor
+                        raw_numerical[ctx_key][tag] = empty_tensor
                         if info.get("calc_mean", True):
                             context_payload["mean"] = None
                         if info.get("calc_std", True):
@@ -220,7 +242,7 @@ class Benchmark:
                         ]
 
                     if len(context_payload) > 0:
-                        processed_results["contexts"][f"context_{context_idx}"]["results"][tag] = context_payload
+                        processed_results["contexts"][ctx_key]["results"][tag] = context_payload
 
                 elif info["type"] == ResultType.VISUAL:
                     if not info.get("save_fig", True):
@@ -229,7 +251,8 @@ class Benchmark:
                     trials_to_save = [0] if info.get("save_first_trial_only", True) else list(range(n_trials))
                     file_extension = info.get("file_extension", "jpg")
 
-                    context_fig_dir = os.path.join(figures_root, f"context_{context_idx}")
+                    fig_seg = _safe_figures_dir_segment(ctx_key)
+                    context_fig_dir = os.path.join(figures_root, fig_seg)
                     saved_count = 0
 
                     for trial_idx in trials_to_save:

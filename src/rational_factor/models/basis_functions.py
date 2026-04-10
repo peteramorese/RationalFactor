@@ -126,6 +126,8 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
     def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5, variance: float = 1.0, device = None):
         if device is None:
             device = offsets.device
+        else:
+            offsets = offsets.to(device)
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(torch.randn(d, n_basis, 2, device=device) * torch.sqrt(torch.tensor(variance, device=device)) + offsets, min_std=min_std)
 
@@ -509,16 +511,12 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
                 device=a.device,
             )
 
-        # --- keep remaining dims ---
         a_k = a[keep_dims, :]
         b_k = b[keep_dims, :]
         c_k = c[keep_dims, :]
 
-        # --- add marginalized contribution into c ---
         c_new = c_k + log_int_sum[None, :]
 
-        # --- convert back to raw parameterization ---
-        # a = -softplus(raw_a) - eps  => invert
         s = (-a_k - self.eps).clamp_min(1e-12)
         raw_a = torch.log(torch.expm1(s))
 
@@ -540,16 +538,24 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         self.eps = eps
 
     @classmethod
-    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), variance: float = 1.0, min_concentration: float = 1.0, eps: float = 1e-6):
+    def random_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), variance: float = 1.0, min_concentration: float = 1.0, eps: float = 1e-6, device = None):
+        if device is None:
+            device = offsets.device
+        else:
+            offsets = offsets.to(device)
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(
-            torch.randn(d, n_basis, 2) * torch.sqrt(torch.tensor(variance)) + offsets,
+            torch.randn(d, n_basis, 2, device=device) * torch.sqrt(torch.tensor(variance, device=device)) + offsets,
             min_concentration=min_concentration,
             eps=eps,
         )
 
     @classmethod
-    def set_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1.0, eps: float = 1e-6):
+    def set_init(cls, d: int, n_basis: int, offsets: torch.Tensor = torch.zeros(2), min_concentration: float = 1.0, eps: float = 1e-6, device = None):
+        if device is None:
+            device = offsets.device
+        else:
+            offsets = offsets.to(device)
         offsets = offsets.repeat(d, n_basis, 1)
         return cls(
             offsets,
@@ -589,14 +595,6 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
             + (beta - 1.0) * torch.log1p(-y)
             - self._log_beta_fn(alpha, beta)
         )
-
-        if torch.isnan(log_dim_factors).any():
-            print("log_dim_factors: ", log_dim_factors)
-            print("alpha: ", alpha)
-            print("beta: ", beta)
-            print("y: ", y)
-            #print("y_input: ", y_input)
-            raise ValueError("log_dim_factors is nan")
 
         return torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
 

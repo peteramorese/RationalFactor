@@ -43,15 +43,12 @@ class ErfSeparableTF(DomainTF):
         if trainable:
             scale_params = torch.sqrt(scale)
             self.params = torch.nn.Parameter(torch.hstack([loc.unsqueeze(1), scale_params.unsqueeze(1)]))
-            #self.params = torch.nn.Parameter(torch.hstack([loc.unsqueeze(1), scale.unsqueeze(1)]))
-            #self.min_scale = min_scale
         else:
             self.register_buffer("params", torch.hstack([loc.unsqueeze(1), scale.unsqueeze(1)]))
 
     @classmethod
     def copy_from_trainable(cls, other : 'ErfSeparableTF'):
         return cls(other.dim, other.params[:, 0].detach().clone(), torch.square(other.params[:, 1]).detach().clone(), trainable=False)
-        #return cls(other.dim, other.params[:, 0].detach().clone(), other.params[:, 1].detach().clone(), trainable=False)
 
     @classmethod
     def from_data(cls, x_data : torch.Tensor, trainable : bool = True):
@@ -63,7 +60,6 @@ class ErfSeparableTF(DomainTF):
     def _loc_scale(self):
         if self.trainable:
             loc = self.params[:, 0]   # (dim,)
-            #scale = torch.nn.functional.softplus(self.params[:, 1]) + self.min_scale # (dim,)
             scale = torch.square(self.params[:, 1]) # (dim,)
             return loc, scale
         else:
@@ -77,13 +73,6 @@ class ErfSeparableTF(DomainTF):
         u = (x - loc) / (scale * sqrt_2)
         z = 0.5 * (1.0 + torch.special.erf(u))
         ladj = (-torch.log(scale) - 0.5 * torch.log(x.new_tensor(2.0 * torch.pi)) - u ** 2).sum(dim=-1)
-        if torch.isnan(z).any():
-            print("z is nan")
-            print("x: ", x)
-            print("loc: ", loc)
-            print("scale: ", scale)
-            print("u: ", u)
-            raise ValueError("z is nan")
         return z, ladj
 
     def inverse(self, z : torch.Tensor):

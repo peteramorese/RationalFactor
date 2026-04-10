@@ -243,7 +243,10 @@ def main() -> None:
             torch.tensor([float(training_time_init)], dtype=torch.float32),
         )
 
-    contexts = [CONTEXT_USE_NFTF_FALSE, CONTEXT_USE_NFTF_TRUE]
+    contexts = [
+        {"name": "wo_nftf", "params": CONTEXT_USE_NFTF_FALSE},
+        {"name": "w_nftf", "params": CONTEXT_USE_NFTF_TRUE},
+    ]
 
     benchmark = Benchmark(name=Path(__file__).stem)
     benchmark.set_experiment_fn(experiment)

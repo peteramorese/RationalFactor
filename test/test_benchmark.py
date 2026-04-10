@@ -41,8 +41,8 @@ def main() -> None:
     benchmark.set_experiment_fn(toy_experiment)
 
     contexts = [
-        {"scale": 1.0, "bias": 0.5},
-        {"scale": 2.0, "bias": -0.25},
+        {"name": "low_scale", "params": {"scale": 1.0, "bias": 0.5}},
+        {"name": "high_scale", "params": {"scale": 2.0, "bias": -0.25}},
     ]
     benchmark.set_contexts(contexts)
 
@@ -78,16 +78,18 @@ def main() -> None:
     with open(processed_results_path, "r", encoding="utf-8") as f:
         processed = json.load(f)
 
-    for context_idx in range(len(contexts)):
-        context_key = f"context_{context_idx}"
+    processed_ctx = processed["contexts"]
+    for ctx in contexts:
+        context_key = ctx["name"]
         assert context_key in raw_data
-        assert context_key in processed
-        assert processed[context_key]["params"] == contexts[context_idx]
+        assert context_key in processed_ctx
+        assert processed_ctx[context_key]["name"] == context_key
+        assert processed_ctx[context_key]["params"] == ctx["params"]
         assert raw_data[context_key]["vector_metric"].shape == (trials, 2)
         assert raw_data[context_key]["matrix_metric"].shape == (trials, 1, 2)
         assert raw_data[context_key]["trial_raw_only_metric"].shape == (trials, 3)
 
-        raw_only_json = processed[context_key]["results"]["trial_raw_only_metric"]
+        raw_only_json = processed_ctx[context_key]["results"]["trial_raw_only_metric"]
         assert "raw_data" in raw_only_json
         assert len(raw_only_json["raw_data"]) == trials
         assert "mean" not in raw_only_json
@@ -96,8 +98,8 @@ def main() -> None:
     figures_root = os.path.join(run_dir, "figures")
     assert os.path.isdir(figures_root)
     expected_figures_per_context = 1 if save_first_trial_only else trials
-    for context_idx in range(len(contexts)):
-        context_fig_dir = os.path.join(figures_root, f"context_{context_idx}")
+    for ctx in contexts:
+        context_fig_dir = os.path.join(figures_root, ctx["name"])
         assert os.path.isdir(context_fig_dir)
         files = os.listdir(context_fig_dir)
         assert len(files) == expected_figures_per_context

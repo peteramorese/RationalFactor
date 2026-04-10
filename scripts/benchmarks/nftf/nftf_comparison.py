@@ -226,7 +226,10 @@ def main() -> None:
             torch.tensor([float(training_time_init)], dtype=torch.float32),
         )
 
-    contexts = [CONTEXT_MASKED_AFFINE, CONTEXT_MASKED_RQS]
+    contexts = [
+        {"name": "masked_affine", "params": CONTEXT_MASKED_AFFINE},
+        {"name": "masked_rqs", "params": CONTEXT_MASKED_RQS},
+    ]
 
     benchmark = Benchmark(name=Path(__file__).stem)
     benchmark.set_experiment_fn(experiment)
