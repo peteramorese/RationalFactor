@@ -63,10 +63,106 @@ CONTEXT_USE_NFTF_TRUE = {
 TRIALS = 15
 BENCHMARK_ROOT = "benchmark_data"
 
-N_DATA_TRAN = 20000
-N_DATA_INIT = 2000
-N_TRAJECTORIES_TEST = 2000
+N_DATA_TRAN = 50000
+N_DATA_INIT = 5000
+N_TRAJECTORIES_TEST = 5000
 N_TIMESTEPS_PROP = 15
+
+
+def make_quadcopter_benchmark_system() -> truth_models.Quadcopter:
+    """
+    12D closed-loop quadcopter: offset initial pose/velocity from a distant waypoint so that
+    10-15 Euler steps produce coupled translation, attitude, and rate motion.
+
+    rate_filter_alpha=1.0 makes one-step transitions Markov in the 12D state (no hidden filter
+    carry-over), which matches sample_trajectories / sample_io_pairs iteration order.
+    """
+    return truth_models.Quadcopter(
+        dt=0.06,
+        waypoint=torch.tensor([2.0, 1.0, 1.35]),
+        yaw_ref=0.35,
+        m=1.0,
+        g=9.81,
+        c_v=0.06,
+        c_w=0.06,
+        thrust_min=0.0,
+        thrust_max=24.0,
+        torque_limits=torch.tensor([1.2, 1.2, 0.55]),
+        covariance=0.012 * torch.eye(12),
+        rate_filter_alpha=1.0,
+    )
+
+
+def quadcopter_init_state_sampler():
+    """Cloud around a hover-adjacent state with nonzero velocity and mild attitude/rates."""
+    mean = torch.tensor(
+        [
+            0.2,
+            -0.15,
+            1.0,
+            0.45,
+            0.3,
+            0.18,
+            0.08,
+            -0.11,
+            0.06,
+            0.05,
+            -0.04,
+            0.03,
+        ],
+        dtype=torch.float32,
+    )
+    variances = torch.tensor(
+        [
+            0.12**2,
+            0.12**2,
+            0.1**2,
+            0.22**2,
+            0.22**2,
+            0.18**2,
+            0.1**2,
+            0.1**2,
+            0.08**2,
+            0.08**2,
+            0.08**2,
+            0.07**2,
+        ],
+        dtype=torch.float32,
+    )
+    return make_mvnormal_init_sampler(mean=mean, covariance=torch.diag(variances))
+
+
+def quadcopter_prev_state_sampler(system: truth_models.Quadcopter):
+    """Broad ellipsoid over states visited under the waypoint-tracking controller."""
+    mean = torch.zeros(system.dim(), dtype=torch.float32)
+    mean[0:3] = torch.tensor([0.8, 0.35, 1.05])
+    mean[3:6] = torch.tensor([0.35, 0.2, 0.12])
+    mean[6:9] = torch.tensor([0.05, -0.05, 0.12])
+    mean[9:12] = torch.tensor([0.03, -0.02, 0.02])
+    scales_sq = torch.tensor(
+        [
+            1.2**2,
+            1.2**2,
+            0.9**2,
+            1.1**2,
+            1.1**2,
+            0.85**2,
+            0.35**2,
+            0.35**2,
+            0.45**2,
+            0.45**2,
+            0.45**2,
+            0.35**2,
+        ],
+        dtype=torch.float32,
+    )
+    cov = torch.diag(scales_sq)
+
+    def _sample(n_samples: int):
+        dist = torch.distributions.MultivariateNormal(mean, cov)
+        return dist.sample((n_samples,))
+
+    return _sample
 
 
 def main() -> None:
@@ -74,12 +170,10 @@ def main() -> None:
     ######## SETUP ########
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
+    print("Using device: ", device)
 
-    system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1 * torch.eye(2))
-    init_state_sampler = make_mvnormal_init_sampler(
-        mean=torch.tensor([0.2, 0.1]),
-        covariance=torch.diag(torch.tensor([0.2, 0.2])),
-    )
+    system = make_quadcopter_benchmark_system()
+    init_state_sampler = quadcopter_init_state_sampler()
 
     test_traj_data = sample_trajectories(
         system,
@@ -88,11 +182,7 @@ def main() -> None:
         n_trajectories=N_TRAJECTORIES_TEST,
     )
 
-    def prev_state_sampler(n_samples: int):
-        mean = torch.tensor([0.0, 0.0])
-        cov = torch.diag(4.0 * torch.ones(system.dim()))
-        dist = torch.distributions.MultivariateNormal(mean, cov)
-        return dist.sample((n_samples,))
+    prev_state_sampler = quadcopter_prev_state_sampler(system)
 
     x0_data = init_state_sampler(N_DATA_INIT)
     x_k_data, x_kp1_data = sample_io_pairs(system, prev_state_sampler, n_pairs=N_DATA_TRAN)

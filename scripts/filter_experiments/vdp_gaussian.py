@@ -23,13 +23,13 @@ if __name__ == "__main__":
     n_basis = 200
     obs_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 1,
+        "iterations": 5,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
     tran_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 2,
+        "iterations": 1,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
@@ -125,7 +125,6 @@ if __name__ == "__main__":
         use_best="mle")
     print("Done! \n")
 
-
     init_model = Linear2FF.from_r2ff(tran_model, psi0_basis).to(device)
     reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
     optimizers = {
@@ -171,9 +170,6 @@ if __name__ == "__main__":
     # Analysis
     box_lows = (-5.0, -5.0)
     box_highs = (5.0, 5.0)
-
-    check_conditional_pdf_valid(obs_model, domain_bounds=(box_lows, box_highs), conditioner_domain_bounds=(box_lows, box_highs), n_samples=100000, n_conditioner_samples=100, device=device)
-    check_conditional_pdf_valid(tran_model, domain_bounds=(box_lows, box_highs), conditioner_domain_bounds=(box_lows, box_highs), n_samples=100000, n_conditioner_samples=100, device=device)
 
 
     fig, axes = plt.subplots(n_timesteps_prop, 3, figsize=(10, max(3*n_timesteps_prop, 15)))

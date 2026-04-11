@@ -39,18 +39,19 @@ def check_conditional_pdf_valid(pdf : ConditionalDensityModel, domain_bounds, co
     conditioner_lows = torch.as_tensor(conditioner_domain_bounds[0], device=device)
     conditioner_highs = torch.as_tensor(conditioner_domain_bounds[1], device=device)
     conditioner_samples = torch.rand(n_conditioner_samples, conditioner_lows.numel(), device=device, dtype=conditioner_lows.dtype) * (conditioner_highs - conditioner_lows) + conditioner_lows
-
+    print("num samples: ", n_samples)
+    print("num conditioner samples: ", n_conditioner_samples)
     integrals = []
     with torch.no_grad():
         pdf.eval()
         for i in range(n_conditioner_samples):
             c = conditioner_samples[i]
 
-            def log_density_cond(x, conditioner=c):
+            def density_cond(x, conditioner=c):
                 y = conditioner.unsqueeze(0).expand(x.shape[0], -1)
-                return pdf.log_density(x, conditioner=y)
+                return pdf.forward(x, conditioner=y)
 
-            integral = mc_integral_box(log_density_cond, domain_bounds_dev, n_samples, device=device)
+            integral = mc_integral_box(density_cond, domain_bounds_dev, n_samples, device=device)
             integrals.append(integral)
 
     stacked = torch.stack(integrals)

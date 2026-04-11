@@ -7,7 +7,7 @@ from .density_model import DensityModel, ConditionalDensityModel
 # Linear models #
 
 class LinearForm(DensityModel):
-    def __init__(self, basis : SeparableBasis, w_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-7):
+    def __init__(self, basis : SeparableBasis, w_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-20):
         super().__init__(basis.dim())
 
         self.basis = basis
@@ -49,7 +49,7 @@ class LinearRFF(ConditionalDensityModel):
 
     Used for Markov transition distribution for propagation only models
     """
-    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-7):
+    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-20):
         assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
@@ -113,7 +113,7 @@ class LinearFF(DensityModel):
 
     Used for belief representation for propagation only models
     """
-    def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
+    def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-20):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
@@ -185,7 +185,7 @@ class LinearRF(ConditionalDensityModel):
 
     Used for time-invariant observation distribution for filtering models
     """
-    def __init__(self, xi_basis : SeparableBasis, zeta_basis : Basis, numerical_tolerance : float = 1e-7):
+    def __init__(self, xi_basis : SeparableBasis, zeta_basis : Basis, numerical_tolerance : float = 1e-20):
         assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
         assert isinstance(zeta_basis, Basis), "zeta_basis must be a Basis"
         assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
@@ -210,10 +210,9 @@ class LinearRF(ConditionalDensityModel):
 
         if not self.zeta_basis.normalized():
             Omega = self.zeta_basis.Omega1()
-            e = d / (Omega + self.numerical_tolerance) 
-        else:
-            return d
-        
+            return d / (Omega + self.numerical_tolerance)
+        return d
+
     def log_density(self, o : torch.Tensor, *, conditioner : torch.Tensor):
         x = conditioner
         xi_x = self.xi_basis(x)
@@ -240,7 +239,7 @@ class LinearR2FF(ConditionalDensityModel):
 
     Used for Markov transition distribution for filtering models
     """
-    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-7):
+    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-20):
         assert phi_basis.dim() == psi_basis.dim(), "Input bases must have the same dimension"
         assert phi_basis.dim() == xi_basis.dim(), "Input bases must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
@@ -272,7 +271,7 @@ class LinearR2FF(ConditionalDensityModel):
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         x = conditioner
         phi_x = self.phi_basis(x) # (n_data, n_phi)
-        xi_xp = self.xi_basis(x) # (n_data, n_xi)
+        xi_xp = self.xi_basis(xp)  # (n_data, n_xi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
         psi_xp = self.psi_basis(xp) # (n_data, n_psi)
         
@@ -320,7 +319,7 @@ class Linear2FF(DensityModel):
 
     Used for belief representation for filtering models
     """
-    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
+    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-20):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"

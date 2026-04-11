@@ -8,7 +8,7 @@ import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
 from rational_factor.tools.visualization import plot_belief
-from rational_factor.tools.analysis import mc_integral_box
+from rational_factor.tools.analysis import check_conditional_pdf_valid, check_pdf_valid
 from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSeparableTF
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 import matplotlib.pyplot as plt
@@ -22,8 +22,8 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     use_dtf = True
     n_basis = 2000
-    n_epochs_tran = 500
-    n_epochs_init = 500
+    n_epochs_tran = 5
+    n_epochs_init = 5
     batch_size = 1024
     lr_tran = 1e-3
     lr_init = 1e-2
@@ -96,6 +96,9 @@ if __name__ == "__main__":
     print("Done! \n")
     print("Valid: ", tran_model.valid())
 
+    box_lows = (-5.0, -5.0)
+    box_highs = (5.0, 5.0)
+    check_conditional_pdf_valid(tran_model, domain_bounds=(box_lows, box_highs), conditioner_domain_bounds=(box_lows, box_highs), n_samples=100000, n_conditioner_samples=100, device=device)
 
     # Copy the domain transformation to fix it for training the initial state model
     trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
