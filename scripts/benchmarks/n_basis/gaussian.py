@@ -10,56 +10,31 @@ import rational_factor.systems.truth_models as truth_models
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import MaskedAffineNFTF, MaskedRQSNFTF
+from rational_factor.models.domain_transformation import MaskedRQSNFTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.base import sample_io_pairs, sample_trajectories
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
 from rational_factor.tools.misc import make_mvnormal_init_sampler
 
-
-CONTEXT_USE_DTF_FALSE = {
-    "use_dtf": False,
-    "n_basis": 2000,
-    "tran_params": {
-        "n_epochs_per_group": [10, 5],
-        "iterations": 40,
-        "lr_basis": 5e-2,
-        "lr_weights": 1e-2,
-    },
-    "init_params": {
-        "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
-        "lr_weights": 1e-2,
-    },
-    "batch_size": 256,
-    "var_reg_strength": 5e-1,
-    "verbose": True,
+# Shared hyperparameters; only n_basis and use_dtf vary per context.
+TRAN_PARAMS = {
+    "n_epochs_per_group": [10, 5],
+    "iterations": 40,
+    "lr_basis": 5e-2,
+    "lr_weights": 1e-2,
+    "lr_dtf": 1e-3,
+}
+INIT_PARAMS = {
+    "n_epochs_per_group": [20, 5],
+    "iterations": 50,
+    "lr_basis": 1e-2,
+    "lr_weights": 1e-2,
 }
 
-CONTEXT_USE_DTF_TRUE = {
-    "use_dtf": True,
-    "n_basis": 2000,
-    "tran_params": {
-        "n_epochs_per_group": [10, 5],
-        "iterations": 40,
-        "lr_basis": 5e-2,
-        "lr_weights": 1e-2,
-        "lr_dtf": 1e-3,
-    },
-    "init_params": {
-        "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
-        "lr_weights": 1e-2,
-    },
-    "batch_size": 256,
-    "var_reg_strength": 5e-1,
-    "verbose": True,
-}
+N_BASIS_VALUES = (200, 500, 1000, 2000, 4000)
 
-TRIALS = 15
+TRIALS = 5
 BENCHMARK_ROOT = "benchmark_data"
 
 N_DATA_TRAN = 20000
@@ -68,8 +43,27 @@ N_TRAJECTORIES_TEST = 2000
 N_TIMESTEPS_PROP = 15
 
 
-def main() -> None:
+def _context_params(*, use_dtf: bool, n_basis: int) -> dict:
+    p = {
+        "use_dtf": use_dtf,
+        "n_basis": n_basis,
+        "tran_params": {
+            "n_epochs_per_group": TRAN_PARAMS["n_epochs_per_group"],
+            "iterations": TRAN_PARAMS["iterations"],
+            "lr_basis": TRAN_PARAMS["lr_basis"],
+            "lr_weights": TRAN_PARAMS["lr_weights"],
+        },
+        "init_params": dict(INIT_PARAMS),
+        "batch_size": 256,
+        "var_reg_strength": 5e-1,
+        "verbose": True,
+    }
+    if use_dtf:
+        p["tran_params"]["lr_dtf"] = TRAN_PARAMS["lr_dtf"]
+    return p
 
+
+def main() -> None:
     ######## SETUP ########
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -98,7 +92,6 @@ def main() -> None:
 
     x0_dataset = TensorDataset(x0_data)
     xp_dataset = TensorDataset(x_k_data, x_kp1_data)
-
 
     def experiment(
         use_dtf: bool,
@@ -240,10 +233,14 @@ def main() -> None:
             torch.tensor([float(training_time_init)], dtype=torch.float32),
         )
 
-    contexts = [
-        {"name": "wo_dtf", "params": CONTEXT_USE_DTF_FALSE},
-        {"name": "w_dtf", "params": CONTEXT_USE_DTF_TRUE},
-    ]
+    contexts = []
+    for n in N_BASIS_VALUES:
+        contexts.append(
+            {"name": f"n{n}_wo_dtf", "params": _context_params(use_dtf=False, n_basis=n)},
+        )
+        contexts.append(
+            {"name": f"n{n}_w_dtf", "params": _context_params(use_dtf=True, n_basis=n)},
+        )
 
     benchmark = Benchmark(name=Path(__file__).stem)
     benchmark.set_experiment_fn(experiment)
@@ -255,7 +252,10 @@ def main() -> None:
     benchmark.set_numerical_result(3, "training_time_transition", json_raw_data=False)
     benchmark.set_numerical_result(4, "training_time_initial", json_raw_data=False)
 
-    print(f"Running benchmark ({len(contexts)} contexts, {TRIALS} trial(s) each)...")
+    print(
+        f"Running benchmark ({len(contexts)} contexts = {len(N_BASIS_VALUES)} n_basis × 2 use_dtf, "
+        f"{TRIALS} trial(s) each)..."
+    )
     benchmark.run(trials=TRIALS, verbose=True)
     run_dir = benchmark.process_and_save_results(root_dir=BENCHMARK_ROOT)
     print(f"Saved to {run_dir}")

@@ -3,20 +3,20 @@ import torch
 from copy import deepcopy
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
 
-def propagate(belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
+def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
     if device is None:
-        device = next(belief.parameters()).device
+        device = next(init_belief.parameters()).device
 
     if isinstance(transition_model, LinearRFF):
-        assert isinstance(belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
+        assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
 
-        Omega_0 = belief.phi_basis.Omega2(belief.psi0_basis)
+        Omega_0 = init_belief.phi_basis.Omega2(init_belief.psi0_basis)
         Omega = transition_model.phi_basis.Omega2(transition_model.psi_basis)
         b = transition_model.get_b(Omega=Omega)
         bOmega_0 = b.unsqueeze(1) * Omega_0
         bOmega = b.unsqueeze(1) * Omega
 
-        c0 = belief.get_c0(Omega_0=Omega_0)
+        c0 = init_belief.get_c0(Omega_0=Omega_0)
 
         c_seq = [c0]
         c_seq.append(bOmega_0 @ c0)
@@ -24,14 +24,14 @@ def propagate(belief : DensityModel, transition_model : ConditionalDensityModel,
             c_seq.append(bOmega @ c_seq[-1])
         
         #print("C_seq:", C_seq)
-        belief_seq = [LinearFF(belief.a, belief.phi_basis, transition_model.psi_basis, c0_fixed=c_seq[i + 1]).to(device=device) for i in range(n_steps)]
-        belief_seq.insert(0, belief) # Add the initial belief
+        belief_seq = [LinearFF(init_belief.a, init_belief.phi_basis, transition_model.psi_basis, c0_fixed=c_seq[i + 1]).to(device=device) for i in range(n_steps)]
+        belief_seq.insert(0, init_belief) # Add the initial belief
         return belief_seq
     
     elif isinstance(transition_model, QuadraticRFF):
-        assert isinstance(belief, QuadraticFF), "Belief must be QuadraticFF for QuadraticRFF transition model"
+        assert isinstance(init_belief, QuadraticFF), "Belief must be QuadraticFF for QuadraticRFF transition model"
 
-        Omega_0 = belief.phi_basis.Omega22(belief.psi0_basis)
+        Omega_0 = init_belief.phi_basis.Omega22(init_belief.psi0_basis)
         Omega = transition_model.phi_basis.Omega22(transition_model.psi_basis)
         B = transition_model.get_B(Omega=Omega)
         #BOmega0 = torch.einsum("ij,klij->klij", B, Omega0)
@@ -39,15 +39,15 @@ def propagate(belief : DensityModel, transition_model : ConditionalDensityModel,
         BOmega_0 = torch.einsum("ij,ijkl->ijkl", B, Omega_0)
         BOmega = torch.einsum("ij,ijkl->ijkl", B, Omega)
         
-        C0 = belief.get_C0(Omega_0=Omega_0)
+        C0 = init_belief.get_C0(Omega_0=Omega_0)
 
         C_seq = [C0]
         C_seq.append(torch.einsum("ij,klij->kl", C0, BOmega_0))
         for _ in range(1, n_steps):
             C_seq.append(torch.einsum("ij,klij->kl", C_seq[-1], BOmega))
         
-        belief_seq = [QuadraticFF(belief.A, belief.phi_basis, transition_model.psi_basis, C0_fixed=C_seq[i + 1]).to(device=device) for i in range(n_steps)]
-        belief_seq.insert(0, belief) # Add the initial belief
+        belief_seq = [QuadraticFF(init_belief.A, init_belief.phi_basis, transition_model.psi_basis, C0_fixed=C_seq[i + 1]).to(device=device) for i in range(n_steps)]
+        belief_seq.insert(0, init_belief) # Add the initial belief
         return belief_seq
 
     elif isinstance(transition_model, LinearR2FF):
@@ -66,9 +66,9 @@ def propagate(belief : DensityModel, transition_model : ConditionalDensityModel,
                 Omega3_0 = curr_belief.xi_basis.Omega3(curr_belief.phi_basis, curr_belief.psi0_basis)
                 b = transition_model.get_b()
                 d = curr_belief.d
-                c0 = belief.get_c0(Omega3_0=Omega3_0)
+                c0 = curr_belief.get_c0(Omega3_0=Omega3_0)
                 
-                c1 = torch.einsum("i,j,k,ijk->k", d, b, c0, Omega3_0)
+                c1 = torch.einsum("i,j,k,ijk->j", d, b, c0, Omega3_0)
 
             else:
                 raise ValueError(f"Unrecognized belief type '{type(curr_belief)}'")
@@ -77,7 +77,7 @@ def propagate(belief : DensityModel, transition_model : ConditionalDensityModel,
                 transition_model.get_a(), transition_model.phi_basis, 
                 transition_model.psi_basis, c0_fixed=c1, 
                 numerical_tolerance=curr_belief.numerical_tolerance).to(device=device)
-        belief_seq = [belief]
+        belief_seq = [init_belief]
         for _ in range(0, n_steps):
             belief_seq.append(_prop(belief_seq[-1]))
         return belief_seq

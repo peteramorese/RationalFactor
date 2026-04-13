@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import rational_factor.systems.po_truth_models as po_truth_models
 from rational_factor.systems.base import sample_io_pairs, sample_observation_pairs, simulate, SystemObservationDistribution, SystemTransitionDistribution
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF
+from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
@@ -20,27 +20,27 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 200
+    n_basis = 300
     obs_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 5,
+        "iterations": 10,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
     tran_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 1,
-        "lr_basis": 1e-2,
+        "iterations": 20,
+        "lr_basis": 3e-2,
         "lr_weights": 1e-2,
     }
     init_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 6,
+        "iterations": 100,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
 
-    batch_size = 1024
+    batch_size = 256
 
     n_data_init = 3000
     n_data_tran = 30000
@@ -125,7 +125,7 @@ if __name__ == "__main__":
         use_best="mle")
     print("Done! \n")
 
-    init_model = Linear2FF.from_r2ff(tran_model, psi0_basis).to(device)
+    init_model = LinearFF.from_r2ff(tran_model, psi0_basis).to(device)
     reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
     optimizers = {
         "basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]),
