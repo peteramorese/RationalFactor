@@ -73,7 +73,7 @@ class Basis(torch.nn.Module):
         omega[i, j, k] = <this_i, other1_j, other2_k>
         
         Returns:
-            Tensor of shape (n_basis, n_basis, other1.n_basis, other2.n_basis)
+            Tensor of shape (n_basis, other1.n_basis, other2.n_basis)
         '''
         raise NotImplementedError("Omega3 is not implemented for this basis function")
 

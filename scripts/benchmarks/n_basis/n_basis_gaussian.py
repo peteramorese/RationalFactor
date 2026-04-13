@@ -17,7 +17,8 @@ from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
 from rational_factor.tools.misc import make_mvnormal_init_sampler
 
-# Shared hyperparameters; only n_basis and use_dtf vary per context.
+USE_DTF = False
+
 TRAN_PARAMS = {
     "n_epochs_per_group": [10, 5],
     "iterations": 40,
@@ -44,23 +45,23 @@ N_TIMESTEPS_PROP = 15
 
 
 def _context_params(*, use_dtf: bool, n_basis: int) -> dict:
-    p = {
+    tran = {
+        "n_epochs_per_group": TRAN_PARAMS["n_epochs_per_group"],
+        "iterations": TRAN_PARAMS["iterations"],
+        "lr_basis": TRAN_PARAMS["lr_basis"],
+        "lr_weights": TRAN_PARAMS["lr_weights"],
+    }
+    if use_dtf:
+        tran["lr_dtf"] = TRAN_PARAMS["lr_dtf"]
+    return {
         "use_dtf": use_dtf,
         "n_basis": n_basis,
-        "tran_params": {
-            "n_epochs_per_group": TRAN_PARAMS["n_epochs_per_group"],
-            "iterations": TRAN_PARAMS["iterations"],
-            "lr_basis": TRAN_PARAMS["lr_basis"],
-            "lr_weights": TRAN_PARAMS["lr_weights"],
-        },
+        "tran_params": tran,
         "init_params": dict(INIT_PARAMS),
         "batch_size": 256,
         "var_reg_strength": 5e-1,
         "verbose": True,
     }
-    if use_dtf:
-        p["tran_params"]["lr_dtf"] = TRAN_PARAMS["lr_dtf"]
-    return p
 
 
 def main() -> None:
@@ -233,16 +234,13 @@ def main() -> None:
             torch.tensor([float(training_time_init)], dtype=torch.float32),
         )
 
-    contexts = []
-    for n in N_BASIS_VALUES:
-        contexts.append(
-            {"name": f"n{n}_wo_dtf", "params": _context_params(use_dtf=False, n_basis=n)},
-        )
-        contexts.append(
-            {"name": f"n{n}_w_dtf", "params": _context_params(use_dtf=True, n_basis=n)},
-        )
+    contexts = [
+        {"name": f"n{n}", "params": _context_params(use_dtf=USE_DTF, n_basis=n)}
+        for n in N_BASIS_VALUES
+    ]
 
-    benchmark = Benchmark(name=Path(__file__).stem)
+    bench_name = f"{Path(__file__).stem}_{'dtf' if USE_DTF else 'no_dtf'}"
+    benchmark = Benchmark(name=bench_name)
     benchmark.set_experiment_fn(experiment)
     benchmark.set_contexts(contexts)
 
@@ -253,7 +251,7 @@ def main() -> None:
     benchmark.set_numerical_result(4, "training_time_initial", json_raw_data=False)
 
     print(
-        f"Running benchmark ({len(contexts)} contexts = {len(N_BASIS_VALUES)} n_basis × 2 use_dtf, "
+        f"Running benchmark ({len(contexts)} n_basis contexts, use_dtf={USE_DTF}, "
         f"{TRIALS} trial(s) each)..."
     )
     benchmark.run(trials=TRIALS, verbose=True)
