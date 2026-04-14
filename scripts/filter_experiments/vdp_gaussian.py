@@ -61,10 +61,14 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if use_gpu else "cpu")
     print("Using GPU: ", use_gpu)
-    print("Device: ", device)
 
     # Create system
-    system = po_truth_models.PartiallyObservableVanDerPol(dt=0.3, mu=0.9, process_covariance=0.1*torch.eye(2), observation_covariance=0.1*torch.eye(2))
+    system = po_truth_models.PartiallyObservableVanDerPol(
+        dt=0.3, 
+        mu=0.9, 
+        process_covariance=0.1*torch.eye(2), 
+        observation_covariance=0.1*torch.eye(2)
+    )
 
     init_state_sampler = make_mvnormal_init_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
 
@@ -72,20 +76,15 @@ if __name__ == "__main__":
     def prev_state_sampler(n_samples : int):
         mean = torch.tensor([0.0, 0.0])
         cov = torch.diag(4.0 * torch.ones(system.dim()))
-        dist = torch.distributions.MultivariateNormal(mean, cov)
-        return dist.sample((n_samples,))
+        return torch.distributions.MultivariateNormal(mean, cov).sample((n_samples,))
 
     x0_data = init_state_sampler(n_data_init)
     x_k_data, x_kp1_data = sample_io_pairs(system, prev_state_sampler, n_pairs=n_data_tran)
     x_data, o_data = sample_observation_pairs(system, init_state_sampler, n_pairs=n_data_obs)
 
-    x0_dataset = TensorDataset(x0_data)
-    xp_dataset = TensorDataset(x_kp1_data, x_k_data)
-    o_dataset = TensorDataset(o_data, x_data)
-
-    x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    xp_dataloader = DataLoader(xp_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    o_dataloader = DataLoader(o_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    xp_dataloader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    o_dataloader = DataLoader(TensorDataset(o_data, x_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
     phi_basis  = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3, block_size=block_size).to(device)

@@ -67,14 +67,14 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
                 d = curr_belief.d
                 c0 = curr_belief.get_c0()
 
-                # streamed: v[k] = sum_{i,j} d[i] b[j] Omega3[i,j,k], then c1[j] = v[j] * c0[j]
-                denom_vec = curr_belief.xi_basis.Omega3_contract(
-                    curr_belief.phi_basis,
+                # c1[j] = b[j] * sum_{i,k} d[i] c0[k] Omega3[i,j,k]
+                contracted_j = curr_belief.xi_basis.Omega3_contract(
                     curr_belief.psi0_basis,
+                    curr_belief.phi_basis,
                     d,
-                    b,
+                    c0,
                 )
-                c1 = denom_vec * c0
+                c1 = b * contracted_j
 
             else:
                 raise ValueError(f"Unrecognized belief type '{type(curr_belief)}'")

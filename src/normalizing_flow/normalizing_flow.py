@@ -55,16 +55,16 @@ class ConditionalNormalizingFlow(ConditionalDensityModel):
         base_distribution = StandardNormal(shape=[dim])
         self.flow = Flow(transform=transform, distribution=base_distribution)
 
-    def log_density(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return self.flow.log_prob(inputs=x, context=y)
+    def log_density(self, x: torch.Tensor, *, conditioner: torch.Tensor) -> torch.Tensor:
+        return self.flow.log_prob(inputs=x, context=conditioner)
     
-    def sample(self, y: torch.Tensor, num_samples_per: int = 1) -> torch.Tensor:
-        if y.ndim == 1:
-            y = y.unsqueeze(0)
-        elif y.ndim > 2:
-            y = y.view(-1, y.shape[-1])
+    def sample(self, conditioner: torch.Tensor, num_samples_per: int = 1) -> torch.Tensor:
+        if conditioner.ndim == 1:
+            conditioner = conditioner.unsqueeze(0)
+        elif conditioner.ndim > 2:
+            conditioner = conditioner.view(-1, conditioner.shape[-1])
 
-        x_samples = self.flow.sample(num_samples=num_samples_per, context=y)
+        x_samples = self.flow.sample(num_samples=num_samples_per, context=conditioner)
 
         if num_samples_per == 1:
             x_samples = x_samples[:, 0, :]
