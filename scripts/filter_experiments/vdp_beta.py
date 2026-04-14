@@ -194,7 +194,8 @@ if __name__ == "__main__":
 
     # Run the filter
     dtf_sim_observations = [trained_wrap_tf(obs)[0] for obs in sim_observations]
-    priors, posteriors = propagate.propagate_and_update(init_model.density_model, tran_model.conditional_density_model, obs_model.conditional_density_model, dtf_sim_observations)
+    with torch.no_grad():
+        priors, posteriors = propagate.propagate_and_update(init_model.density_model, tran_model.conditional_density_model, obs_model.conditional_density_model, dtf_sim_observations)
     print("length of priors: ", len(priors))
     print("length of posteriors: ", len(posteriors))
 
@@ -219,39 +220,40 @@ if __name__ == "__main__":
     fig, axes = plt.subplots(n_timesteps_prop, 3, figsize=(10, max(3*n_timesteps_prop, 15)))
     fig.delaxes(axes[0, 0])  # no prior exists at k=0
     fig.suptitle("Beliefs at each time step")
-    for i in range(n_timesteps_prop):
-        if i > 0:
-            print("Testing prior ", i)
-            check_pdf_valid(priors[i-1], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
-
-            plot_belief(axes[i, 0], CompositeDensityModel([trained_wrap_tf], priors[i-1]), x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-            axes[i, 0].set_title(f"Prior at k={i}", fontsize=8)
-
-        print("Testing posterior", i)
-        check_pdf_valid(posteriors[i], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
-
-        plot_belief(axes[i, 1], CompositeDensityModel([trained_wrap_tf], posteriors[i]), x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-        axes[i, 1].set_title(f"Posterior at k={i}", fontsize=8)
-
-        plot_particle_belief(axes[i, 2], wpf_posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-        axes[i, 2].set_title(f"WPF Posterior at k={i}", fontsize=8)
-        cols = [1, 2] if i == 0 else [0, 1, 2]
-        for j in cols:
-            if j > 0: # Skip first prior plot
-                axes[i, j].scatter(sim_true_states[i, 0].item(), sim_true_states[i, 1].item(), marker="o", s=10, c="red")
+    with torch.no_grad():
+        for i in range(n_timesteps_prop):
             if i > 0:
-                axes[i, j].scatter(sim_observations[i-1, 0].item(), sim_observations[i-1, 1].item(), marker="o", s=10, c="blue")
-            axes[i, j].set_xlabel("")
-            axes[i, j].set_ylabel("")
-            axes[i, j].tick_params(
-                axis="both",
-                which="both",
-                labelbottom=False,
-                labelleft=False,
-                bottom=False,
-                left=False,
-            )
-            axes[i, j].grid(alpha=0.25)
+                print("Testing prior ", i)
+                check_pdf_valid(priors[i-1], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
+
+                plot_belief(axes[i, 0], CompositeDensityModel([trained_wrap_tf], priors[i-1]), x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+                axes[i, 0].set_title(f"Prior at k={i}", fontsize=8)
+
+            print("Testing posterior", i)
+            check_pdf_valid(posteriors[i], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
+
+            plot_belief(axes[i, 1], CompositeDensityModel([trained_wrap_tf], posteriors[i]), x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+            axes[i, 1].set_title(f"Posterior at k={i}", fontsize=8)
+
+            plot_particle_belief(axes[i, 2], wpf_posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+            axes[i, 2].set_title(f"WPF Posterior at k={i}", fontsize=8)
+            cols = [1, 2] if i == 0 else [0, 1, 2]
+            for j in cols:
+                if j > 0: # Skip first prior plot
+                    axes[i, j].scatter(sim_true_states[i, 0].item(), sim_true_states[i, 1].item(), marker="o", s=10, c="red")
+                if i > 0:
+                    axes[i, j].scatter(sim_observations[i-1, 0].item(), sim_observations[i-1, 1].item(), marker="o", s=10, c="blue")
+                axes[i, j].set_xlabel("")
+                axes[i, j].set_ylabel("")
+                axes[i, j].tick_params(
+                    axis="both",
+                    which="both",
+                    labelbottom=False,
+                    labelleft=False,
+                    bottom=False,
+                    left=False,
+                )
+                axes[i, j].grid(alpha=0.25)
 
 
     plt.savefig("figures/vdp_filter_beta.jpg", dpi=1000)
