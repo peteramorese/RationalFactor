@@ -2,8 +2,10 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 import rational_factor.systems.po_truth_models as po_truth_models
 from rational_factor.systems.base import sample_io_pairs, sample_observation_pairs, simulate, SystemObservationDistribution, SystemTransitionDistribution
-from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF, LinearFF
+from rational_factor.models.basis_functions import BetaBasis
+from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF, LinearFF, LinearRFF
+from rational_factor.models.domain_transformation import ErfSeparableTF
+from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
@@ -21,16 +23,23 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     n_basis = 300
+    test_tran_params = {
+        "n_epochs_per_group": [20, 5], # basis, weights
+        "iterations": 10,
+        "lr_basis": 5e-2,
+        "lr_weights": 1e-2,
+        "lr_wrap": 1e-2,
+    }
     obs_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 20,
-        "lr_basis": 5e-2,
+        "iterations": 40,
+        "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
     tran_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 15,
-        "lr_basis": 5e-2,
+        "iterations": 30,
+        "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
     init_params = {
@@ -40,7 +49,7 @@ if __name__ == "__main__":
         "lr_weights": 1e-2,
     }
 
-    batch_size = 256
+    batch_size = 512
 
     n_data_init = 2000
     n_data_tran = 20000
@@ -48,7 +57,7 @@ if __name__ == "__main__":
 
     n_timesteps_prop = 10
     n_particles_test = 3000
-    var_reg_strength = 0 #1e-2
+    var_reg_strength = 0 
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -80,21 +89,48 @@ if __name__ == "__main__":
     o_dataloader = DataLoader(o_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis  = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    psi_basis  = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    xi_basis   = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    zeta_basis = GaussianBasis.random_init(system.observation_dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
+    phi_basis  = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    psi_basis  = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    psi0_basis = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    xi_basis   = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    zeta_basis = BetaBasis.random_init(system.observation_dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+
+    # Train a fake transition model to get a good wrap dtf
+    wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True).to(device)
+    test_tran_model = CompositeConditionalModel([wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
+    optimizers = {
+        "basis": torch.optim.Adam(
+            [
+                {"params": test_tran_model.conditional_density_model.basis_params(), "lr": test_tran_params["lr_basis"]},
+                {"params": test_tran_model.domain_tfs.parameters(), "lr": test_tran_params["lr_wrap"]},
+            ]
+        ),
+        "weights": torch.optim.Adam(
+            test_tran_model.conditional_density_model.weight_params(), lr=test_tran_params["lr_weights"]
+        ),
+    }
+    print("Training test transition model")
+    test_tran_model, _, _ = train.train_iterate(test_tran_model, 
+        xp_dataloader, 
+        {"mle": loss.conditional_mle_loss}, 
+        optimizers,
+        epochs_per_group=test_tran_params["n_epochs_per_group"],
+        iterations=test_tran_params["iterations"],
+        verbose=True,
+        use_best="mle")
+    print("Done! \n")
+
+    trained_wrap_tf = ErfSeparableTF.copy_from_trainable(wrap_tf)
 
     # Create and train the observation model
-    obs_model = LinearRF(xi_basis, zeta_basis).to(device)
+    obs_model = CompositeConditionalModel([trained_wrap_tf], LinearRF(xi_basis, zeta_basis)).to(device)
     reg_loss_fn = lambda model, o, x: var_reg_strength * (
-        loss.gaussian_basis_var_reg_loss(model.xi_basis, mean=True)
-        + loss.gaussian_basis_var_reg_loss(model.zeta_basis, mean=True)
+        loss.beta_basis_concentration_reg_loss(model.conditional_density_model.xi_basis)
+        + loss.beta_basis_concentration_reg_loss(model.conditional_density_model.zeta_basis)
     )
     optimizers = {
-        "basis": torch.optim.Adam(obs_model.basis_params(), lr=obs_params["lr_basis"]),
-        "weights": torch.optim.Adam(obs_model.weight_params(), lr=obs_params["lr_weights"]),
+        "basis": torch.optim.Adam(obs_model.conditional_density_model.basis_params(), lr=obs_params["lr_basis"]),
+        "weights": torch.optim.Adam(obs_model.conditional_density_model.weight_params(), lr=obs_params["lr_weights"]),
     }
     print("Training observation model")
     obs_model, best_loss_obs, training_time_obs = train.train_iterate(obs_model, 
@@ -108,11 +144,16 @@ if __name__ == "__main__":
     print("Done! \n")
 
     # Create and train the transition model
-    tran_model = LinearR2FF.from_rf(obs_model, phi_basis, psi_basis).to(device)
-    reg_loss_fn = lambda model, xp, x : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
+    tran_model = CompositeConditionalModel(
+        [trained_wrap_tf], LinearR2FF.from_rf(obs_model.conditional_density_model, phi_basis, psi_basis)
+    ).to(device)
+    reg_loss_fn = lambda model, xp, x : var_reg_strength * (
+        loss.beta_basis_concentration_reg_loss(model.conditional_density_model.phi_basis) 
+        + loss.beta_basis_concentration_reg_loss(model.conditional_density_model.psi_basis)
+    )
     optimizers = {
-        "basis": torch.optim.Adam(tran_model.basis_params(), lr=tran_params["lr_basis"]),
-        "weights": torch.optim.Adam(tran_model.weight_params(), lr=tran_params["lr_weights"]),
+        "basis": torch.optim.Adam(tran_model.conditional_density_model.basis_params(), lr=tran_params["lr_basis"]),
+        "weights": torch.optim.Adam(tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"]),
     }
     print("Training transition model")
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(tran_model, 
@@ -125,11 +166,13 @@ if __name__ == "__main__":
         use_best="mle")
     print("Done! \n")
 
-    init_model = LinearFF.from_r2ff(tran_model, psi0_basis).to(device)
-    reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
+    init_model = CompositeDensityModel(
+        [trained_wrap_tf], LinearFF.from_r2ff(tran_model.conditional_density_model, psi0_basis)
+    ).to(device)
+    reg_loss_fn = lambda model, x : var_reg_strength * loss.beta_basis_concentration_reg_loss(model.density_model.psi0_basis)
     optimizers = {
-        "basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]),
-        "weights": torch.optim.Adam(init_model.weight_params(), lr=init_params["lr_weights"]),
+        "basis": torch.optim.Adam(init_model.density_model.basis_params(), lr=init_params["lr_basis"]),
+        "weights": torch.optim.Adam(init_model.density_model.weight_params(), lr=init_params["lr_weights"]),
     }
     print("Training initial model")
     init_model, best_loss_init, training_time_init = train.train_iterate(init_model, 
@@ -150,7 +193,8 @@ if __name__ == "__main__":
     sim_true_states, sim_observations = simulate(system, init_state_sampler, n_timesteps=n_timesteps_prop, device=device)
 
     # Run the filter
-    priors, posteriors = propagate.propagate_and_update(init_model, tran_model, obs_model, sim_observations)
+    dtf_sim_observations = [trained_wrap_tf(obs)[0] for obs in sim_observations]
+    priors, posteriors = propagate.propagate_and_update(init_model.density_model, tran_model.conditional_density_model, obs_model.conditional_density_model, dtf_sim_observations)
     print("length of priors: ", len(priors))
     print("length of posteriors: ", len(posteriors))
 
@@ -180,13 +224,13 @@ if __name__ == "__main__":
             print("Testing prior ", i)
             check_pdf_valid(priors[i-1], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
 
-            plot_belief(axes[i, 0], priors[i-1], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+            plot_belief(axes[i, 0], CompositeDensityModel([trained_wrap_tf], priors[i-1]), x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
             axes[i, 0].set_title(f"Prior at k={i}", fontsize=8)
 
         print("Testing posterior", i)
         check_pdf_valid(posteriors[i], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
 
-        plot_belief(axes[i, 1], posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+        plot_belief(axes[i, 1], CompositeDensityModel([trained_wrap_tf], posteriors[i]), x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
         axes[i, 1].set_title(f"Posterior at k={i}", fontsize=8)
 
         plot_particle_belief(axes[i, 2], wpf_posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
@@ -210,6 +254,6 @@ if __name__ == "__main__":
             axes[i, j].grid(alpha=0.25)
 
 
-    plt.savefig("figures/vdp_filter_gaussian.jpg", dpi=1000)
+    plt.savefig("figures/vdp_filter_beta.jpg", dpi=1000)
 
 
