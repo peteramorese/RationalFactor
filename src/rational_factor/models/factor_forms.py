@@ -222,13 +222,13 @@ class LinearR2FF(ConditionalDensityModel):
         return torch.nn.functional.softmax(self.__au, dim=0)
 
     def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
-        if Omega is None:
-            Omega = self.xi_basis.Omega3(self.phi_basis, self.psi_basis)
-
         if a is None:
             a = self.get_a()
 
-        denom = torch.einsum('i,j,ijk->k', self.d, a, Omega) 
+        if Omega is not None:
+            denom = torch.einsum('i,j,ijk->k', self.d, a, Omega)
+        else:
+            denom = self.xi_basis.Omega3_contract(self.phi_basis, self.psi_basis, self.d, a)
 
         b = a / (denom + self.numerical_tolerance)
 
@@ -364,12 +364,15 @@ class Linear2FF(DensityModel):
         if hasattr(self, "c0_fixed"):
             return self.c0_fixed
 
-        if Omega3_0 is None:
-            Omega3_0 = self.xi_basis.Omega3(self.phi_basis, self.psi0_basis)
-        
         c0_unnormalized = torch.nn.functional.softplus(self.__c0u)
-        
-        norm_constant = 1.0 / torch.einsum("i,j,k,ijk->", self.d, self.a, c0_unnormalized, Omega3_0)
+
+        if Omega3_0 is not None:
+            norm_denom = torch.einsum("i,j,k,ijk->", self.d, self.a, c0_unnormalized, Omega3_0)
+        else:
+            denom_vec = self.xi_basis.Omega3_contract(self.phi_basis, self.psi0_basis, self.d, self.a)
+            norm_denom = denom_vec @ c0_unnormalized
+
+        norm_constant = 1.0 / norm_denom
 
         return norm_constant * c0_unnormalized
         

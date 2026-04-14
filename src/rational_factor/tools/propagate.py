@@ -63,12 +63,18 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
                 c1 = bOmega_0 @ c0
 
             elif isinstance(curr_belief, Linear2FF):
-                Omega3_0 = curr_belief.xi_basis.Omega3(curr_belief.phi_basis, curr_belief.psi0_basis)
                 b = transition_model.get_b()
                 d = curr_belief.d
-                c0 = curr_belief.get_c0(Omega3_0=Omega3_0)
-                
-                c1 = torch.einsum("i,j,k,ijk->j", d, b, c0, Omega3_0)
+                c0 = curr_belief.get_c0()
+
+                # streamed: v[k] = sum_{i,j} d[i] b[j] Omega3[i,j,k], then c1[j] = v[j] * c0[j]
+                denom_vec = curr_belief.xi_basis.Omega3_contract(
+                    curr_belief.phi_basis,
+                    curr_belief.psi0_basis,
+                    d,
+                    b,
+                )
+                c1 = denom_vec * c0
 
             else:
                 raise ValueError(f"Unrecognized belief type '{type(curr_belief)}'")
@@ -101,8 +107,13 @@ def update(belief : DensityModel, observation_model : ConditionalDensityModel, o
         d_unnormalized = observation_model.get_e() * zeta_o
 
         c0_fixed = belief.c0_fixed
-        Omega3_0 = belief.xi_basis.Omega3(belief.phi_basis, belief.psi0_basis)
-        norm_constant = 1.0 / torch.einsum("i,j,k,ijk->", d_unnormalized, belief.a, c0_fixed, Omega3_0)
+        denom_vec = belief.xi_basis.Omega3_contract(
+            belief.phi_basis,
+            belief.psi0_basis,
+            d_unnormalized,
+            belief.a,
+        )
+        norm_constant = 1.0 / (denom_vec @ c0_fixed)
         d_updated = norm_constant * d_unnormalized
 
         belief_posterior = Linear2FF(d_updated, 

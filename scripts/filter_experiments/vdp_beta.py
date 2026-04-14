@@ -23,7 +23,7 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     n_basis = 300
-    test_tran_params = {
+    warm_start_tran_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
         "iterations": 10,
         "lr_basis": 5e-2,
@@ -95,27 +95,27 @@ if __name__ == "__main__":
     xi_basis   = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
     zeta_basis = BetaBasis.random_init(system.observation_dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
 
-    # Train a fake transition model to get a good wrap dtf
+    # Train a fake transition model to get a good wrap dtf and warm start the phi and psi basis functions
     wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True).to(device)
-    test_tran_model = CompositeConditionalModel([wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
+    warm_start_tran_model = CompositeConditionalModel([wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
     optimizers = {
         "basis": torch.optim.Adam(
             [
-                {"params": test_tran_model.conditional_density_model.basis_params(), "lr": test_tran_params["lr_basis"]},
-                {"params": test_tran_model.domain_tfs.parameters(), "lr": test_tran_params["lr_wrap"]},
+                {"params": warm_start_tran_model.conditional_density_model.basis_params(), "lr": warm_start_tran_params["lr_basis"]},
+                {"params": warm_start_tran_model.domain_tfs.parameters(), "lr": warm_start_tran_params["lr_wrap"]},
             ]
         ),
         "weights": torch.optim.Adam(
-            test_tran_model.conditional_density_model.weight_params(), lr=test_tran_params["lr_weights"]
+            warm_start_tran_model.conditional_density_model.weight_params(), lr=warm_start_tran_params["lr_weights"]
         ),
     }
-    print("Training test transition model")
-    test_tran_model, _, _ = train.train_iterate(test_tran_model, 
+    print("Training warm start transition model")
+    warm_start_tran_model, _, _ = train.train_iterate(warm_start_tran_model, 
         xp_dataloader, 
         {"mle": loss.conditional_mle_loss}, 
         optimizers,
-        epochs_per_group=test_tran_params["n_epochs_per_group"],
-        iterations=test_tran_params["iterations"],
+        epochs_per_group=warm_start_tran_params["n_epochs_per_group"],
+        iterations=warm_start_tran_params["iterations"],
         verbose=True,
         use_best="mle")
     print("Done! \n")

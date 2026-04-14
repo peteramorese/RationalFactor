@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import rational_factor.systems.po_truth_models as po_truth_models
 from rational_factor.systems.base import sample_io_pairs, sample_observation_pairs, simulate, SystemObservationDistribution, SystemTransitionDistribution
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF, LinearFF
+from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF, LinearFF, LinearRFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
@@ -21,6 +21,13 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     n_basis = 300
+    warm_start_tran_params = {
+        "n_epochs_per_group": [20, 5], # basis, weights
+        "iterations": 10,
+        "lr_basis": 5e-2,
+        "lr_weights": 1e-2,
+        "lr_wrap": 1e-2,
+    }
     obs_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
         "iterations": 20,
@@ -30,7 +37,7 @@ if __name__ == "__main__":
     tran_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
         "iterations": 15,
-        "lr_basis": 5e-2,
+        "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
     init_params = {
@@ -41,6 +48,7 @@ if __name__ == "__main__":
     }
 
     batch_size = 256
+    block_size = None
 
     n_data_init = 2000
     n_data_tran = 20000
@@ -80,11 +88,28 @@ if __name__ == "__main__":
     o_dataloader = DataLoader(o_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis  = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    psi_basis  = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    xi_basis   = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
-    zeta_basis = GaussianBasis.random_init(system.observation_dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3).to(device)
+    phi_basis  = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3, block_size=block_size).to(device)
+    psi_basis  = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3, block_size=block_size).to(device)
+    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3, block_size=block_size).to(device)
+    xi_basis   = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3, block_size=block_size).to(device)
+    zeta_basis = GaussianBasis.random_init(system.observation_dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 30.0], device=device), variance=20.0, min_std=1e-3, block_size=block_size).to(device)
+
+    # Train a fake transition model to get a good wrap dtf and warm start the phi and psi basis functions
+    warm_start_tran_model = LinearRFF(phi_basis, psi_basis).to(device)
+    optimizers = {
+        "basis": torch.optim.Adam(warm_start_tran_model.basis_params(), lr=warm_start_tran_params["lr_basis"]),
+        "weights": torch.optim.Adam(warm_start_tran_model.weight_params(), lr=warm_start_tran_params["lr_weights"]),
+    }
+    print("Training warm start transition model")
+    warm_start_tran_model, _, _ = train.train_iterate(warm_start_tran_model, 
+        xp_dataloader, 
+        {"mle": loss.conditional_mle_loss}, 
+        optimizers,
+        epochs_per_group=warm_start_tran_params["n_epochs_per_group"],
+        iterations=warm_start_tran_params["iterations"],
+        verbose=True,
+        use_best="mle")
+    print("Done! \n")
 
     # Create and train the observation model
     obs_model = LinearRF(xi_basis, zeta_basis).to(device)
@@ -150,7 +175,8 @@ if __name__ == "__main__":
     sim_true_states, sim_observations = simulate(system, init_state_sampler, n_timesteps=n_timesteps_prop, device=device)
 
     # Run the filter
-    priors, posteriors = propagate.propagate_and_update(init_model, tran_model, obs_model, sim_observations)
+    with torch.no_grad():
+        priors, posteriors = propagate.propagate_and_update(init_model, tran_model, obs_model, sim_observations)
     print("length of priors: ", len(priors))
     print("length of posteriors: ", len(posteriors))
 

@@ -117,27 +117,28 @@ class NonnegativeBasis:
 
 
 class GaussianBasis(SeparableBasis, NonnegativeBasis):
-    def __init__(self, params_init : torch.Tensor, trainable : bool = True, min_std : float = 1e-5):
+    def __init__(self, params_init : torch.Tensor, trainable : bool = True, min_std : float = 1e-5, block_size : int = None):
         assert params_init.shape[2] == 2, "params_init must have shape (d, n_basis, 2)"
         super().__init__(params_init, trainable)
         self.min_std = min_std
+        self.block_size = block_size
 
     @classmethod
-    def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5, variance: float = 1.0, device = None):
+    def random_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5, variance: float = 1.0, device = None, block_size : int = None):
         if device is None:
             device = offsets.device
         else:
             offsets = offsets.to(device)
         offsets = offsets.repeat(d, n_basis, 1)
-        return cls(torch.randn(d, n_basis, 2, device=device) * torch.sqrt(torch.tensor(variance, device=device)) + offsets, min_std=min_std)
+        return cls(torch.randn(d, n_basis, 2, device=device) * torch.sqrt(torch.tensor(variance, device=device)) + offsets, min_std=min_std, block_size=block_size)
 
     @classmethod
-    def set_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5):
+    def set_init(cls, d : int, n_basis : int, offsets : torch.Tensor = torch.zeros(2), min_std : float = 1e-5, block_size : int = None):
         offsets = offsets.repeat(d, n_basis, 1)
-        return cls(offsets, min_std=min_std)
+        return cls(offsets, min_std=min_std, block_size=block_size)
 
     def freeze_params(self):
-        return GaussianBasis(self.params.detach().clone(), trainable=False, min_std=self.min_std)
+        return GaussianBasis(self.params.detach().clone(), trainable=False, min_std=self.min_std, block_size=self.block_size)
 
     def means_stds(self):
         return self.params[..., 0], torch.nn.functional.softplus(self.params[..., 1] - 1.0) + self.min_std
@@ -182,57 +183,161 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         log_Omega = log_dim_ip.sum(dim=0)
         return torch.exp(log_Omega)
 
-    def Omega3(self, other1: "GaussianBasis", other2: "GaussianBasis"):
+    #def Omega3(self, other1: "GaussianBasis", other2: "GaussianBasis"):
+    #    assert isinstance(other1, GaussianBasis), "other1 must be GaussianBasis"
+    #    assert isinstance(other2, GaussianBasis), "other2 must be GaussianBasis"
+    #    assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
+
+    #    if self.block_size is not None:
+    #        return self.Omega3_slow(other1, other2)
+
+    #    # (d, n0), (d, n1), (d, n2)
+    #    mu0, std0 = self.means_stds()
+    #    mu1, std1 = other1.means_stds()
+    #    mu2, std2 = other2.means_stds()
+
+    #    var0 = std0 * std0
+    #    var1 = std1 * std1
+    #    var2 = std2 * std2
+
+    #    inv0 = 1.0 / var0
+    #    inv1 = 1.0 / var1
+    #    inv2 = 1.0 / var2
+
+    #    # Broadcast to (d, n0, n1, n2)
+    #    mu_i = mu0[:, :, None, None]
+    #    mu_j = mu1[:, None, :, None]
+    #    mu_k = mu2[:, None, None, :]
+
+    #    inv_i = inv0[:, :, None, None]
+    #    inv_j = inv1[:, None, :, None]
+    #    inv_k = inv2[:, None, None, :]
+
+    #    var_i = var0[:, :, None, None]
+    #    var_j = var1[:, None, :, None]
+    #    var_k = var2[:, None, None, :]
+
+    #    S = inv_i + inv_j + inv_k
+    #    T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k
+    #    U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k
+
+    #    two_pi = mu0.new_tensor(2.0 * torch.pi)
+    #    log2pi = torch.log(two_pi)
+
+    #    log_pref = -0.5 * (
+    #        3.0 * log2pi
+    #        + torch.log(var_i)
+    #        + torch.log(var_j)
+    #        + torch.log(var_k)
+    #    )
+    #    log_gauss_int = 0.5 * (log2pi - torch.log(S))
+    #    quad = -0.5 * (U - (T * T) / S)
+
+    #    log_dim = log_pref + log_gauss_int + quad   # (d, n0, n1, n2)
+    #    log_Omega = log_dim.sum(dim=0)              # (n0, n1, n2)
+
+    #    return torch.exp(log_Omega)
+
+    def Omega3_contract(
+        self,
+        other1: "GaussianBasis",
+        other2: "GaussianBasis",
+        left_i: torch.Tensor,
+        left_j: torch.Tensor,
+        block_size: int | None = None,
+    ):
+        """
+        Computes v[k] = sum_{i,j} left_i[i] * left_j[j] * Omega3[i,j,k]
+        without materializing Omega3.
+        """
         assert isinstance(other1, GaussianBasis), "other1 must be GaussianBasis"
         assert isinstance(other2, GaussianBasis), "other2 must be GaussianBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
+        assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
+        assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
 
-        # (d, n0), (d, n1), (d, n2)
         mu0, std0 = self.means_stds()
         mu1, std1 = other1.means_stds()
         mu2, std2 = other2.means_stds()
 
-        var0 = std0 * std0
-        var1 = std1 * std1
-        var2 = std2 * std2
+        var0 = std0.square()
+        var1 = std1.square()
+        var2 = std2.square()
 
-        inv0 = 1.0 / var0
-        inv1 = 1.0 / var1
-        inv2 = 1.0 / var2
+        inv0 = var0.reciprocal()
+        inv1 = var1.reciprocal()
+        inv2 = var2.reciprocal()
 
-        # Broadcast to (d, n0, n1, n2)
-        mu_i = mu0[:, :, None, None]
-        mu_j = mu1[:, None, :, None]
-        mu_k = mu2[:, None, None, :]
+        n0 = self.n_basis_functions()
+        n1 = other1.n_basis_functions()
+        n2 = other2.n_basis_functions()
 
-        inv_i = inv0[:, :, None, None]
-        inv_j = inv1[:, None, :, None]
-        inv_k = inv2[:, None, None, :]
+        log2pi = torch.log(mu0.new_tensor(2.0 * torch.pi))
 
-        var_i = var0[:, :, None, None]
-        var_j = var1[:, None, :, None]
-        var_k = var2[:, None, None, :]
+        if block_size is None:
+            block_size = self.block_size
+        if block_size is None:
+            # Full vectorized path (equivalent to building Omega3 then contracting).
+            mu_i = mu0[:, :, None, None]
+            mu_j = mu1[:, None, :, None]
+            mu_k = mu2[:, None, None, :]
 
-        S = inv_i + inv_j + inv_k
-        T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k
-        U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k
+            inv_i = inv0[:, :, None, None]
+            inv_j = inv1[:, None, :, None]
+            inv_k = inv2[:, None, None, :]
 
-        two_pi = mu0.new_tensor(2.0 * torch.pi)
-        log2pi = torch.log(two_pi)
+            var_i = var0[:, :, None, None]
+            var_j = var1[:, None, :, None]
+            var_k = var2[:, None, None, :]
 
-        log_pref = -0.5 * (
-            3.0 * log2pi
-            + torch.log(var_i)
-            + torch.log(var_j)
-            + torch.log(var_k)
-        )
-        log_gauss_int = 0.5 * (log2pi - torch.log(S))
-        quad = -0.5 * (U - (T * T) / S)
+            S = inv_i + inv_j + inv_k
+            T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k
+            U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k
 
-        log_dim = log_pref + log_gauss_int + quad   # (d, n0, n1, n2)
-        log_Omega = log_dim.sum(dim=0)              # (n0, n1, n2)
+            log_dim = (
+                -0.5 * (3.0 * log2pi + torch.log(var_i) + torch.log(var_j) + torch.log(var_k))
+                + 0.5 * (log2pi - torch.log(S))
+                - 0.5 * (U - T.square() / S)
+            )
+            omega_full = torch.exp(log_dim.sum(dim=0))
+            return torch.einsum("i,j,ijk->k", left_i, left_j, omega_full)
 
-        return torch.exp(log_Omega)
+        assert block_size > 0, "block_size must be positive"
+        denom = torch.zeros(n2, dtype=mu0.dtype, device=mu0.device)
+
+        for j_start in range(0, n1, block_size):
+            j_end = min(j_start + block_size, n1)
+            left_j_blk = left_j[j_start:j_end]
+            for k_start in range(0, n2, block_size):
+                k_end = min(k_start + block_size, n2)
+                log_chunk = torch.zeros((n0, j_end - j_start, k_end - k_start), dtype=mu0.dtype, device=mu0.device)
+                for r in range(self.dim()):
+                    mu_i = mu0[r, :, None, None]
+                    mu_j = mu1[r, None, j_start:j_end, None]
+                    mu_k = mu2[r, None, None, k_start:k_end]
+
+                    inv_i = inv0[r, :, None, None]
+                    inv_j = inv1[r, None, j_start:j_end, None]
+                    inv_k = inv2[r, None, None, k_start:k_end]
+
+                    var_i = var0[r, :, None, None]
+                    var_j = var1[r, None, j_start:j_end, None]
+                    var_k = var2[r, None, None, k_start:k_end]
+
+                    S = inv_i + inv_j + inv_k
+                    T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k
+                    U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k
+
+                    log_chunk += (
+                        -0.5 * (3.0 * log2pi + torch.log(var_i) + torch.log(var_j) + torch.log(var_k))
+                        + 0.5 * (log2pi - torch.log(S))
+                        - 0.5 * (U - T.square() / S)
+                    )
+
+                omega_chunk = torch.exp(log_chunk)
+                denom[k_start:k_end] += torch.einsum("i,j,ijk->k", left_i, left_j_blk, omega_chunk)
+
+        return denom
 
     #def Omega3(self, other1: "GaussianBasis", other2: "GaussianBasis"):
     #    assert isinstance(other1, GaussianBasis), "other1 must be GaussianBasis"
@@ -346,6 +451,7 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
             self.params[marginal_dims, :, :].detach().clone(),
             trainable=self.params.requires_grad,
             min_std=self.min_std,
+            block_size=self.block_size,
         )
 
 class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
@@ -422,7 +528,7 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         )
         return torch.exp(log_dim_int.sum(dim=0))  # (n1, n2)
     
-    def Omega3(self, other1: "QuadraticExpBasis", other2: "QuadraticExpBasis"):
+    def Omega3(self, other1: "QuadraticExpBasis", other2: "QuadraticExpBasis", block_size: int | None = None):
         assert isinstance(other1, QuadraticExpBasis), "other1 must be QuadraticExpBasis"
         assert isinstance(other2, QuadraticExpBasis), "other2 must be QuadraticExpBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
@@ -431,16 +537,100 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         a1, b1, c1 = other1.abc()   # (d, n1)
         a2, b2, c2 = other2.abc()   # (d, n2)
 
-        # Broadcast to (d, n0, n1, n2)
-        A = a0[:, :, None, None] + a1[:, None, :, None] + a2[:, None, None, :]
-        B = b0[:, :, None, None] + b1[:, None, :, None] + b2[:, None, None, :]
-        C = c0[:, :, None, None] + c1[:, None, :, None] + c2[:, None, None, :]
+        n0 = self.n_basis_functions()
+        n1 = other1.n_basis_functions()
+        n2 = other2.n_basis_functions()
+        log_pi = torch.log(torch.tensor(torch.pi, dtype=a0.dtype, device=a0.device))
 
-        log_pi = torch.log(torch.tensor(torch.pi, dtype=A.dtype, device=A.device))
-        log_dim_int = C - (B * B) / (4.0 * A) + 0.5 * (log_pi - torch.log(-A))
+        if block_size is None:
+            A = a0[:, :, None, None] + a1[:, None, :, None] + a2[:, None, None, :]
+            B = b0[:, :, None, None] + b1[:, None, :, None] + b2[:, None, None, :]
+            C = c0[:, :, None, None] + c1[:, None, :, None] + c2[:, None, None, :]
+            log_dim_int = C - (B * B) / (4.0 * A) + 0.5 * (log_pi - torch.log(-A))
+            return torch.exp(log_dim_int.sum(dim=0))
 
-        log_Omega = log_dim_int.sum(dim=0)   # (n0, n1, n2)
+        assert block_size > 0, "block_size must be positive"
+        log_Omega = torch.zeros((n0, n1, n2), dtype=a0.dtype, device=a0.device)
+        for r in range(self.dim()):
+            for j_start in range(0, n1, block_size):
+                j_end = min(j_start + block_size, n1)
+                for k_start in range(0, n2, block_size):
+                    k_end = min(k_start + block_size, n2)
+                    A = a0[r, :, None, None] + a1[r, None, j_start:j_end, None] + a2[r, None, None, k_start:k_end]
+                    B = b0[r, :, None, None] + b1[r, None, j_start:j_end, None] + b2[r, None, None, k_start:k_end]
+                    C = c0[r, :, None, None] + c1[r, None, j_start:j_end, None] + c2[r, None, None, k_start:k_end]
+                    log_Omega[:, j_start:j_end, k_start:k_end] += C - (B * B) / (4.0 * A) + 0.5 * (log_pi - torch.log(-A))
         return torch.exp(log_Omega)
+
+    def Omega3_slow(self, other1: "QuadraticExpBasis", other2: "QuadraticExpBasis", block_size: int = 32):
+        return self.Omega3(other1, other2, block_size=block_size)
+
+    def Omega3_contract(
+        self,
+        other1: "QuadraticExpBasis",
+        other2: "QuadraticExpBasis",
+        left_i: torch.Tensor,
+        left_j: torch.Tensor,
+        block_size: int | None = None,
+    ):
+        """
+        Computes v[k] = sum_{i,j} left_i[i] * left_j[j] * Omega3[i,j,k]
+        without materializing Omega3.
+        """
+        assert isinstance(other1, QuadraticExpBasis), "other1 must be QuadraticExpBasis"
+        assert isinstance(other2, QuadraticExpBasis), "other2 must be QuadraticExpBasis"
+        assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
+        assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
+        assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
+
+        a0, b0, c0 = self.abc()
+        a1, b1, c1 = other1.abc()
+        a2, b2, c2 = other2.abc()
+
+        n0 = self.n_basis_functions()
+        n1 = other1.n_basis_functions()
+        n2 = other2.n_basis_functions()
+
+        log_pi = torch.log(torch.tensor(torch.pi, dtype=a0.dtype, device=a0.device))
+
+        if block_size is None:
+            A = a0[:, :, None, None] + a1[:, None, :, None] + a2[:, None, None, :]
+            B = b0[:, :, None, None] + b1[:, None, :, None] + b2[:, None, None, :]
+            C = c0[:, :, None, None] + c1[:, None, :, None] + c2[:, None, None, :]
+            log_dim_int = C - (B * B) / (4.0 * A) + 0.5 * (log_pi - torch.log(-A))
+            omega_full = torch.exp(log_dim_int.sum(dim=0))
+            return torch.einsum("i,j,ijk->k", left_i, left_j, omega_full)
+
+        assert block_size > 0, "block_size must be positive"
+        denom = torch.zeros(n2, dtype=a0.dtype, device=a0.device)
+        for j_start in range(0, n1, block_size):
+            j_end = min(j_start + block_size, n1)
+            left_j_blk = left_j[j_start:j_end]
+            for k_start in range(0, n2, block_size):
+                k_end = min(k_start + block_size, n2)
+                log_chunk = torch.zeros((n0, j_end - j_start, k_end - k_start), dtype=a0.dtype, device=a0.device)
+                for r in range(self.dim()):
+                    A = (
+                        a0[r, :, None, None]
+                        + a1[r, None, j_start:j_end, None]
+                        + a2[r, None, None, k_start:k_end]
+                    )
+                    B = (
+                        b0[r, :, None, None]
+                        + b1[r, None, j_start:j_end, None]
+                        + b2[r, None, None, k_start:k_end]
+                    )
+                    C = (
+                        c0[r, :, None, None]
+                        + c1[r, None, j_start:j_end, None]
+                        + c2[r, None, None, k_start:k_end]
+                    )
+                    log_chunk += C - (B * B) / (4.0 * A) + 0.5 * (log_pi - torch.log(-A))
+
+                omega_chunk = torch.exp(log_chunk)
+                denom[k_start:k_end] += torch.einsum("i,j,ijk->k", left_i, left_j_blk, omega_chunk)
+
+        return denom
     
     def Omega22(self, other: "QuadraticExpBasis"):
         """
@@ -628,7 +818,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         log_Omega = log_dim_ip.sum(dim=0)  # (n1, n2)
         return torch.exp(log_Omega)
 
-    def Omega3(self, other1: "BetaBasis", other2: "BetaBasis"):
+    def Omega3(self, other1: "BetaBasis", other2: "BetaBasis", block_size: int | None = None):
         assert isinstance(other1, BetaBasis), "other1 must be BetaBasis"
         assert isinstance(other2, BetaBasis), "other2 must be BetaBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
@@ -637,27 +827,133 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         a1, b1 = other1.alphas_betas()  # (d, n1)
         a2, b2 = other2.alphas_betas()  # (d, n2)
 
-        # Broadcast to (d, n0, n1, n2)
-        a_i = a0[:, :, None, None]
-        a_j = a1[:, None, :, None]
-        a_k = a2[:, None, None, :]
+        n0 = self.n_basis_functions()
+        n1 = other1.n_basis_functions()
+        n2 = other2.n_basis_functions()
 
-        b_i = b0[:, :, None, None]
-        b_j = b1[:, None, :, None]
-        b_k = b2[:, None, None, :]
+        if block_size is None:
+            a_i = a0[:, :, None, None]
+            a_j = a1[:, None, :, None]
+            a_k = a2[:, None, None, :]
+            b_i = b0[:, :, None, None]
+            b_j = b1[:, None, :, None]
+            b_k = b2[:, None, None, :]
+            a_sum = a_i + a_j + a_k - 2.0
+            b_sum = b_i + b_j + b_k - 2.0
+            log_dim = (
+                self._log_beta_fn(a_sum, b_sum)
+                - self._log_beta_fn(a_i, b_i)
+                - self._log_beta_fn(a_j, b_j)
+                - self._log_beta_fn(a_k, b_k)
+            )
+            return torch.exp(log_dim.sum(dim=0))
 
-        a_sum = a_i + a_j + a_k - 2.0
-        b_sum = b_i + b_j + b_k - 2.0
+        assert block_size > 0, "block_size must be positive"
+        log_Omega = torch.zeros((n0, n1, n2), dtype=a0.dtype, device=a0.device)
+        for r in range(self.dim()):
+            for j_start in range(0, n1, block_size):
+                j_end = min(j_start + block_size, n1)
+                for k_start in range(0, n2, block_size):
+                    k_end = min(k_start + block_size, n2)
+                    a_i = a0[r, :, None, None]
+                    a_j = a1[r, None, j_start:j_end, None]
+                    a_k = a2[r, None, None, k_start:k_end]
 
-        log_dim = (
-            self._log_beta_fn(a_sum, b_sum)
-            - self._log_beta_fn(a_i, b_i)
-            - self._log_beta_fn(a_j, b_j)
-            - self._log_beta_fn(a_k, b_k)
-        )
+                    b_i = b0[r, :, None, None]
+                    b_j = b1[r, None, j_start:j_end, None]
+                    b_k = b2[r, None, None, k_start:k_end]
 
-        log_Omega = log_dim.sum(dim=0)   # (n0, n1, n2)
+                    a_sum = a_i + a_j + a_k - 2.0
+                    b_sum = b_i + b_j + b_k - 2.0
+
+                    log_Omega[:, j_start:j_end, k_start:k_end] += (
+                        self._log_beta_fn(a_sum, b_sum)
+                        - self._log_beta_fn(a_i, b_i)
+                        - self._log_beta_fn(a_j, b_j)
+                        - self._log_beta_fn(a_k, b_k)
+                    )
+
         return torch.exp(log_Omega)
+
+    def Omega3_slow(self, other1: "BetaBasis", other2: "BetaBasis", block_size: int = 32):
+        return self.Omega3(other1, other2, block_size=block_size)
+
+    def Omega3_contract(
+        self,
+        other1: "BetaBasis",
+        other2: "BetaBasis",
+        left_i: torch.Tensor,
+        left_j: torch.Tensor,
+        block_size: int | None = None,
+    ):
+        """
+        Computes v[k] = sum_{i,j} left_i[i] * left_j[j] * Omega3[i,j,k]
+        without materializing Omega3.
+        """
+        assert isinstance(other1, BetaBasis), "other1 must be BetaBasis"
+        assert isinstance(other2, BetaBasis), "other2 must be BetaBasis"
+        assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
+        assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
+        assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
+
+        a0, b0 = self.alphas_betas()
+        a1, b1 = other1.alphas_betas()
+        a2, b2 = other2.alphas_betas()
+
+        n0 = self.n_basis_functions()
+        n1 = other1.n_basis_functions()
+        n2 = other2.n_basis_functions()
+
+        if block_size is None:
+            a_i = a0[:, :, None, None]
+            a_j = a1[:, None, :, None]
+            a_k = a2[:, None, None, :]
+            b_i = b0[:, :, None, None]
+            b_j = b1[:, None, :, None]
+            b_k = b2[:, None, None, :]
+            a_sum = a_i + a_j + a_k - 2.0
+            b_sum = b_i + b_j + b_k - 2.0
+            log_dim = (
+                self._log_beta_fn(a_sum, b_sum)
+                - self._log_beta_fn(a_i, b_i)
+                - self._log_beta_fn(a_j, b_j)
+                - self._log_beta_fn(a_k, b_k)
+            )
+            omega_full = torch.exp(log_dim.sum(dim=0))
+            return torch.einsum("i,j,ijk->k", left_i, left_j, omega_full)
+
+        assert block_size > 0, "block_size must be positive"
+        denom = torch.zeros(n2, dtype=a0.dtype, device=a0.device)
+
+        for j_start in range(0, n1, block_size):
+            j_end = min(j_start + block_size, n1)
+            left_j_blk = left_j[j_start:j_end]
+            for k_start in range(0, n2, block_size):
+                k_end = min(k_start + block_size, n2)
+                log_chunk = torch.zeros((n0, j_end - j_start, k_end - k_start), dtype=a0.dtype, device=a0.device)
+                for r in range(self.dim()):
+                    a_i = a0[r, :, None, None]
+                    a_j = a1[r, None, j_start:j_end, None]
+                    a_k = a2[r, None, None, k_start:k_end]
+
+                    b_i = b0[r, :, None, None]
+                    b_j = b1[r, None, j_start:j_end, None]
+                    b_k = b2[r, None, None, k_start:k_end]
+
+                    a_sum = a_i + a_j + a_k - 2.0
+                    b_sum = b_i + b_j + b_k - 2.0
+
+                    log_chunk += (
+                        self._log_beta_fn(a_sum, b_sum)
+                        - self._log_beta_fn(a_i, b_i)
+                        - self._log_beta_fn(a_j, b_j)
+                        - self._log_beta_fn(a_k, b_k)
+                    )
+
+                omega_chunk = torch.exp(log_chunk)
+                denom[k_start:k_end] += torch.einsum("i,j,ijk->k", left_i, left_j_blk, omega_chunk)
+
+        return denom
 
     def Omega22(self, other: "BetaBasis"):
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
