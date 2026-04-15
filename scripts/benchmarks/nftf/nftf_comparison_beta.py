@@ -36,7 +36,7 @@ CONTEXT_WITHOUT_NFTF = {
         "lr_weights": 1e-2,
     },
     "batch_size": 256,
-    "var_reg_strength": 1e-3,
+    "var_reg_strength": 0,
     "verbose": True,
 }
 
@@ -58,7 +58,7 @@ CONTEXT_WITH_NFTF = {
         "lr_weights": 1e-2,
     },
     "batch_size": 256,
-    "var_reg_strength": 1e-3,
+    "var_reg_strength": 0,
     "verbose": True,
 }
 

@@ -20,8 +20,8 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    use_dtf = True
-    n_basis = 1000
+    use_dtf = False
+    n_basis = 500
     if use_dtf:
         tran_params = {
             "n_epochs_per_group": [15, 5], # dtf_params and basis, weights
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     n_data_tran = 10000
     n_data_init = 1000
     #var_reg_strength = 5e-3
-    var_reg_strength = 1e-2
+    var_reg_strength = 0#1e-2
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
