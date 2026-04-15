@@ -23,8 +23,8 @@ CONTEXT_WITHOUT_NFTF = {
     "use_nftf": False,
     "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [15, 5],
-        "iterations": 50,
+        "n_epochs_per_group": [20, 5],
+        "iterations": 60,
         "lr_basis": 5e-2,
         "lr_weights": 1e-2,
         "lr_wrap": 1e-3,
@@ -44,8 +44,8 @@ CONTEXT_WITH_NFTF = {
     "use_nftf": True,
     "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [15, 5],
-        "iterations": 50,
+        "n_epochs_per_group": [20, 5],
+        "iterations": 60,
         "lr_basis": 5e-2,
         "lr_weights": 1e-2,
         "lr_dtf": 1e-3,
