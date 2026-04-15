@@ -80,12 +80,10 @@ def run_basis_experiment(basis_name: str, device: torch.device, use_gpu: bool) -
         n_timesteps=N_TIMESTEPS_TRAIN,
         n_trajectories=N_TRAJECTORIES_TRAIN,
     )
-    x0_data = TensorDataset(traj_data[0])
     x_k, x_kp1 = create_transition_data_matrix(traj_data, separate=True)
-    xp_data = TensorDataset(x_k, x_kp1)
 
-    x0_dataloader = DataLoader(x0_data, batch_size=BATCH_SIZE, shuffle=True, pin_memory=use_gpu)
-    xp_dataloader = DataLoader(xp_data, batch_size=BATCH_SIZE, shuffle=True, pin_memory=use_gpu)
+    x0_dataloader = DataLoader(TensorDataset(traj_data[0]), batch_size=BATCH_SIZE, shuffle=True, pin_memory=use_gpu)
+    xp_dataloader = DataLoader(TensorDataset(x_k, x_kp1), batch_size=BATCH_SIZE, shuffle=True, pin_memory=use_gpu)
 
     phi_basis = _make_basis(basis_name, system.dim(), N_BASIS)
     psi_basis = _make_basis(basis_name, system.dim(), N_BASIS)

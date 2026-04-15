@@ -188,7 +188,7 @@ def main() -> None:
     x_k_data, x_kp1_data = sample_io_pairs(system, prev_state_sampler, n_pairs=N_DATA_TRAN)
 
     x0_dataset = TensorDataset(x0_data)
-    xp_dataset = TensorDataset(x_k_data, x_kp1_data)
+    xp_dataset = TensorDataset(x_kp1_data, x_k_data)
 
     def experiment(
         use_nftf: bool,

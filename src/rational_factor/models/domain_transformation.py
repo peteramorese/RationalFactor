@@ -36,7 +36,7 @@ class DomainTF(torch.nn.Module):
 class ErfSeparableTF(DomainTF):
     """Maps x to z via a parameterized Gaussian CDF per dimension: z_d = Phi((x_d - loc_d) / scale_d)."""
 
-    def __init__(self, dim : int, loc : torch.Tensor, scale : torch.Tensor, trainable : bool = True, min_scale : float = 1e-3):
+    def __init__(self, dim : int, loc : torch.Tensor, scale : torch.Tensor, trainable : bool = True, min_scale : float = 1e-3, numerical_tolerance : float = 1e-20):
         super().__init__(dim)
         # (dim, 2): column 0 = location, column 1 = raw scale (softplus applied in forward)
         self.trainable = trainable
@@ -45,6 +45,8 @@ class ErfSeparableTF(DomainTF):
             self.params = torch.nn.Parameter(torch.hstack([loc.unsqueeze(1), scale_params.unsqueeze(1)]))
         else:
             self.register_buffer("params", torch.hstack([loc.unsqueeze(1), scale.unsqueeze(1)]))
+
+        self.numerical_tolerance = numerical_tolerance
 
     @classmethod
     def copy_from_trainable(cls, other : 'ErfSeparableTF'):
@@ -78,7 +80,7 @@ class ErfSeparableTF(DomainTF):
     def inverse(self, z : torch.Tensor):
         loc, scale = self._loc_scale()
         sqrt_2 = torch.sqrt(z.new_tensor(2.0))
-        u = torch.special.erfinv(2.0 * z.clamp(1e-6, 1.0 - 1e-6) - 1.0)
+        u = torch.special.erfinv(2.0 * z.clamp(self.numerical_tolerance, 1.0 - self.numerical_tolerance) - 1.0)
         x = loc + scale * sqrt_2 * u
         ladj = (torch.log(scale) + 0.5 * (torch.log(z.new_tensor(2.0 * torch.pi)) + u ** 2)).sum(dim=-1) 
         return x, ladj

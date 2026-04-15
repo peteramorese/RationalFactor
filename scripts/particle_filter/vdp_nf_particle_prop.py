@@ -12,69 +12,12 @@ from rational_factor.systems.base import (
     SystemTransitionDistribution,
 )
 from rational_factor.models import loss
+import rational_factor.models.train as rf_train
 from rational_factor.tools.misc import make_mvnormal_init_sampler
 from rational_factor.tools.visualization import plot_particle_belief
 
 from particle_filter.particle_set import WeightedParticleSet
 from particle_filter.propagate import propagate_and_update
-
-
-def train_density_model(
-    model: NormalizingFlow,
-    dataloader: DataLoader,
-    *,
-    lr: float,
-    epochs: int,
-    device: torch.device,
-):
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    model.train()
-
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        for batch in dataloader:
-            x = batch[0].to(device)
-            optimizer.zero_grad()
-            batch_loss = loss.mle_loss(model, x)
-            batch_loss.backward()
-            optimizer.step()
-            epoch_loss += batch_loss.item()
-
-        avg_loss = epoch_loss / len(dataloader)
-        print(f"[init] epoch {epoch + 1}/{epochs} loss={avg_loss:.4f}")
-
-    return model
-
-
-def train_conditional_model(
-    model: ConditionalNormalizingFlow,
-    dataloader: DataLoader,
-    *,
-    lr: float,
-    epochs: int,
-    tag: str,
-    device: torch.device,
-):
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    model.train()
-
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        for batch in dataloader:
-            x = batch[0].to(device)
-            conditioner = batch[1].to(device)
-            optimizer.zero_grad()
-            batch_loss = loss.conditional_mle_loss(model, x, conditioner)
-            batch_loss.backward()
-            optimizer.step()
-            epoch_loss += batch_loss.item()
-
-        avg_loss = epoch_loss / len(dataloader)
-        print(f"[{tag}] epoch {epoch + 1}/{epochs} loss={avg_loss:.4f}")
-
-    return model
 
 
 def main():
@@ -144,31 +87,49 @@ def main():
         hidden_features=train_params["hidden_features"],
     )
 
+    labeled_mle = {"mle": loss.mle_loss}
+    labeled_cond_mle = {"mle": loss.conditional_mle_loss}
+
     print("Training initial flow model")
-    init_model = train_density_model(
+    init_model = init_model.to(device)
+    init_opt = torch.optim.Adam(init_model.parameters(), lr=train_params["lr"])
+    init_model, best_loss_init, training_time_init = rf_train.train(
         init_model,
         init_loader,
-        lr=train_params["lr"],
+        labeled_mle,
+        init_opt,
         epochs=train_params["init_epochs"],
-        device=device,
+        verbose=True,
+        use_best="mle",
     )
     print("Training transition flow model")
-    transition_model = train_conditional_model(
+    transition_model = transition_model.to(device)
+    tran_opt = torch.optim.Adam(transition_model.parameters(), lr=train_params["lr"])
+    transition_model, best_loss_tran, training_time_tran = rf_train.train(
         transition_model,
         tran_loader,
-        lr=train_params["lr"],
+        labeled_cond_mle,
+        tran_opt,
         epochs=train_params["tran_epochs"],
-        tag="tran",
-        device=device,
+        verbose=True,
+        use_best="mle",
     )
     print("Training observation flow model")
-    observation_model = train_conditional_model(
+    observation_model = observation_model.to(device)
+    obs_opt = torch.optim.Adam(observation_model.parameters(), lr=train_params["lr"])
+    observation_model, best_loss_obs, training_time_obs = rf_train.train(
         observation_model,
         obs_loader,
-        lr=train_params["lr"],
+        labeled_cond_mle,
+        obs_opt,
         epochs=train_params["obs_epochs"],
-        tag="obs",
-        device=device,
+        verbose=True,
+        use_best="mle",
+    )
+    print(
+        f"Initial model loss: {best_loss_init:.4f}, time: {training_time_init:.2f}s | "
+        f"Transition: {best_loss_tran:.4f}, time: {training_time_tran:.2f}s | "
+        f"Observation: {best_loss_obs:.4f}, time: {training_time_obs:.2f}s"
     )
 
     init_model.eval()

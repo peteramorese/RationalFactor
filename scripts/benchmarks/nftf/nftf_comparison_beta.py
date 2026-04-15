@@ -1,3 +1,5 @@
+"""Benchmark: Van der Pol with Beta basis — ErfSeparable wrap only vs wrap + MaskedAffine NFTF."""
+
 from __future__ import annotations
 from pathlib import Path
 
@@ -8,81 +10,65 @@ import rational_factor.models.loss as loss
 import rational_factor.models.train as train
 import rational_factor.systems.truth_models as truth_models
 import rational_factor.tools.propagate as propagate
-from rational_factor.models.basis_functions import GaussianBasis
+from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import MaskedAffineNFTF, MaskedRQSNFTF
+from rational_factor.models.domain_transformation import ErfSeparableTF, MaskedAffineNFTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.base import sample_io_pairs, sample_trajectories
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
 from rational_factor.tools.misc import make_mvnormal_init_sampler
 
-
-CONTEXT_MASKED_AFFINE = {
-    "nftf_type": "masked_affine",
-    "n_basis": 1000,
+CONTEXT_WITHOUT_NFTF = {
+    "use_nftf": False,
+    "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [10, 5],
-        "iterations": 20,
+        "n_epochs_per_group": [15, 5],
+        "iterations": 30,
         "lr_basis": 5e-2,
         "lr_weights": 1e-2,
-        "lr_dtf": 1e-3,
+        "lr_wrap": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
+        "iterations": 100,
+        "lr_basis": 5e-2,
         "lr_weights": 1e-2,
     },
     "batch_size": 256,
-    "var_reg_strength": 5e-1,
+    "var_reg_strength": 1e-3,
     "verbose": True,
 }
 
-CONTEXT_MASKED_RQS = {
-    "nftf_type": "masked_rqs",
-    "n_basis": 1000,
+CONTEXT_WITH_NFTF = {
+    "use_nftf": True,
+    "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [10, 5],
-        "iterations": 20,
+        "n_epochs_per_group": [15, 5],
+        "iterations": 30,
         "lr_basis": 5e-2,
         "lr_weights": 1e-2,
         "lr_dtf": 1e-3,
+        "lr_wrap": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
+        "iterations": 100,
+        "lr_basis": 5e-2,
         "lr_weights": 1e-2,
     },
     "batch_size": 256,
-    "var_reg_strength": 5e-1,
+    "var_reg_strength": 1e-3,
     "verbose": True,
 }
 
 TRIALS = 15
 BENCHMARK_ROOT = "benchmark_data"
 
-N_DATA_TRAN = 20000
-N_DATA_INIT = 2000
+N_DATA_TRAN = 10000
+N_DATA_INIT = 1000
 N_TRAJECTORIES_TEST = 2000
 N_TIMESTEPS_PROP = 15
-
-
-def _make_trainable_nftf(nftf_type: str, dim: int) -> torch.nn.Module:
-    if nftf_type == "masked_affine":
-        return MaskedAffineNFTF(dim, trainable=True, hidden_features=128, n_layers=5)
-    if nftf_type == "masked_rqs":
-        return MaskedRQSNFTF(dim, trainable=True, hidden_features=128, n_layers=5)
-    raise ValueError(f"Unknown nftf_type: {nftf_type}")
-
-
-def _freeze_trained_nftf(nftf_type: str, nftf: torch.nn.Module) -> torch.nn.Module:
-    if nftf_type == "masked_affine":
-        return MaskedAffineNFTF.copy_from_trainable(nftf)
-    if nftf_type == "masked_rqs":
-        return MaskedRQSNFTF.copy_from_trainable(nftf)
-    raise ValueError(f"Unknown nftf_type: {nftf_type}")
 
 
 def main() -> None:
@@ -114,10 +100,10 @@ def main() -> None:
     x_k_data, x_kp1_data = sample_io_pairs(system, prev_state_sampler, n_pairs=N_DATA_TRAN)
 
     x0_dataset = TensorDataset(x0_data)
-    xp_dataset = TensorDataset(x_k_data, x_kp1_data)
+    xp_dataset = TensorDataset(x_kp1_data, x_k_data)
 
     def experiment(
-        nftf_type: str,
+        use_nftf: bool,
         n_basis: int,
         tran_params: dict,
         init_params: dict,
@@ -128,47 +114,72 @@ def main() -> None:
         x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
         xp_dataloader = DataLoader(xp_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-        phi_basis = GaussianBasis.random_init(
+        offsets = torch.tensor([10.0, 10.0], device=device)
+        phi_basis = BetaBasis.random_init(
             system.dim(),
             n_basis=n_basis,
-            offsets=torch.tensor([0.0, 20.0], device=device),
+            offsets=offsets,
             variance=30.0,
-            min_std=1e-4,
+            min_concentration=1.0,
         ).to(device)
-        psi_basis = GaussianBasis.random_init(
+        psi_basis = BetaBasis.random_init(
             system.dim(),
             n_basis=n_basis,
-            offsets=torch.tensor([0.0, 20.0], device=device),
+            offsets=offsets,
             variance=30.0,
-            min_std=1e-4,
+            min_concentration=1.0,
         ).to(device)
-        psi0_basis = GaussianBasis.random_init(
+        psi0_basis = BetaBasis.random_init(
             system.dim(),
             n_basis=n_basis,
-            offsets=torch.tensor([0.0, 20.0], device=device),
+            offsets=offsets,
             variance=30.0,
-            min_std=1e-4,
+            min_concentration=1.0,
         ).to(device)
 
-        nftf = _make_trainable_nftf(nftf_type, system.dim()).to(device)
-        tran_model = CompositeConditionalModel([nftf], LinearRFF(phi_basis, psi_basis)).to(device)
+        wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True).to(device)
+        nftf = (
+            MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
+            if use_nftf
+            else None
+        )
+
+        if use_nftf:
+            tran_model = CompositeConditionalModel([nftf, wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
+        else:
+            tran_model = CompositeConditionalModel([wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
 
         mle_loss_fn = loss.conditional_mle_loss
         var_reg_loss_fn = lambda model, x, xp: var_reg_strength * (
-            loss.gaussian_basis_var_reg_loss(model.conditional_density_model.phi_basis, mean=True)
-            + loss.gaussian_basis_var_reg_loss(model.conditional_density_model.psi_basis, mean=True)
+            loss.beta_basis_concentration_reg_loss(model.conditional_density_model.phi_basis)
+            + loss.beta_basis_concentration_reg_loss(model.conditional_density_model.psi_basis)
         )
-        optimizers = {
-            "dtf_and_basis": torch.optim.Adam(
-                [
-                    {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
-                    {"params": tran_model.domain_tfs.parameters(), "lr": tran_params["lr_dtf"]},
-                ]
-            ),
-            "weights": torch.optim.Adam(
-                tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"]
-            ),
-        }
+
+        if use_nftf:
+            optimizers = {
+                "dtf_and_basis": torch.optim.Adam(
+                    [
+                        {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
+                        {"params": tran_model.domain_tfs[0].parameters(), "lr": tran_params["lr_dtf"]},
+                        {"params": tran_model.domain_tfs[1].parameters(), "lr": tran_params["lr_wrap"]},
+                    ]
+                ),
+                "weights": torch.optim.Adam(
+                    tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"]
+                ),
+            }
+        else:
+            optimizers = {
+                "basis": torch.optim.Adam(
+                    [
+                        {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
+                        {"params": tran_model.domain_tfs.parameters(), "lr": tran_params["lr_wrap"]},
+                    ]
+                ),
+                "weights": torch.optim.Adam(
+                    tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"]
+                ),
+            }
 
         tran_model, best_loss_tran, training_time_tran = train.train_iterate(
             tran_model,
@@ -181,14 +192,21 @@ def main() -> None:
             use_best="mle",
         )
 
-        trained_nftf = _freeze_trained_nftf(nftf_type, nftf).to(device)
-        init_model = CompositeDensityModel(
-            [trained_nftf], LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis)
-        ).to(device)
+        trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_nftf else None
+        trained_domain_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
+
+        if use_nftf:
+            init_model = CompositeDensityModel(
+                [trained_nftf, trained_domain_tf], LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis)
+            ).to(device)
+        else:
+            init_model = CompositeDensityModel(
+                [trained_domain_tf], LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis)
+            ).to(device)
 
         mle_loss_fn = loss.mle_loss
-        var_reg_loss_fn = lambda model, x: var_reg_strength * loss.gaussian_basis_var_reg_loss(
-            model.density_model.psi0_basis, mean=True
+        var_reg_loss_fn = lambda model, x: var_reg_strength * loss.beta_basis_concentration_reg_loss(
+            model.density_model.psi0_basis
         )
         optimizers = {
             "basis": torch.optim.Adam(init_model.density_model.basis_params(), lr=init_params["lr_basis"]),
@@ -209,7 +227,10 @@ def main() -> None:
         base_belief_seq = propagate.propagate(
             init_model.density_model, tran_model.conditional_density_model, n_steps=N_TIMESTEPS_PROP
         )
-        belief_seq = [CompositeDensityModel([trained_nftf], belief) for belief in base_belief_seq]
+        if use_nftf:
+            belief_seq = [CompositeDensityModel([trained_nftf, trained_domain_tf], belief) for belief in base_belief_seq]
+        else:
+            belief_seq = [CompositeDensityModel([trained_domain_tf], belief) for belief in base_belief_seq]
 
         ll_per_step = []
         for i in range(N_TIMESTEPS_PROP):
@@ -227,8 +248,8 @@ def main() -> None:
         )
 
     contexts = [
-        {"name": "masked_affine", "params": CONTEXT_MASKED_AFFINE},
-        {"name": "masked_rqs", "params": CONTEXT_MASKED_RQS},
+        {"name": "beta_wrap_only", "params": CONTEXT_WITHOUT_NFTF},
+        {"name": "beta_nftf_and_wrap", "params": CONTEXT_WITH_NFTF},
     ]
 
     benchmark = Benchmark(name=Path(__file__).stem)

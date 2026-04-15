@@ -100,10 +100,13 @@ def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoad
         total_sum_loss = 0.0
         sum_losses = [0.0 for _ in loss_fns]
         for batch in data_loader:
+            dev = next(model.parameters()).device
             if isinstance(batch, list):
-                batch = [b.to(next(model.parameters()).device) for b in batch]
+                batch = [b.to(dev) for b in batch]
+            elif isinstance(batch, tuple):
+                batch = tuple(b.to(dev) for b in batch)
             else:
-                batch = batch.to(next(model.parameters()).device)
+                batch = batch.to(dev)
 
             total_loss, losses = train_step(*batch)
             total_sum_loss += total_loss
@@ -265,10 +268,13 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
                 sum_losses = [0.0 for _ in loss_fns]
                 
                 for batch in data_loader:
+                    dev = next(model.parameters()).device
                     if isinstance(batch, list):
-                        batch = [b.to(next(model.parameters()).device) for b in batch]
+                        batch = [b.to(dev) for b in batch]
+                    elif isinstance(batch, tuple):
+                        batch = tuple(b.to(dev) for b in batch)
                     else:
-                        batch = batch.to(next(model.parameters()).device)
+                        batch = batch.to(dev)
 
                     total_loss, losses = train_step(*batch, optimizer=optimizer, param_groups=param_groups)
                     total_sum_loss += total_loss

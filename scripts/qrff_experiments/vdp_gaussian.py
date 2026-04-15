@@ -41,8 +41,8 @@ if __name__ == "__main__":
     x_k, x_kp1 = create_transition_data_matrix(traj_data, separate=True)
     xp_data = TensorDataset(x_k, x_kp1)
 
-    x0_dataloader = DataLoader(x0_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    xp_dataloader = DataLoader(xp_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    x0_dataloader = DataLoader(TensorDataset(traj_data[0]), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    xp_dataloader = DataLoader(TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
     phi_basis =  GaussianBasis.set_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 0.5]))
