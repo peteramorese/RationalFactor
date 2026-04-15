@@ -6,4 +6,4 @@
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/slurm_log.out
 
-./.venv/bin/python3 -u -m scripts.benchmarks.nftf.vdp_group
+./.venv/bin/python3 -u -m scripts.benchmarks.nftf.nftf_comparison_beta

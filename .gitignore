@@ -1,6 +1,7 @@
 figures/
 benchmark_data/
 logs/
+slurm_batch.sh
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

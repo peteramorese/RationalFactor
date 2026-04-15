@@ -22,7 +22,7 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 300
+    n_basis = 500
     warm_start_tran_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
         "iterations": 10,
@@ -44,7 +44,7 @@ if __name__ == "__main__":
     }
     init_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 100,
+        "iterations": 10,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
     }
