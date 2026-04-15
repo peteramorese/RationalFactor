@@ -12,7 +12,7 @@ import rational_factor.systems.truth_models as truth_models
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF, MaskedAffineNFTF
+from rational_factor.models.domain_transformation import ErfSeparableTF, MaskedRQSNFTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.base import sample_io_pairs, sample_trajectories
 from rational_factor.tools.analysis import avg_log_likelihood
@@ -139,7 +139,7 @@ def main() -> None:
 
         wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True).to(device)
         nftf = (
-            MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
+            MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
             if use_nftf
             else None
         )
@@ -192,7 +192,7 @@ def main() -> None:
             use_best="mle",
         )
 
-        trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_nftf else None
+        trained_nftf = MaskedRQSNFTF.copy_from_trainable(nftf).to(device) if use_nftf else None
         trained_domain_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
 
         if use_nftf:
