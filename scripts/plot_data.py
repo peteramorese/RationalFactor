@@ -76,6 +76,37 @@ def _vector_plot_length(
     return n_plot
 
 
+def _parse_index_range(range_spec: str, n_points: int) -> np.ndarray:
+    """
+    Parse an index selector for vector plots.
+
+    Supports:
+      - python-slice style "start:end" (end exclusive), with either side optional
+      - single index "i"
+    """
+    spec = range_spec.strip()
+    if not spec:
+        raise ValueError("index range cannot be empty")
+
+    if ":" in spec:
+        parts = spec.split(":")
+        if len(parts) != 2:
+            raise ValueError("index range must use at most one ':' (e.g. 0:9)")
+        start_str, end_str = parts
+        start = int(start_str) if start_str.strip() else None
+        end = int(end_str) if end_str.strip() else None
+        idx = np.arange(n_points)[slice(start, end)]
+    else:
+        i = int(spec)
+        idx = np.arange(n_points)[slice(i, i + 1)]
+
+    if idx.size == 0:
+        raise ValueError(
+            f"index range '{range_spec}' selects no points for vector length {n_points}"
+        )
+    return idx
+
+
 def _plot_vector_on_ax(
     ax: plt.Axes,
     contexts_raw: dict,
@@ -83,11 +114,11 @@ def _plot_vector_on_ax(
     context_labels: list[str],
     field: str,
     colors: list,
-    n_plot: int,
+    idx: np.ndarray,
     *,
     legend: bool,
 ) -> None:
-    x = np.arange(n_plot)
+    x = idx
     for i, ckey in enumerate(context_keys):
         res = (contexts_raw[ckey].get("results") or {}).get(field)
         if res is None:
@@ -95,11 +126,18 @@ def _plot_vector_on_ax(
         mean = _as_float_list(res.get("mean"))
         if len(mean) <= 1:
             continue
-        y = np.asarray(mean[:n_plot], dtype=float)
+        y_full = np.asarray(mean, dtype=float)
+        if np.max(idx) >= y_full.size:
+            continue
+        y = y_full[idx]
         color = colors[i]
         std = res.get("std")
         if std is not None:
-            yerr = np.asarray(_as_float_list(std)[:n_plot], dtype=float)
+            yerr_full = np.asarray(_as_float_list(std), dtype=float)
+            if np.max(idx) < yerr_full.size:
+                yerr = yerr_full[idx]
+            else:
+                yerr = np.asarray([])
             if yerr.shape == y.shape:
                 ax.errorbar(
                     x,
@@ -211,6 +249,22 @@ def main() -> int:
         default=None,
         help="Root directory containing benchmark_data/ (default: repo root inferred from script)",
     )
+    parser.add_argument(
+        "--vector-field",
+        default=None,
+        help=(
+            "Plot only this vector-valued numerical field "
+            "(e.g. avg_log_likelihood_per_timestep)"
+        ),
+    )
+    parser.add_argument(
+        "--index-range",
+        default=None,
+        help=(
+            "Subset vector indices to plot; python-slice style start:end (end exclusive) "
+            "or single index, e.g. 0:9 or 5"
+        ),
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -258,9 +312,21 @@ def main() -> int:
             scalar_fields.append(field)
 
     subplot_specs: list[tuple[str, str]] = []
-    for f in vector_fields:
-        if _vector_plot_length(contexts_raw, context_keys, f) is not None:
-            subplot_specs.append(("vector", f))
+    if args.vector_field is not None:
+        if args.vector_field not in vector_fields:
+            available = ", ".join(vector_fields) if vector_fields else "<none>"
+            print(
+                f"error: vector field '{args.vector_field}' not found. "
+                f"Available vector fields: {available}",
+                file=sys.stderr,
+            )
+            return 1
+        if _vector_plot_length(contexts_raw, context_keys, args.vector_field) is not None:
+            subplot_specs.append(("vector", args.vector_field))
+    else:
+        for f in vector_fields:
+            if _vector_plot_length(contexts_raw, context_keys, f) is not None:
+                subplot_specs.append(("vector", f))
     for f in scalar_fields:
         subplot_specs.append(("scalar", f))
 
@@ -293,6 +359,14 @@ def main() -> int:
         if kind == "vector":
             n_plot = _vector_plot_length(contexts_raw, context_keys, field)
             assert n_plot is not None
+            if args.index_range is not None:
+                try:
+                    idx = _parse_index_range(args.index_range, n_plot)
+                except ValueError as e:
+                    print(f"error: {e}", file=sys.stderr)
+                    return 1
+            else:
+                idx = np.arange(n_plot)
             _plot_vector_on_ax(
                 ax,
                 contexts_raw,
@@ -300,7 +374,7 @@ def main() -> int:
                 context_labels,
                 field,
                 colors,
-                n_plot,
+                idx,
                 legend=False,
             )
         else:

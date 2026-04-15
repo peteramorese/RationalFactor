@@ -67,7 +67,7 @@ class Basis(torch.nn.Module):
         '''
         raise NotImplementedError("Omega2 is not implemented for this basis function")
 
-    def Omega3(self, other1: 'Basis', other2: 'Basis'):
+    def Omega3_contract(self, other1: 'Basis', other2: 'Basis'):
         '''
         Computes the 3D quadratic function inner product tensor with another basis function vector. 
         omega[i, j, k] = <this_i, other1_j, other2_k>
