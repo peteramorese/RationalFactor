@@ -19,48 +19,48 @@ from rational_factor.tools.misc import make_mvnormal_init_sampler
 
 CONTEXT_USE_NFTF_FALSE = {
     "use_nftf": False,
-    "n_basis": 1000,
+    "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [10, 5],
-        "iterations": 20,
-        "lr_basis": 1e-2,
+        "n_epochs_per_group": [15, 5],
+        "iterations": 50,
+        "lr_basis": 5e-2,
         "lr_weights": 1e-2,
         "lr_wrap": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
+        "iterations": 100,
+        "lr_basis": 5e-2,
         "lr_weights": 1e-2,
     },
     "batch_size": 256,
-    "var_reg_strength": 1e-3,
+    "var_reg_strength": 0,
     "verbose": True,
 }
 
 CONTEXT_USE_NFTF_TRUE = {
     "use_nftf": True,
-    "n_basis": 1000,
+    "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [10, 5],
-        "iterations": 20,
-        "lr_basis": 1e-2,
+        "n_epochs_per_group": [15, 5],
+        "iterations": 50,
+        "lr_basis": 5e-2,
         "lr_weights": 1e-2,
         "lr_dtf": 1e-3,
         "lr_wrap": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
+        "iterations": 100,
+        "lr_basis": 5e-2,
         "lr_weights": 1e-2,
     },
     "batch_size": 256,
-    "var_reg_strength": 1e-3,
+    "var_reg_strength": 0,
     "verbose": True,
 }
 
-TRIALS = 15
+TRIALS = 10
 BENCHMARK_ROOT = "benchmark_data"
 
 N_DATA_TRAN = 50000
@@ -78,7 +78,7 @@ def make_quadcopter_benchmark_system() -> truth_models.Quadcopter:
     carry-over), which matches sample_trajectories / sample_io_pairs iteration order.
     """
     return truth_models.Quadcopter(
-        dt=0.06,
+        dt=0.1,
         waypoint=torch.tensor([2.0, 1.0, 1.35]),
         yaw_ref=0.35,
         m=1.0,
