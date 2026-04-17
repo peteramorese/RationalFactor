@@ -14,6 +14,7 @@ from rational_factor.systems.base import (
 from rational_factor.models import loss
 import rational_factor.models.train as rf_train
 from rational_factor.tools.misc import make_mvnormal_init_sampler
+from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.visualization import plot_particle_belief
 
 from particle_filter.particle_set import WeightedParticleSet
@@ -21,6 +22,7 @@ from particle_filter.propagate import propagate_and_update
 
 
 def main():
+    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
     print(f"Using device: {device}")
@@ -166,8 +168,8 @@ def main():
         observations=[obs for obs in observations],
     )
 
-    box_lows = (-5.0, -5.0)
-    box_highs = (5.0, 5.0)
+    box_lows = tuple(problem.plot_bounds_low.tolist())
+    box_highs = tuple(problem.plot_bounds_high.tolist())
     fig, axes = plt.subplots(n_timesteps + 1, 2, figsize=(10, max(3 * (n_timesteps + 1), 15)))
     fig.suptitle("NF-trained particle filter vs truth-model particle filter")
 

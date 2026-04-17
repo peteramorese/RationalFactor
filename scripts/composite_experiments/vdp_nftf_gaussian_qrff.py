@@ -1,8 +1,6 @@
 import torch
-import rational_factor.systems.truth_models as truth_models
-from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix, sample_io_pairs
 from torch.utils.data import DataLoader, TensorDataset
-from rational_factor.models.basis_functions import GaussianBasis
+from rational_factor.models.basis_functions import QuadraticExpBasis
 from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
@@ -11,12 +9,11 @@ from rational_factor.tools.visualization import plot_belief
 from rational_factor.tools.analysis import mc_integral_box
 from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSeparableTF
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
+from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 import matplotlib.pyplot as plt
 
-from rational_factor.tools.misc import make_mvnormal_state_sampler
-
-
 if __name__ == "__main__":
+    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
     
     ###
     use_gpu = torch.cuda.is_available()
@@ -27,11 +24,7 @@ if __name__ == "__main__":
     batch_size = 1024
     lr_tran = 1e-1
     lr_init = 1e-2
-    n_timesteps_train = 10
-    n_timesteps_prop = 10
-    n_trajectories_train = 1000
-    n_pairs_train = n_timesteps_train * n_trajectories_train
-    n_init_train = 5000
+    n_timesteps_prop = problem.n_timesteps
     psd_strength = 1e-2
     var_reg_strength = 0 #1e-2
     ###
@@ -40,33 +33,17 @@ if __name__ == "__main__":
     print("Using GPU: ", use_gpu)
     print("Device: ", device)
 
-    # Create system
-    system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1*torch.eye(2))
-
-    init_state_sampler = make_mvnormal_state_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
-
-    ## Generate data set from trajectories
-    traj_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_train, n_trajectories=n_trajectories_train)
-    #x0 = traj_data[0]
-    #x_k, x_kp1 = create_transition_data_matrix(traj_data, separate=True)
-
-    # Generate data as input output pairs
-    def prev_state_sampler(n_samples : int):
-        mean = torch.tensor([0.0, 0.0])
-        cov = torch.diag(4.0 * torch.ones(system.dim()))
-        dist = torch.distributions.MultivariateNormal(mean, cov)
-        return dist.sample((n_samples,))
-
-    x0 = init_state_sampler(n_init_train)
-    x_k, x_kp1 = sample_io_pairs(system, prev_state_sampler, n_pairs=n_pairs_train)
+    system = problem.system
+    x0, x_k, x_kp1 = problem.train_data()
+    traj_data = problem.test_data()
 
     x0_dataloader = DataLoader(TensorDataset(x0), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     xp_dataloader = DataLoader(TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
-    psi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
-    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
+    phi_basis =  QuadraticExpBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
+    psi_basis =  QuadraticExpBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
+    psi0_basis = QuadraticExpBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 10.0], device=device), variance=20.0, min_std=1e-5).to(device)
 
     # Create separable domain transformation
     nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device) if use_dtf else None
@@ -122,8 +99,8 @@ if __name__ == "__main__":
     print(f"Initial model loss: {best_loss_init:.4f}, training time: {training_time_init:.2f} seconds")
 
     # Analysis
-    box_lows = (-5.0, -5.0)
-    box_highs = (5.0, 5.0)
+    box_lows = tuple(problem.plot_bounds_low.tolist())
+    box_highs = tuple(problem.plot_bounds_high.tolist())
 
     if use_dtf:
         base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=n_timesteps_prop)

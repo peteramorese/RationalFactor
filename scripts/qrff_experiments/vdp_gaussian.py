@@ -1,6 +1,4 @@
 import torch
-import rational_factor.systems.truth_models as truth_models
-from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix
 from torch.utils.data import DataLoader, TensorDataset
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF
@@ -12,10 +10,11 @@ from rational_factor.tools.analysis import mc_integral_box
 
 import matplotlib.pyplot as plt
 
-from rational_factor.tools.misc import make_mvnormal_init_sampler
+from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 
 
 if __name__ == "__main__":
+    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
     
     ###
     use_gpu = torch.cuda.is_available()
@@ -23,22 +22,15 @@ if __name__ == "__main__":
     n_epochs = 300
     batch_size = 512
     learning_rate = 1e-3
-    n_timesteps_train = 10
-    n_timesteps_prop = 10
-    n_trajectories_train = 2000
+    n_timesteps_prop = problem.n_timesteps
     var_reg_strength = 0.5
     psd_reg_strength = 1e-1 #0.002
     ###
 
-    # Create system
-    system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1*torch.eye(2))
-
-    # Generate data set from trajectories
-    init_state_sampler = make_mvnormal_init_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
-
-    traj_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_train, n_trajectories=n_trajectories_train)
-    x0_data = TensorDataset(traj_data[0])
-    x_k, x_kp1 = create_transition_data_matrix(traj_data, separate=True)
+    system = problem.system
+    x0_train, x_k, x_kp1 = problem.train_data()
+    traj_data = problem.test_data()
+    x0_data = TensorDataset(x0_train)
     xp_data = TensorDataset(x_k, x_kp1)
 
     x0_dataloader = DataLoader(TensorDataset(traj_data[0]), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
@@ -73,8 +65,8 @@ if __name__ == "__main__":
     print("Done! \n")
 
     # Analysis
-    box_lows = (-5.0, -5.0)
-    box_highs = (5.0, 5.0)
+    box_lows = tuple(problem.plot_bounds_low.tolist())
+    box_highs = tuple(problem.plot_bounds_high.tolist())
 
     belief_seq = propagate.propagate(init_model, tran_model, n_steps=n_timesteps_prop)
 

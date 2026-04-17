@@ -1,8 +1,6 @@
 import torch
-import rational_factor.systems.truth_models as truth_models
-from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix
 from torch.utils.data import DataLoader, TensorDataset
-from rational_factor.models.basis_functions import BetaBasis
+from rational_factor.models.basis_functions import UnnormalizedBetaBasis
 from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
@@ -11,12 +9,11 @@ from rational_factor.tools.visualization import plot_belief
 from rational_factor.tools.analysis import mc_integral_box
 from rational_factor.models.domain_transformation import ErfSeparableTF
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
+from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 import matplotlib.pyplot as plt
 
-from rational_factor.tools.misc import make_mvnormal_state_sampler
-
-
 if __name__ == "__main__":
+    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
     
     ###
     use_gpu = torch.cuda.is_available()
@@ -24,32 +21,25 @@ if __name__ == "__main__":
     n_epochs = 300
     batch_size = 256
     learning_rate = 1e-2
-    n_timesteps_train = 10
-    n_timesteps_prop = 10
-    n_trajectories_train = 2000
+    n_timesteps_prop = problem.n_timesteps
     #var_reg_strength = 5e-3
     var_reg_strength = 0.0
     psd_reg_strength = 1e-2 #0.002
     ###
 
-    # Create system
-    system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1*torch.eye(2))
-
-    # Generate data set from trajectories
-    init_state_sampler = make_mvnormal_state_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
-
-    traj_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_train, n_trajectories=n_trajectories_train)
-    x0_data = TensorDataset(traj_data[0])
-    x_k, x_kp1 = create_transition_data_matrix(traj_data, separate=True)
+    system = problem.system
+    x0_train, x_k, x_kp1 = problem.train_data()
+    traj_data = problem.test_data()
+    x0_data = TensorDataset(x0_train)
     xp_data = TensorDataset(x_k, x_kp1)
 
     x0_dataloader = DataLoader(x0_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     xp_dataloader = DataLoader(xp_data, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis =  BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([1.0, 1.0]), min_concentration=1.0, variance=10.0)
-    psi_basis =  BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([1.0, 1.0]), min_concentration=1.0, variance=10.0)
-    psi0_basis = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([1.0, 1.0]), min_concentration=1.0, variance=10.0)
+    phi_basis =  UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([1.0, 1.0]), min_concentration=1.0, variance=10.0)
+    psi_basis =  UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([1.0, 1.0]), min_concentration=1.0, variance=10.0)
+    psi0_basis = UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([1.0, 1.0]), min_concentration=1.0, variance=10.0)
 
     print("alpha beta b4: ", phi_basis.alphas_betas())
 
@@ -101,8 +91,8 @@ if __name__ == "__main__":
     print("Done! \n")
 
     # Analysis
-    box_lows = (-5.0, -5.0)
-    box_highs = (5.0, 5.0)
+    box_lows = tuple(problem.plot_bounds_low.tolist())
+    box_highs = tuple(problem.plot_bounds_high.tolist())
 
     base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=n_timesteps_prop)
     belief_seq = [CompositeDensityModel(domain_tf, belief) for belief in base_belief_seq]

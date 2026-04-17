@@ -60,26 +60,79 @@ def plot_particle_belief(ax: plt.Axes, belief : WeightedParticleSet, x_range: tu
     )
     return sc
 
-def plot_problem_test_trajectories(problem: FullyObservableProblem, marginals_list : list[tuple[int, int]] = None, scatter_kwargs: dict = None):
+def plot_problem_test_trajectories(problem: FullyObservableProblem, marginals_list : list[tuple[int, int]] = None, scatter_kwargs: dict = None, axes = None):
     n_timesteps = problem.n_timesteps
     if marginals_list is None:
         marginals_list = problem.plot_marginals_list
     n_marginals = len(marginals_list)
-    fig, ax = plt.subplots(
+    if axes is None:
+        fig, axes = plt.subplots(
         n_timesteps,
         n_marginals,
-        figsize=(10, max(8 * n_timesteps, 40)),
-        squeeze=False,
-    )
+            figsize=(10, max(8 * n_timesteps, 40)),
+            squeeze=False,
+        )
+    else:
+        fig = None
+        assert axes.shape == (n_timesteps, n_marginals), "Axes must be a 2D array with shape (n_timesteps, n_marginals)"
     scatter_kwargs = scatter_kwargs or {}
     traj_data = problem.test_data()
     for t in range(n_timesteps):
         for i in range(n_marginals):
-            ax[t, i].scatter(traj_data[t][:, marginals_list[i][0]].detach().cpu().numpy(), traj_data[t][:, marginals_list[i][1]].detach().cpu().numpy(), **scatter_kwargs)
-            ax[t, i].set_xlabel(problem.system.state_label(marginals_list[i][0]))
-            ax[t, i].set_ylabel(problem.system.state_label(marginals_list[i][1]))
-            ax[t, i].set_xlim(problem.plot_bounds_low[marginals_list[i][0]].item(), problem.plot_bounds_high[marginals_list[i][0]].item())
-            ax[t, i].set_ylim(problem.plot_bounds_low[marginals_list[i][1]].item(), problem.plot_bounds_high[marginals_list[i][1]].item())
-            ax[t, i].set_box_aspect(1)
-    fig.tight_layout()
-    return fig, ax
+            axes[t, i].scatter(traj_data[t][:, marginals_list[i][0]].detach().cpu().numpy(), traj_data[t][:, marginals_list[i][1]].detach().cpu().numpy(), **scatter_kwargs)
+            axes[t, i].set_xlabel(problem.system.state_label(marginals_list[i][0]))
+            axes[t, i].set_ylabel(problem.system.state_label(marginals_list[i][1]))
+            axes[t, i].set_xlim(problem.plot_bounds_low[marginals_list[i][0]].item(), problem.plot_bounds_high[marginals_list[i][0]].item())
+            axes[t, i].set_ylim(problem.plot_bounds_low[marginals_list[i][1]].item(), problem.plot_bounds_high[marginals_list[i][1]].item())
+            axes[t, i].set_box_aspect(1)
+    if fig is not None:
+        fig.tight_layout()
+    return fig, axes if fig is not None else axes
+
+def plot_marginal_trajectory_comparison(problem: FullyObservableProblem, beliefs : list[DensityModel], marginals_list : list[tuple[int, int]] = None, scatter_kwargs: dict = None, axes = None):
+    n_timesteps = problem.n_timesteps
+    assert len(beliefs) == n_timesteps, "Beliefs must have length equal to problem.n_timesteps"
+
+    if marginals_list is None:
+        marginals_list = problem.plot_marginals_list
+    n_marginals = len(marginals_list)
+
+    if axes is None:
+        fig, axes = plt.subplots(
+            n_timesteps,
+            n_marginals,
+            figsize=(10, max(8 * n_timesteps, 40)),
+            squeeze=False,
+        )
+    else:
+        fig = None
+        assert axes.shape == (n_timesteps, n_marginals), "Axes must be a 2D array with shape (n_timesteps, n_marginals)"
+
+    # First layer: empirical test trajectory marginals.
+    plot_problem_test_trajectories(
+        problem=problem,
+        marginals_list=marginals_list,
+        scatter_kwargs=scatter_kwargs,
+        axes=axes,
+    )
+
+    # Second layer: model-implied belief marginals.
+    for t in range(n_timesteps):
+        for i, marginal_dims in enumerate(marginals_list):
+            belief_marginal = beliefs[t].marginal(marginal_dims=marginal_dims)
+            x_dim, y_dim = marginal_dims
+            plot_belief(
+                axes[t, i],
+                belief_marginal,
+                x_range=(problem.plot_bounds_low[x_dim].item(), problem.plot_bounds_high[x_dim].item()),
+                y_range=(problem.plot_bounds_low[y_dim].item(), problem.plot_bounds_high[y_dim].item()),
+            )
+            axes[t, i].set_xlabel(problem.system.state_label(x_dim))
+            axes[t, i].set_ylabel(problem.system.state_label(y_dim))
+            axes[t, i].set_xlim(problem.plot_bounds_low[x_dim].item(), problem.plot_bounds_high[x_dim].item())
+            axes[t, i].set_ylim(problem.plot_bounds_low[y_dim].item(), problem.plot_bounds_high[y_dim].item())
+            axes[t, i].set_box_aspect(1)
+
+    if fig is not None:
+        fig.tight_layout()
+    return fig, axes if fig is not None else axes

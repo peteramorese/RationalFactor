@@ -6,16 +6,14 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import rational_factor.models.loss as loss
 import rational_factor.models.train as train
-import rational_factor.systems.truth_models as truth_models
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.domain_transformation import MaskedAffineNFTF, MaskedRQSNFTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
-from rational_factor.systems.base import sample_io_pairs, sample_trajectories
+from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
-from rational_factor.tools.misc import make_mvnormal_init_sampler
 
 
 CONTEXT_MASKED_AFFINE = {
@@ -63,12 +61,6 @@ CONTEXT_MASKED_RQS = {
 TRIALS = 15
 BENCHMARK_ROOT = "benchmark_data"
 
-N_DATA_TRAN = 20000
-N_DATA_INIT = 2000
-N_TRAJECTORIES_TEST = 2000
-N_TIMESTEPS_PROP = 15
-
-
 def _make_trainable_nftf(nftf_type: str, dim: int) -> torch.nn.Module:
     if nftf_type == "masked_affine":
         return MaskedAffineNFTF(dim, trainable=True, hidden_features=128, n_layers=5)
@@ -90,28 +82,11 @@ def main() -> None:
     ######## SETUP ########
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
+    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
-    system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1 * torch.eye(2))
-    init_state_sampler = make_mvnormal_init_sampler(
-        mean=torch.tensor([0.2, 0.1]),
-        covariance=torch.diag(torch.tensor([0.2, 0.2])),
-    )
-
-    test_traj_data = sample_trajectories(
-        system,
-        init_state_sampler,
-        n_timesteps=N_TIMESTEPS_PROP,
-        n_trajectories=N_TRAJECTORIES_TEST,
-    )
-
-    def prev_state_sampler(n_samples: int):
-        mean = torch.tensor([0.0, 0.0])
-        cov = torch.diag(4.0 * torch.ones(system.dim()))
-        dist = torch.distributions.MultivariateNormal(mean, cov)
-        return dist.sample((n_samples,))
-
-    x0_data = init_state_sampler(N_DATA_INIT)
-    x_k_data, x_kp1_data = sample_io_pairs(system, prev_state_sampler, n_pairs=N_DATA_TRAN)
+    system = problem.system
+    x0_data, x_k_data, x_kp1_data = problem.train_data()
+    test_traj_data = problem.test_data()
 
     x0_dataset = TensorDataset(x0_data)
     xp_dataset = TensorDataset(x_kp1_data, x_k_data)
@@ -207,12 +182,12 @@ def main() -> None:
         )
 
         base_belief_seq = propagate.propagate(
-            init_model.density_model, tran_model.conditional_density_model, n_steps=N_TIMESTEPS_PROP
+            init_model.density_model, tran_model.conditional_density_model, n_steps=problem.n_timesteps
         )
         belief_seq = [CompositeDensityModel([trained_nftf], belief) for belief in base_belief_seq]
 
         ll_per_step = []
-        for i in range(N_TIMESTEPS_PROP):
+        for i in range(problem.n_timesteps):
             data_i = test_traj_data[i].to(device)
             ll = avg_log_likelihood(belief_seq[i], data_i)
             ll_per_step.append(ll.detach().cpu().reshape(()))
