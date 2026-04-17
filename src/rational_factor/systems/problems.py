@@ -5,8 +5,8 @@ from typing import Callable
 
 import torch
 
-from rational_factor.systems import truth_models
-from rational_factor.systems.base import DiscreteTimeStochasticSystem, PartiallyObservableSystem, sample_io_pairs, sample_trajectories
+from rational_factor.systems import systems, po_systems
+from rational_factor.systems.base import DiscreteTimeStochasticSystem, PartiallyObservableSystem, sample_io_pairs, sample_observation_pairs, sample_trajectories
 from rational_factor.tools.misc import make_mvnormal_state_sampler
 
 
@@ -24,7 +24,7 @@ class FullyObservableProblem:
     plot_bounds_high: torch.Tensor
     plot_marginals_list: list[tuple[int, int]]
 
-    def train_data(self):
+    def train_state_data(self):
         with torch.random.fork_rng():
             if self.seed is not None:
                 torch.manual_seed(self.seed)
@@ -35,26 +35,34 @@ class FullyObservableProblem:
     def test_data(self):
         with torch.random.fork_rng():
             if self.seed is not None:
-                torch.manual_seed(self.seed)
+                torch.manual_seed(self.seed + 1)
             traj_data = sample_trajectories(self.system, self.initial_state_sampler, n_timesteps=self.n_timesteps, n_trajectories=self.n_trajectories_test)
             return traj_data
 
 @dataclass
-class PartiallyObservableProblem:
-    system: PartiallyObservableSystem
-    initial_state_sampler: Callable[[int], torch.Tensor]
-    prev_state_sampler: Callable[[int], torch.Tensor]
-    n_timesteps: int
-    n_trajectories_test: int
-    n_data_tran: int
-    n_data_init: int
+class PartiallyObservableProblem(FullyObservableProblem):
+    obs_state_sampler: Callable[[int], torch.Tensor]
     n_data_obs: int
-    seed: int
+
+    def train_obs_data(self):
+        with torch.random.fork_rng():
+            if self.seed is not None:
+                torch.manual_seed(self.seed + 2)
+            x_data, o_data = sample_observation_pairs(self.system, self.obs_state_sampler, n_pairs=self.n_data_obs)
+            return x_data, o_data    
+
+    def test_data(self):
+        with torch.random.fork_rng():
+            if self.seed is not None:
+                torch.manual_seed(self.seed + 3)
+            traj_data = sample_trajectories(self.system, self.obs_state_sampler, n_timesteps=self.n_timesteps, n_trajectories=self.n_trajectories_test)
+            obs_data = [self.system.observe(curr_states) for curr_states in traj_data]
+            return traj_data, obs_data
 
 
 FULLY_OBSERVABLE_PROBLEMS = {
     "van_der_pol": FullyObservableProblem(
-        system=truth_models.VanDerPol(
+        system=systems.VanDerPol(
             dt=0.3,
             mu=0.9,
             covariance=0.1 * torch.eye(2),
@@ -77,7 +85,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         plot_marginals_list=[(0, 1)],
     ),
     "dubins_trailer": FullyObservableProblem(
-        system=truth_models.SecondOrderDubinsTrailer(
+        system=systems.SecondOrderDubinsTrailer(
             dt=0.3,
             L_t=0.5,
             v_ref=1.0,
@@ -108,7 +116,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         plot_marginals_list=[(0, 1), (2, 3), (4, 5)],
     ),
     "planar_quadrotor": FullyObservableProblem(
-        system=truth_models.PlanarQuadrotor(
+        system=systems.PlanarQuadrotor(
             dt=0.08,
             waypoint=torch.tensor([2.2, 1.4]),
             m=1.0,
@@ -136,7 +144,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         plot_marginals_list=[(0, 1), (3, 4), (2, 5)],
     ),
     "quadcopter": FullyObservableProblem(
-        system=truth_models.Quadcopter(
+        system=systems.Quadcopter(
             dt=0.05,
             waypoint=torch.tensor([3.0, -1.5, 2.0]),
             yaw_ref=0.4,
@@ -161,5 +169,37 @@ FULLY_OBSERVABLE_PROBLEMS = {
         plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0]),
         plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
+    ),
+}
+
+PARTIALLY_OBSERVABLE_PROBLEMS = {
+    "po_van_der_pol": PartiallyObservableProblem(
+        system=po_systems.PartiallyObservableVanDerPol(
+            dt=0.3,
+            mu=0.9,
+            process_covariance=0.1 * torch.eye(2),
+            observation_covariance=0.1 * torch.eye(2),
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.2, 0.1]),
+            covariance=torch.diag(torch.tensor([0.2, 0.2])),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0]),
+            covariance=torch.diag(2.0 * torch.ones(2)),
+        ),
+        obs_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0]),
+            covariance=torch.diag(2.0 * torch.ones(2)),
+        ),
+        n_timesteps=10,
+        n_trajectories_test=5000,
+        n_data_tran=10000,
+        n_data_init=1000,
+        n_data_obs=10000,
+        seed=42,
+        plot_bounds_low=torch.tensor([-5.0, -5.0]),
+        plot_bounds_high=torch.tensor([5.0, 5.0]),
+        plot_marginals_list=[(0, 1)],
     ),
 }

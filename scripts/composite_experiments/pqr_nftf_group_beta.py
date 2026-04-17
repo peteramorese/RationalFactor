@@ -23,7 +23,7 @@ def main() -> None:
 
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
-    use_dtf = True
+    use_dtf = False
     n_basis = 500
     batch_size = 256
     var_reg_strength = 0.0
@@ -39,8 +39,8 @@ def main() -> None:
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 200,
-            "lr_basis": 5e-2,
+            "iterations": 400,
+            "lr_basis": 5e-3,
             "lr_weights": 1e-2,
         }
     else:
@@ -53,8 +53,8 @@ def main() -> None:
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 200,
-            "lr_basis": 5e-2,
+            "iterations": 400,
+            "lr_basis": 5e-3,
             "lr_weights": 1e-2,
         }
 
@@ -63,7 +63,7 @@ def main() -> None:
     print("Using device: ", device)
 
     system = problem.system
-    x0_data, x_k_data, x_kp1_data = problem.train_data()
+    x0_data, x_k_data, x_kp1_data = problem.train_state_data()
     test_traj_data = problem.test_data()
 
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
@@ -217,16 +217,21 @@ def main() -> None:
     plt.savefig(ll_out_path, dpi=200)
     print(f"Saved LL plot to {ll_out_path}")
 
-    comp_out_path = out_dir / f"{Path(__file__).stem}__marginal_comparison.png"
-    fig, _ = plot_marginal_trajectory_comparison(
-        problem=problem,
-        beliefs=belief_seq,
-        scatter_kwargs={"s": 1, "alpha": 0.7},
-    )
-    if fig is not None:
-        fig.suptitle(f"{Path(__file__).stem} marginal comparison", y=1.02)
-        fig.savefig(comp_out_path, dpi=200, bbox_inches="tight")
-        print(f"Saved marginal comparison plot to {comp_out_path}")
+    if not use_dtf:
+        comp_out_path = out_dir / f"{Path(__file__).stem}__marginal_comparison.png"
+        # Visualization does not need GPU; move beliefs to CPU to reduce peak memory.
+        belief_seq = [belief.to("cpu") for belief in belief_seq]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        fig, _ = plot_marginal_trajectory_comparison(
+            problem=problem,
+            beliefs=belief_seq,
+            scatter_kwargs={"s": 1, "alpha": 0.7},
+        )
+        if fig is not None:
+            fig.suptitle(f"{Path(__file__).stem} marginal comparison", y=1.02)
+            fig.savefig(comp_out_path, dpi=200, bbox_inches="tight")
+            print(f"Saved marginal comparison plot to {comp_out_path}")
 
 
 if __name__ == "__main__":

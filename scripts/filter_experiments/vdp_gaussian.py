@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-import rational_factor.systems.po_truth_models as po_truth_models
 from rational_factor.systems.base import sample_io_pairs, sample_observation_pairs, simulate, SystemObservationDistribution, SystemTransitionDistribution
+from rational_factor.systems.problems import PARTIALLY_OBSERVABLE_PROBLEMS
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF, LinearFF, LinearRFF
 import rational_factor.models.train as train
@@ -12,8 +12,6 @@ from rational_factor.tools.analysis import mc_integral_box, check_pdf_valid, che
 from particle_filter.particle_set import WeightedParticleSet
 from particle_filter.propagate import propagate_and_update
 import matplotlib.pyplot as plt
-
-from rational_factor.tools.misc import make_mvnormal_init_sampler
 
 
 if __name__ == "__main__":
@@ -50,11 +48,12 @@ if __name__ == "__main__":
     batch_size = 256
     block_size = None
 
-    n_data_init = 2000
-    n_data_tran = 20000
-    n_data_obs = 20000
+    problem = PARTIALLY_OBSERVABLE_PROBLEMS["po_van_der_pol"]
+    n_data_init = problem.n_data_init
+    n_data_tran = problem.n_data_tran
+    n_data_obs = problem.n_data_obs
 
-    n_timesteps_prop = 10
+    n_timesteps_prop = problem.n_timesteps
     n_particles_test = 3000
     var_reg_strength = 0 #1e-2
     ###
@@ -62,21 +61,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if use_gpu else "cpu")
     print("Using GPU: ", use_gpu)
 
-    # Create system
-    system = po_truth_models.PartiallyObservableVanDerPol(
-        dt=0.3, 
-        mu=0.9, 
-        process_covariance=0.1*torch.eye(2), 
-        observation_covariance=0.1*torch.eye(2)
-    )
-
-    init_state_sampler = make_mvnormal_init_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
-
-    # Generate data as input output pairs
-    def prev_state_sampler(n_samples : int):
-        mean = torch.tensor([0.0, 0.0])
-        cov = torch.diag(4.0 * torch.ones(system.dim()))
-        return torch.distributions.MultivariateNormal(mean, cov).sample((n_samples,))
+    # Create system from shared partially observable problem parameters
+    system = problem.system
+    init_state_sampler = problem.initial_state_sampler
+    prev_state_sampler = problem.prev_state_sampler
 
     x0_data = init_state_sampler(n_data_init)
     x_k_data, x_kp1_data = sample_io_pairs(system, prev_state_sampler, n_pairs=n_data_tran)

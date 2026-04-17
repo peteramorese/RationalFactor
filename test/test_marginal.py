@@ -21,7 +21,7 @@ from typing import Callable, Sequence, Type
 import torch
 
 from rational_factor.models.basis_functions import QuadraticExpBasis, UnnormalizedBetaBasis
-from rational_factor.models.factor_forms import Linear2FF, LinearFF, LinearR2FF, LinearRFF, QuadraticFF, QuadraticRFF
+from rational_factor.models.factor_forms import Linear2FF, LinearFF, QuadraticFF
 from rational_factor.tools.analysis import check_pdf_valid
 
 # --- edit these -------------------------------------------------------------
@@ -35,10 +35,9 @@ MODELS = ("linear_ff", "linear2ff")
 DIM = 6  # full dimension d, must be >= 2
 N_BASIS = 12
 N_MARGINAL_SAMPLES = 4  # random marginals per model
-N_MC = 10000  # MC samples for ∫ p(x) dx
+N_MC = 10000  
 SEED = 0
 
-# If True, use CPU; if False, use CUDA when available.
 USE_CPU = False
 
 # `random_init` hyperparameters (same spirit as vdp_nfdf_gaussian.py for GaussianBasis)

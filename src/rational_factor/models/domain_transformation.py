@@ -31,6 +31,9 @@ class DomainTF(torch.nn.Module):
             ladj : torch.Tensor log absolute determinant of the Jacobian of the transformation
         '''
         raise NotImplementedError("Inverse TF is not implemented")
+    
+    def marginal(self, marginal_dims : tuple[int, ...]):
+        raise NotImplementedError("Marginal is not implemented")
 
 
 class ErfSeparableTF(DomainTF):
@@ -84,6 +87,19 @@ class ErfSeparableTF(DomainTF):
         x = loc + scale * sqrt_2 * u
         ladj = (torch.log(scale) + 0.5 * (torch.log(z.new_tensor(2.0 * torch.pi)) + u ** 2)).sum(dim=-1) 
         return x, ladj
+    
+    def marginal(self, marginal_dims : tuple[int, ...]):
+        marginal_dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim for i in marginal_dims), "marginal_dims must be in [0, dim)"
+
+        loc, scale = self._loc_scale()
+        return ErfSeparableTF(
+            dim=len(marginal_dims),
+            loc=loc[list(marginal_dims)].detach().clone(),
+            scale=scale[list(marginal_dims)].detach().clone(),
+            trainable=False,
+            numerical_tolerance=self.numerical_tolerance,
+        )
 
 
 class MaskedAffineNFTF(DomainTF):

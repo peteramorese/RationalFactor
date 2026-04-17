@@ -1,8 +1,8 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-import rational_factor.systems.po_truth_models as po_truth_models
 from rational_factor.systems.base import sample_io_pairs, sample_observation_pairs, simulate, SystemObservationDistribution, SystemTransitionDistribution
-from rational_factor.models.basis_functions import BetaBasis
+from rational_factor.systems.problems import PARTIALLY_OBSERVABLE_PROBLEMS
+from rational_factor.models.basis_functions import UnnormalizedBetaBasis
 from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF, LinearFF, LinearRFF
 from rational_factor.models.domain_transformation import ErfSeparableTF
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
@@ -15,10 +15,9 @@ from particle_filter.particle_set import WeightedParticleSet
 from particle_filter.propagate import propagate_and_update
 import matplotlib.pyplot as plt
 
-from rational_factor.tools.misc import make_mvnormal_init_sampler
-
 
 if __name__ == "__main__":
+    problem = PARTIALLY_OBSERVABLE_PROBLEMS["po_van_der_pol"]
     
     ###
     use_gpu = torch.cuda.is_available()
@@ -51,12 +50,7 @@ if __name__ == "__main__":
 
     batch_size = 512
 
-    n_data_init = 2000
-    n_data_tran = 20000
-    n_data_obs = 20000
 
-    n_timesteps_prop = 10
-    n_particles_test = 3000
     var_reg_strength = 0 
     ###
 
@@ -64,21 +58,13 @@ if __name__ == "__main__":
     print("Using GPU: ", use_gpu)
     print("Device: ", device)
 
-    # Create system
-    system = po_truth_models.PartiallyObservableVanDerPol(dt=0.3, mu=0.9, process_covariance=0.1*torch.eye(2), observation_covariance=0.1*torch.eye(2))
+    # Create system from shared partially observable problem parameters
+    system = problem.system
+    init_state_sampler = problem.initial_state_sampler
+    prev_state_sampler = problem.prev_state_sampler
 
-    init_state_sampler = make_mvnormal_init_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
-
-    # Generate data as input output pairs
-    def prev_state_sampler(n_samples : int):
-        mean = torch.tensor([0.0, 0.0])
-        cov = torch.diag(4.0 * torch.ones(system.dim()))
-        dist = torch.distributions.MultivariateNormal(mean, cov)
-        return dist.sample((n_samples,))
-
-    x0_data = init_state_sampler(n_data_init)
-    x_k_data, x_kp1_data = sample_io_pairs(system, prev_state_sampler, n_pairs=n_data_tran)
-    x_data, o_data = sample_observation_pairs(system, init_state_sampler, n_pairs=n_data_obs)
+    x0_data, x_k_data, x_kp1_data = problem.train_state_data()
+    x_data, o_data = problem.train_obs_data()
 
     x0_dataset = TensorDataset(x0_data)
     xp_dataset = TensorDataset(x_kp1_data, x_k_data)
@@ -89,11 +75,11 @@ if __name__ == "__main__":
     o_dataloader = DataLoader(o_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis  = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
-    psi_basis  = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
-    psi0_basis = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
-    xi_basis   = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
-    zeta_basis = BetaBasis.random_init(system.observation_dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    phi_basis  = UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    psi_basis  = UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    psi0_basis = UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    xi_basis   = UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    zeta_basis = UnnormalizedBetaBasis.random_init(system.observation_dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
 
     # Train a fake transition model to get a good wrap dtf and warm start the phi and psi basis functions
     wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True).to(device)

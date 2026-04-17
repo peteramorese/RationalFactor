@@ -29,6 +29,12 @@ class CompositeDensityModel(DensityModel):
         for tf in reversed(self.domain_tfs):
             x, _ = tf.inverse(x)
         return x
+    
+    def marginal(self, marginal_dims : tuple[int, ...]):
+        return CompositeDensityModel(
+            domain_tfs=[tf.marginal(marginal_dims) for tf in self.domain_tfs],
+            density_model=self.density_model.marginal(marginal_dims),
+        )
 
 class CompositeConditionalModel(ConditionalDensityModel):
     def __init__(self, domain_tfs: DomainTF | Sequence[DomainTF], conditional_density_model: ConditionalDensityModel):

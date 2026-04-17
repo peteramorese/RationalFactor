@@ -57,6 +57,7 @@ def update(
 
     belief_next.weights = belief_next.weights * likelihoods
     belief_next.normalize_weights()
+    belief_next.resample()
     return belief_next
 
 def propagate_and_update(belief : WeightedParticleSet, transition_model : ConditionalDensityModel, observation_model : ConditionalDensityModel, observations : list[torch.Tensor]):
