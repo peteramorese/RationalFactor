@@ -2,8 +2,8 @@ import torch
 import rational_factor.systems.truth_models as truth_models
 from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix, sample_io_pairs
 from torch.utils.data import DataLoader, TensorDataset
-from rational_factor.models.basis_functions import BetaBasis
-from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
+from rational_factor.models.basis_functions import BetaBasis, UnnormalizedBetaBasis
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
@@ -13,7 +13,7 @@ from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSe
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 import matplotlib.pyplot as plt
 
-from rational_factor.tools.misc import make_mvnormal_init_sampler
+from rational_factor.tools.misc import make_mvnormal_state_sampler
 
 
 if __name__ == "__main__":
@@ -68,7 +68,7 @@ if __name__ == "__main__":
     # Create system
     system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1*torch.eye(2))
 
-    init_state_sampler = make_mvnormal_init_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
+    init_state_sampler = make_mvnormal_state_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
 
     ## Generate data set from trajectories
     test_traj_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_prop, n_trajectories=n_trajectories_test)
@@ -87,9 +87,9 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create basis functions
-    phi_basis =  BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
-    psi_basis =  BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
-    psi0_basis = BetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    phi_basis =  UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    psi_basis =  UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
+    psi0_basis = UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
 
     # Create separable domain transformation
     wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True)

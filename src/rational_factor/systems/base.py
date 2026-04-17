@@ -2,9 +2,14 @@ import torch
 from rational_factor.models.density_model import ConditionalDensityModel
 
 class DiscreteTimeStochasticSystem(torch.nn.Module):
-    def __init__(self, dim : int, v_dist : torch.distributions.Distribution | None = None):
+    def __init__(self, dim : int, state_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None):
         super().__init__()
         self._dim = dim
+        if state_labels is not None:
+            assert len(state_labels) == dim, "state_labels must be a list of length dim"
+            self._state_labels = state_labels
+        else:
+            self._state_labels = [f"x{i}" for i in range(dim)]
 
         if v_dist is not None:
             self._v_dist = v_dist
@@ -35,11 +40,19 @@ class DiscreteTimeStochasticSystem(torch.nn.Module):
 
     def dim(self):
         return self._dim
+    
+    def state_label(self, i : int):
+        return self._state_labels[i]
 
 class PartiallyObservableSystem(DiscreteTimeStochasticSystem):
-    def __init__(self, state_dim : int, observation_dim : int, v_dist : torch.distributions.Distribution | None = None, w_dist : torch.distributions.Distribution | None = None):
-        super().__init__(state_dim, v_dist)
+    def __init__(self, state_dim : int, observation_dim : int, state_labels : list[str] = None, observation_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None, w_dist : torch.distributions.Distribution | None = None):
+        super().__init__(state_dim, state_labels, v_dist)
         self._observation_dim = observation_dim
+        if observation_labels is not None:
+            assert len(observation_labels) == observation_dim, "observation_labels must be a list of length observation_dim"
+            self._observation_labels = observation_labels
+        else:
+            self._observation_labels = [f"o{i}" for i in range(observation_dim)]
 
         if w_dist is not None:
             self._w_dist = w_dist
@@ -64,6 +77,12 @@ class PartiallyObservableSystem(DiscreteTimeStochasticSystem):
 
     def observation_dim(self):
         return self._observation_dim
+
+    def state_label(self, i : int):
+        return self._state_labels[i]
+
+    def observation_label(self, i : int):
+        return self._observation_labels[i]
 
 class SystemTransitionDistribution(ConditionalDensityModel):
     """

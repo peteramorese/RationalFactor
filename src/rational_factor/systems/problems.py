@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
+import torch
+
+from rational_factor.systems import truth_models
+from rational_factor.systems.base import DiscreteTimeStochasticSystem, PartiallyObservableSystem, sample_io_pairs, sample_trajectories
+from rational_factor.tools.misc import make_mvnormal_state_sampler
+
+
+@dataclass
+class FullyObservableProblem:
+    system: DiscreteTimeStochasticSystem
+    initial_state_sampler: Callable[[int], torch.Tensor]
+    prev_state_sampler: Callable[[int], torch.Tensor]
+    n_timesteps: int
+    n_trajectories_test: int
+    n_data_tran: int
+    n_data_init: int
+    seed: int
+    plot_bounds_low: torch.Tensor
+    plot_bounds_high: torch.Tensor
+    plot_marginals_list: list[tuple[int, int]]
+
+    def train_data(self):
+        with torch.random.fork_rng():
+            if self.seed is not None:
+                torch.manual_seed(self.seed)
+            x0_data = self.initial_state_sampler(self.n_data_init)
+            x_k_data, x_kp1_data = sample_io_pairs(self.system, self.prev_state_sampler, n_pairs=self.n_data_tran)
+            return x0_data, x_k_data, x_kp1_data    
+    
+    def test_data(self):
+        with torch.random.fork_rng():
+            if self.seed is not None:
+                torch.manual_seed(self.seed)
+            traj_data = sample_trajectories(self.system, self.initial_state_sampler, n_timesteps=self.n_timesteps, n_trajectories=self.n_trajectories_test)
+            return traj_data
+
+@dataclass
+class PartiallyObservableProblem:
+    system: PartiallyObservableSystem
+    initial_state_sampler: Callable[[int], torch.Tensor]
+    prev_state_sampler: Callable[[int], torch.Tensor]
+    n_timesteps: int
+    n_trajectories_test: int
+    n_data_tran: int
+    n_data_init: int
+    n_data_obs: int
+    seed: int
+
+
+FULLY_OBSERVABLE_PROBLEMS = {
+    "van_der_pol": FullyObservableProblem(
+        system=truth_models.VanDerPol(
+            dt=0.3,
+            mu=0.9,
+            covariance=0.1 * torch.eye(2),
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.2, 0.1]),
+            covariance=torch.diag(torch.tensor([0.2, 0.2])),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0]),
+            covariance=torch.diag(2.0 * torch.ones(2)),
+        ),
+        n_timesteps=10,
+        n_trajectories_test=5000,
+        n_data_tran=10000,
+        n_data_init=1000,
+        seed=42,
+        plot_bounds_low=torch.tensor([-5.0, -5.0]),
+        plot_bounds_high=torch.tensor([5.0, 5.0]),
+        plot_marginals_list=[(0, 1)],
+    ),
+    "dubins_trailer": FullyObservableProblem(
+        system=truth_models.SecondOrderDubinsTrailer(
+            dt=0.3,
+            L_t=0.5,
+            v_ref=1.0,
+            k_v=1.0,
+            k_theta=2.2,
+            sigma_v=0.12,
+            sigma_omega=0.15,
+            sigma_speed_state=0.08,
+            cov_scale=0.1,
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.35, 0.2, -0.85, 1.0]),
+            covariance=torch.diag(
+                torch.tensor([0.4, 0.4, 0.25, 0.35, 0.6, 0.4], dtype=torch.float32) ** 2
+            ),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            covariance=torch.diag(torch.tensor([3.0, 3.0, 1.8, 1.8, 1.2, 2.0], dtype=torch.float32)),
+        ),
+        n_timesteps=15,
+        n_trajectories_test=5000,
+        n_data_tran=15000,
+        n_data_init=1500,
+        seed=42,
+        plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -10.0]),
+        plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 10.0]),
+        plot_marginals_list=[(0, 1), (2, 3), (4, 5)],
+    ),
+    "planar_quadrotor": FullyObservableProblem(
+        system=truth_models.PlanarQuadrotor(
+            dt=0.08,
+            waypoint=torch.tensor([2.2, 1.4]),
+            m=1.0,
+            I=0.02,
+            ell=0.22,
+            covariance=0.008 * torch.eye(6),
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.15, 0.35, -0.08, 0.0, 0.0, 0.0]),
+            covariance=torch.diag(
+                torch.tensor([0.12, 0.12, 0.12, 0.35, 0.35, 0.6], dtype=torch.float32) ** 2
+            ),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+            covariance=torch.diag(torch.tensor([2.5, 2.5, 0.9, 2.0, 2.0, 2.5], dtype=torch.float32)),
+        ),
+        n_timesteps=15,
+        n_trajectories_test=5000,
+        n_data_tran=15000,
+        n_data_init=1500,
+        seed=42,
+        plot_bounds_low=torch.tensor([-10.0, -10.0, -5.0, -15.0, -15.0, -15.0]),
+        plot_bounds_high=torch.tensor([10.0, 10.0, 5.0, 15.0, 15.0, 15.0]),
+        plot_marginals_list=[(0, 1), (3, 4), (2, 5)],
+    ),
+    "quadcopter": FullyObservableProblem(
+        system=truth_models.Quadcopter(
+            dt=0.05,
+            waypoint=torch.tensor([3.0, -1.5, 2.0]),
+            yaw_ref=0.4,
+            covariance=0.0008 * torch.eye(12),
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0]),
+            covariance=torch.diag(
+                torch.tensor([0.15, 0.15, 0.12, 0.25, 0.25, 0.25, 0.08, 0.08, 0.2, 0.35, 0.35, 0.35], dtype=torch.float32)
+                ** 2
+            ),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.zeros(12),
+            covariance=torch.diag(torch.tensor([2.0, 2.0, 1.5, 1.5, 1.5, 1.5, 0.6, 0.6, 1.2, 1.5, 1.5, 1.5], dtype=torch.float32)),
+        ),
+        n_timesteps=15,
+        n_trajectories_test=5000,
+        n_data_tran=20000,
+        n_data_init=2000,
+        seed=42,
+        plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0]),
+        plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]),
+        plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
+    ),
+}

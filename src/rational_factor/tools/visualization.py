@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
+from rational_factor.systems.problems import FullyObservableProblem
 from rational_factor.models.density_model import DensityModel
 from particle_filter.particle_set import WeightedParticleSet
 
@@ -58,3 +59,27 @@ def plot_particle_belief(ax: plt.Axes, belief : WeightedParticleSet, x_range: tu
         **default_scatter_kwargs,
     )
     return sc
+
+def plot_problem_test_trajectories(problem: FullyObservableProblem, marginals_list : list[tuple[int, int]] = None, scatter_kwargs: dict = None):
+    n_timesteps = problem.n_timesteps
+    if marginals_list is None:
+        marginals_list = problem.plot_marginals_list
+    n_marginals = len(marginals_list)
+    fig, ax = plt.subplots(
+        n_timesteps,
+        n_marginals,
+        figsize=(10, max(8 * n_timesteps, 40)),
+        squeeze=False,
+    )
+    scatter_kwargs = scatter_kwargs or {}
+    traj_data = problem.test_data()
+    for t in range(n_timesteps):
+        for i in range(n_marginals):
+            ax[t, i].scatter(traj_data[t][:, marginals_list[i][0]].detach().cpu().numpy(), traj_data[t][:, marginals_list[i][1]].detach().cpu().numpy(), **scatter_kwargs)
+            ax[t, i].set_xlabel(problem.system.state_label(marginals_list[i][0]))
+            ax[t, i].set_ylabel(problem.system.state_label(marginals_list[i][1]))
+            ax[t, i].set_xlim(problem.plot_bounds_low[marginals_list[i][0]].item(), problem.plot_bounds_high[marginals_list[i][0]].item())
+            ax[t, i].set_ylim(problem.plot_bounds_low[marginals_list[i][1]].item(), problem.plot_bounds_high[marginals_list[i][1]].item())
+            ax[t, i].set_box_aspect(1)
+    fig.tight_layout()
+    return fig, ax

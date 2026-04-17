@@ -14,7 +14,7 @@ from rational_factor.models.domain_transformation import MaskedRQSNFTF, ErfSepar
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 import matplotlib.pyplot as plt
 
-from rational_factor.tools.misc import make_mvnormal_init_sampler
+from rational_factor.tools.misc import make_mvnormal_state_sampler
 
 
 if __name__ == "__main__":
@@ -76,7 +76,7 @@ if __name__ == "__main__":
     # Create system
     system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1*torch.eye(2))
 
-    init_state_sampler = make_mvnormal_init_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
+    init_state_sampler = make_mvnormal_state_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
 
     ## Generate data set from trajectories
     test_traj_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_prop, n_trajectories=n_trajectories_test)

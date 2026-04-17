@@ -8,6 +8,7 @@ class VanDerPol(DiscreteTimeStochasticSystem):
     def __init__(self, dt: float, mu: float = 1.0, covariance: torch.Tensor | None = None):
         """
         Van der Pol oscillator with additive Gaussian noise.
+        State x = [x1, x2] (first-order realization of the oscillator).
 
         Args:
             dt : time step
@@ -20,7 +21,11 @@ class VanDerPol(DiscreteTimeStochasticSystem):
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
         dist = torch.distributions.MultivariateNormal(torch.zeros(2), covariance)
-        super().__init__(dim=2, v_dist=dist)
+        super().__init__(
+            dim=2,
+            state_labels=["x1", "x2"],
+            v_dist=dist,
+        )
 
         self.dt = dt
         self.mu = mu
@@ -97,7 +102,6 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
         State x = [px, pz, theta, vx, vz, omega]
 
         Controller drives (px, pz) -> waypoint using PD position control, pitch control from desired horizontal accel.
-        Inputs are internal (no extra args to next_state), so the system is autonomous.
         """
         if covariance is None:
             covariance = 0.01 * torch.eye(6)
@@ -105,7 +109,11 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
         dist = torch.distributions.MultivariateNormal(torch.zeros(6), covariance)
-        super().__init__(dim=6, v_dist=dist)
+        super().__init__(
+            dim=6,
+            state_labels=["px", "pz", "theta", "vx", "vz", "omega"],
+            v_dist=dist,
+        )
 
         self.dt = dt
         self.m, self.I, self.ell, self.g = m, I, ell, g
@@ -118,11 +126,11 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
             waypoint = torch.zeros(2)
         self.waypoint = torch.as_tensor(waypoint, dtype=torch.float32).reshape(2,)
 
-        # PD gains (tune as needed)
-        self.kp_pos = torch.tensor([2.0, 2.0])  # [x, z]
-        self.kd_pos = torch.tensor([1.0, 1.0])
-        self.kp_theta = 5.0
-        self.kd_theta = 3.0
+        # PD gains 
+        self.kp_pos = torch.tensor([1.35, 1.35])  # [x, z]
+        self.kd_pos = torch.tensor([0.55, 0.55])
+        self.kp_theta = 3.5
+        self.kd_theta = 2.25
 
         # Convenience: hover thrust per rotor (not used directly but useful bound)
         self.u_hover = torch.tensor([m * g / 2, m * g / 2])
@@ -187,9 +195,6 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
         return u
 
     def next_state(self, x: torch.Tensor, v: torch.Tensor):
-        """
-        Autonomous closed-loop: x_{k+1} = f(x_k) + v_k
-        """
         u = self._state_feedback(x)
         dx = self._dynamics(x, u)
         x_next = x + self.dt * dx  # Euler step (matches style of your other systems)
@@ -205,6 +210,100 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
         mean = x + self.dt * dx
         return mean, self.cov
 
+
+class SecondOrderDubinsTrailer(DiscreteTimeStochasticSystem):
+    """
+    6D second-order Dubins tractor–trailer with multiplicative noise in steering control, speed control, and the speed state itself 
+    State x = [px, py, theta_c, theta_t, v, omega].
+    """
+    def __init__(
+        self,
+        dt: float,
+        L_t: float = 1.0,
+        v_ref: float = 1.0,
+        k_v: float = 1.0,
+        k_theta: float = 1.0,
+        sigma_v: float = 0.1,
+        sigma_omega: float = 0.1,
+        sigma_speed_state: float = 0.1,
+        cov_scale: float = 0.01,
+    ):
+        # Mixture-of-Gaussians non-Gaussian noise (2D): xi = [xi_v, xi_omega]
+        cov1 = cov_scale * torch.tensor([[1.0, 0.2], [0.2, 1.0]], dtype=torch.float32)
+        cov2 = cov_scale * torch.tensor([[1.0, -0.2], [-0.2, 1.0]], dtype=torch.float32)
+        loc = torch.tensor([[0.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
+        mix = torch.distributions.Categorical(probs=torch.tensor([0.6, 0.4], dtype=torch.float32))
+        comp = torch.distributions.MultivariateNormal(
+            loc=loc,
+            covariance_matrix=torch.stack([cov1, cov2]),
+        )
+        v_dist = torch.distributions.MixtureSameFamily(mix, comp)
+
+        super().__init__(
+            dim=6,
+            state_labels=["px", "py", "theta_c", "theta_t", "v", "omega"],
+            v_dist=v_dist,
+        )
+
+        self.dt = dt
+        self.L_t = L_t
+
+        # Control parameters
+        self.v_ref = v_ref
+        self.k_v = k_v
+        self.k_theta = k_theta
+
+        # Noise parameters
+        self.sigma_v = sigma_v                # multiplicative noise in speed control
+        self.sigma_omega = sigma_omega        # multiplicative noise in steering control
+        self.sigma_speed_state = sigma_speed_state  # multiplicative noise directly on speed state
+
+    def next_state(self, x: torch.Tensor, v: torch.Tensor):
+        x = x.flatten()
+        v = v.flatten()
+        px, py, theta_c, theta_t, speed, omega = x[0], x[1], x[2], x[3], x[4], x[5]
+        xi_v, xi_omega = v[0], v[1]
+
+        dt = self.dt
+
+        # --- Deterministic control laws ---
+
+        # Speed control (toward v_ref)
+        u_v = self.k_v * (self.v_ref - speed)
+
+        # Steering rate control (oscillator)
+        #   theta_c'' + k_theta * theta_c = 0 (continuous limit)
+        u_omega = -self.k_theta * theta_c
+
+        # --- Multiplicative noise on controls ---
+
+        u_v_noisy = u_v * (1.0 + self.sigma_v * xi_v)
+        u_omega_noisy = u_omega * (1.0 + self.sigma_omega * xi_omega)
+
+        # --- Tractor–trailer kinematics ---
+
+        px_next = px + dt * speed * torch.cos(theta_c)
+        py_next = py + dt * speed * torch.sin(theta_c)
+        theta_c_next = theta_c + dt * omega
+        theta_t_next = theta_t + dt * (speed / self.L_t) * torch.sin(theta_c - theta_t)
+
+        # --- Speed update: second-order + multiplicative noise in state ---
+        #
+        #   v_{k+1} = v_k + dt*u_v_noisy + (multiplicative state noise)
+        #
+        speed_next = (
+            speed
+            + dt * u_v_noisy
+            + self.sigma_speed_state * speed * xi_v
+        )
+
+        # --- Steering rate update ---
+        omega_next = omega + dt * u_omega_noisy
+
+        return torch.stack(
+            [px_next, py_next, theta_c_next, theta_t_next, speed_next, omega_next],
+            dim=0,
+        )
 
 
 class Quadcopter(DiscreteTimeStochasticSystem):
@@ -240,7 +339,24 @@ class Quadcopter(DiscreteTimeStochasticSystem):
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
         dist = torch.distributions.MultivariateNormal(torch.zeros(12), covariance)
-        super().__init__(dim=12, v_dist=dist)
+        super().__init__(
+            dim=12,
+            state_labels=[
+                "px",
+                "py",
+                "pz",
+                "vx",
+                "vy",
+                "vz",
+                "phi",
+                "theta",
+                "psi",
+                "p",
+                "q",
+                "r",
+            ],
+            v_dist=dist,
+        )
 
         self.dt = dt
         self.m = m

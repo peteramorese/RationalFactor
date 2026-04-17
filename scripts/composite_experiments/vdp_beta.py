@@ -13,15 +13,7 @@ from rational_factor.models.domain_transformation import ErfSeparableTF
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 import matplotlib.pyplot as plt
 
-def make_mvnormal_init_sampler(mean: torch.Tensor, covariance: torch.Tensor):
-    mean = torch.as_tensor(mean, dtype=torch.float32)
-    covariance = torch.as_tensor(covariance, dtype=torch.float32)
-    dist = torch.distributions.MultivariateNormal(mean, covariance)
-
-    def sampler(n_samples: int) -> torch.Tensor:
-        return dist.sample((n_samples,))
-
-    return sampler
+from rational_factor.tools.misc import make_mvnormal_state_sampler
 
 
 if __name__ == "__main__":
@@ -44,11 +36,7 @@ if __name__ == "__main__":
     system = truth_models.VanDerPol(dt=0.3, mu=0.9, covariance=0.1*torch.eye(2))
 
     # Generate data set from trajectories
-    mean = torch.tensor([0.2, 0.1])
-    cov = torch.diag(torch.tensor([0.2, 0.2]))
-    dist = torch.distributions.MultivariateNormal(mean, cov)
-    def init_state_sampler(n_samples : int):
-        return dist.sample((n_samples,))
+    init_state_sampler = make_mvnormal_state_sampler(mean=torch.tensor([0.2, 0.1]), covariance=torch.diag(torch.tensor([0.2, 0.2])))
 
     traj_data = sample_trajectories(system, init_state_sampler, n_timesteps=n_timesteps_train, n_trajectories=n_trajectories_train)
     x0_data = TensorDataset(traj_data[0])

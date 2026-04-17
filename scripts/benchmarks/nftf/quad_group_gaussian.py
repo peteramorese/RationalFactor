@@ -8,7 +8,7 @@ import rational_factor.models.loss as loss
 import rational_factor.models.train as train
 import rational_factor.systems.truth_models as truth_models
 import rational_factor.tools.propagate as propagate
-from rational_factor.models.basis_functions import BetaBasis
+from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.domain_transformation import ErfSeparableTF, MaskedAffineNFTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
@@ -21,9 +21,9 @@ CONTEXT_USE_NFTF_FALSE = {
     "use_nftf": False,
     "n_basis": 1000,
     "tran_params": {
-        "n_epochs_per_group": [15, 5],
+        "n_epochs_per_group": [10, 5],
         "iterations": 50,
-        "lr_basis": 5e-2,
+        "lr_basis": 1e-1,
         "lr_weights": 1e-2,
         "lr_wrap": 1e-3,
     },
@@ -42,9 +42,9 @@ CONTEXT_USE_NFTF_TRUE = {
     "use_nftf": True,
     "n_basis": 1000,
     "tran_params": {
-        "n_epochs_per_group": [15, 5],
+        "n_epochs_per_group": [10, 5],
         "iterations": 50,
-        "lr_basis": 1e-2,
+        "lr_basis": 1e-1,
         "lr_weights": 1e-2,
         "lr_dtf": 1e-3,
         "lr_wrap": 1e-3,
@@ -202,32 +202,32 @@ def main() -> None:
         x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
         xp_dataloader = DataLoader(xp_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-        offsets = torch.tensor([-1.0, -1.0], device=device)
-        variance = 1.0
-        phi_basis = BetaBasis.random_init(
+        offsets = torch.tensor([0.0, 10.0], device=device)
+        variance = 10.0
+        phi_basis = GaussianBasis.random_init(
             system.dim(),
             n_basis=n_basis,
             offsets=offsets,
             variance=variance,
-            min_concentration=1.0,
+            min_std=1e-4,
         ).to(device)
-        psi_basis = BetaBasis.random_init(
+        psi_basis = GaussianBasis.random_init(
             system.dim(),
             n_basis=n_basis,
             offsets=offsets,
             variance=variance,
-            min_concentration=1.0,
+            min_std=1e-4,
         ).to(device)
-        psi0_basis = BetaBasis.random_init(
+        psi0_basis = GaussianBasis.random_init(
             system.dim(),
             n_basis=n_basis,
             offsets=offsets,
             variance=variance,
-            min_concentration=1.0,
+            min_std=1e-4,
         ).to(device)
 
         wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True).to(device)
-        nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device) if use_nftf else None
+        nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device) if use_nftf else None
 
         if use_nftf:
             tran_model = CompositeConditionalModel([nftf, wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
@@ -236,8 +236,8 @@ def main() -> None:
 
         mle_loss_fn = loss.conditional_mle_loss
         var_reg_loss_fn = lambda model, x, xp: var_reg_strength * (
-            loss.beta_basis_concentration_reg_loss(model.conditional_density_model.phi_basis)
-            + loss.beta_basis_concentration_reg_loss(model.conditional_density_model.psi_basis)
+            loss.gaussian_basis_var_reg_loss(model.conditional_density_model.phi_basis, mean=True)
+            + loss.gaussian_basis_var_reg_loss(model.conditional_density_model.psi_basis, mean=True)
         )
 
         if use_nftf:
@@ -290,8 +290,8 @@ def main() -> None:
             ).to(device)
 
         mle_loss_fn = loss.mle_loss
-        var_reg_loss_fn = lambda model, x: var_reg_strength * loss.beta_basis_concentration_reg_loss(
-            model.density_model.psi0_basis
+        var_reg_loss_fn = lambda model, x: var_reg_strength * loss.gaussian_basis_var_reg_loss(
+            model.density_model.psi0_basis, mean=True
         )
         optimizers = {
             "basis": torch.optim.Adam(init_model.density_model.basis_params(), lr=init_params["lr_basis"]),
@@ -333,8 +333,8 @@ def main() -> None:
         )
 
     contexts = [
-        {"name": "w_nftf", "params": CONTEXT_USE_NFTF_TRUE},
         {"name": "wo_nftf", "params": CONTEXT_USE_NFTF_FALSE},
+        {"name": "w_nftf", "params": CONTEXT_USE_NFTF_TRUE},
     ]
 
     benchmark = Benchmark(name=Path(__file__).stem)
