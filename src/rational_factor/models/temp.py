@@ -213,64 +213,6 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
 
         return torch.exp(log_Omega)
 
-    def product_basis(self, other_basis_factors : list['Basis']) -> 'QuadraticExpBasis':
-        factors: list[GaussianBasis] = [self]
-        for other in other_basis_factors:
-            assert isinstance(other, GaussianBasis), "all factors must be GaussianBasis"
-            assert other.dim() == self.dim(), "Basis functions must have the same dimension"
-            factors.append(other)
-
-        n_factors = len(factors)
-        dtype = self.params.dtype
-        device = self.params.device
-
-        # Convert each Gaussian factor to quadratic-exponential coefficients:
-        # N(x | mu, std^2) = exp(a x^2 + b x + c), where
-        # a = -1/(2 std^2), b = mu/std^2, c = -0.5*log(2pi) - log(std) - mu^2/(2 std^2)
-        a_terms: list[torch.Tensor] = []
-        b_terms: list[torch.Tensor] = []
-        c_terms: list[torch.Tensor] = []
-        n_per_factor: list[int] = []
-        log2pi = torch.log(torch.tensor(2.0 * torch.pi, dtype=dtype, device=device))
-
-        for basis in factors:
-            mu, std = basis.means_stds()  # (d, n_basis)
-            var = std.square()
-            a_terms.append(-0.5 / var)
-            b_terms.append(mu / var)
-            c_terms.append(-0.5 * log2pi - torch.log(std) - 0.5 * mu.square() / var)
-            n_per_factor.append(basis.n_basis_functions())
-
-        # Broadcast/sum coefficients over all basis-index combinations:
-        # shape -> (d, n1, n2, ..., nm)
-        coeff_shape = [self.dim(), *n_per_factor]
-        a_sum = torch.zeros(coeff_shape, dtype=dtype, device=device)
-        b_sum = torch.zeros_like(a_sum)
-        c_sum = torch.zeros_like(a_sum)
-
-        for k in range(n_factors):
-            view_shape = [self.dim()] + [1] * n_factors
-            view_shape[k + 1] = n_per_factor[k]
-            a_sum = a_sum + a_terms[k].reshape(view_shape)
-            b_sum = b_sum + b_terms[k].reshape(view_shape)
-            c_sum = c_sum + c_terms[k].reshape(view_shape)
-
-        # Flatten basis-combination dimensions, preserving order:
-        # (phi1*psi1, phi1*psi2, ..., phi2*psi1, ...)
-        n_total = 1
-        for n in n_per_factor:
-            n_total *= n
-
-        a_flat = a_sum.reshape(self.dim(), n_total)
-        b_flat = b_sum.reshape(self.dim(), n_total)
-        c_flat = c_sum.reshape(self.dim(), n_total)
-
-        eps = 1e-6
-        s = (-a_flat - eps).clamp_min(1e-12)
-        raw_a = torch.log(torch.expm1(s))
-        params = torch.stack([raw_a, b_flat, c_flat], dim=-1)
-
-        return QuadraticExpBasis(params, trainable=False, eps=eps)
 
     def marginal(self, marginal_dims: tuple[int, ...]) -> 'GaussianBasis':
         marginal_dims = tuple(marginal_dims)

@@ -1,9 +1,8 @@
 """
 Randomized checks that lower-dimensional marginals of FF density models integrate to ~1.
 
-Basis marginal conventions in this codebase differ by class:
-  - GaussianBasis, BetaBasis: marginal_dims = coordinate indices to *keep*.
-  - QuadraticExpBasis: marginal_dims = coordinate indices to *integrate out*.
+Basis marginal conventions in this test:
+  - QuadraticExpBasis, UnnormalizedBetaBasis: marginal_dims = coordinate indices to *keep*.
 
 Models are built like scripts/composite_experiments/vdp_nfdf_gaussian.py: bases from
 `random_init`, then `LinearFF.from_rff` / `Linear2FF.from_r2ff` / `QuadraticFF.from_rff`.
@@ -21,14 +20,14 @@ from typing import Callable, Sequence, Type
 
 import torch
 
-from rational_factor.models.basis_functions import BetaBasis, GaussianBasis, QuadraticExpBasis
+from rational_factor.models.basis_functions import QuadraticExpBasis, UnnormalizedBetaBasis
 from rational_factor.models.factor_forms import Linear2FF, LinearFF, LinearR2FF, LinearRFF, QuadraticFF, QuadraticRFF
 from rational_factor.tools.analysis import check_pdf_valid
 
 # --- edit these -------------------------------------------------------------
 
-# "gaussian" | "beta" | "quadratic_exp"
-BASIS = "gaussian"
+# "quadratic_exp" | "unnormalized_beta"
+BASIS = "unnormalized_beta"
 
 # Subset of: "linear_ff", "linear2ff", "quadratic_ff"
 MODELS = ("linear_ff", "linear2ff", "quadratic_ff")
@@ -44,38 +43,48 @@ USE_CPU = False
 
 # `random_init` hyperparameters (same spirit as vdp_nfdf_gaussian.py for GaussianBasis)
 VARIANCE = 20.0
-# GaussianBasis.random_init
-GAUSSIAN_OFFSETS = (0.0, 30.0)  # length-2 tensor passed as offsets=
-GAUSSIAN_MIN_STD = 1e-3
-# BetaBasis.random_init (offsets length 2; created on CPU then moved — Beta uses CPU randn)
-BETA_OFFSETS = (0.0, 0.0)
-BETA_MIN_CONCENTRATION = 1.0
-BETA_EPS = 1e-6
 # QuadraticExpBasis.random_init
 QUADRATIC_EXP_OFFSETS = (0.0, 0.0, 0.0)
 QUADRATIC_EXP_EPS = 1e-6
+# UnnormalizedBetaBasis.random_init
+UNNORMALIZED_BETA_OFFSETS = (0.0, 0.0)
+UNNORMALIZED_BETA_VARIANCE = 1.0
+UNNORMALIZED_BETA_MIN_CONCENTRATION = 1.0
+UNNORMALIZED_BETA_EPS = 1e-6
 
 # Standard deviation for Gaussian noise written into each *trainable* parameter after build
 PARAM_RAND_STD = 1.0
 
 # ---------------------------------------------------------------------------
 
-SeparableBasisType = Type[GaussianBasis] | Type[BetaBasis] | Type[QuadraticExpBasis]
+SeparableBasisType = Type[QuadraticExpBasis] | Type[UnnormalizedBetaBasis]
 
 # (basis class, how marginal_dims is interpreted, per-dim domain (low, high) for MC)
 _BASIS_REGISTRY: dict[str, tuple[SeparableBasisType, str, tuple[float, float]]] = {
-    "gaussian": (GaussianBasis, "keep", (-10.0, 10.0)),
-    "beta": (BetaBasis, "keep", (0.01, 0.99)),
-    "quadratic_exp": (QuadraticExpBasis, "integrate_out", (-10.0, 10.0)),
+    "quadratic_exp": (QuadraticExpBasis, "keep", (-10.0, 10.0)),
+    # Use near-full support to match analytic Beta integrals in basis marginal/Omega ops.
+    "unnormalized_beta": (UnnormalizedBetaBasis, "keep", (1e-6, 1.0 - 1e-6)),
 }
 
 
-def _randomize_trainable_params(module: torch.nn.Module, std: float, generator: torch.Generator) -> None:
+def _randomize_trainable_params(module: torch.nn.Module, std: float, seed: int) -> None:
     """In-place Gaussian reinitialization of every parameter with requires_grad=True."""
+    gens: dict[tuple[str, int | None], torch.Generator] = {}
+
+    def _generator_for(device: torch.device) -> torch.Generator:
+        key = (device.type, device.index)
+        if key not in gens:
+            gen = torch.Generator(device=device.type)
+            # Keep deterministic-but-distinct streams per device.
+            gen.manual_seed(seed + len(gens))
+            gens[key] = gen
+        return gens[key]
+
     with torch.no_grad():
         for p in module.parameters():
             if p.requires_grad:
-                noise = torch.randn(p.shape, device=p.device, dtype=p.dtype, generator=generator)
+                gen = _generator_for(p.device)
+                noise = torch.randn(p.shape, device=p.device, dtype=p.dtype, generator=gen)
                 p.copy_(noise * std)
 
 
@@ -90,33 +99,26 @@ def _random_basis(
     """Single `random_init` basis, same hyperparameters as vdp_nfdf_gaussian.py (per BASIS kind)."""
     cls = _BASIS_REGISTRY[basis_name][0]
 
-    if basis_name == "gaussian":
-        off = torch.tensor(GAUSSIAN_OFFSETS, device=device, dtype=dtype)
-        basis = cls.random_init(d, n_basis, offsets=off, variance=VARIANCE, min_std=GAUSSIAN_MIN_STD)
-        if freeze_params:
-            basis = cls.freeze_params(basis)
-        return basis
-
-    if basis_name == "beta":
-        off = torch.tensor(BETA_OFFSETS, dtype=dtype)
-        basis = cls.random_init(
-            d,
-            n_basis,
-            offsets=off,
-            variance=VARIANCE,
-            min_concentration=BETA_MIN_CONCENTRATION,
-            eps=BETA_EPS,
-        ).to(device=device, dtype=dtype)
-        if freeze_params:
-            basis = cls.freeze_params(basis)
-        return basis
-
     if basis_name == "quadratic_exp":
         off = torch.tensor(QUADRATIC_EXP_OFFSETS, device=device, dtype=dtype)
         basis = cls.random_init(d, n_basis, offsets=off, variance=VARIANCE, eps=QUADRATIC_EXP_EPS)
         if freeze_params:
             basis = cls.freeze_params(basis)
         return basis
+    if basis_name == "unnormalized_beta":
+        off = torch.tensor(UNNORMALIZED_BETA_OFFSETS, dtype=dtype)
+        basis = cls.random_init(
+            d,
+            n_basis,
+            offsets=off,
+            variance=VARIANCE,
+            min_concentration=UNNORMALIZED_BETA_MIN_CONCENTRATION,
+            eps=UNNORMALIZED_BETA_EPS,
+        ).to(device=device, dtype=dtype)
+        if freeze_params:
+            basis = cls.freeze_params(basis)
+        return basis
+
 
     raise ValueError(f"Unknown basis name: {basis_name}")
 
@@ -212,8 +214,6 @@ def run_trial(
     _, convention, per_dim = _BASIS_REGISTRY[basis_name]
     rng = random.Random(seed)
     torch.manual_seed(seed)
-    gen = torch.Generator()
-    gen.manual_seed(seed)
     dtype = torch.float32
 
     for mname in model_names:
@@ -222,7 +222,7 @@ def run_trial(
         model = model.to(device=device)
         model.eval()
 
-        _randomize_trainable_params(model, param_rand_std, gen)
+        _randomize_trainable_params(model, param_rand_std, seed)
 
         for t in range(n_marginal_samples):
             arg = random_marginal_arg(dim, convention, rng)
@@ -233,7 +233,7 @@ def run_trial(
 
             bounds = marginal_box_bounds(dim, arg, convention, per_dim)
             print(f"\n{basis_name} / {mname} / marginal {arg} -> dim {m_d} (trial {t + 1}/{n_marginal_samples})")
-            check_pdf_valid(m_model, bounds, n_samples=n_mc)
+            check_pdf_valid(m_model, bounds, n_samples=n_mc, device=device)
 
 
 def main() -> None:

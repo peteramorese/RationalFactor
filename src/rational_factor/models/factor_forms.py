@@ -306,8 +306,18 @@ class LinearFF(DensityModel):
 
         return log_g_x + log_h0_x
 
-    def expand():
-        pass
+    def marginal(self, marginal_dims : tuple[int, ...]):
+        phi_basis_copy = self.phi_basis.freeze_params()
+        psi0_basis_copy = self.psi0_basis.freeze_params()
+        phi_basis_copy.set_coeffs(self.a, trainable=False)
+        psi0_basis_copy.set_coeffs(self.get_c0(), trainable=False)
+        expanded_basis_marginal = phi_basis_copy.product_basis([psi0_basis_copy]).marginal(marginal_dims)
+        w_fixed = torch.ones(
+            expanded_basis_marginal.n_basis_functions(),
+            device=expanded_basis_marginal.params.device,
+            dtype=expanded_basis_marginal.params.dtype,
+        )
+        return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
 
     def weight_params(self):
         if hasattr(self, "c0_fixed"):

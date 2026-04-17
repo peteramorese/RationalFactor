@@ -2,13 +2,13 @@ import torch
 import rational_factor.systems.truth_models as truth_models
 from rational_factor.systems.base import sample_trajectories, create_transition_data_matrix, sample_io_pairs
 from torch.utils.data import DataLoader, TensorDataset
-from rational_factor.models.basis_functions import BetaBasis, UnnormalizedBetaBasis
+from rational_factor.models.basis_functions import UnnormalizedBetaBasis
 from rational_factor.models.factor_forms import LinearRFF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
 from rational_factor.tools.visualization import plot_belief
-from rational_factor.tools.analysis import avg_log_likelihood
+from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
 from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSeparableTF
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 import matplotlib.pyplot as plt
@@ -178,6 +178,7 @@ if __name__ == "__main__":
         data_i = test_traj_data[i].to(device)
         ll = avg_log_likelihood(belief_seq[i], data_i)
         print(f"Log likelihood at time {i}: {ll:.4f}")
+        check_pdf_valid(belief_seq[i], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
         plot_belief(axes[1, i], belief_seq[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
         axes[0, i].scatter(test_traj_data[i][:, 0], test_traj_data[i][:, 1], s=1)
         axes[0, i].set_aspect("equal")
