@@ -400,12 +400,19 @@ class Linear2FF(DensityModel):
         return log_r_x + log_g_x + log_h0_x
 
     def marginal(self, marginal_dims : tuple[int, ...]):
-        if hasattr(self, "c0_fixed"):
-            return Linear2FF(self.d, self.xi_basis.marginal(marginal_dims), self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), c0_fixed=self.c0_fixed, numerical_tolerance=self.numerical_tolerance)
-        else:
-            new_2ff = Linear2FF(self.d, self.xi_basis.marginal(marginal_dims), self.a, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), numerical_tolerance=self.numerical_tolerance)
-            new_2ff.__c0u = self.__c0u
-            return new_2ff
+        xi_basis_copy = self.xi_basis.freeze_params()
+        phi_basis_copy = self.phi_basis.freeze_params()
+        psi0_basis_copy = self.psi0_basis.freeze_params()
+        xi_basis_copy.set_coeffs(self.d, trainable=False)
+        phi_basis_copy.set_coeffs(self.a, trainable=False)
+        psi0_basis_copy.set_coeffs(self.get_c0(), trainable=False)
+        expanded_basis_marginal = xi_basis_copy.product_basis([phi_basis_copy, psi0_basis_copy]).marginal(marginal_dims)
+        w_fixed = torch.ones(
+            expanded_basis_marginal.n_basis_functions(),
+            device=expanded_basis_marginal.params.device,
+            dtype=expanded_basis_marginal.params.dtype,
+        )
+        return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
 
     def weight_params(self):
         if hasattr(self, "c0_fixed"):
@@ -538,12 +545,24 @@ class QuadraticFF(DensityModel):
         return log_g_x + log_h0_x
 
     def marginal(self, marginal_dims : tuple[int, ...]):
-        if hasattr(self, "C0_fixed"):
-            return QuadraticFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), C0_fixed=self.C0_fixed, numerical_tolerance=self.numerical_tolerance)
-        else:
-            new_ff = QuadraticFF(self.A, self.phi_basis.marginal(marginal_dims), self.psi0_basis.marginal(marginal_dims), numerical_tolerance=self.numerical_tolerance)
-            new_ff.__LC0u = self.__LC0u
-            return new_ff
+        phi_basis_1 = self.phi_basis.freeze_params()
+        phi_basis_2 = self.phi_basis.freeze_params()
+        psi0_basis_1 = self.psi0_basis.freeze_params()
+        psi0_basis_2 = self.psi0_basis.freeze_params()
+
+        phi_quad_basis = phi_basis_1.product_basis([phi_basis_2], ignore_coeffs=True)
+        psi0_quad_basis = psi0_basis_1.product_basis([psi0_basis_2], ignore_coeffs=True)
+
+        phi_quad_basis.set_coeffs(self.A.reshape(-1), trainable=False)
+        psi0_quad_basis.set_coeffs(self.get_C0().reshape(-1), trainable=False)
+
+        expanded_basis_marginal = phi_quad_basis.product_basis([psi0_quad_basis]).marginal(marginal_dims)
+        w_fixed = torch.ones(
+            expanded_basis_marginal.n_basis_functions(),
+            device=expanded_basis_marginal.params.device,
+            dtype=expanded_basis_marginal.params.dtype,
+        )
+        return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
 
     def weight_params(self):
         if hasattr(self, "C0_fixed"):

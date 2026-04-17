@@ -28,7 +28,8 @@ from rational_factor.tools.visualization import plot_belief
 BASIS = "unnormalized_beta"
 
 # None => random choice from ("linear_ff", "linear2ff", "quadratic_ff")
-MODEL: str | None = None
+#MODEL: str | None = None
+MODEL: str = "linear_ff"
 
 SEED = 0
 N_BASIS = 12

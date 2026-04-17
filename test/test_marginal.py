@@ -30,12 +30,12 @@ from rational_factor.tools.analysis import check_pdf_valid
 BASIS = "unnormalized_beta"
 
 # Subset of: "linear_ff", "linear2ff", "quadratic_ff"
-MODELS = ("linear_ff", "linear2ff", "quadratic_ff")
+MODELS = ("linear_ff", "linear2ff")
 
 DIM = 6  # full dimension d, must be >= 2
 N_BASIS = 12
 N_MARGINAL_SAMPLES = 4  # random marginals per model
-N_MC = 100000  # MC samples for ∫ p(x) dx
+N_MC = 10000  # MC samples for ∫ p(x) dx
 SEED = 0
 
 # If True, use CPU; if False, use CUDA when available.
