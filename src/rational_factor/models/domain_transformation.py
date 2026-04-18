@@ -62,7 +62,7 @@ class ErfSeparableTF(DomainTF):
         std = x_data.std(dim=0)
         return cls(dim, mean, std, trainable)
 
-    def _loc_scale(self):
+    def loc_scale(self):
         if self.trainable:
             loc = self.params[:, 0]   # (dim,)
             scale = torch.square(self.params[:, 1]) # (dim,)
@@ -73,7 +73,7 @@ class ErfSeparableTF(DomainTF):
             return loc, scale
 
     def forward(self, x : torch.Tensor):
-        loc, scale = self._loc_scale()
+        loc, scale = self.loc_scale()
         sqrt_2 = torch.sqrt(x.new_tensor(2.0))
         u = (x - loc) / (scale * sqrt_2)
         z = 0.5 * (1.0 + torch.special.erf(u))
@@ -81,7 +81,7 @@ class ErfSeparableTF(DomainTF):
         return z, ladj
 
     def inverse(self, z : torch.Tensor):
-        loc, scale = self._loc_scale()
+        loc, scale = self.loc_scale()
         sqrt_2 = torch.sqrt(z.new_tensor(2.0))
         u = torch.special.erfinv(2.0 * z.clamp(self.numerical_tolerance, 1.0 - self.numerical_tolerance) - 1.0)
         x = loc + scale * sqrt_2 * u
@@ -92,7 +92,7 @@ class ErfSeparableTF(DomainTF):
         marginal_dims = tuple(marginal_dims)
         assert all(0 <= i < self.dim for i in marginal_dims), "marginal_dims must be in [0, dim)"
 
-        loc, scale = self._loc_scale()
+        loc, scale = self.loc_scale()
         return ErfSeparableTF(
             dim=len(marginal_dims),
             loc=loc[list(marginal_dims)].detach().clone(),

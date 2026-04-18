@@ -60,7 +60,7 @@ if __name__ == "__main__":
     print("Device: ", device)
 
     system = problem.system
-    x0_data, x_k_data, x_kp1_data = problem.train_data()
+    x0_data, x_k_data, x_kp1_data = problem.train_state_data()
     test_traj_data = problem.test_data()
 
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
@@ -78,9 +78,9 @@ if __name__ == "__main__":
 
     # Create and train the transition model
     if use_dtf:
-        tran_model = CompositeConditionalModel([nftf, wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
+        tran_model = CompositeConditionalModel([nftf, wrap_tf], LinearRFF(phi_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance)).to(device)
     else:
-        tran_model = CompositeConditionalModel([wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
+        tran_model = CompositeConditionalModel([wrap_tf], LinearRFF(phi_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance)).to(device)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss

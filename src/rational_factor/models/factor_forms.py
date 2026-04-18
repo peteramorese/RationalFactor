@@ -247,7 +247,7 @@ class LinearFF(DensityModel):
 
     Used for belief representation for propagation only models
     """
-    def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-20):
+    def __init__(self, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-20, renormalize_c0_fixed : bool = True):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
@@ -263,12 +263,17 @@ class LinearFF(DensityModel):
         self.n_psi0 = self.psi0_basis.n_basis_functions()
 
         self.register_buffer("a", a) 
+        
+        self.numerical_tolerance = numerical_tolerance
         if c0_fixed is not None:
+            if renormalize_c0_fixed:
+                # Renormalize for numerical stability
+                Omega_0 = self.phi_basis.Omega2(self.psi0_basis)
+                norm_constant = 1.0 / (a @ Omega_0 @ c0_fixed + self.numerical_tolerance)
+                c0_fixed = norm_constant * c0_fixed
             self.register_buffer("c0_fixed", c0_fixed)
         else:
             self.__c0u = torch.nn.Parameter(torch.ones(self.n_psi0))
-        
-        self.numerical_tolerance = numerical_tolerance
     
     @classmethod
     def from_rff(cls, rff : LinearRFF, psi0_basis : SeparableBasis):
@@ -291,7 +296,7 @@ class LinearFF(DensityModel):
         
         c0_unnormalized = torch.nn.functional.softplus(self.__c0u)
         
-        norm_constant = 1.0 / (self.a @ Omega_0 @ c0_unnormalized)
+        norm_constant = 1.0 / (self.a @ Omega_0 @ c0_unnormalized + self.numerical_tolerance)
         
         return norm_constant * c0_unnormalized
         
@@ -335,7 +340,7 @@ class Linear2FF(DensityModel):
 
     Used for belief representation for filtering models
     """
-    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-20):
+    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-20, renormalize_c0_fixed : bool = True):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
@@ -352,12 +357,19 @@ class Linear2FF(DensityModel):
         
         self.register_buffer("d", d) 
         self.register_buffer("a", a) 
+        
+        self.numerical_tolerance = numerical_tolerance
         if c0_fixed is not None:
+            if renormalize_c0_fixed:
+                # Renormalize for numerical stability
+                Omega3_0 = self.xi_basis.Omega3(self.phi_basis, self.psi0_basis)
+                denom_vec = self.xi_basis.Omega3_contract(self.phi_basis, self.psi0_basis, self.d, self.a)
+                norm_denom = denom_vec @ c0_fixed
+                norm_constant = 1.0 / (norm_denom + self.numerical_tolerance)
+                c0_fixed = norm_constant * c0_fixed
             self.register_buffer("c0_fixed", c0_fixed)
         else:
             self.__c0u = torch.nn.Parameter(torch.ones(psi0_basis.n_basis_functions()))
-        
-        self.numerical_tolerance = numerical_tolerance
     
     @classmethod
     def from_r2ff(cls, r2ff : LinearRFF, psi0_basis : SeparableBasis):
@@ -382,7 +394,7 @@ class Linear2FF(DensityModel):
             denom_vec = self.xi_basis.Omega3_contract(self.phi_basis, self.psi0_basis, self.d, self.a)
             norm_denom = denom_vec @ c0_unnormalized
 
-        norm_constant = 1.0 / norm_denom
+        norm_constant = 1.0 / (norm_denom + self.numerical_tolerance)
 
         return norm_constant * c0_unnormalized
         
@@ -550,8 +562,8 @@ class QuadraticFF(DensityModel):
         psi0_basis_1 = self.psi0_basis.freeze_params()
         psi0_basis_2 = self.psi0_basis.freeze_params()
 
-        phi_quad_basis = phi_basis_1.product_basis([phi_basis_2], ignore_coeffs=True)
-        psi0_quad_basis = psi0_basis_1.product_basis([psi0_basis_2], ignore_coeffs=True)
+        phi_quad_basis = phi_basis_1.product_basis([phi_basis_2])
+        psi0_quad_basis = psi0_basis_1.product_basis([psi0_basis_2])
 
         phi_quad_basis.set_coeffs(self.A.reshape(-1), trainable=False)
         psi0_quad_basis.set_coeffs(self.get_C0().reshape(-1), trainable=False)

@@ -16,7 +16,12 @@ from typing import Callable, Type
 import matplotlib.pyplot as plt
 import torch
 
-from rational_factor.models.basis_functions import QuadraticExpBasis, UnnormalizedBetaBasis
+from rational_factor.models.basis_functions import (
+    BetaBasis,
+    GaussianBasis,
+    QuadraticExpBasis,
+    UnnormalizedBetaBasis,
+)
 from rational_factor.models.factor_forms import Linear2FF, LinearFF, QuadraticFF
 from rational_factor.tools.analysis import check_pdf_valid
 from rational_factor.tools.visualization import plot_belief
@@ -24,8 +29,8 @@ from rational_factor.tools.visualization import plot_belief
 
 # --- edit these -------------------------------------------------------------
 
-# "quadratic_exp" | "unnormalized_beta"
-BASIS = "unnormalized_beta"
+# "quadratic_exp" | "unnormalized_beta" | "gaussian" | "beta"
+BASIS = "quadratic_exp"
 
 # None => random choice from ("linear_ff", "linear2ff", "quadratic_ff")
 #MODEL: str | None = None
@@ -43,21 +48,32 @@ FIGSIZE = (14, 4)
 
 # Basis init controls
 VARIANCE = 20.0
-QUADRATIC_EXP_OFFSETS = (0.0, 0.0, 0.0)
+# QuadraticExpBasis: keep mass concentrated for MC/plots on (-10, 10); see test_marginal.py.
+QUADRATIC_EXP_INIT_VARIANCE = 1.0
+QUADRATIC_EXP_OFFSETS = (0.0, 0.0)  # len must match n_params_per_basis == 2 (raw_a, b)
 QUADRATIC_EXP_EPS = 1e-6
 UNNORMALIZED_BETA_OFFSETS = (0.0, 0.0)
 UNNORMALIZED_BETA_MIN_CONCENTRATION = 1.0
 UNNORMALIZED_BETA_EPS = 1e-6
+GAUSSIAN_OFFSETS = (0.0, 30.0)
+GAUSSIAN_MIN_STD = 1e-3
+BETA_OFFSETS = (0.0, 0.0)
+BETA_MIN_CONCENTRATION = 1.0
+BETA_EPS = 1e-6
 
 # ---------------------------------------------------------------------------
 
-SeparableBasisType = Type[QuadraticExpBasis] | Type[UnnormalizedBetaBasis]
+SeparableBasisType = (
+    Type[QuadraticExpBasis] | Type[UnnormalizedBetaBasis] | Type[GaussianBasis] | Type[BetaBasis]
+)
 ModelType = LinearFF | Linear2FF | QuadraticFF
 
 _BASIS_REGISTRY: dict[str, tuple[SeparableBasisType, tuple[float, float]]] = {
     "quadratic_exp": (QuadraticExpBasis, (-10.0, 10.0)),
     # Use near-full support to match analytic Beta integrals in basis marginal/Omega ops.
     "unnormalized_beta": (UnnormalizedBetaBasis, (1e-6, 1.0 - 1e-6)),
+    "gaussian": (GaussianBasis, (-12.0, 12.0)),
+    "beta": (BetaBasis, (1e-6, 1.0 - 1e-6)),
 }
 
 
@@ -100,7 +116,13 @@ def _random_basis(
     cls = _BASIS_REGISTRY[basis_name][0]
     if basis_name == "quadratic_exp":
         off = torch.tensor(QUADRATIC_EXP_OFFSETS, device=device, dtype=dtype)
-        basis = cls.random_init(d, n_basis, offsets=off, variance=VARIANCE, eps=QUADRATIC_EXP_EPS)
+        basis = cls.random_init(
+            d,
+            n_basis,
+            offsets=off,
+            variance=QUADRATIC_EXP_INIT_VARIANCE,
+            eps=QUADRATIC_EXP_EPS,
+        )
     elif basis_name == "unnormalized_beta":
         off = torch.tensor(UNNORMALIZED_BETA_OFFSETS, dtype=dtype)
         basis = cls.random_init(
@@ -111,10 +133,31 @@ def _random_basis(
             min_concentration=UNNORMALIZED_BETA_MIN_CONCENTRATION,
             eps=UNNORMALIZED_BETA_EPS,
         ).to(device=device, dtype=dtype)
+    elif basis_name == "gaussian":
+        off = torch.tensor(GAUSSIAN_OFFSETS, dtype=dtype)
+        basis = cls.random_init(
+            d,
+            n_basis,
+            offsets=off,
+            variance=VARIANCE,
+            min_std=GAUSSIAN_MIN_STD,
+            device=device,
+        ).to(device=device, dtype=dtype)
+    elif basis_name == "beta":
+        off = torch.tensor(BETA_OFFSETS, dtype=dtype)
+        basis = cls.random_init(
+            d,
+            n_basis,
+            offsets=off,
+            variance=VARIANCE,
+            min_concentration=BETA_MIN_CONCENTRATION,
+            eps=BETA_EPS,
+            device=device,
+        ).to(device=device, dtype=dtype)
     else:
         raise ValueError(f"Unknown basis name: {basis_name}")
 
-    return cls.freeze_params(basis) if freeze_params else basis
+    return basis.freeze_params() if freeze_params else basis
 
 
 def make_linear_ff(

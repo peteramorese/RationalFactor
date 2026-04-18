@@ -20,6 +20,7 @@ class FullyObservableProblem:
     n_data_tran: int
     n_data_init: int
     seed: int
+    numerical_tolerance: float
     plot_bounds_low: torch.Tensor
     plot_bounds_high: torch.Tensor
     plot_marginals_list: list[tuple[int, int]]
@@ -80,6 +81,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_tran=10000,
         n_data_init=1000,
         seed=42,
+        numerical_tolerance=1e-20,
         plot_bounds_low=torch.tensor([-5.0, -5.0]),
         plot_bounds_high=torch.tensor([5.0, 5.0]),
         plot_marginals_list=[(0, 1)],
@@ -111,6 +113,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_tran=15000,
         n_data_init=1500,
         seed=42,
+        numerical_tolerance=1e-10,
         plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -10.0]),
         plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 10.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5)],
@@ -122,7 +125,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
             m=1.0,
             I=0.02,
             ell=0.22,
-            covariance=0.008 * torch.eye(6),
+            covariance=0.1 * torch.eye(6),
         ),
         initial_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.15, 0.35, -0.08, 0.0, 0.0, 0.0]),
@@ -131,16 +134,19 @@ FULLY_OBSERVABLE_PROBLEMS = {
             ),
         ),
         prev_state_sampler=make_mvnormal_state_sampler(
-            mean=torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
-            covariance=torch.diag(torch.tensor([2.5, 2.5, 0.9, 2.0, 2.0, 2.5], dtype=torch.float32)),
+            mean=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            covariance=torch.diag(torch.tensor([5.0, 10.0, 3.0, 10.0, 10.0, 15.0], dtype=torch.float32)),
         ),
-        n_timesteps=15,
+        n_timesteps=10,
         n_trajectories_test=5000,
         n_data_tran=15000,
         n_data_init=1500,
         seed=42,
-        plot_bounds_low=torch.tensor([-10.0, -10.0, -5.0, -15.0, -15.0, -15.0]),
-        plot_bounds_high=torch.tensor([10.0, 10.0, 5.0, 15.0, 15.0, 15.0]),
+        numerical_tolerance=1e-10,
+        plot_bounds_low=torch.tensor([-5.0, -5.0, -4.0, -10.0, -10.0, -15.0]),
+        plot_bounds_high=torch.tensor([5.0, 5.0, 4.0, 10.0, 10.0, 15.0]),
+        #plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -5.0]),
+        #plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 5.0]),
         plot_marginals_list=[(0, 1), (3, 4), (2, 5)],
     ),
     "quadcopter": FullyObservableProblem(
@@ -166,6 +172,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_tran=20000,
         n_data_init=2000,
         seed=42,
+        numerical_tolerance=1e-10,
         plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0]),
         plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
@@ -198,6 +205,7 @@ PARTIALLY_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         n_data_obs=10000,
         seed=42,
+        numerical_tolerance=1e-20,
         plot_bounds_low=torch.tensor([-5.0, -5.0]),
         plot_bounds_high=torch.tensor([5.0, 5.0]),
         plot_marginals_list=[(0, 1)],

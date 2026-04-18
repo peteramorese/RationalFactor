@@ -1,28 +1,44 @@
 import torch
-from particle_filter.particle_set import WeightedParticleSet
+from particle_filter.particle_set import ParticleSet, WeightedParticleSet
 from rational_factor.models.density_model import ConditionalDensityModel
 
 @torch.no_grad()
-def propagate(belief: WeightedParticleSet, transition_model: ConditionalDensityModel, n_steps: int, copy_belief: bool = True):
+def propagate(
+    belief: ParticleSet,
+    transition_model: ConditionalDensityModel,
+    n_steps: int,
+    copy_belief: bool = True,
+):
     """
     Propagate the particle belief forward through p(x' | x).
 
-    If `copy_belief` is True, this returns an updated copy and leaves `belief`
-    unchanged. Otherwise, this mutates `belief` in place and also returns it.
+    Returns a sequence with length `n_steps + 1`, including the starting belief
+    at index 0 and propagated beliefs for each subsequent timestep.
+
+    If `copy_belief` is True, `belief` is left unchanged. Otherwise, `belief` is
+    updated in place while snapshots are returned in the sequence.
     """
     assert n_steps >= 1, "n_steps must be >= 1"
 
-    belief_next = belief.clone() if copy_belief else belief
-    particles = belief_next.particles
-    for _ in range(n_steps):
-        particles = transition_model.sample(particles)
-        assert particles.ndim == 2, "transition_model.sample must return shape (N, dim)"
-        assert particles.shape[0] == belief_next.n_particles, \
-            "transition_model.sample must return one sample per input particle"
+    if copy_belief:
+        belief_curr = belief.clone()
+        belief_seq = [belief_curr.clone()]
+    else:
+        belief_curr = belief
+        belief_seq = [belief.clone()]
 
-    belief_next.particles = particles
-    belief_next.normalize_weights()
-    return belief_next
+    for _ in range(n_steps):
+        particles = transition_model.sample(belief_curr.particles)
+        assert particles.ndim == 2, "transition_model.sample must return shape (N, dim)"
+        assert particles.shape[0] == belief_curr.n_particles(), "transition_model.sample must return one sample per input particle"
+
+        belief_curr.particles = particles
+        if isinstance(belief_curr, WeightedParticleSet):
+            belief_curr.normalize_weights()
+
+        belief_seq.append(belief_curr.clone())
+
+    return belief_seq
 
 @torch.no_grad()
 def update(
@@ -67,7 +83,7 @@ def propagate_and_update(belief : WeightedParticleSet, transition_model : Condit
     for observation in observations:
         
         # Propagate the previous posterior belief to get the prior for the current timestep
-        prior = propagate(posteriors[-1], transition_model, 1, copy_belief=True)
+        prior = propagate(posteriors[-1], transition_model, 1, copy_belief=True)[1]
         
         if observation is not None:
             posterior = update(prior, observation_model, observation, copy_belief=True)

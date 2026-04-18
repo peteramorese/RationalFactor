@@ -5,6 +5,7 @@ from matplotlib.colors import Normalize
 from rational_factor.systems.problems import FullyObservableProblem
 from rational_factor.models.density_model import DensityModel
 from particle_filter.particle_set import WeightedParticleSet
+from rational_factor.tools.analysis import check_pdf_valid
 
 def _square_ranges(x_range: tuple[float, float], y_range: tuple[float, float]) -> tuple[tuple[float, float], tuple[float, float]]:
     x_mid = 0.5 * (x_range[0] + x_range[1])
@@ -29,9 +30,14 @@ def plot_belief(ax: plt.Axes, belief : DensityModel, x_range: tuple[float, float
         param = next(iter(belief.parameters()), None)
         buffer = next(iter(belief.buffers()), None)
         belief_device = param.device if param is not None else (buffer.device if buffer is not None else torch.device("cpu"))
-        density = belief(torch.tensor(xy, dtype=torch.get_default_dtype(), device=belief_device))
+        belief_dtype = param.dtype if param is not None else (buffer.dtype if buffer is not None else torch.get_default_dtype())
+        density = belief(torch.tensor(xy, dtype=belief_dtype, device=belief_device))
         density = density.cpu().numpy()
     Z = density.reshape(X.shape)
+    # Use scientific notation: very small but normal densities can look like 0 in default float printing.
+    print(f"Z min: {float(np.min(Z)):.6e}  Z max: {float(np.max(Z)):.6e}")
+    print("Z is nan: ", np.isnan(Z).any())
+    print("Z is inf: ", np.isinf(Z).any())
 
     contourf_kwargs = contourf_kwargs or {}
     default_contour_kwargs = dict(colors="white", linewidths=0.5)
@@ -129,8 +135,11 @@ def plot_marginal_trajectory_comparison(problem: FullyObservableProblem, beliefs
     traj_data = problem.test_data()
     assert len(traj_data) == n_slices, "problem.test_data() length must equal problem.n_timesteps + 1"
     scatter_kwargs = scatter_kwargs or {}
+    fig_i = 0
     for t in range(n_slices):
         for i, marginal_dims in enumerate(marginals_list):
+            print(f"Creating figure {fig_i + 1} of {n_slices * n_marginals}")
+            fig_i += 1
             x_dim, y_dim = marginal_dims
             x_range, y_range = _square_ranges(
                 (problem.plot_bounds_low[x_dim].item(), problem.plot_bounds_high[x_dim].item()),
@@ -152,6 +161,20 @@ def plot_marginal_trajectory_comparison(problem: FullyObservableProblem, beliefs
             traj_ax.set_aspect("equal")
 
             belief_marginal = beliefs[t].marginal(marginal_dims=marginal_dims)
+            #marg_param = next(iter(belief_marginal.parameters()), None)
+            #marg_buffer = next(iter(belief_marginal.buffers()), None)
+            #belief_device = (
+            #    marg_param.device
+            #    if marg_param is not None
+            #    else (marg_buffer.device if marg_buffer is not None else torch.device("cpu"))
+            #)
+            #domain_bounds_marginal = ((x_range[0], y_range[0]), (x_range[1], y_range[1]))
+            #check_pdf_valid(
+            #    belief_marginal,
+            #    domain_bounds=domain_bounds_marginal,
+            #    n_samples=10000,
+            #    device=belief_device,
+            #)
             plot_belief(
                 belief_ax,
                 belief_marginal,

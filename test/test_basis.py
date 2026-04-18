@@ -39,7 +39,7 @@ NUM_MC_SAMPLES = 100000
 # Basis initialization offsets by family.
 GAUSSIAN_OFFSETS = (0.0, 0.5)
 BETA_OFFSETS = (0.0, 0.5)
-QUADRATIC_EXP_OFFSETS = (0.0, 0.5, 0.0)
+QUADRATIC_EXP_OFFSETS = (0.0, 0.5)  # raw_a, b; len must be 2 for QuadraticExpBasis
 
 # ---------------------------------------------------------------------------
 

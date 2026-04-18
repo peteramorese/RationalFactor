@@ -2,7 +2,7 @@
 Randomized checks that lower-dimensional marginals of FF density models integrate to ~1.
 
 Basis marginal conventions in this test:
-  - QuadraticExpBasis, UnnormalizedBetaBasis: marginal_dims = coordinate indices to *keep*.
+  - QuadraticExpBasis, UnnormalizedBetaBasis, GaussianBasis, BetaBasis: marginal_dims = coordinate indices to *keep*.
 
 Models are built like scripts/composite_experiments/vdp_nfdf_gaussian.py: bases from
 `random_init`, then `LinearFF.from_rff` / `Linear2FF.from_r2ff` / `QuadraticFF.from_rff`.
@@ -20,14 +20,19 @@ from typing import Callable, Sequence, Type
 
 import torch
 
-from rational_factor.models.basis_functions import QuadraticExpBasis, UnnormalizedBetaBasis
+from rational_factor.models.basis_functions import (
+    BetaBasis,
+    GaussianBasis,
+    QuadraticExpBasis,
+    UnnormalizedBetaBasis,
+)
 from rational_factor.models.factor_forms import Linear2FF, LinearFF, QuadraticFF
 from rational_factor.tools.analysis import check_pdf_valid
 
 # --- edit these -------------------------------------------------------------
 
-# "quadratic_exp" | "unnormalized_beta"
-BASIS = "unnormalized_beta"
+# "quadratic_exp" | "unnormalized_beta" | "gaussian" | "beta"
+BASIS = "quadratic_exp"
 
 # Subset of: "linear_ff", "linear2ff", "quadratic_ff"
 MODELS = ("linear_ff", "linear2ff")
@@ -36,33 +41,46 @@ DIM = 6  # full dimension d, must be >= 2
 N_BASIS = 12
 N_MARGINAL_SAMPLES = 4  # random marginals per model
 N_MC = 10000  
-SEED = 0
+SEED = 2
 
 USE_CPU = False
 
 # `random_init` hyperparameters (same spirit as vdp_nfdf_gaussian.py for GaussianBasis)
 VARIANCE = 20.0
-# QuadraticExpBasis.random_init
-QUADRATIC_EXP_OFFSETS = (0.0, 0.0, 0.0)
+# QuadraticExpBasis: small variance + centered offsets so modes sit near 0 and most mass
+# lies inside the quadratic_exp MC box (-10, 10) (large VARIANCE spreads exp(a x^2+b x) tails).
+QUADRATIC_EXP_INIT_VARIANCE = 1.35
+QUADRATIC_EXP_OFFSETS = (0.0, 0.0)  # len must match n_params_per_basis == 2 (raw_a, b)
 QUADRATIC_EXP_EPS = 1e-6
 # UnnormalizedBetaBasis.random_init
 UNNORMALIZED_BETA_OFFSETS = (0.0, 0.0)
 UNNORMALIZED_BETA_VARIANCE = 1.0
 UNNORMALIZED_BETA_MIN_CONCENTRATION = 1.0
 UNNORMALIZED_BETA_EPS = 1e-6
+# GaussianBasis.random_init (cf. scripts using offsets [0, 30], variance 20)
+GAUSSIAN_OFFSETS = (0.0, 30.0)
+GAUSSIAN_MIN_STD = 1e-3
+# BetaBasis.random_init
+BETA_OFFSETS = (0.0, 0.0)
+BETA_MIN_CONCENTRATION = 1.0
+BETA_EPS = 1e-6
 
 # Standard deviation for Gaussian noise written into each *trainable* parameter after build
 PARAM_RAND_STD = 1.0
 
 # ---------------------------------------------------------------------------
 
-SeparableBasisType = Type[QuadraticExpBasis] | Type[UnnormalizedBetaBasis]
+SeparableBasisType = (
+    Type[QuadraticExpBasis] | Type[UnnormalizedBetaBasis] | Type[GaussianBasis] | Type[BetaBasis]
+)
 
 # (basis class, how marginal_dims is interpreted, per-dim domain (low, high) for MC)
 _BASIS_REGISTRY: dict[str, tuple[SeparableBasisType, str, tuple[float, float]]] = {
     "quadratic_exp": (QuadraticExpBasis, "keep", (-10.0, 10.0)),
     # Use near-full support to match analytic Beta integrals in basis marginal/Omega ops.
     "unnormalized_beta": (UnnormalizedBetaBasis, "keep", (1e-6, 1.0 - 1e-6)),
+    "gaussian": (GaussianBasis, "keep", (-12.0, 12.0)),
+    "beta": (BetaBasis, "keep", (1e-6, 1.0 - 1e-6)),
 }
 
 
@@ -95,14 +113,20 @@ def _random_basis(
     dtype: torch.dtype,
     freeze_params: bool = False,
 ):
-    """Single `random_init` basis, same hyperparameters as vdp_nfdf_gaussian.py (per BASIS kind)."""
+    """Single `random_init` basis (per BASIS kind). QuadraticExp uses its own init variance."""
     cls = _BASIS_REGISTRY[basis_name][0]
 
     if basis_name == "quadratic_exp":
         off = torch.tensor(QUADRATIC_EXP_OFFSETS, device=device, dtype=dtype)
-        basis = cls.random_init(d, n_basis, offsets=off, variance=VARIANCE, eps=QUADRATIC_EXP_EPS)
+        basis = cls.random_init(
+            d,
+            n_basis,
+            offsets=off,
+            variance=QUADRATIC_EXP_INIT_VARIANCE,
+            eps=QUADRATIC_EXP_EPS,
+        )
         if freeze_params:
-            basis = cls.freeze_params(basis)
+            basis = basis.freeze_params()
         return basis
     if basis_name == "unnormalized_beta":
         off = torch.tensor(UNNORMALIZED_BETA_OFFSETS, dtype=dtype)
@@ -115,9 +139,35 @@ def _random_basis(
             eps=UNNORMALIZED_BETA_EPS,
         ).to(device=device, dtype=dtype)
         if freeze_params:
-            basis = cls.freeze_params(basis)
+            basis = basis.freeze_params()
         return basis
-
+    if basis_name == "gaussian":
+        off = torch.tensor(GAUSSIAN_OFFSETS, dtype=dtype)
+        basis = cls.random_init(
+            d,
+            n_basis,
+            offsets=off,
+            variance=VARIANCE,
+            min_std=GAUSSIAN_MIN_STD,
+            device=device,
+        ).to(device=device, dtype=dtype)
+        if freeze_params:
+            basis = basis.freeze_params()
+        return basis
+    if basis_name == "beta":
+        off = torch.tensor(BETA_OFFSETS, dtype=dtype)
+        basis = cls.random_init(
+            d,
+            n_basis,
+            offsets=off,
+            variance=VARIANCE,
+            min_concentration=BETA_MIN_CONCENTRATION,
+            eps=BETA_EPS,
+            device=device,
+        ).to(device=device, dtype=dtype)
+        if freeze_params:
+            basis = basis.freeze_params()
+        return basis
 
     raise ValueError(f"Unknown basis name: {basis_name}")
 
