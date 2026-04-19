@@ -12,12 +12,15 @@ class CompositeDensityModel(DensityModel):
         self.domain_tfs = torch.nn.ModuleList(domain_tfs)
         self.density_model = density_model
     
-    def log_density(self, x: torch.Tensor):
+    def log_density(self, x: torch.Tensor, debug = False):
         z_i = x
         total_ladj = x.new_zeros(x.shape[0])
         for tf in self.domain_tfs:
             z_i, ladj = tf(z_i)
             total_ladj = total_ladj + ladj
+        if debug:
+            print("base log density: ", self.density_model.log_density(z_i))
+            print("total ladj: ", total_ladj)
         return self._clip_log_density(self.density_model.log_density(z_i) + total_ladj)
     
     def valid(self):

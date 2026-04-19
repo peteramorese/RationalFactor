@@ -22,6 +22,8 @@ from rational_factor.models.basis_functions import (
     QuadraticExpBasis,
     UnnormalizedBetaBasis,
 )
+from rational_factor.models.composite_model import CompositeDensityModel
+from rational_factor.models.domain_transformation import ErfSeparableTF
 from rational_factor.models.factor_forms import Linear2FF, LinearFF, QuadraticFF
 from rational_factor.tools.analysis import check_pdf_valid
 from rational_factor.tools.visualization import plot_belief
@@ -30,11 +32,11 @@ from rational_factor.tools.visualization import plot_belief
 # --- edit these -------------------------------------------------------------
 
 # "quadratic_exp" | "unnormalized_beta" | "gaussian" | "beta"
-BASIS = "quadratic_exp"
+BASIS = "beta"
 
-# None => random choice from ("linear_ff", "linear2ff", "quadratic_ff")
+# None => random choice from ("linear_ff", "linear2ff", "quadratic_ff", "composite_erf_linear_ff")
 #MODEL: str | None = None
-MODEL: str = "linear_ff"
+MODEL: str = "composite_erf_linear_ff"
 
 SEED = 0
 N_BASIS = 12
@@ -60,6 +62,12 @@ GAUSSIAN_MIN_STD = 1e-3
 BETA_OFFSETS = (0.0, 0.0)
 BETA_MIN_CONCENTRATION = 1.0
 BETA_EPS = 1e-6
+
+# CompositeDensityModel(ErfSeparableTF, base density) is visualized in x-space on a finite
+# window that captures essentially all of the transformed mass.
+ERF_LOC = 0.0
+ERF_SCALE = 1.0
+ERF_BOX = (-6.0, 6.0)
 
 # ---------------------------------------------------------------------------
 
@@ -190,11 +198,32 @@ def make_quadratic_ff(
     return QuadraticFF(A, phi, psi0)
 
 
-_MODEL_BUILDERS: dict[str, Callable[[str, int, int, torch.device, torch.dtype], ModelType]] = {
+def make_composite_erf_linear_ff(
+    basis_name: str, d: int, n_basis: int, device: torch.device, dtype: torch.dtype
+) -> CompositeDensityModel:
+    del basis_name
+    base_density = make_linear_ff("beta", d, n_basis, device, dtype)
+    loc = torch.full((d,), ERF_LOC, device=device, dtype=dtype)
+    scale = torch.full((d,), ERF_SCALE, device=device, dtype=dtype)
+    domain_tf = ErfSeparableTF(d, loc=loc, scale=scale, trainable=False)
+    return CompositeDensityModel(domain_tf, base_density)
+
+
+_MODEL_BUILDERS: dict[
+    str,
+    Callable[[str, int, int, torch.device, torch.dtype], ModelType | CompositeDensityModel],
+] = {
     "linear_ff": make_linear_ff,
     "linear2ff": make_linear_2ff,
     "quadratic_ff": make_quadratic_ff,
+    "composite_erf_linear_ff": make_composite_erf_linear_ff,
 }
+
+
+def model_bounds(model_name: str, basis_name: str) -> tuple[float, float]:
+    if model_name == "composite_erf_linear_ff":
+        return ERF_BOX
+    return _BASIS_REGISTRY[basis_name][1]
 
 
 def _plot_1d_marginal(ax: plt.Axes, model: ModelType, x_low: float, x_high: float, n_points: int, title: str) -> None:
@@ -233,7 +262,7 @@ def main() -> None:
     marg_x0 = belief.marginal((0,))
     marg_x1 = belief.marginal((1,))
 
-    x_low, x_high = _BASIS_REGISTRY[BASIS][1]
+    x_low, x_high = model_bounds(model_name, BASIS)
     bounds_2d = ((x_low, x_low), (x_high, x_high))
     bounds_1d = ((x_low,), (x_high,))
 

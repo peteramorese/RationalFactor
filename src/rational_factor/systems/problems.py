@@ -25,13 +25,19 @@ class FullyObservableProblem:
     plot_bounds_high: torch.Tensor
     plot_marginals_list: list[tuple[int, int]]
 
-    def train_state_data(self):
+    def train_initial_state_data(self):
         with torch.random.fork_rng():
             if self.seed is not None:
                 torch.manual_seed(self.seed)
             x0_data = self.initial_state_sampler(self.n_data_init)
+            return x0_data
+
+    def train_state_transition_data(self):
+        with torch.random.fork_rng():
+            if self.seed is not None:
+                torch.manual_seed(self.seed)
             x_k_data, x_kp1_data = sample_io_pairs(self.system, self.prev_state_sampler, n_pairs=self.n_data_tran)
-            return x0_data, x_k_data, x_kp1_data    
+            return x_k_data, x_kp1_data    
     
     def test_data(self):
         with torch.random.fork_rng():
@@ -130,7 +136,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         initial_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.15, 0.35, -0.08, 0.0, 0.0, 0.0]),
             covariance=torch.diag(
-                torch.tensor([0.12, 0.12, 0.12, 0.35, 0.35, 0.6], dtype=torch.float32) ** 2
+                torch.tensor([1.0, 1.0, 0.5, 0.35, 0.35, 1.5], dtype=torch.float32) ** 2
             ),
         ),
         prev_state_sampler=make_mvnormal_state_sampler(
@@ -139,8 +145,8 @@ FULLY_OBSERVABLE_PROBLEMS = {
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
-        n_data_tran=15000,
-        n_data_init=1500,
+        n_data_tran=30000,
+        n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-10,
         plot_bounds_low=torch.tensor([-5.0, -5.0, -4.0, -10.0, -10.0, -15.0]),

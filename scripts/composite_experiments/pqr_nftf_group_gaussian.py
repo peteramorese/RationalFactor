@@ -45,7 +45,7 @@ def main() -> None:
     else:
         tran_params = {
             "n_epochs_per_group": [15, 5],  # basis, then weights
-            "iterations": 400,
+            "iterations": 50,
             "lr_basis": 5e-3,
             "lr_weights": 1e-2,
         }
@@ -61,7 +61,8 @@ def main() -> None:
     print("Using device: ", device)
 
     system = problem.system
-    x0_data, x_k_data, x_kp1_data = problem.train_state_data()
+    x0_data = problem.train_initial_state_data()
+    x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj_data = problem.test_data()
 
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)

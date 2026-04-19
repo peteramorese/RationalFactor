@@ -43,6 +43,8 @@ class ErfSeparableTF(DomainTF):
         super().__init__(dim)
         # (dim, 2): column 0 = location, column 1 = raw scale (softplus applied in forward)
         self.trainable = trainable
+        self.min_scale = min_scale
+        scale = torch.as_tensor(scale, dtype=loc.dtype, device=loc.device).clamp(min=min_scale)
         if trainable:
             scale_params = torch.sqrt(scale)
             self.params = torch.nn.Parameter(torch.hstack([loc.unsqueeze(1), scale_params.unsqueeze(1)]))
@@ -53,24 +55,30 @@ class ErfSeparableTF(DomainTF):
 
     @classmethod
     def copy_from_trainable(cls, other : 'ErfSeparableTF'):
-        return cls(other.dim, other.params[:, 0].detach().clone(), torch.square(other.params[:, 1]).detach().clone(), trainable=False)
+        return cls(
+            other.dim,
+            other.params[:, 0].detach().clone(),
+            torch.square(other.params[:, 1]).detach().clone(),
+            trainable=False,
+            min_scale=getattr(other, "min_scale", 1e-3),
+            numerical_tolerance=getattr(other, "numerical_tolerance", 1e-20),
+        )
 
     @classmethod
-    def from_data(cls, x_data : torch.Tensor, trainable : bool = True):
+    def from_data(cls, x_data : torch.Tensor, trainable : bool = True, min_scale : float = 1e-3):
         dim = x_data.shape[1]
         mean = x_data.mean(dim=0)
-        std = x_data.std(dim=0)
-        return cls(dim, mean, std, trainable)
+        std = x_data.std(dim=0).clamp_min(min_scale)
+        return cls(dim, mean, std, trainable=trainable, min_scale=min_scale)
 
     def loc_scale(self):
         if self.trainable:
             loc = self.params[:, 0]   # (dim,)
             scale = torch.square(self.params[:, 1]) # (dim,)
-            return loc, scale
         else:
             loc = self.params[:, 0]   # (dim,)
             scale = self.params[:, 1]  # (dim,)
-            return loc, scale
+        return loc, torch.clamp(scale, min=self.min_scale)
 
     def forward(self, x : torch.Tensor):
         loc, scale = self.loc_scale()
@@ -98,6 +106,7 @@ class ErfSeparableTF(DomainTF):
             loc=loc[list(marginal_dims)].detach().clone(),
             scale=scale[list(marginal_dims)].detach().clone(),
             trainable=False,
+            min_scale=self.min_scale,
             numerical_tolerance=self.numerical_tolerance,
         )
 

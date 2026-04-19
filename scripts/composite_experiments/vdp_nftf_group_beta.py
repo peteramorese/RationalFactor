@@ -50,9 +50,6 @@ if __name__ == "__main__":
         }
 
     batch_size = 256
-    n_timesteps_prop = problem.n_timesteps
-    #var_reg_strength = 5e-3
-    var_reg_strength = 0#1e-2
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -60,7 +57,8 @@ if __name__ == "__main__":
     print("Device: ", device)
 
     system = problem.system
-    x0_data, x_k_data, x_kp1_data = problem.train_state_data()
+    x0_data = problem.train_initial_state_data()
+    x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj_data = problem.test_data()
 
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
@@ -86,19 +84,17 @@ if __name__ == "__main__":
     mle_loss_fn = loss.conditional_mle_loss
     
     if use_dtf:
-        var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.beta_basis_concentration_reg_loss(model.conditional_density_model.phi_basis) + loss.beta_basis_concentration_reg_loss(model.conditional_density_model.psi_basis))
         optimizers ={"dtf_and_basis": torch.optim.Adam([{'params': tran_model.conditional_density_model.basis_params(), 'lr': tran_params["lr_basis"]}, 
                 {'params':tran_model.domain_tfs[0].parameters(), 'lr': tran_params["lr_dtf"]}, 
                 {'params':tran_model.domain_tfs[1].parameters(), 'lr': tran_params["lr_wrap"]}]), 
             "weights": torch.optim.Adam(tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"])} 
     else:
-        var_reg_loss_fn = lambda model, x, xp : var_reg_strength * (loss.beta_basis_concentration_reg_loss(model.conditional_density_model.phi_basis) + loss.beta_basis_concentration_reg_loss(model.conditional_density_model.psi_basis))
         optimizers ={"basis": torch.optim.Adam([{'params': tran_model.conditional_density_model.basis_params(), 'lr': tran_params["lr_basis"]}, {'params': tran_model.domain_tfs.parameters(), 'lr': tran_params["lr_wrap"]}]),
             "weights": torch.optim.Adam(tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"])}
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(tran_model,
         xp_dataloader,
-        {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
+        {"mle": mle_loss_fn}, 
         optimizers,
         epochs_per_group=tran_params["n_epochs_per_group"],
         iterations=tran_params["iterations"],
@@ -122,15 +118,13 @@ if __name__ == "__main__":
     mle_loss_fn = loss.mle_loss
 
     if use_dtf:
-        var_reg_loss_fn = lambda model, x : var_reg_strength * loss.beta_basis_concentration_reg_loss(model.density_model.psi0_basis)
         optimizers = {"basis": torch.optim.Adam(init_model.density_model.basis_params(), lr=init_params["lr_basis"]), "weights": torch.optim.Adam(init_model.density_model.weight_params(), lr=init_params["lr_weights"])}
     else:
-        var_reg_loss_fn = lambda model, x : var_reg_strength * loss.beta_basis_concentration_reg_loss(model.density_model.psi0_basis)
         optimizers = {"basis": torch.optim.Adam(init_model.density_model.basis_params(), lr=init_params["lr_basis"]), "weights": torch.optim.Adam(init_model.density_model.weight_params(), lr=init_params["lr_weights"])}
 
     init_model, best_loss_init, training_time_init = train.train_iterate(init_model, 
         x0_dataloader, 
-        {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn}, 
+        {"mle": mle_loss_fn}, 
         optimizers,
         epochs_per_group=init_params["n_epochs_per_group"],
         iterations=init_params["iterations"],
@@ -146,15 +140,15 @@ if __name__ == "__main__":
     box_highs = tuple(problem.plot_bounds_high.tolist())
 
     if use_dtf:
-        base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=n_timesteps_prop)
+        base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=problem.n_timesteps)
         belief_seq = [CompositeDensityModel([trained_nftf, trained_domain_tf], belief) for belief in base_belief_seq]
     else:
-        base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=n_timesteps_prop)
+        base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=problem.n_timesteps)
         belief_seq = [CompositeDensityModel([trained_domain_tf], belief) for belief in base_belief_seq]
 
-    fig, axes = plt.subplots(2, n_timesteps_prop, figsize=(20, 10))
+    fig, axes = plt.subplots(2, problem.n_timesteps, figsize=(20, 10))
     fig.suptitle("Beliefs at each time step")
-    for i in range(n_timesteps_prop):
+    for i in range(problem.n_timesteps):
         data_i = test_traj_data[i].to(device)
         ll = avg_log_likelihood(belief_seq[i], data_i)
         print(f"Log likelihood at time {i}: {ll:.4f}")

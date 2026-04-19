@@ -26,6 +26,8 @@ from rational_factor.models.basis_functions import (
     QuadraticExpBasis,
     UnnormalizedBetaBasis,
 )
+from rational_factor.models.composite_model import CompositeDensityModel
+from rational_factor.models.domain_transformation import ErfSeparableTF
 from rational_factor.models.factor_forms import Linear2FF, LinearFF, QuadraticFF
 from rational_factor.tools.analysis import check_pdf_valid
 
@@ -34,8 +36,8 @@ from rational_factor.tools.analysis import check_pdf_valid
 # "quadratic_exp" | "unnormalized_beta" | "gaussian" | "beta"
 BASIS = "quadratic_exp"
 
-# Subset of: "linear_ff", "linear2ff", "quadratic_ff"
-MODELS = ("linear_ff", "linear2ff")
+# Subset of: "linear_ff", "linear2ff", "quadratic_ff", "composite_erf_linear_ff"
+MODELS = ("linear_ff", "linear2ff", "composite_erf_linear_ff")
 
 DIM = 6  # full dimension d, must be >= 2
 N_BASIS = 12
@@ -67,6 +69,12 @@ BETA_EPS = 1e-6
 
 # Standard deviation for Gaussian noise written into each *trainable* parameter after build
 PARAM_RAND_STD = 1.0
+
+# CompositeDensityModel(ErfSeparableTF, base density) checks happen in x-space over a finite
+# window that captures essentially all Gaussian-CDF tail mass.
+ERF_LOC = 0.0
+ERF_SCALE = 1.0
+ERF_BOX = (-6.0, 6.0)
 
 # ---------------------------------------------------------------------------
 
@@ -203,10 +211,28 @@ def make_quadratic_ff(
     return QuadraticFF(A, phi, psi0)
 
 
-_MODEL_BUILDERS: dict[str, Callable[[str, int, int, torch.device, torch.dtype], LinearFF | Linear2FF | QuadraticFF]] = {
+def make_composite_erf_linear_ff(
+    basis_name: str, d: int, n_basis: int, device: torch.device, dtype: torch.dtype
+) -> CompositeDensityModel:
+    del basis_name
+    base_density = make_linear_ff("beta", d, n_basis, device, dtype)
+    loc = torch.full((d,), ERF_LOC, device=device, dtype=dtype)
+    scale = torch.full((d,), ERF_SCALE, device=device, dtype=dtype)
+    domain_tf = ErfSeparableTF(d, loc=loc, scale=scale, trainable=False)
+    return CompositeDensityModel(domain_tf, base_density)
+
+
+_MODEL_BUILDERS: dict[
+    str,
+    Callable[
+        [str, int, int, torch.device, torch.dtype],
+        LinearFF | Linear2FF | QuadraticFF | CompositeDensityModel,
+    ],
+] = {
     "linear_ff": make_linear_ff,
     "linear2ff": make_linear_2ff,
     "quadratic_ff": make_quadratic_ff,
+    "composite_erf_linear_ff": make_composite_erf_linear_ff,
 }
 
 
@@ -232,6 +258,12 @@ def marginal_box_bounds(
         tuple(full_lo[i] for i in keep),
         tuple(full_hi[i] for i in keep),
     )
+
+
+def model_per_dim_bounds(model_name: str, basis_name: str) -> tuple[float, float]:
+    if model_name == "composite_erf_linear_ff":
+        return ERF_BOX
+    return _BASIS_REGISTRY[basis_name][2]
 
 
 def random_marginal_arg(d: int, convention: str, rng: random.Random) -> tuple[int, ...]:
@@ -260,7 +292,7 @@ def run_trial(
     device: torch.device,
     param_rand_std: float,
 ) -> None:
-    _, convention, per_dim = _BASIS_REGISTRY[basis_name]
+    _, convention, _ = _BASIS_REGISTRY[basis_name]
     rng = random.Random(seed)
     torch.manual_seed(seed)
     dtype = torch.float32
@@ -270,6 +302,7 @@ def run_trial(
         model = builder(basis_name, dim, n_basis, device, dtype)
         model = model.to(device=device)
         model.eval()
+        per_dim = model_per_dim_bounds(mname, basis_name)
 
         _randomize_trainable_params(model, param_rand_std, seed)
 

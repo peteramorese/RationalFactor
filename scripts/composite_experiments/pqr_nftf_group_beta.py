@@ -23,24 +23,23 @@ def main() -> None:
 
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
-    use_dtf = False
-    n_basis = 1000
+    use_dtf = True
+    n_basis = 500
     batch_size = 256
-    var_reg_strength = 0.0
 
     if use_dtf:
         tran_params = {
-            "n_epochs_per_group": [15, 5],  # dtf+basis, then weights
-            "iterations": 250,
+            "n_epochs_per_group": [15, 15],  # dtf+basis, then weights
+            "iterations": 100,
             "lr_basis": 1e-2,
-            "lr_weights": 1e-2,
+            "lr_weights": 1e-3,
             "lr_dtf": 1e-3,
             "lr_wrap": 1e-3,
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 400,
-            "lr_basis": 5e-3,
+            "iterations": 1000,
+            "lr_basis": 5e-2,
             "lr_weights": 1e-2,
         }
     else:
@@ -63,14 +62,15 @@ def main() -> None:
     print("Using device: ", device)
 
     system = problem.system
-    x0_data, x_k_data, x_kp1_data = problem.train_state_data()
+    x0_data = problem.train_initial_state_data()
+    x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj_data = problem.test_data()
 
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     xp_dataloader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-    offsets = torch.tensor([-1.0, -1.0], device=device)
-    variance = 1.0
+    offsets = torch.tensor([10.0, 10.0], device=device)
+    variance = 30.0
     phi_basis = BetaBasis.random_init(
         system.dim(),
         n_basis=n_basis,
@@ -93,7 +93,7 @@ def main() -> None:
         min_concentration=1.0,
     ).to(device)
 
-    wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True).to(device)
+    wrap_tf = ErfSeparableTF.from_data(torch.cat([x0_data, x_k_data], dim=0), trainable=True).to(device)
     nftf = (
         MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
         if use_dtf
@@ -107,11 +107,6 @@ def main() -> None:
         tran_model = CompositeConditionalModel([wrap_tf], LinearRFF(phi_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance)).to(device)
 
     print("Training transition model")
-    mle_loss_fn = loss.conditional_mle_loss
-    var_reg_loss_fn = lambda model, x, xp: var_reg_strength * (
-        loss.beta_basis_concentration_reg_loss(model.conditional_density_model.phi_basis)
-        + loss.beta_basis_concentration_reg_loss(model.conditional_density_model.psi_basis)
-    )
 
     if use_dtf:
         optimizers = {
@@ -138,7 +133,7 @@ def main() -> None:
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(
         tran_model,
         xp_dataloader,
-        {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn},
+        {"mle": loss.conditional_mle_loss},
         optimizers,
         epochs_per_group=tran_params["n_epochs_per_group"],
         iterations=tran_params["iterations"],
@@ -164,10 +159,6 @@ def main() -> None:
         ).to(device)
 
     print("Training initial model")
-    mle_loss_fn = loss.mle_loss
-    var_reg_loss_fn = lambda model, x: var_reg_strength * loss.beta_basis_concentration_reg_loss(
-        model.density_model.psi0_basis
-    )
     optimizers = {
         "basis": torch.optim.Adam(init_model.density_model.basis_params(), lr=init_params["lr_basis"]),
         "weights": torch.optim.Adam(init_model.density_model.weight_params(), lr=init_params["lr_weights"]),
@@ -176,7 +167,7 @@ def main() -> None:
     init_model, best_loss_init, training_time_init = train.train_iterate(
         init_model,
         x0_dataloader,
-        {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn},
+        {"mle": loss.mle_loss},
         optimizers,
         epochs_per_group=init_params["n_epochs_per_group"],
         iterations=init_params["iterations"],
@@ -184,6 +175,21 @@ def main() -> None:
         use_best="mle",
     )
     print("Done.\n")
+
+    #print("wrap loc scale: ", trained_domain_tf.loc_scale())
+    #print("psi0_basis alpha beta: ", init_model.density_model.psi0_basis.alphas_betas())
+    #print("psi_basis alpha beta: ", tran_model.conditional_density_model.psi_basis.alphas_betas())
+    #print("phi_basis alpha beta: ", tran_model.conditional_density_model.phi_basis.alphas_betas())
+    ## Debug a few random physical states through the initial composite log density.
+    #n_debug_samples = 5
+    #lows = problem.plot_bounds_low.to(device=device, dtype=x0_data.dtype)
+    #highs = problem.plot_bounds_high.to(device=device, dtype=x0_data.dtype)
+    #x_debug = torch.rand(n_debug_samples, system.dim(), device=device, dtype=x0_data.dtype) * (highs - lows) + lows
+    #print("x_debug samples:\n", x_debug)
+    #with torch.no_grad():
+    #    init_model.eval()
+    #    logp_debug = init_model.log_density(x_debug, debug=True)
+    #print("init_model.log_density(x_debug):\n", logp_debug)
 
     print(f"Transition model loss: {best_loss_tran:.6f}, training time: {training_time_tran:.2f}s")
     print(f"Initial model loss: {best_loss_init:.6f}, training time: {training_time_init:.2f}s")
@@ -228,7 +234,7 @@ def main() -> None:
             problem=problem,
             beliefs=belief_seq,
             scatter_kwargs={"s": 1, "alpha": 0.7},
-            n_points=50,
+            n_points=40,
         )
         if fig is not None:
             fig.suptitle(f"{Path(__file__).stem} marginal comparison", y=1.02)

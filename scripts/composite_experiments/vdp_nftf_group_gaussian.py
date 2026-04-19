@@ -58,7 +58,8 @@ if __name__ == "__main__":
     print("Device: ", device)
 
     system = problem.system
-    x0, x_k, x_kp1 = problem.train_data()
+    x0 = problem.train_initial_state_data()
+    x_k, x_kp1 = problem.train_state_transition_data()
     traj_data = problem.test_data()
 
     x0_dataloader = DataLoader(TensorDataset(x0), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
