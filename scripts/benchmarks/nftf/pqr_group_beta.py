@@ -70,7 +70,8 @@ def main() -> None:
     problem = FULLY_OBSERVABLE_PROBLEMS["planar_quadrotor"]
     system = problem.system
 
-    x0_data, x_k_data, x_kp1_data = problem.train_data()
+    x0_data = problem.train_initial_state_data()
+    x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj_data = problem.test_data()
 
     x0_dataset = TensorDataset(x0_data)
