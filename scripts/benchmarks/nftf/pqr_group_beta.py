@@ -19,8 +19,8 @@ CONTEXT_USE_NFTF_FALSE = {
     "use_nftf": False,
     "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [15, 15],
-        "iterations": 500,
+        "n_epochs_per_group": [15, 5],
+        "iterations": 300,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
         "lr_wrap": 1e-3,
