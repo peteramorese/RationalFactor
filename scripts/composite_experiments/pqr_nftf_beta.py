@@ -24,7 +24,7 @@ def main() -> None:
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
     use_dtf = False
-    n_basis = 4000
+    n_basis = 500
     batch_size = 256
 
     if use_dtf:
