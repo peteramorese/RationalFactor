@@ -24,12 +24,12 @@ def main() -> None:
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
     use_dtf = False
-    n_basis = 4000
+    n_basis = 500
     batch_size = 256
 
     if use_dtf:
         tran_params = {
-            "n_epochs_per_group": [15, 15],  # dtf+basis, then weights
+            "n_epochs_per_group": [15, 15, 15],  # phi_basis+dtf+wrap, psi_basis+dtf+wrap, weights
             "iterations": 100,
             "lr_basis": 1e-2,
             "lr_weights": 1e-3,
@@ -44,7 +44,7 @@ def main() -> None:
         }
     else:
         tran_params = {
-            "n_epochs_per_group": [15, 5],  # basis, then weights
+            "n_epochs_per_group": [15, 15, 5],  # phi_basis+wrap, psi_basis+wrap, weights
             "iterations": 150,
             "lr_basis": 1e-2,
             "lr_weights": 1e-2,
@@ -110,9 +110,16 @@ def main() -> None:
 
     if use_dtf:
         optimizers = {
-            "dtf_and_basis": torch.optim.Adam(
+            "phi_basis": torch.optim.Adam(
                 [
-                    {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
+                    {"params": tran_model.conditional_density_model.phi_basis.parameters(), "lr": tran_params["lr_basis"]},
+                    {"params": tran_model.domain_tfs[0].parameters(), "lr": tran_params["lr_dtf"]},
+                    {"params": tran_model.domain_tfs[1].parameters(), "lr": tran_params["lr_wrap"]},
+                ]
+            ),
+            "psi_basis": torch.optim.Adam(
+                [
+                    {"params": tran_model.conditional_density_model.psi_basis.parameters(), "lr": tran_params["lr_basis"]},
                     {"params": tran_model.domain_tfs[0].parameters(), "lr": tran_params["lr_dtf"]},
                     {"params": tran_model.domain_tfs[1].parameters(), "lr": tran_params["lr_wrap"]},
                 ]
@@ -121,9 +128,15 @@ def main() -> None:
         }
     else:
         optimizers = {
-            "basis": torch.optim.Adam(
+            "phi_basis": torch.optim.Adam(
                 [
-                    {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
+                    {"params": tran_model.conditional_density_model.phi_basis.parameters(), "lr": tran_params["lr_basis"]},
+                    {"params": tran_model.domain_tfs.parameters(), "lr": tran_params["lr_wrap"]},
+                ]
+            ),
+            "psi_basis": torch.optim.Adam(
+                [
+                    {"params": tran_model.conditional_density_model.psi_basis.parameters(), "lr": tran_params["lr_basis"]},
                     {"params": tran_model.domain_tfs.parameters(), "lr": tran_params["lr_wrap"]},
                 ]
             ),

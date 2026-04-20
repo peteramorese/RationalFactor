@@ -34,10 +34,6 @@ def plot_belief(ax: plt.Axes, belief : DensityModel, x_range: tuple[float, float
         density = belief(torch.tensor(xy, dtype=belief_dtype, device=belief_device))
         density = density.cpu().numpy()
     Z = density.reshape(X.shape)
-    # Use scientific notation: very small but normal densities can look like 0 in default float printing.
-    print(f"Z min: {float(np.min(Z)):.6e}  Z max: {float(np.max(Z)):.6e}")
-    print("Z is nan: ", np.isnan(Z).any())
-    print("Z is inf: ", np.isinf(Z).any())
 
     contourf_kwargs = contourf_kwargs or {}
     default_contour_kwargs = dict(colors="white", linewidths=0.5)
@@ -161,20 +157,6 @@ def plot_marginal_trajectory_comparison(problem: FullyObservableProblem, beliefs
             traj_ax.set_aspect("equal")
 
             belief_marginal = beliefs[t].marginal(marginal_dims=marginal_dims)
-            #marg_param = next(iter(belief_marginal.parameters()), None)
-            #marg_buffer = next(iter(belief_marginal.buffers()), None)
-            #belief_device = (
-            #    marg_param.device
-            #    if marg_param is not None
-            #    else (marg_buffer.device if marg_buffer is not None else torch.device("cpu"))
-            #)
-            #domain_bounds_marginal = ((x_range[0], y_range[0]), (x_range[1], y_range[1]))
-            #check_pdf_valid(
-            #    belief_marginal,
-            #    domain_bounds=domain_bounds_marginal,
-            #    n_samples=10000,
-            #    device=belief_device,
-            #)
             plot_belief(
                 belief_ax,
                 belief_marginal,

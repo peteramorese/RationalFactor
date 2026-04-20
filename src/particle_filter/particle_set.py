@@ -6,7 +6,7 @@ from rational_factor.models.density_model import DensityModel
 class ParticleSet(DensityModel):
     def __init__(self, particles: torch.Tensor):
         super().__init__(particles.shape[1])
-        self.particles = particles
+        self.register_buffer("particles", particles)
 
     def clone(self):
         return ParticleSet(particles=self.particles.clone())
@@ -80,8 +80,8 @@ class ParticleSet(DensityModel):
 
 class WeightedParticleSet(ParticleSet):
     def __init__(self, particles: torch.Tensor, weights: torch.Tensor, resample: bool = True):
-        self.weights = weights
         super().__init__(particles)
+        self.register_buffer("weights", weights)
         self.normalize_weights()
         self.resample = resample
 

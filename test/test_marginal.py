@@ -1,8 +1,8 @@
 """
-Randomized checks that lower-dimensional marginals of FF density models integrate to ~1.
+Randomized checks that 2D marginals of FF density models integrate to ~1.
 
 Basis marginal conventions in this test:
-  - QuadraticExpBasis, UnnormalizedBetaBasis, GaussianBasis, BetaBasis: marginal_dims = coordinate indices to *keep*.
+  - QuadraticExpBasis, UnnormalizedBetaBasis, GaussianBasis, BetaBasis: marginal_dims = coordinate indices to *keep* (always two).
 
 Models are built like scripts/composite_experiments/vdp_nfdf_gaussian.py: bases from
 `random_init`, then `LinearFF.from_rff` / `Linear2FF.from_r2ff` / `QuadraticFF.from_rff`.
@@ -16,8 +16,10 @@ Edit the CONFIG block below, then run:
 from __future__ import annotations
 
 import random
+from pathlib import Path
 from typing import Callable, Sequence, Type
 
+import matplotlib.pyplot as plt
 import torch
 
 from rational_factor.models.basis_functions import (
@@ -30,6 +32,7 @@ from rational_factor.models.composite_model import CompositeDensityModel
 from rational_factor.models.domain_transformation import ErfSeparableTF
 from rational_factor.models.factor_forms import Linear2FF, LinearFF, QuadraticFF
 from rational_factor.tools.analysis import check_pdf_valid
+from rational_factor.tools.visualization import plot_belief
 
 # --- edit these -------------------------------------------------------------
 
@@ -41,11 +44,16 @@ MODELS = ("linear_ff", "linear2ff", "composite_erf_linear_ff")
 
 DIM = 6  # full dimension d, must be >= 2
 N_BASIS = 12
-N_MARGINAL_SAMPLES = 4  # random marginals per model
-N_MC = 10000  
+N_MARGINAL_SAMPLES = 4  # random 2D marginals per model (pairs of coordinate indices)
+N_MC = 10000
 SEED = 2
 
 USE_CPU = False
+
+# If True, saves one figure with a contour plot for each (model, marginal) trial.
+PLOT_MARGINALS = True
+PLOT_PATH = Path("figures/test_marginal__2d_marginals.png")
+N_PLOT_POINTS = 80
 
 # `random_init` hyperparameters (same spirit as vdp_nfdf_gaussian.py for GaussianBasis)
 VARIANCE = 20.0
@@ -267,16 +275,21 @@ def model_per_dim_bounds(model_name: str, basis_name: str) -> tuple[float, float
 
 
 def random_marginal_arg(d: int, convention: str, rng: random.Random) -> tuple[int, ...]:
-    """Return marginal_dims suitable for DensityModel.marginal (per basis convention)."""
+    """Return marginal_dims suitable for DensityModel.marginal (per basis convention).
+
+    For convention ``keep``, always returns exactly two distinct coordinate indices so the
+    marginal density is 2D.
+    """
     if d < 2:
-        raise ValueError("Need dim >= 2 to form a proper lower-dimensional marginal.")
+        raise ValueError("Need dim >= 2 to form a 2D marginal.")
 
     if convention == "keep":
-        k = rng.randint(1, d - 1)
-        return tuple(sorted(rng.sample(range(d), k)))
+        return tuple(sorted(rng.sample(range(d), 2)))
 
-    # integrate_out: non-empty proper subset to remove
-    m = rng.randint(1, d - 1)
+    # integrate_out: remove a non-empty proper subset so the kept marginal is 2D when d > 2
+    if d == 2:
+        raise ValueError("integrate_out convention needs dim > 2 for a 2D marginal.")
+    m = d - 2  # number of coordinates to integrate out
     return tuple(sorted(rng.sample(range(d), m)))
 
 
@@ -291,13 +304,20 @@ def run_trial(
     seed: int,
     device: torch.device,
     param_rand_std: float,
+    plot_marginals: bool = False,
+    plot_path: Path | None = None,
+    n_plot_points: int = 80,
 ) -> None:
     _, convention, _ = _BASIS_REGISTRY[basis_name]
     rng = random.Random(seed)
     torch.manual_seed(seed)
     dtype = torch.float32
 
-    for mname in model_names:
+    if plot_marginals:
+        nrows, ncols = len(model_names), n_marginal_samples
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.0 * nrows), squeeze=False)
+
+    for mi, mname in enumerate(model_names):
         builder = _MODEL_BUILDERS[mname]
         model = builder(basis_name, dim, n_basis, device, dtype)
         model = model.to(device=device)
@@ -310,12 +330,30 @@ def run_trial(
             arg = random_marginal_arg(dim, convention, rng)
             m_model = model.marginal(arg)
             m_d = m_model.dim
-            if m_d < 1:
-                raise RuntimeError("Marginal has dim < 1 (basis / marginal_dims bug).")
+            if m_d != 2:
+                raise RuntimeError(f"Expected 2D marginal, got dim {m_d} for marginal_dims {arg}.")
 
             bounds = marginal_box_bounds(dim, arg, convention, per_dim)
             print(f"\n{basis_name} / {mname} / marginal {arg} -> dim {m_d} (trial {t + 1}/{n_marginal_samples})")
             check_pdf_valid(m_model, bounds, n_samples=n_mc, device=device)
+
+            if plot_marginals:
+                assert plot_path is not None
+                lo, hi = bounds
+                x_range = (float(lo[0]), float(hi[0]))
+                y_range = (float(lo[1]), float(hi[1]))
+                ax = axes[mi, t]
+                plot_belief(ax, m_model, x_range=x_range, y_range=y_range, n_points=n_plot_points)
+                ax.set_title(f"{mname}\n{arg}", fontsize=9)
+
+    if plot_marginals:
+        assert plot_path is not None
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.suptitle(f"{basis_name} basis — 2D marginals", fontsize=11, y=1.02)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"\nSaved marginal figure to {plot_path.resolve()}")
 
 
 def main() -> None:
@@ -341,6 +379,9 @@ def main() -> None:
         seed=SEED,
         device=device,
         param_rand_std=PARAM_RAND_STD,
+        plot_marginals=PLOT_MARGINALS,
+        plot_path=PLOT_PATH if PLOT_MARGINALS else None,
+        n_plot_points=N_PLOT_POINTS,
     )
     print("\nAll marginal PDF checks passed.")
 

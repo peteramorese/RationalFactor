@@ -19,8 +19,10 @@ class CompositeDensityModel(DensityModel):
             z_i, ladj = tf(z_i)
             total_ladj = total_ladj + ladj
         if debug:
-            print("base log density: ", self.density_model.log_density(z_i))
-            print("total ladj: ", total_ladj)
+            print("----z_i: ", z_i)
+            print("----total ladj: ", total_ladj)
+            self.density_model.debug = True
+            print("----base log density: ", self.density_model.log_density(z_i))
         return self._clip_log_density(self.density_model.log_density(z_i) + total_ladj)
     
     def valid(self):

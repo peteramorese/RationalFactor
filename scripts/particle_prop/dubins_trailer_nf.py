@@ -1,7 +1,8 @@
 """
-Planar quadrotor: train a conditional NF for transitions and an NF for the
-initial distribution, propagate a particle belief with `particle_filter.propagate`,
-then report average log-likelihood of held-out states under each KDE belief.
+Second-order Dubins trailer: train a conditional NF for transitions and an NF
+for the initial distribution, propagate a particle belief with
+`particle_filter.propagate`, then report average log-likelihood of held-out
+states under each KDE belief.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from rational_factor.tools.visualization import plot_marginal_trajectory_compari
 
 
 def main() -> None:
-    problem = FULLY_OBSERVABLE_PROBLEMS["planar_quadrotor"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["dubins_trailer"]
     dim = problem.system.dim()
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -101,19 +102,18 @@ def main() -> None:
 
     out_dir = Path("figures")
     out_dir.mkdir(parents=True, exist_ok=True)
-    ll_path = out_dir / "pqr_nf__avg_ll.png"
+    ll_path = out_dir / "dubins_trailer_nf__avg_ll.png"
     plt.figure(figsize=(8, 4))
     plt.plot(ll_per_step, marker="o")
     plt.xlabel("timestep")
     plt.ylabel("avg log-likelihood (KDE belief vs test states)")
-    plt.title("planar_quadrotor — particle NF propagation")
+    plt.title("dubins_trailer - particle NF propagation")
     plt.grid(True, alpha=0.25)
     plt.tight_layout()
     plt.savefig(ll_path, dpi=200)
     print(f"Saved plot to {ll_path}")
 
-    comp_out_path = out_dir / "pqr_nf__marginal_comparison.png"
-    # Visualization does not need GPU; move beliefs to CPU to reduce peak memory.
+    comp_out_path = out_dir / "dubins_trailer_nf__marginal_comparison.png"
     belief_seq = [belief.to("cpu") for belief in belief_seq]
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -124,9 +124,10 @@ def main() -> None:
         n_points=40,
     )
     if fig is not None:
-        fig.suptitle("planar_quadrotor — particle NF marginal comparison", y=1.02)
+        fig.suptitle("dubins_trailer - particle NF marginal comparison", y=1.02)
         fig.savefig(comp_out_path, dpi=200, bbox_inches="tight")
         print(f"Saved marginal comparison plot to {comp_out_path}")
+
 
 if __name__ == "__main__":
     main()

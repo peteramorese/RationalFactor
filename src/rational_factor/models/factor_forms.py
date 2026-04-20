@@ -26,11 +26,23 @@ class LinearForm(DensityModel):
             Omega = self.basis.Omega1()
 
         w = self.__wu / (Omega @ self.__wu + self.numerical_tolerance)
+        if hasattr(self, "debug"):
+            print("LINEAR FORM: get_w: ", w)
         return w
     
     def log_density(self, x : torch.Tensor):
         w = self.get_w()
         log_g_x = torch.log(self.basis(x) @ w + self.numerical_tolerance) # (n_data)
+
+        if hasattr(self, "debug"):
+            print("LINEAR FORM: x: ", x)
+            print("LINEAR FORM: basis coeffs: ", self.basis.coeffs)
+            alphas, betas = self.basis.alphas_betas()
+            print("LINEAR FORM: basis alphas: ", alphas)
+            print("LINEAR FORM: basis betas: ", betas)
+            print("LINEAR FORM: basis(x): ", self.basis(x))
+            print("LINEAR FORM: w: ", w)
+            print("LINEAR FORM: log_g_x: ", log_g_x)
         return log_g_x
     
     def weight_params(self):
@@ -105,7 +117,7 @@ class LinearRFF(ConditionalDensityModel):
     
     def basis_params(self):
         return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
-
+    
     
 class LinearRF(ConditionalDensityModel):
     """
@@ -297,7 +309,7 @@ class LinearFF(DensityModel):
         c0_unnormalized = torch.nn.functional.softplus(self.__c0u)
         
         norm_constant = 1.0 / (self.a @ Omega_0 @ c0_unnormalized + self.numerical_tolerance)
-        
+
         return norm_constant * c0_unnormalized
         
     def log_density(self, x : torch.Tensor):
@@ -314,13 +326,14 @@ class LinearFF(DensityModel):
     def marginal(self, marginal_dims : tuple[int, ...]):
         phi_basis_copy = self.phi_basis.freeze_params()
         psi0_basis_copy = self.psi0_basis.freeze_params()
-        phi_basis_copy.set_coeffs(self.a, trainable=False)
-        psi0_basis_copy.set_coeffs(self.get_c0(), trainable=False)
+        phi_basis_copy.set_coeffs(self.a)
+        psi0_basis_copy.set_coeffs(self.get_c0())
         expanded_basis_marginal = phi_basis_copy.product_basis([psi0_basis_copy]).marginal(marginal_dims)
+        dtype, device = expanded_basis_marginal.param_dtype_device()
         w_fixed = torch.ones(
             expanded_basis_marginal.n_basis_functions(),
-            device=expanded_basis_marginal.params.device,
-            dtype=expanded_basis_marginal.params.dtype,
+            device=device,
+            dtype=dtype,
         )
         return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
 
@@ -415,14 +428,15 @@ class Linear2FF(DensityModel):
         xi_basis_copy = self.xi_basis.freeze_params()
         phi_basis_copy = self.phi_basis.freeze_params()
         psi0_basis_copy = self.psi0_basis.freeze_params()
-        xi_basis_copy.set_coeffs(self.d, trainable=False)
-        phi_basis_copy.set_coeffs(self.a, trainable=False)
-        psi0_basis_copy.set_coeffs(self.get_c0(), trainable=False)
+        xi_basis_copy.set_coeffs(self.d)
+        phi_basis_copy.set_coeffs(self.a)
+        psi0_basis_copy.set_coeffs(self.get_c0())
         expanded_basis_marginal = xi_basis_copy.product_basis([phi_basis_copy, psi0_basis_copy]).marginal(marginal_dims)
+        dtype, device = expanded_basis_marginal.param_dtype_device()
         w_fixed = torch.ones(
             expanded_basis_marginal.n_basis_functions(),
-            device=expanded_basis_marginal.params.device,
-            dtype=expanded_basis_marginal.params.dtype,
+            device=device,
+            dtype=dtype,
         )
         return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
 
@@ -565,14 +579,15 @@ class QuadraticFF(DensityModel):
         phi_quad_basis = phi_basis_1.product_basis([phi_basis_2])
         psi0_quad_basis = psi0_basis_1.product_basis([psi0_basis_2])
 
-        phi_quad_basis.set_coeffs(self.A.reshape(-1), trainable=False)
-        psi0_quad_basis.set_coeffs(self.get_C0().reshape(-1), trainable=False)
+        phi_quad_basis.set_coeffs(self.A.reshape(-1))
+        psi0_quad_basis.set_coeffs(self.get_C0().reshape(-1))
 
         expanded_basis_marginal = phi_quad_basis.product_basis([psi0_quad_basis]).marginal(marginal_dims)
+        dtype, device = expanded_basis_marginal.param_dtype_device()
         w_fixed = torch.ones(
             expanded_basis_marginal.n_basis_functions(),
-            device=expanded_basis_marginal.params.device,
-            dtype=expanded_basis_marginal.params.dtype,
+            device=device,
+            dtype=dtype,
         )
         return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
 

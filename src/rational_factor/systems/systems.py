@@ -82,6 +82,103 @@ class VanDerPol(DiscreteTimeStochasticSystem):
         return H
 
 
+class CartPole(DiscreteTimeStochasticSystem):
+    """
+    Cart-pole (open-loop, no horizontal force). State angles follow the usual
+    convention: theta is the pole angle from vertical; theta = 0 is upright.
+    State x = [p, p_dot, theta, theta_dot].
+
+    Dynamics match the classic uniform-pole model (pole half-length l, moment
+    term 4/3 in the angular equation); see e.g. Barto/Sutton cart-pole.
+    """
+
+    def __init__(
+        self,
+        dt: float,
+        m_c: float = 1.0,
+        m_p: float = 0.1,
+        l: float = 0.5,
+        g: float = 9.81,
+        covariance: torch.Tensor | None = None,
+    ):
+        """
+        Args:
+            dt : time step
+            m_c : cart mass
+            m_p : pole mass
+            l : half-length of the pole (hinge to center of mass)
+            g : gravity
+            covariance : 4x4 process noise covariance (additive Gaussian)
+        """
+        if covariance is None:
+            covariance = 0.001 * torch.eye(4)
+        else:
+            covariance = torch.as_tensor(covariance, dtype=torch.float32)
+
+        dist = torch.distributions.MultivariateNormal(torch.zeros(4), covariance)
+        super().__init__(
+            dim=4,
+            state_labels=["p", "p_dot", "theta", "theta_dot"],
+            v_dist=dist,
+        )
+
+        self.dt = dt
+        self.m_c = m_c
+        self.m_p = m_p
+        self.l = l
+        self.g = g
+        self.cov = covariance
+
+    def _accelerations(
+        self,
+        theta: torch.Tensor,
+        theta_dot: torch.Tensor,
+        u: torch.Tensor | float = 0.0,
+    ):
+        """Horizontal cart acceleration and pole angular acceleration (no velocity in force terms)."""
+        m_c, m_p, l, g = self.m_c, self.m_p, self.l, self.g
+        total_mass = m_c + m_p
+        sin_th = torch.sin(theta)
+        cos_th = torch.cos(theta)
+        if not isinstance(u, torch.Tensor):
+            u = theta.new_tensor(float(u))
+
+        temp = (u + m_p * l * theta_dot**2 * sin_th) / total_mass
+        theta_acc = (g * sin_th - cos_th * temp) / (
+            l * (4.0 / 3.0 - (m_p * cos_th**2) / total_mass)
+        )
+        p_acc = temp - (m_p * l * theta_acc * cos_th) / total_mass
+        return p_acc, theta_acc
+
+    def next_state(self, x: torch.Tensor, v: torch.Tensor):
+        x_flat = x.flatten()
+        p, p_dot, theta, theta_dot = x_flat[0], x_flat[1], x_flat[2], x_flat[3]
+
+        p_acc, theta_acc = self._accelerations(theta, theta_dot, 0.0)
+
+        p_next = p + self.dt * p_dot
+        p_dot_next = p_dot + self.dt * p_acc
+        theta_next = theta + self.dt * theta_dot
+        theta_dot_next = theta_dot + self.dt * theta_acc
+
+        return torch.stack([p_next, p_dot_next, theta_next, theta_dot_next]) + v.flatten()
+
+    def predict(self, x: torch.Tensor):
+        """Mean and additive noise covariance under forward Euler (no noise in mean)."""
+        x_flat = x.flatten()
+        p, p_dot, theta, theta_dot = x_flat[0], x_flat[1], x_flat[2], x_flat[3]
+        p_acc, theta_acc = self._accelerations(theta, theta_dot, 0.0)
+        mean = torch.stack(
+            [
+                p + self.dt * p_dot,
+                p_dot + self.dt * p_acc,
+                theta + self.dt * theta_dot,
+                theta_dot + self.dt * theta_acc,
+            ]
+        )
+        return mean, self.cov
+
+
 class PlanarQuadrotor(DiscreteTimeStochasticSystem):
     def __init__(
         self,

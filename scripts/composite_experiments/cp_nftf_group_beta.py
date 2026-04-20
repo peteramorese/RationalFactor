@@ -19,41 +19,41 @@ from rational_factor.tools.visualization import plot_marginal_trajectory_compari
 
 
 def main() -> None:
-    problem = FULLY_OBSERVABLE_PROBLEMS["planar_quadrotor"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["cartpole"]
 
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
     use_dtf = False
-    n_basis = 4000
+    n_basis = 500
     batch_size = 256
 
     if use_dtf:
         tran_params = {
-            "n_epochs_per_group": [15, 15],  # dtf+basis, then weights
+            "n_epochs_per_group": [15, 5],  # dtf+basis, then weights
             "iterations": 100,
             "lr_basis": 1e-2,
-            "lr_weights": 1e-3,
+            "lr_weights": 1e-2,
             "lr_dtf": 1e-3,
             "lr_wrap": 1e-3,
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 1000,
+            "iterations": 200,
             "lr_basis": 5e-2,
             "lr_weights": 1e-2,
         }
     else:
         tran_params = {
             "n_epochs_per_group": [15, 5],  # basis, then weights
-            "iterations": 150,
+            "iterations": 20,
             "lr_basis": 1e-2,
             "lr_weights": 1e-2,
-            "lr_wrap": 1e-3,
+            "lr_wrap": 1e-5,
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 300,
-            "lr_basis": 5e-3,
+            "iterations": 100,
+            "lr_basis": 5e-2,
             "lr_weights": 1e-2,
         }
 
@@ -69,8 +69,8 @@ def main() -> None:
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     xp_dataloader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-    offsets = torch.tensor([-1.0, -1.0], device=device)
-    variance = 1.0
+    offsets = torch.tensor([10.0, 10.0], device=device)
+    variance = 30.0
     phi_basis = BetaBasis.random_init(
         system.dim(),
         n_basis=n_basis,
@@ -178,6 +178,36 @@ def main() -> None:
 
     print(f"Transition model loss: {best_loss_tran:.6f}, training time: {training_time_tran:.2f}s")
     print(f"Initial model loss: {best_loss_init:.6f}, training time: {training_time_init:.2f}s")
+
+    init_model.density_model.debug = True
+    n_debug_samples = 5
+    #lows = problem.plot_bounds_low.to(device=device, dtype=x0_data.dtype)
+    #highs = problem.plot_bounds_high.to(device=device, dtype=x0_data.dtype)
+    #x_debug = torch.rand(n_debug_samples, system.dim(), device=device, dtype=x0_data.dtype) * (highs - lows) + lows
+    #x_debug = torch.tensor([
+    #    [0.0, 0.0, 0.0, 0.0],
+    #    [0.5, 0.0, 0.0, 0.0],
+    #    [0.0, 0.5, 0.0, 0.0],
+    #    [0.0, 0.0, 0.5, 0.0],
+    #    [0.0, 0.0, 0.0, 0.5],
+    #    ], device=device, dtype=x0_data.dtype)
+    #print("x_debug samples:\n", x_debug)
+    #with torch.no_grad():
+    #    init_model.eval()
+    #    logp_debug = init_model.log_density(x_debug, debug=True)
+    #print("init_model.log_density(x_debug):\n", logp_debug)
+    #x_debug_marginal = torch.tensor([
+    #    [0.0, 0.0],
+    #    [0.5, 0.0],
+    #    [0.0, 0.5],
+    #    [0.0, 0.0],
+    #    [0.0, 0.0],
+    #    ], device=device, dtype=x0_data.dtype)
+    #test_marginal = init_model.marginal((0, 1))
+    #test_marginal.debug = True
+    #print("test_marginal.log_density(x_debug_marginal):\n", test_marginal.log_density(x_debug_marginal, debug=True))
+
+    #input("Press Enter to continue...")
 
     ######## ANALYSIS ########
     base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=problem.n_timesteps)

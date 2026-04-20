@@ -29,7 +29,7 @@ def main() -> None:
 
     if use_dtf:
         tran_params = {
-            "n_epochs_per_group": [15, 15],  # dtf+basis, then weights
+            "n_epochs_per_group": [15],  # all transition params in one group
             "iterations": 100,
             "lr_basis": 1e-2,
             "lr_weights": 1e-3,
@@ -44,7 +44,7 @@ def main() -> None:
         }
     else:
         tran_params = {
-            "n_epochs_per_group": [15, 5],  # basis, then weights
+            "n_epochs_per_group": [15],  # all transition params in one group
             "iterations": 150,
             "lr_basis": 1e-2,
             "lr_weights": 1e-2,
@@ -110,24 +110,24 @@ def main() -> None:
 
     if use_dtf:
         optimizers = {
-            "dtf_and_basis": torch.optim.Adam(
+            "all": torch.optim.Adam(
                 [
                     {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
+                    {"params": tran_model.conditional_density_model.weight_params(), "lr": tran_params["lr_weights"]},
                     {"params": tran_model.domain_tfs[0].parameters(), "lr": tran_params["lr_dtf"]},
                     {"params": tran_model.domain_tfs[1].parameters(), "lr": tran_params["lr_wrap"]},
                 ]
-            ),
-            "weights": torch.optim.Adam(tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"]),
+            )
         }
     else:
         optimizers = {
-            "basis": torch.optim.Adam(
+            "all": torch.optim.Adam(
                 [
                     {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
+                    {"params": tran_model.conditional_density_model.weight_params(), "lr": tran_params["lr_weights"]},
                     {"params": tran_model.domain_tfs.parameters(), "lr": tran_params["lr_wrap"]},
                 ]
-            ),
-            "weights": torch.optim.Adam(tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"]),
+            )
         }
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(
