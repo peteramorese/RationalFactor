@@ -21,19 +21,19 @@ CONTEXT_USE_NFTF_FALSE = {
     "use_nftf": False,
     "tran_params": {
         "n_epochs_per_group": [10, 5],
-        "iterations": 20,
-        "lr_basis": 1e-2,
-        "lr_weights": 1e-2,
+        "iterations": 100,
+        "lr_basis": 1e-1,
+        "lr_weights": 1e-1,
         "lr_wrap": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
-        "lr_weights": 1e-2,
+        "iterations": 500,
+        "lr_basis": 5e-2,
+        "lr_weights": 5e-2,
     },
-    "batch_size": 256,
-    "var_reg_strength": 1e-3,
+    "batch_size": 1024,
+    "var_reg_strength": 0.0,
     "verbose": True,
 }
 
@@ -41,24 +41,24 @@ CONTEXT_USE_NFTF_TRUE = {
     "use_nftf": True,
     "tran_params": {
         "n_epochs_per_group": [10, 5],
-        "iterations": 20,
-        "lr_basis": 1e-2,
-        "lr_weights": 1e-2,
-        "lr_dtf": 1e-3,
+        "iterations": 100,
+        "lr_basis": 1e-1,
+        "lr_weights": 1e-1,
+        "lr_dtf": 5e-3,
         "lr_wrap": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
+        "iterations": 500,
+        "lr_basis": 5e-2,
         "lr_weights": 1e-2,
     },
-    "batch_size": 256,
-    "var_reg_strength": 1e-3,
+    "batch_size": 1024,
+    "var_reg_strength": 0.0,
     "verbose": True,
 }
 
-TRIALS = 15
+TRIALS = 3
 BENCHMARK_ROOT = "benchmark_data"
 
 def main() -> None:
@@ -69,7 +69,8 @@ def main() -> None:
     problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     system = problem.system
-    x0_data, x_k_data, x_kp1_data = problem.train_data()
+    x0_data = problem.train_initial_state_data()
+    x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj_data = problem.test_data()
 
     x0_dataset = TensorDataset(x0_data)
@@ -87,26 +88,27 @@ def main() -> None:
         x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
         xp_dataloader = DataLoader(xp_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-        offsets = torch.tensor([10.0, 10.0], device=device)
+        offsets = torch.tensor([-1.0, -1.0], device=device)
+        variance = 10.0
         phi_basis = BetaBasis.random_init(
             system.dim(),
             n_basis=n_basis,
             offsets=offsets,
-            variance=30.0,
+            variance=variance,
             min_concentration=1.0,
         ).to(device)
         psi_basis = BetaBasis.random_init(
             system.dim(),
             n_basis=n_basis,
             offsets=offsets,
-            variance=30.0,
+            variance=variance,
             min_concentration=1.0,
         ).to(device)
         psi0_basis = BetaBasis.random_init(
             system.dim(),
             n_basis=n_basis,
             offsets=offsets,
-            variance=30.0,
+            variance=variance,
             min_concentration=1.0,
         ).to(device)
 
