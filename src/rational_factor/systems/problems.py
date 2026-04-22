@@ -7,7 +7,7 @@ import torch
 
 from rational_factor.systems import systems, po_systems
 from rational_factor.systems.base import DiscreteTimeStochasticSystem, PartiallyObservableSystem, sample_io_pairs, sample_observation_pairs, sample_trajectories
-from rational_factor.tools.misc import make_mvnormal_state_sampler
+from rational_factor.tools.misc import make_mvnormal_state_sampler, make_unform_state_sampler
 
 
 @dataclass
@@ -68,6 +68,28 @@ class PartiallyObservableProblem(FullyObservableProblem):
 
 
 FULLY_OBSERVABLE_PROBLEMS = {
+    "scalar_nonlinear_drift": FullyObservableProblem(
+        system=systems.ScalarNonlinearDrift(
+            sigma=0.1,
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0]),
+            covariance=torch.diag(torch.tensor([0.5])),
+        ),
+        prev_state_sampler=make_unform_state_sampler(
+            low=torch.tensor([-4.0]),
+            high=torch.tensor([4.0]),
+        ),
+        n_timesteps=10,
+        n_trajectories_test=5000,
+        n_data_tran=5000,
+        n_data_init=500,
+        seed=42,
+        numerical_tolerance=1e-20,
+        plot_bounds_low=torch.tensor([-4.0]),
+        plot_bounds_high=torch.tensor([4.0]),
+        plot_marginals_list=[],
+    ),
     "van_der_pol": FullyObservableProblem(
         system=systems.VanDerPol(
             dt=0.3,
@@ -172,8 +194,8 @@ FULLY_OBSERVABLE_PROBLEMS = {
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
-        n_data_tran=10000,
-        n_data_init=1000,
+        n_data_tran=50000,
+        n_data_init=5000,
         seed=42,
         numerical_tolerance=1e-10,
         plot_bounds_low=torch.tensor([-5.0, -5.0, -4.0, -10.0, -10.0, -15.0]),

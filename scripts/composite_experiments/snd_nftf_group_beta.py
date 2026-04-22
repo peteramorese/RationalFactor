@@ -11,26 +11,140 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF, MaskedAffineNFTF
+from rational_factor.models.domain_transformation import ErfSeparableTF, MaskedRQSNFTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
-from rational_factor.tools.visualization import plot_marginal_trajectory_comparison
+
+
+def _plot_snd_1d_marginal_trajectory_comparison(
+    problem,
+    beliefs: list[CompositeDensityModel],
+    test_traj_data: list[torch.Tensor],
+    out_path: Path,
+    *,
+    n_grid: int = 400,
+    title: str = "",
+) -> None:
+    """1D-only: learned marginal pdf vs normalized histogram of test trajectories per timestep."""
+    n_slices = problem.n_timesteps + 1
+    assert len(beliefs) == n_slices
+    lo = float(problem.plot_bounds_low[0].item())
+    hi = float(problem.plot_bounds_high[0].item())
+    x_grid = torch.linspace(lo, hi, n_grid).unsqueeze(1)
+
+    param = next(iter(beliefs[0].parameters()), None)
+    buffer = next(iter(beliefs[0].buffers()), None)
+    dev = param.device if param is not None else (buffer.device if buffer is not None else torch.device("cpu"))
+    dt = param.dtype if param is not None else (buffer.dtype if buffer is not None else torch.float32)
+    x_grid = x_grid.to(device=dev, dtype=dt)
+
+    fig, axes = plt.subplots(n_slices, 1, figsize=(8, 2.2 * n_slices), squeeze=False)
+    for t in range(n_slices):
+        ax = axes[t, 0]
+        samples = test_traj_data[t][:, 0].detach().cpu().numpy()
+        with torch.no_grad():
+            beliefs[t].eval()
+            pdf = beliefs[t](x_grid).squeeze(-1).detach().cpu().numpy()
+        x_np = x_grid.squeeze(-1).detach().cpu().numpy()
+        ax.plot(x_np, pdf, color="C0", lw=2.0, label="learned marginal")
+        ax.hist(samples, bins=50, density=True, alpha=0.35, color="C1", label="test traj. (hist)")
+        ax.set_xlim(lo, hi)
+        ax.set_ylabel("density")
+        ax.set_title(f"t = {t}")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.25)
+    axes[-1, 0].set_xlabel(problem.system.state_label(0))
+    if title:
+        fig.suptitle(title, y=1.002)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_snd_conditional_true_vs_learned(
+    tran_model: CompositeConditionalModel,
+    system,
+    out_path: Path,
+    *,
+    problem,
+    n_grid: int = 200,
+    title: str = "",
+) -> None:
+    """
+    2D heatmaps of p(x'|x): horizontal axis = conditioner x, vertical axis = next state x'.
+    Left: true (Gaussian around drift); right: learned LinearRFF (+ domain transforms).
+    """
+    lo = float(problem.plot_bounds_low[0].item())
+    hi = float(problem.plot_bounds_high[0].item())
+
+    param = next(iter(tran_model.parameters()), None)
+    buffer = next(iter(tran_model.buffers()), None)
+    dev = param.device if param is not None else (buffer.device if buffer is not None else torch.device("cpu"))
+    dt = param.dtype if param is not None else (buffer.dtype if buffer is not None else torch.float32)
+
+    nx = n_grid
+    nxp = n_grid
+    x_1d = torch.linspace(lo, hi, nx, device=dev, dtype=dt)
+    xp_1d = torch.linspace(lo, hi, nxp, device=dev, dtype=dt)
+    x_cond = x_1d.unsqueeze(1).expand(nx, nxp).reshape(-1, 1)
+    xp_flat = xp_1d.unsqueeze(0).expand(nx, nxp).reshape(-1, 1)
+
+    with torch.no_grad():
+        tran_model.eval()
+        log_learned = tran_model.log_density(xp_flat, conditioner=x_cond)
+        learned = log_learned.exp().detach().cpu().numpy().reshape(nx, nxp)
+
+    log_true = system.log_transition_density(
+        x_cond.detach().cpu().float(),
+        xp_flat.detach().cpu().float(),
+    )
+    true_pdf = log_true.exp().detach().numpy().reshape(nx, nxp)
+
+    # Shared color scale for direct comparison
+    vmax = float(max(true_pdf.max(), learned.max()))
+    vmin = 0.0
+    if vmax <= 0:
+        vmax = 1.0
+
+    x_np = x_1d.detach().cpu().numpy()
+    xp_np = xp_1d.detach().cpu().numpy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), squeeze=False)
+    cmap = "viridis"
+    for ax, Z, subt in zip(
+        axes[0],
+        [true_pdf.T, learned.T],
+        ["true p(x'|x)", "learned p(x'|x)"],
+    ):
+        # contourf expects Z with shape (len(yp), len(xp)) for values at (x, y) = (columns, rows)
+        cf = ax.contourf(x_np, xp_np, Z, levels=50, cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_aspect("auto")
+        ax.set_xlabel("x (conditioner)")
+        ax.set_ylabel("x'")
+        ax.set_title(subt)
+        fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
+
+    if title:
+        fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main() -> None:
-    problem = FULLY_OBSERVABLE_PROBLEMS["cartpole"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["scalar_nonlinear_drift"]
 
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
     use_dtf = False
-    n_basis = 500
+    n_basis = 50
     batch_size = 256
 
     if use_dtf:
         tran_params = {
             "n_epochs_per_group": [15, 5],  # dtf+basis, then weights
-            "iterations": 100,
+            "iterations": 50,
             "lr_basis": 1e-2,
             "lr_weights": 1e-2,
             "lr_dtf": 1e-3,
@@ -38,21 +152,21 @@ def main() -> None:
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 200,
+            "iterations": 100,
             "lr_basis": 5e-2,
             "lr_weights": 1e-2,
         }
     else:
         tran_params = {
             "n_epochs_per_group": [15, 5],  # basis, then weights
-            "iterations": 100,
+            "iterations": 50,
             "lr_basis": 1e-2,
             "lr_weights": 1e-2,
             "lr_wrap": 1e-5,
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 200,
+            "iterations": 100,
             "lr_basis": 5e-2,
             "lr_weights": 1e-2,
         }
@@ -95,7 +209,7 @@ def main() -> None:
 
     wrap_tf = ErfSeparableTF.from_data(torch.cat([x0_data, x_k_data], dim=0), trainable=True).to(device)
     nftf = (
-        MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
+        MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
         if use_dtf
         else None
     )
@@ -143,7 +257,7 @@ def main() -> None:
     print("Done.\n")
     print("Valid: ", tran_model.valid())
 
-    trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
+    trained_nftf = MaskedRQSNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
     trained_domain_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
 
     ######## TRAIN INITIAL ########
@@ -239,22 +353,34 @@ def main() -> None:
     plt.savefig(ll_out_path, dpi=200)
     print(f"Saved LL plot to {ll_out_path}")
 
-    if not use_dtf:
-        comp_out_path = out_dir / f"{Path(__file__).stem}__marginal_comparison.png"
-        # Visualization does not need GPU; move beliefs to CPU to reduce peak memory.
-        belief_seq = [belief.to("cpu") for belief in belief_seq]
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        fig, _ = plot_marginal_trajectory_comparison(
-            problem=problem,
-            beliefs=belief_seq,
-            scatter_kwargs={"s": 1, "alpha": 0.7},
-            n_points=40,
-        )
-        if fig is not None:
-            fig.suptitle(f"{Path(__file__).stem} marginal comparison", y=1.02)
-            fig.savefig(comp_out_path, dpi=200, bbox_inches="tight")
-            print(f"Saved marginal comparison plot to {comp_out_path}")
+    # 1D-only figures: marginal pdfs + true vs learned conditional densities (CPU for plotting).
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    belief_seq_cpu = [belief.to("cpu").eval() for belief in belief_seq]
+    tran_model_cpu = tran_model.cpu().eval()
+
+    stem = Path(__file__).stem
+    marg_out_path = out_dir / f"{stem}__marginal_comparison.png"
+    _plot_snd_1d_marginal_trajectory_comparison(
+        problem,
+        belief_seq_cpu,
+        test_traj_data,
+        marg_out_path,
+        n_grid=400,
+        title=f"{stem} marginal (1D): learned vs test samples",
+    )
+    print(f"Saved 1D marginal comparison plot to {marg_out_path}")
+
+    cond_out_path = out_dir / f"{stem}__conditional_comparison.png"
+    _plot_snd_conditional_true_vs_learned(
+        tran_model_cpu,
+        system,
+        cond_out_path,
+        problem=problem,
+        n_grid=200,
+        title=f"{stem}: true vs learned conditional density (2D)",
+    )
+    print(f"Saved conditional density comparison plot to {cond_out_path}")
 
 
 if __name__ == "__main__":

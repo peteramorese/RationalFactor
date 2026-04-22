@@ -117,8 +117,8 @@ class LinearRFF(ConditionalDensityModel):
     
     def basis_params(self):
         return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
-    
-    
+
+
 class LinearRF(ConditionalDensityModel):
     """
     Linear Rational Form

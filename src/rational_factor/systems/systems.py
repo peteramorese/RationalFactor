@@ -4,6 +4,65 @@ import torch
 from .base import DiscreteTimeStochasticSystem
 
 
+class ScalarNonlinearDrift(DiscreteTimeStochasticSystem):
+    """
+    One-dimensional state with a fixed nonlinear drift f(x) and additive Gaussian noise:
+    x_{k+1} = f(x_k) + v,  v ~ N(0, Sigma).
+
+    f is a deliberately irregular mix of sines, cosines, tanh, and rational terms (for testing).
+    The transition density is p(x' | x) = N(x' | f(x), Sigma).
+    """
+
+    def __init__(self, sigma: float = 0.1, covariance: torch.Tensor | None = None):
+        if covariance is None:
+            covariance = torch.tensor([[sigma**2]], dtype=torch.float32)
+        else:
+            covariance = torch.as_tensor(covariance, dtype=torch.float32)
+        assert covariance.shape == (1, 1), "covariance must be 1x1"
+
+        dist = torch.distributions.MultivariateNormal(torch.zeros(1), covariance)
+        super().__init__(dim=1, state_labels=["x"], v_dist=dist)
+        self.cov = covariance
+
+    @staticmethod
+    def _drift(x: torch.Tensor) -> torch.Tensor:
+        """Deterministic next state f(x), same batch shape as `x.reshape(-1)`."""
+        t = x.reshape(-1)
+        u = torch.tanh(0.5 * t)
+        return (
+            0.42 * torch.sin(2.1 * t + 0.31)
+            + 0.28 * torch.cos(1.37 * t * t - 0.73)
+            + 0.22 * u
+            + 0.17 * (t / (1.0 + t * t))
+            + 0.11 * torch.sin(3.05 * t) * torch.cos(0.48 * t)
+            + 0.09 * torch.sin(t * torch.cos(1.2 * t))
+        )
+
+    def next_state(self, x: torch.Tensor, v: torch.Tensor):
+        mean = self._drift(x)
+        return mean + v.reshape(-1)
+
+    def predict(self, x: torch.Tensor):
+        mean = self._drift(x)
+        return mean, self.cov
+
+    def log_transition_density(self, x: torch.Tensor, x_prime: torch.Tensor) -> torch.Tensor:
+        """
+        log p(x' | x) under additive Gaussian noise: x' = f(x) + v, v ~ N(0, Sigma).
+        Same batch size for x and x' (each row is one state if batched as (n, 1) or (n,)).
+        """
+        mean = self._drift(x).reshape(-1, 1)
+        xp = x_prime.reshape(-1, 1)
+        if mean.shape[0] != xp.shape[0]:
+            raise ValueError("x and x_prime must have the same number of elements in the batch dimension")
+        mvn = torch.distributions.MultivariateNormal(mean, self.cov)
+        return mvn.log_prob(xp)
+
+    def transition_density(self, x: torch.Tensor, x_prime: torch.Tensor) -> torch.Tensor:
+        """p(x' | x) = exp(log_transition_density(...))."""
+        return self.log_transition_density(x, x_prime).exp()
+
+
 class VanDerPol(DiscreteTimeStochasticSystem):
     def __init__(self, dt: float, mu: float = 1.0, covariance: torch.Tensor | None = None):
         """

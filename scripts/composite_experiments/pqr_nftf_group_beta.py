@@ -23,9 +23,9 @@ def main() -> None:
 
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
-    use_dtf = False
-    n_basis = 4000
-    batch_size = 256
+    use_dtf = True
+    n_basis = 300
+    batch_size = 1024
 
     if use_dtf:
         tran_params = {
@@ -35,24 +35,25 @@ def main() -> None:
             "lr_weights": 1e-3,
             "lr_dtf": 1e-3,
             "lr_wrap": 1e-3,
+            "weight_decay_dtf": 1e-3,
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 1000,
+            "iterations": 500,
             "lr_basis": 5e-2,
             "lr_weights": 1e-2,
         }
     else:
         tran_params = {
             "n_epochs_per_group": [15, 5],  # basis, then weights
-            "iterations": 150,
+            "iterations": 200,
             "lr_basis": 1e-2,
             "lr_weights": 1e-2,
             "lr_wrap": 1e-3,
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 300,
+            "iterations": 500,
             "lr_basis": 5e-3,
             "lr_weights": 1e-2,
         }
@@ -70,7 +71,9 @@ def main() -> None:
     xp_dataloader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     offsets = torch.tensor([-1.0, -1.0], device=device)
-    variance = 1.0
+    #variance = 1.0
+    #offsets = torch.tensor([10.0, 10.0], device=device)
+    variance = 10.0
     phi_basis = BetaBasis.random_init(
         system.dim(),
         n_basis=n_basis,
@@ -113,7 +116,7 @@ def main() -> None:
             "dtf_and_basis": torch.optim.Adam(
                 [
                     {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
-                    {"params": tran_model.domain_tfs[0].parameters(), "lr": tran_params["lr_dtf"]},
+                    {"params": tran_model.domain_tfs[0].parameters(), "lr": tran_params["lr_dtf"], "weight_decay": tran_params["weight_decay_dtf"]},
                     {"params": tran_model.domain_tfs[1].parameters(), "lr": tran_params["lr_wrap"]},
                 ]
             ),
