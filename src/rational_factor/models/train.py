@@ -5,6 +5,9 @@ import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 
+def _is_bad_epoch_loss(loss_value: float, threshold: float = 29.0) -> bool:
+    return torch.isnan(torch.tensor(loss_value)).item() or loss_value > threshold
+
 class TrainingTimer:
     def __init__(self, n_groups : int, iterations : int, epochs_per_group : int):
         self.n_groups = n_groups
@@ -122,9 +125,19 @@ def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoad
         epoch_time = end_time - start_time
 
         valid = model.valid()
-        if use_best and valid and loss_dict[use_best] < best_loss:
+        if valid and loss_dict[use_best] < best_loss:
             best_loss = loss_dict[use_best]
             best_state = deepcopy(model.state_dict())
+
+        if _is_bad_epoch_loss(avg_total_loss):
+            if best_state is not None:
+                model.load_state_dict(best_state)
+                print(
+                    f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
+                    f"after unstable epoch loss: {avg_total_loss}"
+                )
+            else:
+                print(f"\n Unstable epoch loss detected ({avg_total_loss}), but no best_state to restore.")
 
         training_timer.update_epoch()
 
@@ -193,6 +206,16 @@ def train_to_valid(model : DensityModel | ConditionalDensityModel, labeled_loss_
             best_loss = loss_dict[use_best]
             best_state = deepcopy(model.state_dict())
 
+        if _is_bad_epoch_loss(loss):
+            if best_state is not None:
+                model.load_state_dict(best_state)
+                print(
+                    f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
+                    f"after unstable epoch loss: {loss}"
+                )
+            else:
+                print(f"\n Unstable epoch loss detected ({loss}), but no best_state to restore.")
+
         if verbose:
             loss_details = ", ".join(
                 f"{label}:{value:.4f}"
@@ -236,7 +259,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
         total_loss = sum(losses)
         total_loss.backward()
         for params in param_groups:
-            torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=0.5)
         optimizer.step()
         return total_loss.item(), losses
 
@@ -290,9 +313,19 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
                 epoch_time = end_time - start_time
 
                 valid = model.valid()
-                if use_best and valid and loss_dict[use_best] < best_loss:
+                if valid and loss_dict[use_best] < best_loss:
                     best_loss = loss_dict[use_best]
                     best_state = deepcopy(model.state_dict())
+
+                if _is_bad_epoch_loss(avg_total_loss):
+                    if best_state is not None:
+                        model.load_state_dict(best_state)
+                        print(
+                            f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
+                            f"after unstable epoch loss: {avg_total_loss}"
+                        )
+                    else:
+                        print(f"\n Unstable epoch loss detected ({avg_total_loss}), but no best_state to restore.")
 
                 training_timer.update_epoch()
 

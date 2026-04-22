@@ -24,22 +24,22 @@ def main() -> None:
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
     use_dtf = True
-    n_basis = 300
+    n_basis = 5000
     batch_size = 1024
 
     if use_dtf:
         tran_params = {
-            "n_epochs_per_group": [15, 15],  # dtf+basis, then weights
-            "iterations": 100,
-            "lr_basis": 1e-2,
-            "lr_weights": 1e-3,
-            "lr_dtf": 1e-3,
+            "n_epochs_per_group": [15, 5],  # dtf+basis, then weights
+            "iterations": 8,
+            "lr_basis": 1e-1,
+            "lr_weights": 1e-1,
+            "lr_dtf": 5e-3,
             "lr_wrap": 1e-3,
-            "weight_decay_dtf": 1e-3,
+            "weight_decay_dtf": 1e-2,
         }
         init_params = {
             "n_epochs_per_group": [20, 5],  # basis, then weights
-            "iterations": 500,
+            "iterations": 150,
             "lr_basis": 5e-2,
             "lr_weights": 1e-2,
         }
@@ -73,7 +73,7 @@ def main() -> None:
     offsets = torch.tensor([-1.0, -1.0], device=device)
     #variance = 1.0
     #offsets = torch.tensor([10.0, 10.0], device=device)
-    variance = 10.0
+    variance = 1.0
     phi_basis = BetaBasis.random_init(
         system.dim(),
         n_basis=n_basis,
