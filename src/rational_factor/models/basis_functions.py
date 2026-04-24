@@ -235,7 +235,7 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
             return self.fixed_params[..., 0], self.fixed_params[..., 1]
     
     def forward(self, y: torch.Tensor):
-        assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
+        assert y.dim() == 2 and y.shape[1] == self.dim(), "y must have shape (n_data, d)"
         y = y[:, :, None]  # (n_data, d, n_basis)
         mu, std = self.means_stds()
 
@@ -1599,7 +1599,7 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
 class NFBasis(Basis, NonnegativeBasis):
     def __init__(self, dim : int, n_basis : int, n_layers : int = 5, hidden_features : int = 128, embedding_dim : int = 16, trainable : bool = True):
         del trainable  # NF basis params are handled by flow modules.
-        super().__init__(dim, n_basis, fixed_params=torch.empty(dim, n_basis, 0))
+        super().__init__(fixed_params=torch.empty(dim, n_basis, 0))
 
         self.embedding_dim = embedding_dim
         self.index_embedding = torch.nn.Embedding(num_embeddings=n_basis, embedding_dim=embedding_dim)
@@ -1643,13 +1643,15 @@ class NFBasis(Basis, NonnegativeBasis):
         )
 
 
-class GaussianKernelBasis(Basis, NonnegativeBasis):
+class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
     def __init__(self, x : torch.Tensor, kernel_bandwidth : float = None, trainable : bool = True, coeffs_init : torch.Tensor = None):
         assert coeffs_init is None, "Not implemented yet"
+        print("x shape: ", x.shape)
+        data_params = x.reshape(x.shape[1], x.shape[0], 1) # (d, n_params, n_params_per_basis=1)
         if trainable:
-            super().__init__(x.shape[1], x.shape[0], uparams_init=x, coeffs_init=coeffs_init)
+            super().__init__(uparams_init=data_params, coeffs_init=coeffs_init)
         else:
-            super().__init__(x.shape[1], x.shape[0], fixed_params=x, coeffs_init=coeffs_init)
+            super().__init__(fixed_params=data_params, coeffs_init=coeffs_init)
 
         if trainable:
             if kernel_bandwidth is None:
@@ -1687,7 +1689,10 @@ class GaussianKernelBasis(Basis, NonnegativeBasis):
         return h.clamp_min(eps)
     
     def kernel_centers(self):
-        return self.uparams if self.trainable() else self.fixed_params
+        # Stored as (d, n_basis, 1) to match SeparableBasis parameter layout.
+        # Convert to canonical center matrix shape (n_basis, d).
+        p = self.uparams if self.trainable() else self.fixed_params
+        return p[..., 0].transpose(0, 1)
 
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
@@ -1700,7 +1705,10 @@ class GaussianKernelBasis(Basis, NonnegativeBasis):
 
         norm_const = torch.pow(y.new_tensor(2.0 * torch.pi), -0.5 * d) * h.pow(-d)
         kernels = norm_const * torch.exp(-0.5 * sq_norm / (h * h))  # (n_data, n_kernels)
-        return kernels.sum(dim=1)  # KDE without 1/N factor
+        return kernels  # (n_data, n_basis)
+
+    def Omega1(self):
+        return torch.ones(self.n_basis_functions(), dtype=self.param_dtype_device()[0], device=self.param_dtype_device()[1])
 
     def Omega2(self, other: "GaussianKernelBasis", ignore_coeffs: bool = False):
         del ignore_coeffs  # GaussianKernelBasis has no coeffs.

@@ -60,7 +60,7 @@ def beta_basis_concentration_reg_loss(basis : UnnormalizedBetaBasis):
     return torch.square(alpha).mean() + torch.square(beta).mean()
 
 def dtf_data_concentration_loss(dtf, x : torch.Tensor, concentration_point : torch.Tensor, radius : float):
-    x_transformed = dtf(x)
+    x_transformed, _ = dtf(x)
     assert x_transformed.dim() == 2, "dtf(x) must have shape (n_data, d)"
     assert radius >= 0.0, "radius must be non-negative"
 

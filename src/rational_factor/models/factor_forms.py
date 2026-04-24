@@ -26,23 +26,12 @@ class LinearForm(DensityModel):
             Omega = self.basis.Omega1()
 
         w = self.__wu / (Omega @ self.__wu + self.numerical_tolerance)
-        if hasattr(self, "debug"):
-            print("LINEAR FORM: get_w: ", w)
         return w
     
     def log_density(self, x : torch.Tensor):
         w = self.get_w()
         log_g_x = torch.log(self.basis(x) @ w + self.numerical_tolerance) # (n_data)
 
-        if hasattr(self, "debug"):
-            print("LINEAR FORM: x: ", x)
-            print("LINEAR FORM: basis coeffs: ", self.basis.coeffs)
-            alphas, betas = self.basis.alphas_betas()
-            print("LINEAR FORM: basis alphas: ", alphas)
-            print("LINEAR FORM: basis betas: ", betas)
-            print("LINEAR FORM: basis(x): ", self.basis(x))
-            print("LINEAR FORM: w: ", w)
-            print("LINEAR FORM: log_g_x: ", log_g_x)
         return log_g_x
     
     def weight_params(self):

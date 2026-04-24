@@ -36,6 +36,17 @@ class DomainTF(torch.nn.Module):
         raise NotImplementedError("Marginal is not implemented")
 
 
+class IdentityTF(DomainTF):
+    def __init__(self, dim : int):
+        super().__init__(dim)
+
+    def forward(self, x : torch.Tensor):
+        return x, x.new_zeros(x.shape[0])
+
+    def inverse(self, z : torch.Tensor):
+        return z, z.new_zeros(z.shape[0])
+
+
 class ErfSeparableTF(DomainTF):
     """Maps x to z via a parameterized Gaussian CDF per dimension: z_d = Phi((x_d - loc_d) / scale_d)."""
 

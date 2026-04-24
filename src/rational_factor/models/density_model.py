@@ -62,3 +62,49 @@ class ConditionalDensityModel(torch.nn.Module):
         """
         raise NotImplementedError("sample not implemented")
     
+
+###### Special Distributions ######
+class LogisticSigmoid(DensityModel):
+    def __init__(
+        self,
+        dim: int,
+        temperature: float = 0.1,
+        loc: torch.Tensor = None,
+        scale: torch.Tensor = None,
+    ):
+        super().__init__(dim)
+        assert temperature > 0.0, "temperature must be positive"
+        self.temperature = temperature
+
+        if loc is None:
+            loc = torch.full((dim,), 0.5)
+        if scale is None:
+            scale = torch.ones(dim)
+
+        assert torch.all(scale > 0), "scale must be positive"
+
+        self.register_buffer("loc", loc)
+        self.register_buffer("scale", scale)
+
+    def log_density(self, x: torch.Tensor):
+        tau = torch.as_tensor(self.temperature, dtype=x.dtype, device=x.device)
+
+        loc = self.loc.to(dtype=x.dtype, device=x.device)
+        scale = self.scale.to(dtype=x.dtype, device=x.device)
+
+        # map to unit-box coordinates
+        x_norm = (x - loc) / scale + 0.5
+
+        term1 = torch.nn.functional.softplus(-x_norm / tau)
+        term2 = torch.nn.functional.softplus(-(1.0 - x_norm) / tau)
+
+        # stable log(1 - exp(-1/tau))
+        log_inv_Z_1d = torch.log(-torch.expm1(-1.0 / tau))
+
+        log_p = (
+            self.dim * log_inv_Z_1d
+            - torch.log(scale).sum()
+            - (term1 + term2).sum(dim=-1)
+        )
+
+        return log_p

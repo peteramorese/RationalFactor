@@ -76,9 +76,13 @@ FULLY_OBSERVABLE_PROBLEMS = {
             mean=torch.tensor([0.0]),
             covariance=torch.diag(torch.tensor([0.5])),
         ),
-        prev_state_sampler=make_uniform_state_sampler(
-            low=torch.tensor([-4.0]),
-            high=torch.tensor([4.0]),
+        #prev_state_sampler=make_uniform_state_sampler(
+        #    low=torch.tensor([-4.0]),
+        #    high=torch.tensor([4.0]),
+        #),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0]),
+            covariance=torch.diag(torch.tensor([4.0])),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
