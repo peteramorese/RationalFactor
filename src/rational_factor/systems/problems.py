@@ -7,7 +7,7 @@ import torch
 
 from rational_factor.systems import systems, po_systems
 from rational_factor.systems.base import DiscreteTimeStochasticSystem, PartiallyObservableSystem, sample_io_pairs, sample_observation_pairs, sample_trajectories
-from rational_factor.tools.misc import make_mvnormal_state_sampler, make_unform_state_sampler
+from rational_factor.tools.misc import make_mvnormal_state_sampler, make_uniform_state_sampler
 
 
 @dataclass
@@ -76,14 +76,14 @@ FULLY_OBSERVABLE_PROBLEMS = {
             mean=torch.tensor([0.0]),
             covariance=torch.diag(torch.tensor([0.5])),
         ),
-        prev_state_sampler=make_unform_state_sampler(
+        prev_state_sampler=make_uniform_state_sampler(
             low=torch.tensor([-4.0]),
             high=torch.tensor([4.0]),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
-        n_data_tran=5000,
-        n_data_init=500,
+        n_data_tran=10000,
+        n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-20,
         plot_bounds_low=torch.tensor([-4.0]),

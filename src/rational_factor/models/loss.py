@@ -58,3 +58,20 @@ def B_psd_loss(model : QuadraticRFF, min_eigval : float = 0.0, penalty_offset : 
 def beta_basis_concentration_reg_loss(basis : UnnormalizedBetaBasis):
     alpha, beta = basis.alphas_betas()
     return torch.square(alpha).mean() + torch.square(beta).mean()
+
+def dtf_data_concentration_loss(dtf, x : torch.Tensor, concentration_point : torch.Tensor, radius : float):
+    x_transformed = dtf(x)
+    assert x_transformed.dim() == 2, "dtf(x) must have shape (n_data, d)"
+    assert radius >= 0.0, "radius must be non-negative"
+
+    concentration_point = concentration_point.to(device=x_transformed.device, dtype=x_transformed.dtype)
+    if concentration_point.dim() == 0:
+        concentration_point = concentration_point.expand(x_transformed.shape[1])
+
+    assert concentration_point.dim() == 1, "concentration_point must be a scalar or 1D tensor"
+    assert concentration_point.shape[0] == x_transformed.shape[1], "concentration_point must have shape (d,)"
+
+    distance_from_center = torch.abs(x_transformed - concentration_point.unsqueeze(0))
+    outside_distance = torch.relu(distance_from_center - radius)
+    return outside_distance.mean()
+

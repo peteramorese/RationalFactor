@@ -1641,3 +1641,158 @@ class NFBasis(Basis, NonnegativeBasis):
             dtype=dtype,
             device=device,
         )
+
+
+class GaussianKernelBasis(Basis, NonnegativeBasis):
+    def __init__(self, x : torch.Tensor, kernel_bandwidth : float = None, trainable : bool = True, coeffs_init : torch.Tensor = None):
+        assert coeffs_init is None, "Not implemented yet"
+        if trainable:
+            super().__init__(x.shape[1], x.shape[0], uparams_init=x, coeffs_init=coeffs_init)
+        else:
+            super().__init__(x.shape[1], x.shape[0], fixed_params=x, coeffs_init=coeffs_init)
+
+        if trainable:
+            if kernel_bandwidth is None:
+                self.kernel_bandwidth = torch.nn.Parameter(GaussianKernelBasis._bandwidth(x))
+            else:
+                self.kernel_bandwidth = torch.nn.Parameter(
+                    torch.tensor(float(kernel_bandwidth), dtype=x.dtype, device=x.device)
+                )
+        else:
+            if kernel_bandwidth is None:
+                self.register_buffer("kernel_bandwidth", GaussianKernelBasis._bandwidth(x))
+            else:
+                self.register_buffer(
+                    "kernel_bandwidth",
+                    torch.tensor(float(kernel_bandwidth), dtype=x.dtype, device=x.device),
+                )
+
+    @staticmethod
+    def _bandwidth(x : torch.Tensor):
+        """
+        Isotropic Silverman/Scott-style rule of thumb.
+        Returns a scalar bandwidth shared by all kernels.
+        """
+        assert x.dim() == 2, "x must have shape (n_samples, d)"
+        n, d = x.shape
+        eps = torch.finfo(x.dtype).eps
+
+        if n <= 1:
+            return torch.tensor(1.0, dtype=x.dtype, device=x.device)
+
+        sample_std = x.std(dim=0, unbiased=True)
+        scale = sample_std.mean().clamp_min(eps)
+        silverman = (4.0 / (d + 2.0)) ** (1.0 / (d + 4.0))
+        h = silverman * (n ** (-1.0 / (d + 4.0))) * scale
+        return h.clamp_min(eps)
+    
+    def kernel_centers(self):
+        return self.uparams if self.trainable() else self.fixed_params
+
+    def forward(self, y: torch.Tensor):
+        assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
+
+        h = self.kernel_bandwidth.clamp_min(torch.finfo(y.dtype).eps)
+        d = self.dim()
+
+        diff = y[:, None, :] - self.kernel_centers()[None, :, :]  # (n_data, n_kernels, d)
+        sq_norm = diff.square().sum(dim=2)  # (n_data, n_kernels)
+
+        norm_const = torch.pow(y.new_tensor(2.0 * torch.pi), -0.5 * d) * h.pow(-d)
+        kernels = norm_const * torch.exp(-0.5 * sq_norm / (h * h))  # (n_data, n_kernels)
+        return kernels.sum(dim=1)  # KDE without 1/N factor
+
+    def Omega2(self, other: "GaussianKernelBasis", ignore_coeffs: bool = False):
+        del ignore_coeffs  # GaussianKernelBasis has no coeffs.
+        assert isinstance(other, GaussianKernelBasis), "other must be GaussianKernelBasis"
+        assert self.dim() == other.dim(), "Basis functions must have the same dimension"
+
+        x0 = self.kernel_centers()   # (n0, d)
+        x1 = other.kernel_centers()  # (n1, d)
+        d = self.dim()
+
+        h0 = self.kernel_bandwidth.clamp_min(torch.finfo(x0.dtype).eps)
+        h1 = other.kernel_bandwidth.clamp_min(torch.finfo(x1.dtype).eps)
+        var = h0.square() + h1.square()
+
+        diff = x0[:, None, :] - x1[None, :, :]      # (n0, n1, d)
+        sq_norm = diff.square().sum(dim=2)          # (n0, n1)
+        norm_const = torch.pow(x0.new_tensor(2.0 * torch.pi * var), -0.5 * d)
+        return norm_const * torch.exp(-0.5 * sq_norm / var)
+
+    def Omega3_contract(
+        self,
+        other1: "GaussianKernelBasis",
+        other2: "GaussianKernelBasis",
+        left_i: torch.Tensor,
+        left_j: torch.Tensor,
+        block_size: int | None = None,
+        ignore_coeffs: bool = False,
+    ):
+        del ignore_coeffs  # GaussianKernelBasis has no coeffs.
+        assert isinstance(other1, GaussianKernelBasis), "other1 must be GaussianKernelBasis"
+        assert isinstance(other2, GaussianKernelBasis), "other2 must be GaussianKernelBasis"
+        assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
+        assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
+        assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
+
+        x0 = self.kernel_centers()     # (n0, d)
+        x1 = other1.kernel_centers()   # (n1, d)
+        x2 = other2.kernel_centers()   # (n2, d)
+        d = self.dim()
+        n0 = x0.shape[0]
+        n1 = x1.shape[0]
+        n2 = x2.shape[0]
+
+        h0 = self.kernel_bandwidth.clamp_min(torch.finfo(x0.dtype).eps)
+        h1 = other1.kernel_bandwidth.clamp_min(torch.finfo(x1.dtype).eps)
+        h2 = other2.kernel_bandwidth.clamp_min(torch.finfo(x2.dtype).eps)
+
+        var0 = h0.square()
+        var1 = h1.square()
+        var2 = h2.square()
+        tau0 = 1.0 / var0
+        tau1 = 1.0 / var1
+        tau01 = tau0 + tau1
+        var01 = 1.0 / tau01
+
+        # Product identity:
+        # N(x|x0_i,var0I)N(x|x1_j,var1I) = c01_ij * N(x|m01_ij,var01I),
+        # then integrate with the third Gaussian against x2_k.
+        pair_var = var0 + var1
+        pair_norm = torch.pow(x0.new_tensor(2.0 * torch.pi * pair_var), -0.5 * d)
+        tail_var = var01 + var2
+        tail_norm = torch.pow(x0.new_tensor(2.0 * torch.pi * tail_var), -0.5 * d)
+
+        if block_size is None:
+            block_size = 256
+        assert block_size > 0, "block_size must be positive"
+
+        out = torch.zeros(n2, dtype=x0.dtype, device=x0.device)
+
+        for j_start in range(0, n1, block_size):
+            j_end = min(j_start + block_size, n1)
+            x1_blk = x1[j_start:j_end, :]              # (bj, d)
+            left_j_blk = left_j[j_start:j_end]         # (bj,)
+
+            diff01 = x0[:, None, :] - x1_blk[None, :, :]         # (n0, bj, d)
+            sq01 = diff01.square().sum(dim=2)                    # (n0, bj)
+            c01 = pair_norm * torch.exp(-0.5 * sq01 / pair_var)  # (n0, bj)
+
+            m01 = (tau0 * x0[:, None, :] + tau1 * x1_blk[None, :, :]) / tau01  # (n0, bj, d)
+
+            for k_start in range(0, n2, block_size):
+                k_end = min(k_start + block_size, n2)
+                x2_blk = x2[k_start:k_end, :]                                   # (bk, d)
+
+                diff2 = m01[:, :, None, :] - x2_blk[None, None, :, :]           # (n0, bj, bk, d)
+                sq2 = diff2.square().sum(dim=3)                                  # (n0, bj, bk)
+                tail = tail_norm * torch.exp(-0.5 * sq2 / tail_var)              # (n0, bj, bk)
+
+                omega_blk = c01[:, :, None] * tail                               # (n0, bj, bk)
+                out[k_start:k_end] += torch.einsum("i,j,ijk->k", left_i, left_j_blk, omega_blk)
+
+        return out
+
+    def normalized(self):
+        return True

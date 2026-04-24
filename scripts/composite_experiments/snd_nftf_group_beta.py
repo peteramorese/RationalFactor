@@ -138,7 +138,7 @@ def main() -> None:
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
     use_dtf = False
-    n_basis = 50
+    n_basis = 1000
     batch_size = 256
 
     if use_dtf:
@@ -159,7 +159,7 @@ def main() -> None:
     else:
         tran_params = {
             "n_epochs_per_group": [15, 5],  # basis, then weights
-            "iterations": 50,
+            "iterations": 100,
             "lr_basis": 1e-2,
             "lr_weights": 1e-2,
             "lr_wrap": 1e-5,
@@ -207,7 +207,8 @@ def main() -> None:
         min_concentration=1.0,
     ).to(device)
 
-    wrap_tf = ErfSeparableTF.from_data(torch.cat([x0_data, x_k_data], dim=0), trainable=True).to(device)
+    wrap_tf = ErfSeparableTF.from_data(torch.cat([x0_data, x_k_data], dim=0), trainable=False).to(device)
+    #wrap_tf = ErfSeparableTF.from_data(torch.cat([x0_data, x_k_data], dim=0), trainable=True).to(device)
     nftf = (
         MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
         if use_dtf
@@ -228,7 +229,7 @@ def main() -> None:
                 [
                     {"params": tran_model.conditional_density_model.basis_params(), "lr": tran_params["lr_basis"]},
                     {"params": tran_model.domain_tfs[0].parameters(), "lr": tran_params["lr_dtf"]},
-                    {"params": tran_model.domain_tfs[1].parameters(), "lr": tran_params["lr_wrap"]},
+                    #{"params": tran_model.domain_tfs[1].parameters(), "lr": tran_params["lr_wrap"]},
                 ]
             ),
             "weights": torch.optim.Adam(tran_model.conditional_density_model.weight_params(), lr=tran_params["lr_weights"]),
@@ -259,6 +260,8 @@ def main() -> None:
 
     trained_nftf = MaskedRQSNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
     trained_domain_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
+
+    print("Wrap loc/scale: ", wrap_tf.loc_scale())
 
     ######## TRAIN INITIAL ########
     if use_dtf:

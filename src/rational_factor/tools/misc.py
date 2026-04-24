@@ -11,7 +11,7 @@ def make_mvnormal_state_sampler(mean: torch.Tensor, covariance: torch.Tensor):
     return sampler
 
 
-def make_unform_state_sampler(low: torch.Tensor, high: torch.Tensor):
+def make_uniform_state_sampler(low: torch.Tensor, high: torch.Tensor):
     low = torch.as_tensor(low, dtype=torch.float32)
     high = torch.as_tensor(high, dtype=torch.float32)
 
