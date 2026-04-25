@@ -26,6 +26,7 @@ def _plot_quad_latent_marginal_hist_g_base(
     lrff: LinearRFF,
     base_distribution: LogisticSigmoid,
     hist_latent: torch.Tensor,
+    x0_latent: torch.Tensor,
     out_path: Path,
     *,
     n_grid: int = 200,
@@ -33,8 +34,9 @@ def _plot_quad_latent_marginal_hist_g_base(
 ) -> None:
     """
     Per latent dimension d: normalized histogram of ``hist_latent`` (latent z marginals),
-    the 1D LogisticSigmoid marginal, and g as the marginal of g(z)=phi(z)@a (``phi_d @ a``)
-    for isotropic Gaussian ``lrff.phi_basis``; axis range is set from the histogram data per dim.
+    normalized histogram of transformed initial data ``x0_latent``, the 1D LogisticSigmoid
+    marginal, and g as the marginal of g(z)=phi(z)@a (``phi_d @ a``) for isotropic Gaussian
+    ``lrff.phi_basis``; axis range is set from the histogram data per dim.
     """
     param = next(iter(lrff.parameters()), None)
     buffer = next(iter(lrff.buffers()), None)
@@ -42,6 +44,7 @@ def _plot_quad_latent_marginal_hist_g_base(
     dt = param.dtype if param is not None else (buffer.dtype if buffer is not None else torch.float32)
 
     z_train = hist_latent.to(device=dev, dtype=dt)
+    z0_train = x0_latent.to(device=dev, dtype=dt)
     state_dim = z_train.shape[1]
     phi_basis = lrff.phi_basis
     if not isinstance(phi_basis, GaussianKernelBasis):
@@ -66,6 +69,8 @@ def _plot_quad_latent_marginal_hist_g_base(
                 z_hi = z_lo + 1e-6
 
             ax.hist(z_d_np, bins=50, density=True, alpha=0.35, color="C1")
+            z0_d_np = z0_train[:, d].detach().cpu().numpy()
+            ax.hist(z0_d_np, bins=50, density=True, alpha=0.25, color="C4")
 
             z_line = torch.linspace(z_lo, z_hi, n_grid, device=dev, dtype=dt)
             phi_d = phi_basis.marginal((d,))
@@ -109,19 +114,20 @@ def main() -> None:
 
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
-    batch_size = 512
+    batch_size = 1024
 
     dtf_params = {
-        "epochs": 30,
+        "epochs": 20,
         "lr": 1e-3,
     }
     ls_temp = 0.01
-    kernel_bandwidth_factor = 0.01
+    kernel_bandwidth_factor = 0.9
 
     init_params = {
         "n_epochs_per_group": [1],
-        "iterations": 10,
-        "lr_weights": 1e-2,
+        "iterations": 200,
+        "lr_weights": 1e-1,
+        "lr_kernel_bandwidth": 1e-3,
     }
 
     ######## SETUP ########
@@ -134,10 +140,10 @@ def main() -> None:
     test_traj_data = problem.test_data()
 
     x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    x_kp1_dataloader = DataLoader(TensorDataset(x_kp1_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    xp_dataloader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-    loc, scale = data_bounds(torch.cat([x0_data, x_k_data, x_kp1_data], dim=0), mode="center_lengths")
+    loc, scale = data_bounds(x_k_data, mode="center_lengths")
     #loc, scale = data_mean_std(torch.cat([x0_data, x_k_data, x_kp1_data], dim=0))
     loc = loc.to(device)
     scale = scale.to(device)
@@ -153,11 +159,23 @@ def main() -> None:
     optimizer = torch.optim.Adam(decorrupter.parameters(), lr=dtf_params["lr"])
 
     dtf_concentration_loss_xk = lambda composite_model, x: 1.0 * loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
-    dtf_concentration_loss_xkp1 = lambda composite_model, x: 0.0 *loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
-    decorrupter, best_loss, training_time = train.train_multiset(
+    #dtf_concentration_loss_xkp1 = lambda composite_model, x: 100.0 *loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
+    #decorrupter, best_loss, training_time = train.train_multiset(
+    #    decorrupter,
+    #    [x_dataloader, x_kp1_dataloader],
+    #    [{"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk}, {"dtf_conc": dtf_concentration_loss_xkp1}],
+    #    optimizer,
+    #    epochs=dtf_params["epochs"],
+    #    verbose=True,
+    #    use_best="mle",
+    #    clip_grad_norm=5.0,
+    #    restore_loss_threshold=50.0,
+    #)
+
+    decorrupter, best_loss, training_time = train.train(
         decorrupter,
-        [x_dataloader, x_kp1_dataloader],
-        [{"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk}, {"dtf_conc": dtf_concentration_loss_xkp1}],
+        x_dataloader,
+        {"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk},
         optimizer,
         epochs=dtf_params["epochs"],
         verbose=True,
@@ -165,45 +183,53 @@ def main() -> None:
         clip_grad_norm=5.0,
         restore_loss_threshold=50.0,
     )
-
-    #decorrupter, best_loss, training_time = train.train(
-    #    decorrupter,
-    #    x_dataloader,
-    #    {"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk},
-    #    optimizers,
-    #    epochs=dtf_params["epochs"],
-    #    iterations=dtf_params["iterations"],
-    #    verbose=True,
-    #    use_best="mle",
-    #    clip_grad_norm=5.0,
-    #    restore_loss_threshold=50.0,
-    #)
     print("Done.\n")
+
+    dtf_trained = MaskedRQSNFTF.copy_from_trainable(dtf).to(device)
 
 
     x_k_data = x_k_data.to(device)
     x_kp1_data = x_kp1_data.to(device)
     x0_data = x0_data.to(device)
-    x_k_transformed, _ = dtf(x_k_data)
-    x_kp1_transformed, _ = dtf(x_kp1_data)
-    x0_transformed, _ = dtf(x0_data)
-    phi_basis = GaussianKernelBasis(x_k_transformed, trainable=False)
-    psi_basis = GaussianKernelBasis(x_kp1_transformed, trainable=False)
-    psi0_basis = GaussianKernelBasis(x0_transformed, trainable=False)
-    phi_basis.kernel_bandwidth *= kernel_bandwidth_factor
-    psi_basis.kernel_bandwidth *= kernel_bandwidth_factor
-    psi0_basis.kernel_bandwidth *= kernel_bandwidth_factor
+    x_k_transformed, _ = dtf_trained(x_k_data)
+    x_kp1_transformed, _ = dtf_trained(x_kp1_data)
+    x0_transformed, _ = dtf_trained(x0_data)
+    joint_kernel_bandwidth = GaussianKernelBasis.ss_bandwidth(torch.cat([x_k_transformed, x_kp1_transformed], dim = 1))
+    joint_kernel_bandwidth_param = torch.nn.Parameter(joint_kernel_bandwidth * kernel_bandwidth_factor)
+
+    init_kernel_bandwidth = GaussianKernelBasis.ss_bandwidth(x0_transformed)
+    init_kernel_bandwidth_param = torch.nn.Parameter(init_kernel_bandwidth * kernel_bandwidth_factor)
+
+    phi_basis = GaussianKernelBasis(x_k_transformed, kernel_bandwidth=joint_kernel_bandwidth_param, trainable=False)
+    psi_basis = GaussianKernelBasis(x_kp1_transformed, kernel_bandwidth=joint_kernel_bandwidth_param, trainable=False)
+    psi0_basis = GaussianKernelBasis(x0_transformed, kernel_bandwidth=init_kernel_bandwidth_param, trainable=True)
 
     lrff = LinearRFF(phi_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance).to(device)
-    tran_model = CompositeConditionalModel([dtf], lrff).to(device)
+    tran_model = CompositeConditionalModel([dtf_trained], lrff).to(device)
+
+    #print("Training transition model kernel and weights")
+    #optimizer = torch.optim.Adam([joint_kernel_bandwidth_param], lr=init_params["lr_kernel_bandwidth"])
+    #tran_model, best_loss_tran, training_time_tran = train.train(
+    #    tran_model,
+    #    xp_dataloader,
+    #    {"mle": loss.conditional_mle_loss},
+    #    optimizer,
+    #    epochs=dtf_params["epochs"],
+    #    verbose=True,
+    #    use_best="mle",
+    #)
+    #print("Done.\n")
+    #print(f"Transition model loss: {best_loss_tran:.6f}, training time: {training_time_tran:.2f}s")
 
     ff = LinearFF.from_rff(lrff, psi0_basis).to(device)
-    init_model = CompositeDensityModel([dtf], ff).to(device)
+    init_model = CompositeDensityModel([dtf_trained], ff).to(device)
     
 
     print("Training initial model weights")
     optimizers = {
-        "weights": torch.optim.Adam(init_model.density_model.weight_params(), lr=init_params["lr_weights"]),
+        "weights": torch.optim.Adam([
+            {"params":init_model.density_model.weight_params(),"lr": init_params["lr_weights"]}, 
+            {"params": init_kernel_bandwidth_param, "lr": init_params["lr_kernel_bandwidth"]}]),
     }
     init_model, best_loss_init, training_time_init = train.train_iterate(
         init_model,
@@ -221,39 +247,44 @@ def main() -> None:
     print(f"Initial model loss: {best_loss_init:.6f}, training time: {training_time_init:.2f}s")
 
     ######### ANALYSIS ########
-    #cpu = torch.device("cpu")
-    #init_model.to(cpu)
-    #tran_model.to(cpu)
-    #base_belief_seq = propagate.propagate(
-    #    init_model.density_model,
-    #    tran_model.conditional_density_model,
-    #    n_steps=problem.n_timesteps,
-    #    device=cpu,
-    #)
-    #belief_seq = [CompositeDensityModel([dtf], belief) for belief in base_belief_seq]
+    cpu = torch.device("cpu")
+    init_model.to(cpu)
+    tran_model.to(cpu)
+    joint_kernel_bandwidth_param.to(cpu)
+    init_kernel_bandwidth_param.to(cpu)
+    dtf_trained.to(cpu)
+    print("Propagating beliefs...")
+    base_belief_seq = propagate.propagate(
+        init_model.density_model,
+        tran_model.conditional_density_model,
+        n_steps=problem.n_timesteps,
+        device=cpu,
+    )
+    print("Done.\n")
+    belief_seq = [CompositeDensityModel([dtf_trained], belief) for belief in base_belief_seq]
 
-    #ll_per_step = []
-    #for i in range(problem.n_timesteps):
-    #    #data_i = test_traj_data[i].to(cpu)
-    #    data_i = test_traj_data[i].to(cpu)
-    #    ll = avg_log_likelihood(belief_seq[i], data_i)
-    #    ll_per_step.append(ll.detach().cpu().reshape(()))
-    #    print(f"Avg log-likelihood at time {i}: {float(ll_per_step[-1]):.6f}")
-    #prop_ll_vector = torch.stack(ll_per_step).to(dtype=torch.float32)
+    ll_per_step = []
+    for i in range(problem.n_timesteps):
+        #data_i = test_traj_data[i].to(cpu)
+        data_i = test_traj_data[i].to(cpu)
+        ll = avg_log_likelihood(belief_seq[i], data_i)
+        ll_per_step.append(ll.detach().cpu().reshape(()))
+        print(f"Avg log-likelihood at time {i}: {float(ll_per_step[-1]):.6f}")
+    prop_ll_vector = torch.stack(ll_per_step).to(dtype=torch.float32)
 
     out_dir = Path("figures")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    #ll_out_path = out_dir / f"{Path(__file__).stem}__ll.png"
-    #plt.figure(figsize=(8, 4))
-    #plt.plot(prop_ll_vector.numpy(), marker="o")
-    #plt.xlabel("timestep")
-    #plt.ylabel("avg log-likelihood")
-    #plt.title(f"{Path(__file__).stem}")
-    #plt.grid(True, alpha=0.25)
-    #plt.tight_layout()
-    #plt.savefig(ll_out_path, dpi=200)
-    #print(f"Saved LL plot to {ll_out_path}")
+    ll_out_path = out_dir / f"{Path(__file__).stem}__ll.png"
+    plt.figure(figsize=(8, 4))
+    plt.plot(prop_ll_vector.numpy(), marker="o")
+    plt.xlabel("timestep")
+    plt.ylabel("avg log-likelihood")
+    plt.title(f"{Path(__file__).stem}")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(ll_out_path, dpi=200)
+    print(f"Saved LL plot to {ll_out_path}")
 
     if use_gpu:
         torch.cuda.empty_cache()
@@ -263,6 +294,7 @@ def main() -> None:
         dtf_c = tran_model_cpu.domain_tfs[0]
         x_k_latent, _ = dtf_c(x_k_data.detach().cpu())
         x_kp1_latent, _ = dtf_c(x_kp1_data.detach().cpu())
+        x0_latent, _ = dtf_c(x0_data.detach().cpu())
 
     stem = Path(__file__).stem
     marg_path = out_dir / f"{stem}__latent_marginal_hist_g_base.png"
@@ -270,9 +302,10 @@ def main() -> None:
         tran_model_cpu.conditional_density_model,
         base_dist_cpu,
         x_k_latent,
+        x0_latent,
         marg_path,
         n_grid=200,
-        title=f"{stem}: z=f(x_k); hist(x_k), g marginal = phi_d@a, LogisticSigmoid marginal",
+        title=f"{stem}: z=f(x_k); hist(x_k) + hist(x0), g marginal = phi_d@a, LogisticSigmoid marginal",
     )
     print(f"Saved latent marginal hist / g(z) / base plot to {marg_path}")
 
@@ -281,9 +314,10 @@ def main() -> None:
         tran_model_cpu.conditional_density_model,
         base_dist_cpu,
         x_kp1_latent,
+        x0_latent,
         marg_xkp1_path,
         n_grid=200,
-        title=f"{stem}: z=f(x); hist(x_kp1), g marginal = phi_d@a (same as x_k), LogisticSigmoid marginal",
+        title=f"{stem}: z=f(x); hist(x_kp1) + hist(x0), g marginal = phi_d@a (same as x_k), LogisticSigmoid marginal",
     )
     print(f"Saved x_kp1-hist / g / base plot to {marg_xkp1_path}")
 

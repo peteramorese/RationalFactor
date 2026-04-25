@@ -210,7 +210,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
     ),
     "quadcopter": FullyObservableProblem(
         system=systems.Quadcopter(
-            dt=0.2,
+            dt=0.1,
             waypoint=torch.tensor([3.0, -1.5, 2.0]),
             yaw_ref=0.4,
             covariance=0.0008 * torch.eye(12),

@@ -1647,29 +1647,34 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
     def __init__(self, x : torch.Tensor, kernel_bandwidth : float = None, trainable : bool = True, coeffs_init : torch.Tensor = None):
         if coeffs_init is not None:
             assert not trainable, "GaussianKernelBasis: coeffs_init requires trainable=False"
-        # Detach so buffers/parameters are not tied to an unrelated forward (e.g. DTF output),
-        # which would free after the first backward and break subsequent training steps.
         x_stored = x.detach().reshape(x.shape[1], x.shape[0], 1).clone()  # (d, n_params, n_params_per_basis=1)
-        if trainable:
-            super().__init__(uparams_init=x_stored, coeffs_init=coeffs_init)
-        else:
-            super().__init__(fixed_params=x_stored, coeffs_init=coeffs_init)
+        #if trainable:
+        #    super().__init__(uparams_init=x_stored, coeffs_init=coeffs_init)
+        #else:
+        #    super().__init__(fixed_params=x_stored, coeffs_init=coeffs_init)
+        super().__init__(fixed_params=x_stored, coeffs_init=coeffs_init)
 
-        if trainable:
-            if kernel_bandwidth is None:
-                self.kernel_bandwidth = torch.nn.Parameter(GaussianKernelBasis._bandwidth(x.detach()))
+        if kernel_bandwidth is None:
+            bw = GaussianKernelBasis.bandwidth(x.detach())
+            if trainable:
+                self.kernel_bandwidth = torch.nn.Parameter(bw)
             else:
-                self.kernel_bandwidth = torch.nn.Parameter(
-                    torch.tensor(float(kernel_bandwidth), dtype=x.dtype, device=x.device)
-                )
+                self.register_buffer("kernel_bandwidth", bw)
+        elif isinstance(kernel_bandwidth, torch.nn.Parameter):
+            # Preserve external/shared parameter object across modules.
+            self.register_parameter("kernel_bandwidth", kernel_bandwidth)
+        elif torch.is_tensor(kernel_bandwidth):
+            # Preserve external/shared tensor object across modules.
+            if trainable:
+                self.kernel_bandwidth = torch.nn.Parameter(kernel_bandwidth)
+            else:
+                self.register_buffer("kernel_bandwidth", kernel_bandwidth)
         else:
-            if kernel_bandwidth is None:
-                self.register_buffer("kernel_bandwidth", GaussianKernelBasis._bandwidth(x.detach()))
+            bw = torch.tensor(kernel_bandwidth, dtype=x.dtype, device=x.device)
+            if trainable:
+                self.kernel_bandwidth = torch.nn.Parameter(bw)
             else:
-                self.register_buffer(
-                    "kernel_bandwidth",
-                    torch.tensor(float(kernel_bandwidth), dtype=x.dtype, device=x.device),
-                )
+                self.register_buffer("kernel_bandwidth", bw)
 
     def freeze_params(self):
         coeffs = self.coeffs.detach().clone() if hasattr(self, "coeffs") else None
@@ -1681,7 +1686,7 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         )
 
     @staticmethod
-    def _bandwidth(x : torch.Tensor):
+    def ss_bandwidth(x : torch.Tensor):
         """
         Isotropic Silverman/Scott-style rule of thumb.
         Returns a scalar bandwidth shared by all kernels.
