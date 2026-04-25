@@ -5,7 +5,7 @@ import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 
-def _is_bad_epoch_loss(loss_value: float, threshold: float = 29.0) -> bool:
+def _is_bad_epoch_loss(loss_value: float, threshold: float) -> bool:
     return torch.isnan(torch.tensor(loss_value)).item() or loss_value > threshold
 
 class TrainingTimer:
@@ -72,7 +72,14 @@ class TrainingTimer:
     def total_since_start(self):
         return sum(self.times)
 
-def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoader, labeled_loss_fns : dict[str, callable], optimizer, epochs=100, verbose=True, use_best : str = "total"):
+def train(model : DensityModel | ConditionalDensityModel, 
+        data_loader : DataLoader, 
+        labeled_loss_fns : dict[str, callable], 
+        optimizer, epochs=100, 
+        verbose=True, 
+        use_best : str = "total",
+        clip_grad_norm : float = 5.0,
+        restore_loss_threshold : float = 29.0):
     
     torch.autograd.set_detect_anomaly(True)
 
@@ -91,7 +98,7 @@ def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoad
         losses = [loss_fn(model, *args) for loss_fn in loss_fns]
         total_loss = sum(losses)
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
         optimizer.step()
         return total_loss.item(), losses
 
@@ -129,7 +136,7 @@ def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoad
             best_loss = loss_dict[use_best]
             best_state = deepcopy(model.state_dict())
 
-        if _is_bad_epoch_loss(avg_total_loss):
+        if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
             if best_state is not None:
                 model.load_state_dict(best_state)
                 print(
@@ -163,7 +170,13 @@ def train(model : DensityModel | ConditionalDensityModel, data_loader : DataLoad
 
     return model, best_loss, training_timer.total_since_start()
 
-def train_to_valid(model : DensityModel | ConditionalDensityModel, labeled_loss_fns : dict[str, callable], optimizer, epochs=100, verbose=True, use_best : str = "total"):
+def train_to_valid(model : DensityModel | ConditionalDensityModel, 
+        labeled_loss_fns : dict[str, callable], 
+        optimizer, 
+        epochs=100, 
+        verbose=True, 
+        use_best : str = "total", 
+        restore_loss_threshold : float = 29.0):
     
     torch.autograd.set_detect_anomaly(True)
 
@@ -206,7 +219,7 @@ def train_to_valid(model : DensityModel | ConditionalDensityModel, labeled_loss_
             best_loss = loss_dict[use_best]
             best_state = deepcopy(model.state_dict())
 
-        if _is_bad_epoch_loss(loss):
+        if _is_bad_epoch_loss(loss, restore_loss_threshold):
             if best_state is not None:
                 model.load_state_dict(best_state)
                 print(
@@ -240,7 +253,16 @@ def set_requires_grad(params : list[torch.nn.Parameter], requires_grad : bool):
     for param in params:
         param.requires_grad_(requires_grad)
 
-def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : DataLoader, labeled_loss_fns : dict[str, callable], labeled_optimizers : dict[str, torch.optim.Optimizer], epochs_per_group=10, iterations=10, verbose=True, use_best : str = "total"):
+def train_iterate(model : DensityModel | ConditionalDensityModel, 
+        data_loader : DataLoader, 
+        labeled_loss_fns : dict[str, callable], 
+        labeled_optimizers : dict[str, torch.optim.Optimizer], 
+        epochs_per_group=10, 
+        iterations=10, 
+        verbose=True, 
+        use_best : str = "total",
+        clip_grad_norm : float = 0.5,
+        restore_loss_threshold : float = 29.0):
     
     torch.autograd.set_detect_anomaly(False)
 
@@ -259,7 +281,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
         total_loss = sum(losses)
         total_loss.backward()
         for params in param_groups:
-            torch.nn.utils.clip_grad_norm_(params, max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=clip_grad_norm)
         optimizer.step()
         return total_loss.item(), losses
 
@@ -317,7 +339,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel, data_loader : 
                     best_loss = loss_dict[use_best]
                     best_state = deepcopy(model.state_dict())
 
-                if _is_bad_epoch_loss(avg_total_loss):
+                if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
                     if best_state is not None:
                         model.load_state_dict(best_state)
                         print(

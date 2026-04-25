@@ -676,7 +676,9 @@ class Quadcopter(DiscreteTimeStochasticSystem):
         Omega = torch.stack([p, q, r])
         a_world = (T / self.m) * (R @ e3) - self.g * e3 - self.c_v * torch.stack([vx, vy, vz])
         J_omega = J @ Omega
-        Omega_dot = Jinv @ (tau - torch.cross(Omega, J_omega) - self.c_w * Omega)
+        Omega_dot = Jinv @ (
+            tau - torch.cross(Omega, J_omega, dim=0) - self.c_w * Omega
+        )
         E = self._euler_rate_matrix(phi, theta, device, dtype)
         euler_dot = E @ Omega
 

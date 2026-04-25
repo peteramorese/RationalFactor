@@ -270,10 +270,16 @@ def main() -> None:
 
     dtf_params = {
         "n_epochs_per_group": [1],  
-        "iterations": 50,
+        "iterations": 10,
         "lr": 1e-3,
     }
     ls_temp = 0.01
+
+    init_params = {
+        "n_epochs_per_group": [1],
+        "iterations": 100,
+        "lr_weights": 1e-3,
+    }
 
     ######## SETUP ########
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -285,8 +291,8 @@ def main() -> None:
     test_traj_data = problem.test_data()
 
     x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    xp_dataloader = DataLoader(TensorDataset(x_kp1_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-
+    #xp_dataloader = DataLoader(TensorDataset(x_kp1_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     all_train_data = torch.cat([x0_data, x_k_data, x_kp1_data], dim=0)
     data_min = all_train_data.min(dim=0).values
@@ -327,17 +333,39 @@ def main() -> None:
 
     x_k_data = x_k_data.to(device)
     x_kp1_data = x_kp1_data.to(device)
+    x0_data = x0_data.to(device)
     x_k_transformed, _ = dtf(x_k_data)
     x_kp1_transformed, _ = dtf(x_kp1_data)
+    x0_transformed, _ = dtf(x0_data)
     phi_basis = GaussianKernelBasis(x_k_transformed, trainable=False)
     psi_basis = GaussianKernelBasis(x_kp1_transformed, trainable=False)
+    psi0_basis = GaussianKernelBasis(x0_transformed, trainable=False)
     phi_basis.kernel_bandwidth *= 0.2
     psi_basis.kernel_bandwidth *= 0.2
 
     lrff = LinearRFF(phi_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance).to(device)
     tran_model = CompositeConditionalModel([dtf], lrff).to(device)
+
+    ff = LinearFF.from_rff(lrff, psi0_basis).to(device)
+    init_model = CompositeDensityModel([dtf], ff).to(device)
     
 
+    print("Training initial model weights")
+    optimizers = {
+        "weights": torch.optim.Adam(init_model.density_model.weight_params(), lr=init_params["lr_weights"]),
+    }
+    init_model, best_loss_init, training_time_init = train.train_iterate(
+        init_model,
+        x0_dataloader,
+        {"mle": loss.mle_loss},
+        optimizers,
+        epochs_per_group=init_params["n_epochs_per_group"],
+        iterations=init_params["iterations"],
+        verbose=True,
+        use_best="mle",
+    )
+    print("Done.\n")
+    print(f"Initial model loss: {best_loss_init:.6f}, training time: {training_time_init:.2f}s")
 
     #tran_model = CompositeConditionalModel([IdentityTF(system.dim())], lrff).to(device)
 
@@ -376,52 +404,49 @@ def main() -> None:
 
 
     ######### ANALYSIS ########
-    #base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=problem.n_timesteps)
-    #if use_dtf:
-    #    belief_seq = [CompositeDensityModel([trained_nftf, trained_domain_tf], belief) for belief in base_belief_seq]
-    #else:
-    #    belief_seq = [CompositeDensityModel([trained_domain_tf], belief) for belief in base_belief_seq]
+    base_belief_seq = propagate.propagate(init_model.density_model, tran_model.conditional_density_model, n_steps=problem.n_timesteps)
+    belief_seq = [CompositeDensityModel([dtf], belief) for belief in base_belief_seq]
 
-    #ll_per_step = []
-    #for i in range(problem.n_timesteps):
-    #    data_i = test_traj_data[i].to(device)
-    #    ll = avg_log_likelihood(belief_seq[i], data_i)
-    #    check_pdf_valid(belief_seq[i], domain_bounds=(tuple(problem.plot_bounds_low.tolist()), tuple(problem.plot_bounds_high.tolist())), n_samples=10000, device=device)
-    #    ll_per_step.append(ll.detach().cpu().reshape(()))
-    #    print(f"Avg log-likelihood at time {i}: {float(ll_per_step[-1]):.6f}")
-    #prop_ll_vector = torch.stack(ll_per_step).to(dtype=torch.float32)
+    ll_per_step = []
+    for i in range(problem.n_timesteps):
+        data_i = test_traj_data[i].to(device)
+        ll = avg_log_likelihood(belief_seq[i], data_i)
+        check_pdf_valid(belief_seq[i], domain_bounds=(tuple(problem.plot_bounds_low.tolist()), tuple(problem.plot_bounds_high.tolist())), n_samples=10000, device=device)
+        ll_per_step.append(ll.detach().cpu().reshape(()))
+        print(f"Avg log-likelihood at time {i}: {float(ll_per_step[-1]):.6f}")
+    prop_ll_vector = torch.stack(ll_per_step).to(dtype=torch.float32)
 
     out_dir = Path("figures")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    #ll_out_path = out_dir / f"{Path(__file__).stem}__ll.png"
-    #plt.figure(figsize=(8, 4))
-    #plt.plot(prop_ll_vector.numpy(), marker="o")
-    #plt.xlabel("timestep")
-    #plt.ylabel("avg log-likelihood")
-    #plt.title(f"{Path(__file__).stem} (use_dtf={use_dtf}, n_basis={n_basis})")
-    #plt.grid(True, alpha=0.25)
-    #plt.tight_layout()
-    #plt.savefig(ll_out_path, dpi=200)
-    #print(f"Saved LL plot to {ll_out_path}")
+    ll_out_path = out_dir / f"{Path(__file__).stem}__ll.png"
+    plt.figure(figsize=(8, 4))
+    plt.plot(prop_ll_vector.numpy(), marker="o")
+    plt.xlabel("timestep")
+    plt.ylabel("avg log-likelihood")
+    plt.title(f"{Path(__file__).stem}")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(ll_out_path, dpi=200)
+    print(f"Saved LL plot to {ll_out_path}")
 
     # 1D-only figures: marginal pdfs + true vs learned conditional densities (CPU for plotting).
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    #belief_seq_cpu = [belief.to("cpu").eval() for belief in belief_seq]
+    belief_seq_cpu = [belief.to("cpu").eval() for belief in belief_seq]
     tran_model_cpu = tran_model.cpu().eval()
 
     stem = Path(__file__).stem
-    #marg_out_path = out_dir / f"{stem}__marginal_comparison.png"
-    #_plot_snd_1d_marginal_trajectory_comparison(
-    #    problem,
-    #    belief_seq_cpu,
-    #    test_traj_data,
-    #    marg_out_path,
-    #    n_grid=400,
-    #    title=f"{stem} marginal (1D): learned vs test samples",
-    #)
-    #print(f"Saved 1D marginal comparison plot to {marg_out_path}")
+    marg_out_path = out_dir / f"{stem}__marginal_comparison.png"
+    _plot_snd_1d_marginal_trajectory_comparison(
+        problem,
+        belief_seq_cpu,
+        test_traj_data,
+        marg_out_path,
+        n_grid=400,
+        title=f"{stem} marginal (1D): learned vs test samples",
+    )
+    print(f"Saved 1D marginal comparison plot to {marg_out_path}")
 
     cond_out_path = out_dir / f"{stem}__conditional_comparison.png"
     _plot_snd_conditional_true_vs_learned(

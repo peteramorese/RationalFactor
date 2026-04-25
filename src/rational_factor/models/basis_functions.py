@@ -1645,29 +1645,40 @@ class NFBasis(Basis, NonnegativeBasis):
 
 class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
     def __init__(self, x : torch.Tensor, kernel_bandwidth : float = None, trainable : bool = True, coeffs_init : torch.Tensor = None):
-        assert coeffs_init is None, "Not implemented yet"
-        print("x shape: ", x.shape)
-        data_params = x.reshape(x.shape[1], x.shape[0], 1) # (d, n_params, n_params_per_basis=1)
+        if coeffs_init is not None:
+            assert not trainable, "GaussianKernelBasis: coeffs_init requires trainable=False"
+        # Detach so buffers/parameters are not tied to an unrelated forward (e.g. DTF output),
+        # which would free after the first backward and break subsequent training steps.
+        x_stored = x.detach().reshape(x.shape[1], x.shape[0], 1).clone()  # (d, n_params, n_params_per_basis=1)
         if trainable:
-            super().__init__(uparams_init=data_params, coeffs_init=coeffs_init)
+            super().__init__(uparams_init=x_stored, coeffs_init=coeffs_init)
         else:
-            super().__init__(fixed_params=data_params, coeffs_init=coeffs_init)
+            super().__init__(fixed_params=x_stored, coeffs_init=coeffs_init)
 
         if trainable:
             if kernel_bandwidth is None:
-                self.kernel_bandwidth = torch.nn.Parameter(GaussianKernelBasis._bandwidth(x))
+                self.kernel_bandwidth = torch.nn.Parameter(GaussianKernelBasis._bandwidth(x.detach()))
             else:
                 self.kernel_bandwidth = torch.nn.Parameter(
                     torch.tensor(float(kernel_bandwidth), dtype=x.dtype, device=x.device)
                 )
         else:
             if kernel_bandwidth is None:
-                self.register_buffer("kernel_bandwidth", GaussianKernelBasis._bandwidth(x))
+                self.register_buffer("kernel_bandwidth", GaussianKernelBasis._bandwidth(x.detach()))
             else:
                 self.register_buffer(
                     "kernel_bandwidth",
                     torch.tensor(float(kernel_bandwidth), dtype=x.dtype, device=x.device),
                 )
+
+    def freeze_params(self):
+        coeffs = self.coeffs.detach().clone() if hasattr(self, "coeffs") else None
+        return GaussianKernelBasis(
+            self.kernel_centers().detach().clone(),
+            kernel_bandwidth=self.kernel_bandwidth.detach().clone(),
+            trainable=False,
+            coeffs_init=coeffs,
+        )
 
     @staticmethod
     def _bandwidth(x : torch.Tensor):
@@ -1703,15 +1714,135 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         diff = y[:, None, :] - self.kernel_centers()[None, :, :]  # (n_data, n_kernels, d)
         sq_norm = diff.square().sum(dim=2)  # (n_data, n_kernels)
 
-        norm_const = torch.pow(y.new_tensor(2.0 * torch.pi), -0.5 * d) * h.pow(-d)
+        two_pi = torch.as_tensor(2.0 * math.pi, device=y.device, dtype=y.dtype)
+        norm_const = torch.pow(two_pi, -0.5 * d) * h.pow(-d)
         kernels = norm_const * torch.exp(-0.5 * sq_norm / (h * h))  # (n_data, n_kernels)
+        if hasattr(self, "coeffs"):
+            kernels = kernels * self.coeffs[None, :]
         return kernels  # (n_data, n_basis)
 
-    def Omega1(self):
-        return torch.ones(self.n_basis_functions(), dtype=self.param_dtype_device()[0], device=self.param_dtype_device()[1])
+    def marginal(self, marginal_dims: tuple[int, ...], ignore_coeffs: bool = False) -> "GaussianKernelBasis":
+        marginal_dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim() for i in marginal_dims), "marginal_dims must be in [0, d)"
+        coeffs_out = None
+        if (not ignore_coeffs) and hasattr(self, "coeffs"):
+            coeffs_out = self.coeffs.detach().clone()
+        p = self.uparams if self.trainable() else self.fixed_params
+        centers_sliced = p[marginal_dims, :, :].detach().clone()
+        h = self.kernel_bandwidth.detach().clone()
+        if self.trainable():
+            return GaussianKernelBasis(
+                centers_sliced[..., 0].transpose(0, 1),
+                kernel_bandwidth=h,
+                trainable=True,
+                coeffs_init=coeffs_out,
+            )
+        return GaussianKernelBasis(
+            centers_sliced[..., 0].transpose(0, 1),
+            kernel_bandwidth=h,
+            trainable=False,
+            coeffs_init=coeffs_out,
+        )
+
+    def product_basis(self, other_basis_factors: list["Basis"]) -> "GaussianKernelBasis":
+        """
+        Cartesian product index over factors. Each factor is an isotropic normalized Gaussian
+        kernel; their pointwise product is proportional to another such kernel. Analytic
+        prefactors and factor ``coeffs`` are stored on the returned basis as ``coeffs``.
+        """
+        factors: list[GaussianKernelBasis] = [self]
+        for other in other_basis_factors:
+            assert isinstance(other, GaussianKernelBasis), "all factors must be GaussianKernelBasis"
+            assert other.dim() == self.dim(), "Basis functions must have the same dimension"
+            factors.append(other)
+
+        n_factors = len(factors)
+        dtype, device = self.param_dtype_device()
+        dim = self.dim()
+
+        mus_stds = []
+        for basis in factors:
+            mu_k = basis.kernel_centers().transpose(0, 1).contiguous()  # (d, n_basis_k)
+            h_k = basis.kernel_bandwidth.clamp_min(torch.finfo(dtype).eps)
+            std_k = torch.full_like(mu_k, h_k)
+            mus_stds.append((mu_k, std_k))
+
+        n_per_factor = [basis.n_basis_functions() for basis in factors]
+
+        coeff_shape = [dim, *n_per_factor]
+        tau_sum = torch.zeros(coeff_shape, dtype=dtype, device=device)
+        mu_tau_sum = torch.zeros_like(tau_sum)
+        mu_sq_tau_sum = torch.zeros_like(tau_sum)
+        log_std_sum = torch.zeros_like(tau_sum)
+
+        log2pi = torch.log(torch.tensor(2.0 * torch.pi, dtype=dtype, device=device))
+
+        for k, (mu_k, std_k) in enumerate(mus_stds):
+            inv_var = 1.0 / (std_k * std_k)
+            view_shape = [dim] + [1] * n_factors
+            view_shape[k + 1] = n_per_factor[k]
+
+            mu_b = mu_k.reshape(view_shape)
+            inv_b = inv_var.reshape(view_shape)
+            std_b = std_k.reshape(view_shape)
+
+            tau_sum = tau_sum + inv_b
+            mu_tau_sum = mu_tau_sum + mu_b * inv_b
+            mu_sq_tau_sum = mu_sq_tau_sum + (mu_b * mu_b) * inv_b
+            log_std_sum = log_std_sum + torch.log(std_b)
+
+        n_total = 1
+        for n in n_per_factor:
+            n_total *= n
+
+        mu_star = mu_tau_sum / tau_sum
+        surplus = mu_sq_tau_sum - tau_sum * mu_star.square()
+        log_const_dim = (
+            -0.5 * float(n_factors - 1) * log2pi
+            - log_std_sum
+            - 0.5 * torch.log(tau_sum)
+            - 0.5 * surplus
+        )
+        log_const = log_const_dim.sum(dim=0)
+
+        sigma_star = torch.sqrt(1.0 / tau_sum)
+
+        mu_flat = mu_star.reshape(dim, n_total)
+        sigma_flat = sigma_star.reshape(dim, n_total)
+        log_const_flat = log_const.reshape(n_total)
+
+        coeff_terms = []
+        for basis in factors:
+            if not hasattr(basis, "coeffs"):
+                coeff_terms.append(torch.ones(basis.n_basis_functions(), dtype=dtype, device=device))
+            else:
+                coeff_terms.append(basis.coeffs)
+
+        coeff_prod = torch.ones(n_per_factor, dtype=dtype, device=device)
+        for k, c_k in enumerate(coeff_terms):
+            view_shape = [1] * n_factors
+            view_shape[k] = n_per_factor[k]
+            coeff_prod = coeff_prod * c_k.reshape(view_shape)
+        coeffs_new = (coeff_prod * torch.exp(log_const_flat.reshape(n_per_factor))).reshape(n_total)
+
+        centers_new = mu_flat.transpose(0, 1).contiguous().detach().clone()
+        h_new = sigma_flat[0, 0].detach().clone()
+
+        return GaussianKernelBasis(
+            centers_new,
+            kernel_bandwidth=h_new,
+            trainable=False,
+            coeffs_init=coeffs_new.detach().clone(),
+        )
+
+    def Omega1(self, ignore_coeffs: bool = False):
+        dtype, device = self.param_dtype_device()
+        out = torch.ones(self.n_basis_functions(), dtype=dtype, device=device)
+        if (not ignore_coeffs) and hasattr(self, "coeffs"):
+            out = out * self.coeffs
+        return out
 
     def Omega2(self, other: "GaussianKernelBasis", ignore_coeffs: bool = False):
-        del ignore_coeffs  # GaussianKernelBasis has no coeffs.
         assert isinstance(other, GaussianKernelBasis), "other must be GaussianKernelBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
@@ -1725,8 +1856,14 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
 
         diff = x0[:, None, :] - x1[None, :, :]      # (n0, n1, d)
         sq_norm = diff.square().sum(dim=2)          # (n0, n1)
-        norm_const = torch.pow(x0.new_tensor(2.0 * torch.pi * var), -0.5 * d)
-        return norm_const * torch.exp(-0.5 * sq_norm / var)
+        norm_const = torch.pow(2.0 * math.pi * var, -0.5 * d)
+        out = norm_const * torch.exp(-0.5 * sq_norm / var)
+        if not ignore_coeffs:
+            if hasattr(self, "coeffs"):
+                out = out * self.coeffs[:, None]
+            if hasattr(other, "coeffs"):
+                out = out * other.coeffs[None, :]
+        return out
 
     def Omega3_contract(
         self,
@@ -1737,7 +1874,6 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         block_size: int | None = None,
         ignore_coeffs: bool = False,
     ):
-        del ignore_coeffs  # GaussianKernelBasis has no coeffs.
         assert isinstance(other1, GaussianKernelBasis), "other1 must be GaussianKernelBasis"
         assert isinstance(other2, GaussianKernelBasis), "other2 must be GaussianKernelBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
@@ -1756,6 +1892,23 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         h1 = other1.kernel_bandwidth.clamp_min(torch.finfo(x1.dtype).eps)
         h2 = other2.kernel_bandwidth.clamp_min(torch.finfo(x2.dtype).eps)
 
+        c0 = (
+            torch.ones(n0, dtype=x0.dtype, device=x0.device)
+            if ignore_coeffs or (not hasattr(self, "coeffs"))
+            else self.coeffs
+        )
+        c1 = (
+            torch.ones(n1, dtype=x0.dtype, device=x0.device)
+            if ignore_coeffs or (not hasattr(other1, "coeffs"))
+            else other1.coeffs
+        )
+        c2 = (
+            torch.ones(n2, dtype=x0.dtype, device=x0.device)
+            if ignore_coeffs or (not hasattr(other2, "coeffs"))
+            else other2.coeffs
+        )
+        coeff_scale = c0[:, None, None] * c1[None, :, None] * c2[None, None, :]
+
         var0 = h0.square()
         var1 = h1.square()
         var2 = h2.square()
@@ -1768,9 +1921,9 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         # N(x|x0_i,var0I)N(x|x1_j,var1I) = c01_ij * N(x|m01_ij,var01I),
         # then integrate with the third Gaussian against x2_k.
         pair_var = var0 + var1
-        pair_norm = torch.pow(x0.new_tensor(2.0 * torch.pi * pair_var), -0.5 * d)
+        pair_norm = torch.pow(2.0 * math.pi * pair_var, -0.5 * d)
         tail_var = var01 + var2
-        tail_norm = torch.pow(x0.new_tensor(2.0 * torch.pi * tail_var), -0.5 * d)
+        tail_norm = torch.pow(2.0 * math.pi * tail_var, -0.5 * d)
 
         if block_size is None:
             block_size = 256
@@ -1797,10 +1950,14 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
                 sq2 = diff2.square().sum(dim=3)                                  # (n0, bj, bk)
                 tail = tail_norm * torch.exp(-0.5 * sq2 / tail_var)              # (n0, bj, bk)
 
-                omega_blk = c01[:, :, None] * tail                               # (n0, bj, bk)
+                omega_blk = (
+                    c01[:, :, None]
+                    * tail
+                    * coeff_scale[:, j_start:j_end, k_start:k_end]
+                )  # (n0, bj, bk)
                 out[k_start:k_end] += torch.einsum("i,j,ijk->k", left_i, left_j_blk, omega_blk)
 
         return out
 
     def normalized(self):
-        return True
+        return not hasattr(self, "coeffs")

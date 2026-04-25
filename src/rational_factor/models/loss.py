@@ -31,29 +31,15 @@ def lrff_bOmega_trace_loss(model : LinearRFF):
 
 def B_psd_loss(model : QuadraticRFF, min_eigval : float = 0.0, penalty_offset : float = 2e0, eval_condition : float = 1e-8, exponent : float = 2.0):
     B = model.get_B()
-    #print("B: ", B)
     eigvals = torch.linalg.eigvalsh(B) + eval_condition * torch.eye(B.shape[0], device=B.device, dtype=B.dtype)
     if torch.all(eigvals > min_eigval):
-        #print("torch.min(eigvals): ", torch.min(eigvals))
-        #print("torch.max(eigvals): ", torch.max(eigvals))
-        #print("torch.prod(eigvals): ", torch.prod(eigvals))
-        #print("eigvals: ", eigvals, " loss: ", torch.sum(torch.log(eigvals + eval_condition)))
-
-        #print("eigvals: ", eigvals, " loss: ", torch.min(eigvals).log())
         return -exponent * torch.log(eigvals).mean()
-        #return torch.min(eigvals).log()
     else:
-        #print("invalid evals", eigvals.min(), eigvals.max())
         penalty = torch.relu(-eigvals + penalty_offset)
         return torch.sum(penalty**exponent + penalty)
 
 
 #### Regularization ####
-
-#def gaussian_basis_var_reg_loss(basis : GaussianBasis, mean=True):
-#    mu, std = basis.means_stds()
-#    log_det_cov = 2.0 * torch.log(std).sum(dim=0)
-#    return -log_det_cov.mean() if mean else -log_det_cov.sum()
 
 def beta_basis_concentration_reg_loss(basis : UnnormalizedBetaBasis):
     alpha, beta = basis.alphas_betas()
@@ -62,7 +48,7 @@ def beta_basis_concentration_reg_loss(basis : UnnormalizedBetaBasis):
 def dtf_data_concentration_loss(dtf, x : torch.Tensor, concentration_point : torch.Tensor, radius : float):
     x_transformed, _ = dtf(x)
     assert x_transformed.dim() == 2, "dtf(x) must have shape (n_data, d)"
-    assert radius >= 0.0, "radius must be non-negative"
+    assert torch.all(radius >= 0.0), "radius must be non-negative"
 
     concentration_point = concentration_point.to(device=x_transformed.device, dtype=x_transformed.dtype)
     if concentration_point.dim() == 0:
