@@ -170,6 +170,154 @@ def train(model : DensityModel | ConditionalDensityModel,
 
     return model, best_loss, training_timer.total_since_start()
 
+def train_multiset(model : DensityModel | ConditionalDensityModel,
+        data_loaders : list[DataLoader],
+        labeled_loss_fns_list : list[dict[str, callable]],
+        optimizer, epochs=100,
+        verbose=True,
+        use_best : str = "total",
+        clip_grad_norm : float = 5.0,
+        restore_loss_threshold : float = 29.0):
+    
+    torch.autograd.set_detect_anomaly(True)
+
+    model.train()
+
+    assert len(data_loaders) > 0, "data_loaders must contain at least one DataLoader"
+    assert len(data_loaders) == len(labeled_loss_fns_list), "data_loaders and labeled_loss_fns_list must have same length"
+
+    loss_labels = []
+    for labeled_loss_fns in labeled_loss_fns_list:
+        for label in labeled_loss_fns.keys():
+            if label not in loss_labels:
+                loss_labels.append(label)
+
+    loss_fns_per_loader = [
+        list(labeled_loss_fns.items()) for labeled_loss_fns in labeled_loss_fns_list
+    ]
+    n_data_loaders = len(data_loaders)
+
+    assert use_best in loss_labels or use_best == "total", f"use_best must be one of {loss_labels + ['total']}"
+
+    training_timer = TrainingTimer(n_groups=1, iterations=1, epochs_per_group=epochs)
+    training_timer.initialize()
+
+    def _batch_to_device(batch, dev):
+        if isinstance(batch, list):
+            return [b.to(dev) for b in batch]
+        if isinstance(batch, tuple):
+            return tuple(b.to(dev) for b in batch)
+        return batch.to(dev)
+
+    def train_step(batches):
+        optimizer.zero_grad()
+
+        total_loss = 0.0
+        combined_losses = {label: 0.0 for label in loss_labels}
+        dataset_losses = []
+        for batch, labeled_loss_fns in zip(batches, loss_fns_per_loader):
+            losses = [(label, loss_fn(model, *batch)) for label, loss_fn in labeled_loss_fns]
+            total_loss = total_loss + sum(loss for _, loss in losses)
+            curr_dataset_losses = {}
+            for label, loss in losses:
+                combined_losses[label] = combined_losses[label] + loss
+                curr_dataset_losses[label] = loss
+            dataset_losses.append(curr_dataset_losses)
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+        optimizer.step()
+        return total_loss.item(), combined_losses, dataset_losses
+
+    best_loss = float('inf')
+    best_state = None
+
+    for epoch in range(epochs):
+        start_time = time.time()
+        total_sum_loss = 0.0
+        sum_losses = {label: 0.0 for label in loss_labels}
+        label_counts = {label: 0 for label in loss_labels}
+        dataset_sum_losses = [{label: 0.0 for label in labeled_loss_fns.keys()} for labeled_loss_fns in labeled_loss_fns_list]
+        n_steps = 0
+
+        for batches in zip(*data_loaders):
+            dev = next(model.parameters()).device
+            batches = [_batch_to_device(batch, dev) for batch in batches]
+
+            total_loss, losses, per_dataset_losses = train_step(batches)
+            total_sum_loss += total_loss
+            for labeled_loss_fns in labeled_loss_fns_list:
+                for label in labeled_loss_fns.keys():
+                    label_counts[label] += 1
+            for label, loss in losses.items():
+                sum_losses[label] += loss.item()
+            for dataset_idx, curr_dataset_losses in enumerate(per_dataset_losses):
+                for label, loss in curr_dataset_losses.items():
+                    dataset_sum_losses[dataset_idx][label] += loss.item()
+            n_steps += 1
+
+        if n_steps == 0:
+            raise RuntimeError("No training batches available in train_multiset. Ensure all data_loaders are non-empty.")
+
+        end_time = time.time()
+        avg_total_loss = total_sum_loss / n_steps
+        avg_losses = {
+            label: (sum_losses[label] / label_counts[label] if label_counts[label] > 0 else 0.0)
+            for label in loss_labels
+        }
+        avg_losses_per_dataset = [
+            {label: loss_sum / n_steps for label, loss_sum in dataset_losses.items()}
+            for dataset_losses in dataset_sum_losses
+        ]
+        loss_dict = dict(avg_losses)
+        loss_dict["total"] = avg_total_loss
+
+        epoch_time = end_time - start_time
+
+        valid = model.valid()
+        if valid and loss_dict[use_best] < best_loss:
+            best_loss = loss_dict[use_best]
+            best_state = deepcopy(model.state_dict())
+
+        if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
+            if best_state is not None:
+                model.load_state_dict(best_state)
+                print(
+                    f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
+                    f"after unstable epoch loss: {avg_total_loss}"
+                )
+            else:
+                print(f"\n Unstable epoch loss detected ({avg_total_loss}), but no best_state to restore.")
+
+        training_timer.update_epoch()
+
+        if verbose:
+            loss_details = ", ".join(
+                f"{label}:{avg_losses[label]:.4f}"
+                for label in loss_labels
+            )
+            dataset_loss_details = "; ".join(
+                f"ds{dataset_idx+1}[{', '.join(f'{label}:{value:.4f}' for label, value in dataset_losses.items())}]"
+                for dataset_idx, dataset_losses in enumerate(avg_losses_per_dataset)
+            )
+            if not valid:
+                loss_details += " <invld>"
+            print(
+                f"Epoch {epoch+1}, Time: {epoch_time:.2f}s, Loss: tot:{avg_total_loss:.4f}, "
+                f"{loss_details}, per_dataset: {dataset_loss_details}, "
+                f"loaders:{n_data_loaders}, etr: {training_timer.get_predicted_etr_str()}"
+            )
+        else:
+            print(f"Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")
+        
+    if verbose:
+        print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
+    if use_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
+
+    return model, best_loss, training_timer.total_since_start()
+
 def train_to_valid(model : DensityModel | ConditionalDensityModel, 
         labeled_loss_fns : dict[str, callable], 
         optimizer, 

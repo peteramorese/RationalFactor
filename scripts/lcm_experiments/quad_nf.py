@@ -12,7 +12,7 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianKernelBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import MaskedRQSNFTF
+from rational_factor.models.domain_transformation import MaskedRQSNFTF, IdentityTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.models.density_model import LogisticSigmoid
 from normalizing_flow.normalizing_flow import NormalizingFlow
@@ -112,8 +112,7 @@ def main() -> None:
     batch_size = 512
 
     dtf_params = {
-        "n_epochs_per_group": [1],  
-        "iterations": 1,
+        "epochs": 30,
         "lr": 1e-3,
     }
     ls_temp = 0.01
@@ -135,6 +134,7 @@ def main() -> None:
     test_traj_data = problem.test_data()
 
     x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    x_kp1_dataloader = DataLoader(TensorDataset(x_kp1_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     loc, scale = data_bounds(torch.cat([x0_data, x_k_data, x_kp1_data], dim=0), mode="center_lengths")
@@ -150,24 +150,36 @@ def main() -> None:
 
     print("Training NF decorrupter")
 
-    optimizers = {
-        "dec": torch.optim.Adam(decorrupter.parameters(), lr=dtf_params["lr"]),
-    }
+    optimizer = torch.optim.Adam(decorrupter.parameters(), lr=dtf_params["lr"])
 
-    dtf_concentration_loss = lambda composite_model, x: loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
-    decorrupter, best_loss, training_time = train.train_iterate(
+    dtf_concentration_loss_xk = lambda composite_model, x: 1.0 * loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
+    dtf_concentration_loss_xkp1 = lambda composite_model, x: 0.0 *loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
+    decorrupter, best_loss, training_time = train.train_multiset(
         decorrupter,
-        x_dataloader,
-        {"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss},
-        optimizers,
-        epochs_per_group=dtf_params["n_epochs_per_group"],
-        iterations=dtf_params["iterations"],
+        [x_dataloader, x_kp1_dataloader],
+        [{"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk}, {"dtf_conc": dtf_concentration_loss_xkp1}],
+        optimizer,
+        epochs=dtf_params["epochs"],
         verbose=True,
         use_best="mle",
         clip_grad_norm=5.0,
         restore_loss_threshold=50.0,
     )
+
+    #decorrupter, best_loss, training_time = train.train(
+    #    decorrupter,
+    #    x_dataloader,
+    #    {"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk},
+    #    optimizers,
+    #    epochs=dtf_params["epochs"],
+    #    iterations=dtf_params["iterations"],
+    #    verbose=True,
+    #    use_best="mle",
+    #    clip_grad_norm=5.0,
+    #    restore_loss_threshold=50.0,
+    #)
     print("Done.\n")
+
 
     x_k_data = x_k_data.to(device)
     x_kp1_data = x_kp1_data.to(device)
