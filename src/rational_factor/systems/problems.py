@@ -97,16 +97,20 @@ FULLY_OBSERVABLE_PROBLEMS = {
     "van_der_pol": FullyObservableProblem(
         system=systems.VanDerPol(
             dt=0.3,
-            mu=0.9,
+            mu = 0.9,
             covariance=0.1 * torch.eye(2),
         ),
         initial_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.2, 0.1]),
             covariance=torch.diag(torch.tensor([0.2, 0.2])),
         ),
-        prev_state_sampler=make_mvnormal_state_sampler(
-            mean=torch.tensor([0.0, 0.0]),
-            covariance=torch.diag(2.0 * torch.ones(2)),
+        #prev_state_sampler=make_mvnormal_state_sampler(
+        #    mean=torch.tensor([0.0, 0.0]),
+        #    covariance=torch.diag(2.0 * torch.ones(2)),
+        #),
+        prev_state_sampler=make_uniform_state_sampler(
+            low=torch.tensor([-5.0, -5.0]),
+            high=torch.tensor([5.0, 5.0]),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,

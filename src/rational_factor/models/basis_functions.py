@@ -1647,7 +1647,9 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
     def __init__(self, x : torch.Tensor, kernel_bandwidth : float = None, trainable : bool = True, coeffs_init : torch.Tensor = None):
         if coeffs_init is not None:
             assert not trainable, "GaussianKernelBasis: coeffs_init requires trainable=False"
-        x_stored = x.detach().reshape(x.shape[1], x.shape[0], 1).clone()  # (d, n_params, n_params_per_basis=1)
+        # Preserve sample/dimension alignment as (d, n_basis, 1).
+        # NOTE: reshape would reinterpret memory and scramble centers; use transpose.
+        x_stored = x.detach().transpose(0, 1).unsqueeze(-1).clone()  # (d, n_params, n_params_per_basis=1)
         #if trainable:
         #    super().__init__(uparams_init=x_stored, coeffs_init=coeffs_init)
         #else:
@@ -1655,7 +1657,7 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         super().__init__(fixed_params=x_stored, coeffs_init=coeffs_init)
 
         if kernel_bandwidth is None:
-            bw = GaussianKernelBasis.bandwidth(x.detach())
+            bw = GaussianKernelBasis.ss_bandwidth(x.detach())
             if trainable:
                 self.kernel_bandwidth = torch.nn.Parameter(bw)
             else:

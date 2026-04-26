@@ -270,7 +270,7 @@ def main() -> None:
 
     dtf_params = {
         "n_epochs_per_group": [1],  
-        "iterations": 10,
+        "iterations": 40,
         "lr": 1e-3,
     }
     ls_temp = 0.01
@@ -345,6 +345,9 @@ def main() -> None:
 
     lrff = LinearRFF(phi_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance).to(device)
     tran_model = CompositeConditionalModel([dtf], lrff).to(device)
+
+    lrff_b = lrff.get_b()
+    print("Lrff b: ", lrff_b, " max: ", lrff_b.max(), " min: ", lrff_b.min())
 
     ff = LinearFF.from_rff(lrff, psi0_basis).to(device)
     init_model = CompositeDensityModel([dtf], ff).to(device)

@@ -29,7 +29,7 @@ class ScalarNonlinearDrift(DiscreteTimeStochasticSystem):
         """Deterministic next state f(x), same batch shape as `x.reshape(-1)`."""
         t = x.reshape(-1)
         u = torch.tanh(0.5 * t)
-        return (
+        return 1.0 * t + (
             0.42 * torch.sin(2.1 * t + 0.31)
             + 0.28 * torch.cos(1.37 * t * t - 0.73)
             + 0.22 * u
