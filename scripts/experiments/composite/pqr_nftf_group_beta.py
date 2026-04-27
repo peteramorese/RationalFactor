@@ -30,7 +30,7 @@ def main() -> None:
     if use_dtf:
         tran_params = {
             "n_epochs_per_group": [15, 5],  # dtf+basis, then weights
-            "iterations": 8,
+            "iterations": 10,
             "lr_basis": 1e-1,
             "lr_weights": 1e-1,
             "lr_dtf": 5e-3,

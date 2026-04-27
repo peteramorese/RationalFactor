@@ -217,7 +217,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
             dt=0.1,
             waypoint=torch.tensor([3.0, -1.5, 2.0]),
             yaw_ref=0.4,
-            covariance=0.0008 * torch.eye(12),
+            covariance=0.08 * torch.eye(12),
         ),
         initial_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0]),
@@ -232,7 +232,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         ),
         n_timesteps=15,
         n_trajectories_test=5000,
-        n_data_tran=20000,
+        n_data_tran=40000,
         n_data_init=2000,
         seed=42,
         numerical_tolerance=1e-10,

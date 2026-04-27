@@ -48,6 +48,12 @@ class LinearForm(DensityModel):
     def basis_params(self):
         return self.basis.parameters()
 
+    def marginal(self, marginal_dims : tuple[int, ...]):
+        basis_copy = self.basis.freeze_params()
+        basis_marginal = basis_copy.marginal(marginal_dims)
+        dtype, device = basis_marginal.param_dtype_device()
+        return LinearForm(basis_marginal, w_fixed=self.get_w(), numerical_tolerance=self.numerical_tolerance)
+
 
 class LinearRFF(ConditionalDensityModel):
     """
@@ -55,7 +61,7 @@ class LinearRFF(ConditionalDensityModel):
 
     Used for Markov transition distribution for propagation only models
     """
-    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-20):
+    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-20, a_fixed : torch.Tensor = None):
         assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
         assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
@@ -70,7 +76,10 @@ class LinearRFF(ConditionalDensityModel):
         self.phi_basis = phi_basis
         self.psi_basis = psi_basis
 
-        self.__au = torch.nn.Parameter(torch.ones(self.n_phi)) # g
+        if a_fixed is not None:
+            self.register_buffer("a_fixed", a_fixed)
+        else:
+            self.__au = torch.nn.Parameter(torch.ones(self.n_phi)) # g
 
         self.numerical_tolerance = numerical_tolerance
     
@@ -93,6 +102,9 @@ class LinearRFF(ConditionalDensityModel):
         return log_g_xp + log_f - log_g_x
 
     def get_a(self):
+        if hasattr(self, "a_fixed"):
+            return self.a_fixed
+
         return torch.nn.functional.softmax(self.__au, dim=0)
 
     def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
@@ -107,7 +119,10 @@ class LinearRFF(ConditionalDensityModel):
         return b
 
     def weight_params(self):
-        return [self.__au]
+        if hasattr(self, "a_fixed"):
+            return [self.a_fixed]
+        else:
+            return [self.__au]
     
     def basis_params(self):
         return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())

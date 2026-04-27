@@ -47,6 +47,48 @@ class IdentityTF(DomainTF):
         return z, z.new_zeros(z.shape[0])
 
 
+class StackedTF(DomainTF):
+    def __init__(self, tfs : list[DomainTF]):
+        stacked_dim = sum(tf.dim for tf in tfs)
+        super().__init__(stacked_dim)
+        self.tfs = torch.nn.ModuleList(tfs)
+        
+    def forward(self, x : torch.Tensor):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+
+        z_parts = []
+        ladj = x.new_zeros(x.shape[0])
+        cursor = 0
+
+        for tf in self.tfs:
+            x_part = x[:, cursor : cursor + tf.dim]
+            z_part, ladj_part = tf.forward(x_part)
+            z_parts.append(z_part)
+            ladj = ladj + ladj_part
+            cursor += tf.dim
+
+        z = torch.cat(z_parts, dim=1)
+        return z, ladj
+
+    def inverse(self, z : torch.Tensor):
+        assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
+
+        x_parts = []
+        ladj = z.new_zeros(z.shape[0])
+        cursor = 0
+
+        for tf in self.tfs:
+            z_part = z[:, cursor : cursor + tf.dim]
+            x_part, ladj_part = tf.inverse(z_part)
+            x_parts.append(x_part)
+            ladj = ladj + ladj_part
+            cursor += tf.dim
+
+        x = torch.cat(x_parts, dim=1)
+        return x, ladj
+
+
+
 class ErfSeparableTF(DomainTF):
     """Maps x to z via a parameterized Gaussian CDF per dimension: z_d = Phi((x_d - loc_d) / scale_d)."""
 
@@ -460,3 +502,4 @@ class VolumePreservingNFTF(DomainTF):
 
         # Should be exactly zero except for dtype/device shape.
         return x, ladj
+

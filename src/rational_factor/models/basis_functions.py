@@ -33,8 +33,10 @@ class Basis(torch.nn.Module):
         assert not (uparams_init is not None and fixed_params is not None), "uparams_init and fixed_params cannot both be set"
 
         if uparams_init is not None:
+            assert uparams_init.shape[1] == n_basis, "uparams_init must have shape (dim, n_basis, n_params_per_basis)"
             self.uparams = torch.nn.Parameter(uparams_init)
         elif fixed_params is not None:
+            assert fixed_params.shape[1] == n_basis, "fixed_params must have shape (dim, n_basis, n_params_per_basis)"
             self.register_buffer("fixed_params", fixed_params)
         else:
             raise ValueError("uparams_init or fixed_params must be set")

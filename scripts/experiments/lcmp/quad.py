@@ -12,7 +12,7 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import MaskedRQSNFTF, IdentityTF, VolumePreservingNFTF, StackedTF
+from rational_factor.models.domain_transformation import MaskedAffineNFTF, IdentityTF, VolumePreservingNFTF, StackedTF
 from rational_factor.models.density_model import LogisticSigmoid
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, LinearForm
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
@@ -23,20 +23,21 @@ from rational_factor.models.kde import GaussianKDE
 
 
 def main() -> None:
-    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["quadcopter"]
 
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
-    batch_size = 1024
+    batch_size = 2048
 
     decorrupter_params = {
         "epochs": 50,
         "lr": 1e-3,
+        "weight_decay": 1e-3,
     }
 
     mover_params = {
         "n_epochs_per_group": [1],
-        "iterations": 50,
+        "iterations": 20,
         "lr_basis": 5e-2,
         "lr_weights": 1e-1,
         "lr_dtf": 1e-3,
@@ -50,8 +51,9 @@ def main() -> None:
     }
 
     ls_temp = 0.1
-    n_basis = 50
-    mover_iterations = 3
+    n_basis = 1000
+    mover_iterations = 5
+    reg_covar = 5e-2
 
     ######## SETUP ########
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -71,11 +73,11 @@ def main() -> None:
     loc = loc.to(device)
     scale = scale.to(device)
     base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
-    decorrupter = MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
+    decorrupter = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
     decorrupter_density = CompositeDensityModel([decorrupter], base_distribution).to(device)
 
     print("Training NF decorrupter")
-    optimizer = torch.optim.Adam(decorrupter.parameters(), lr=decorrupter_params["lr"], weight_decay=1e-3)
+    optimizer = torch.optim.Adam(decorrupter.parameters(), lr=decorrupter_params["lr"], weight_decay=decorrupter_params["weight_decay"])
     dtf_concentration_loss_xk = lambda composite_model, x: 1.0 * loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
 
     decorrupter_density, best_loss, training_time = train.train(
@@ -91,7 +93,7 @@ def main() -> None:
     )
     print("Done.\n")
 
-    decorrupter_trained = MaskedRQSNFTF.copy_from_trainable(decorrupter).to(device)
+    decorrupter_trained = MaskedAffineNFTF.copy_from_trainable(decorrupter).to(device)
 
     x_k_data = x_k_data.to(device)
     x_kp1_data = x_kp1_data.to(device)
@@ -102,7 +104,7 @@ def main() -> None:
     
     ######## TRAIN MOVER ########
     print("Training mover")
-    mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
+    mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
     base_density_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
     
     # Initialize base density to LF GMM
@@ -116,7 +118,7 @@ def main() -> None:
     z_joint_data = y_joint_data
     for i in range(mover_iterations):
         print("Fitting GMM LF...")
-        gmm_lf = train.fit_gaussian_lf_em(z_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=1e-2, max_iter=100)
+        gmm_lf = train.fit_gaussian_lf_em(z_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar, max_iter=100)
         mover_density = CompositeDensityModel([mover_joint], gmm_lf).to(device)
         y_joint_dataloader = DataLoader(TensorDataset(y_joint_data.to(torch.device("cpu"))), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
@@ -130,7 +132,7 @@ def main() -> None:
         optimizers = {
             "dtf": torch.optim.Adam([
                 #{"params": mover_density.conditional_density_model.basis_params(), "lr": mover_params["lr_basis"]},
-                {"params": mover_density.domain_tfs[0].parameters(), "lr": mover_params["lr_dtf"], "weight_decay": 1e-3},
+                {"params": mover_density.domain_tfs[0].parameters(), "lr": mover_params["lr_dtf"], "weight_decay": 1e-4},
             ]),
             #"weights": torch.optim.Adam(mover_density.density_model.weight_params(), lr=mover_params["lr_weights"]),
         }
@@ -194,24 +196,11 @@ def main() -> None:
     base_belief_seq = propagate.propagate(ff, lrff, n_steps=problem.n_timesteps)
     belief_seq = [CompositeDensityModel([decorrupter_trained,mover_trained], belief) for belief in base_belief_seq]
 
-    tran_model = CompositeConditionalModel([decorrupter_trained, mover_trained], lrff)
-
-    fig, axes = plt.subplots(2, problem.n_timesteps, figsize=(20, 10))
-    fig.suptitle("Beliefs at each time step")
     for i in range(problem.n_timesteps):
         data_i = test_traj_data[i].to(device)
         ll = avg_log_likelihood(belief_seq[i], data_i)
         print(f"Log likelihood at time {i}: {ll:.4f}")
-        plot_belief(axes[1, i], belief_seq[i], x_range=(problem.plot_bounds_low[0], problem.plot_bounds_high[0]), y_range=(problem.plot_bounds_low[1], problem.plot_bounds_high[1]))
-        axes[0, i].scatter(test_traj_data[i][:, 0], test_traj_data[i][:, 1], s=1)
-        axes[0, i].set_aspect("equal")
-        axes[0, i].set_xlim(problem.plot_bounds_low[0], problem.plot_bounds_high[0])
-        axes[0, i].set_ylim(problem.plot_bounds_low[1], problem.plot_bounds_high[1])
-    
 
-
-    plt.savefig("figures/vdp_lcmp_beliefs.png", dpi=1000)
-    print("Saved beliefs to figures/vdp_lcmp_beliefs.png")
 
 if __name__ == "__main__":
     main()

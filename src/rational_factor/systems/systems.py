@@ -598,7 +598,6 @@ class Quadcopter(DiscreteTimeStochasticSystem):
 
     @staticmethod
     def _euler_rate_matrix(phi: torch.Tensor, theta: torch.Tensor, device, dtype):
-        """Map body rates Ω=[p,q,r] to Euler angle rates [phi_dot, theta_dot, psi_dot] (ZYX)."""
         cphi, sphi = torch.cos(phi), torch.sin(phi)
         cth, sth = torch.cos(theta), torch.sin(theta)
         cth_safe = torch.where(
@@ -621,7 +620,6 @@ class Quadcopter(DiscreteTimeStochasticSystem):
         return torch.stack([row0, row1, row2])
 
     def _state_feedback(self, x: torch.Tensor):
-        """Compute (T, tau) from state. Tracks self.waypoint at yaw = self.yaw_ref."""
         x = x.flatten()
         device, dtype = x.device, x.dtype
 

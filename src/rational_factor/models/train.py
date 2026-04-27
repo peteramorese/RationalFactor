@@ -1,9 +1,12 @@
 import torch
 from torch.utils.data import DataLoader
 from .density_model import DensityModel, ConditionalDensityModel
+from .basis_functions import GaussianBasis
+from .factor_forms import LinearForm
 import time
 from copy import deepcopy
 from datetime import datetime, timedelta
+from sklearn.mixture import GaussianMixture
 
 def _is_bad_epoch_loss(loss_value: float, threshold: float) -> bool:
     return torch.isnan(torch.tensor(loss_value)).item() or loss_value > threshold
@@ -524,3 +527,57 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
         print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
 
     return model, best_loss, training_timer.total_since_start()
+
+
+@torch.no_grad()
+def fit_gaussian_lf_em(
+    z: torch.Tensor,
+    n_components: int,
+    reg_covar: float = 1e-5,
+    max_iter: int = 100,
+    warm_start: bool = False,
+):
+    """
+    Fit a diagonal-covariance Gaussian mixture with sklearn EM and convert it to
+    a `LinearForm` using `GaussianBasis`.
+
+    Args:
+        z: Tensor with shape (N, D).
+        n_components: Number of mixture components.
+        reg_covar: Non-negative regularization added to diagonal covariance.
+        max_iter: Maximum number of EM iterations.
+        warm_start: Whether sklearn should reuse previous fit parameters.
+    """
+    assert z.ndim == 2, "z must have shape (N, D)"
+    assert n_components > 0, "n_components must be positive"
+    assert reg_covar >= 0.0, "reg_covar must be non-negative"
+    assert max_iter > 0, "max_iter must be positive"
+
+    device = z.device
+    dtype = z.dtype
+
+    z_np = z.detach().cpu().numpy()
+
+    sk_gmm = GaussianMixture(
+        n_components=n_components,
+        covariance_type='diag',
+        reg_covar=reg_covar,
+        max_iter=max_iter,
+        warm_start=warm_start,
+        init_params="kmeans",
+    )
+
+    sk_gmm.fit(z_np)
+
+    weights = torch.as_tensor(sk_gmm.weights_, device=device, dtype=dtype)
+    means = torch.as_tensor(sk_gmm.means_, device=device, dtype=dtype)
+
+    vars = torch.as_tensor(sk_gmm.covariances_, device=device, dtype=dtype)
+    stds = torch.sqrt(vars.clamp_min(torch.finfo(dtype).eps))
+
+    # GaussianBasis expects parameters with shape (D, K, 2): [..., 0]=mean, [..., 1]=std.
+    fixed_params = torch.stack([means.T, stds.T], dim=-1)
+    basis = GaussianBasis(fixed_params=fixed_params)
+    lf = LinearForm(basis=basis, w_fixed=weights)
+
+    return lf
