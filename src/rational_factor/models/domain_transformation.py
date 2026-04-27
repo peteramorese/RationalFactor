@@ -1,7 +1,7 @@
 import copy
 
 import torch
-from nflows.transforms.base import CompositeTransform
+from nflows.transforms.base import Transform, CompositeTransform
 from nflows.transforms.permutations import RandomPermutation
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform, MaskedPiecewiseRationalQuadraticAutoregressiveTransform
 
@@ -222,3 +222,241 @@ class MaskedRQSNFTF(DomainTF):
     def inverse(self, z: torch.Tensor):
         assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
         return self.T.inverse(z)
+
+
+class MLP(torch.nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        hidden_features: int = 128,
+        num_hidden_layers: int = 2,
+        activation=torch.nn.Tanh,
+        zero_init_last: bool = True,
+    ):
+        super().__init__()
+
+        layers = []
+        last = in_features
+        for _ in range(num_hidden_layers):
+            layers.append(torch.nn.Linear(last, hidden_features))
+            layers.append(activation())
+            last = hidden_features
+
+        layers.append(torch.nn.Linear(last, out_features))
+        self.net = torch.nn.Sequential(*layers)
+
+        if zero_init_last:
+            final = self.net[-1]
+            torch.nn.init.zeros_(final.weight)
+            torch.nn.init.zeros_(final.bias)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class AdditiveCouplingTransform(Transform):
+    """
+    NICE-style additive coupling layer.
+
+    y_masked = x_masked
+    y_free   = x_free + t_theta(x_masked)
+
+    Exact inverse:
+    x_free = y_free - t_theta(y_masked)
+
+    log |det J| = 0 exactly.
+    """
+
+    def __init__(
+        self,
+        features: int,
+        mask: torch.Tensor,
+        hidden_features: int = 128,
+        num_hidden_layers: int = 2,
+        activation=torch.nn.Tanh,
+        zero_init: bool = True,
+    ):
+        super().__init__()
+        assert mask.shape == (features,)
+        assert mask.dtype in (torch.float32, torch.float64, torch.bool)
+
+        self.features = features
+        self.register_buffer("mask", mask.float())
+        self.register_buffer("inv_mask", 1.0 - mask.float())
+
+        self.shift_net = MLP(
+            in_features=features,
+            out_features=features,
+            hidden_features=hidden_features,
+            num_hidden_layers=num_hidden_layers,
+            activation=activation,
+            zero_init_last=zero_init,
+        )
+
+    def forward(self, inputs, context=None):
+        assert inputs.shape[-1] == self.features
+
+        x_id = inputs * self.mask
+        shift = self.shift_net(x_id) * self.inv_mask
+
+        outputs = inputs + shift
+        ladj = inputs.new_zeros(inputs.shape[0])
+        return outputs, ladj
+
+    def inverse(self, inputs, context=None):
+        assert inputs.shape[-1] == self.features
+
+        y_id = inputs * self.mask
+        shift = self.shift_net(y_id) * self.inv_mask
+
+        outputs = inputs - shift
+        ladj = inputs.new_zeros(inputs.shape[0])
+        return outputs, ladj
+
+
+class HouseholderTransform(Transform):
+    """
+    Orthogonal mixing using a product of Householder reflections.
+
+    H(v) = I - 2 vv^T / (v^T v)
+
+    Each reflection is orthogonal, so |det H| = 1.
+    Therefore log |det J| = 0 exactly.
+
+    A product of K reflections gives a learned orthogonal matrix.
+    """
+
+    def __init__(
+        self,
+        features: int,
+        num_reflections: int = 4,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.features = features
+        self.num_reflections = num_reflections
+        self.eps = eps
+
+        self.vectors = torch.nn.Parameter(
+            torch.randn(num_reflections, features) / features**0.5
+        )
+
+    def _apply_reflection(self, x, v):
+        # x: (batch, features)
+        # v: (features,)
+        denom = torch.sum(v * v).clamp_min(self.eps)
+        projection = (x @ v)[:, None] * v[None, :] / denom
+        return x - 2.0 * projection
+
+    def forward(self, inputs, context=None):
+        assert inputs.shape[-1] == self.features
+
+        outputs = inputs
+        for k in range(self.num_reflections):
+            outputs = self._apply_reflection(outputs, self.vectors[k])
+
+        ladj = inputs.new_zeros(inputs.shape[0])
+        return outputs, ladj
+
+    def inverse(self, inputs, context=None):
+        assert inputs.shape[-1] == self.features
+
+        # Each Householder reflection is self-inverse.
+        # The inverse of the product applies them in reverse order.
+        outputs = inputs
+        for k in reversed(range(self.num_reflections)):
+            outputs = self._apply_reflection(outputs, self.vectors[k])
+
+        ladj = inputs.new_zeros(inputs.shape[0])
+        return outputs, ladj
+
+
+class VolumePreservingNFTF(DomainTF):
+    """
+    Expressive exact volume-preserving normalizing-flow-style domain transform.
+
+    Architecture:
+        additive coupling
+        Householder orthogonal mixing
+        additive coupling
+        Householder orthogonal mixing
+        ...
+
+    Every layer has log |det J| = 0 exactly.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_layers: int = 6,
+        hidden_features: int = 128,
+        num_hidden_layers: int = 2,
+        num_householder_reflections: int = 4,
+        trainable: bool = True,
+        use_random_permutation: bool = False,
+        zero_init: bool = True,
+    ):
+        super().__init__(dim)
+
+        transforms = []
+
+        base_mask = torch.arange(dim) % 2
+        base_mask = base_mask.float()
+
+        for layer_idx in range(n_layers):
+            # Alternate masks so both halves get updated.
+            if layer_idx % 2 == 0:
+                mask = base_mask
+            else:
+                mask = 1.0 - base_mask
+
+            transforms.append(
+                AdditiveCouplingTransform(
+                    features=dim,
+                    mask=mask,
+                    hidden_features=hidden_features,
+                    num_hidden_layers=num_hidden_layers,
+                    activation=torch.nn.Tanh,
+                    zero_init=zero_init,
+                )
+            )
+
+            # Orthogonal learned mixing.
+            transforms.append(
+                HouseholderTransform(
+                    features=dim,
+                    num_reflections=num_householder_reflections,
+                )
+            )
+
+            # Optional fixed permutation. Also exact volume-preserving.
+            if use_random_permutation:
+                transforms.append(RandomPermutation(features=dim))
+
+        self.T = CompositeTransform(transforms)
+
+        if not trainable:
+            for p in self.parameters():
+                p.requires_grad_(False)
+
+    @classmethod
+    def copy_from_trainable(cls, other: "VolumePreservingNFTF"):
+        new_module = copy.deepcopy(other)
+        for p in new_module.parameters():
+            p.requires_grad_(False)
+        return new_module
+
+    def forward(self, x: torch.Tensor):
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        z, ladj = self.T(x)
+
+        # Should be exactly zero except for dtype/device shape.
+        return z, ladj
+
+    def inverse(self, z: torch.Tensor):
+        assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
+        x, ladj = self.T.inverse(z)
+
+        # Should be exactly zero except for dtype/device shape.
+        return x, ladj

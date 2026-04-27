@@ -22,10 +22,15 @@ class LinearForm(DensityModel):
         if hasattr(self, "w_fixed"):
             return self.w_fixed
 
+        if self.basis.normalized():
+            return torch.nn.functional.softmax(self.__wu, dim=0)
+        
         if Omega is None:
             Omega = self.basis.Omega1()
 
-        w = self.__wu / (Omega @ self.__wu + self.numerical_tolerance)
+        w_unnormalized = torch.nn.functional.softplus(self.__wu)
+
+        w = w_unnormalized / (Omega @ w_unnormalized + self.numerical_tolerance)
         return w
     
     def log_density(self, x : torch.Tensor):
