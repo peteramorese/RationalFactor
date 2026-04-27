@@ -17,12 +17,12 @@ from rational_factor.models.kde import GaussianKDE
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
-from rational_factor.tools.misc import data_bounds, train_test_split
+from rational_factor.tools.misc import data_bounds
 
-TRIALS = 5
+TRIALS = 3
 BENCHMARK_ROOT = "benchmark_data"
 
-BANDWIDTH_THRESHOLDS_TRAN = [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
+BANDWIDTH_FACTORS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.75, 1.0, 1.25, 1.5, 2.0]
 
 CONTEXT_TEMPLATE = {
     "dtf_params": {
@@ -36,9 +36,7 @@ CONTEXT_TEMPLATE = {
     },
     "batch_size": 1024,
     "ls_temp": 0.1,
-    "bw_val_thresh_init": 10.0,
-    "bw_val_lr_tran": 1e-3,
-    "bw_val_lr_init": 1e-2,
+    "bandwidth_factor": 1.0,
     "verbose": True,
 }
 
@@ -59,10 +57,7 @@ def main() -> None:
         init_params: dict,
         batch_size: int,
         ls_temp: float,
-        bw_val_thresh_tran: float,
-        bw_val_thresh_init: float,
-        bw_val_lr_tran: float,
-        bw_val_lr_init: float,
+        bandwidth_factor: float,
         verbose: bool = True,
     ):
         x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
@@ -99,29 +94,11 @@ def main() -> None:
             x0_transformed, _ = dtf_trained(x0_data_device)
 
         joint_data = torch.cat([x_k_transformed, x_kp1_transformed], dim=1)
-        joint_train_data, joint_val_data = train_test_split(joint_data, test_size=0.2)
-        joint_kde = GaussianKDE(joint_train_data)
-        best_bandwidth_joint, _ = joint_kde.fit_bandwidth_validation_mle(
-            joint_val_data,
-            epochs=200,
-            threshold=bw_val_thresh_tran,
-            lr=bw_val_lr_tran,
-            min_step=1e-3,
-            verbose=verbose,
-            block_size=128,
-        )
+        joint_kde = GaussianKDE(joint_data)
+        best_bandwidth_joint = joint_kde.bandwidth.detach().clone() * bandwidth_factor
 
-        init_train_data, init_val_data = train_test_split(x0_transformed, test_size=0.2)
-        init_kde = GaussianKDE(init_train_data)
-        best_bandwidth_init, _ = init_kde.fit_bandwidth_validation_mle(
-            init_val_data,
-            epochs=200,
-            threshold=bw_val_thresh_init,
-            lr=bw_val_lr_init,
-            min_step=1e-3,
-            verbose=verbose,
-            block_size=128,
-        )
+        init_kde = GaussianKDE(x0_transformed)
+        best_bandwidth_init = init_kde.bandwidth.detach().clone() * bandwidth_factor
 
         phi_basis = GaussianKernelBasis(x_k_transformed, kernel_bandwidth=best_bandwidth_joint, trainable=False)
         psi_basis = GaussianKernelBasis(x_kp1_transformed, kernel_bandwidth=best_bandwidth_joint, trainable=False)
@@ -180,11 +157,11 @@ def main() -> None:
         )
 
     contexts = []
-    for threshold in BANDWIDTH_THRESHOLDS_TRAN:
+    for factor in BANDWIDTH_FACTORS:
         contexts.append(
             {
-                "name": f"bw_val_thresh_tran_{str(threshold).replace('.', 'p')}",
-                "params": {**CONTEXT_TEMPLATE, "bw_val_thresh_tran": threshold},
+                "name": f"bandwidth_factor_{str(factor).replace('.', 'p')}",
+                "params": {**CONTEXT_TEMPLATE, "bandwidth_factor": factor},
             }
         )
 
