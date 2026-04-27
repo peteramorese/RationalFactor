@@ -17,8 +17,9 @@ from rational_factor.models.density_model import LogisticSigmoid
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
-from rational_factor.tools.misc import data_bounds
+from rational_factor.tools.misc import data_bounds, train_test_split
 from rational_factor.tools.visualization import plot_belief
+from rational_factor.models.kde import GaussianKDE
 
 
 def _plot_conditional_slices_lrff_vs_data(
@@ -346,11 +347,10 @@ def main() -> None:
     batch_size = 1024
 
     dtf_params = {
-        "epochs": 20,
+        "epochs": 100,
         "lr": 1e-3,
     }
-    ls_temp = 0.01
-    kernel_bandwidth_factor = 0.3
+    ls_temp = 0.1
 
     init_params = {
         "n_epochs_per_group": [1],
@@ -377,30 +377,30 @@ def main() -> None:
     scale = scale.to(device)
     print("scale: ", scale)
     base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
-    dtf = MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=3).to(device)
+    dtf = MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
     decorrupter = CompositeDensityModel([dtf], base_distribution).to(device)
 
     ######## TRAIN LCM ########
     print("Training NF decorrupter")
-    optimizer = torch.optim.Adam(decorrupter.parameters(), lr=dtf_params["lr"])
+    optimizer = torch.optim.Adam(decorrupter.parameters(), lr=dtf_params["lr"], weight_decay=1e-3)
     dtf_concentration_loss_xk = lambda composite_model, x: 1.0 * loss.dtf_data_concentration_loss(
         composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale
     )
-    #decorrupter, best_loss, training_time = train.train(
-    #    decorrupter,
-    #    x_dataloader,
-    #    {"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk},
-    #    optimizer,
-    #    epochs=dtf_params["epochs"],
-    #    verbose=True,
-    #    use_best="mle",
-    #    clip_grad_norm=5.0,
-    #    restore_loss_threshold=50.0,
-    #)
+    decorrupter, best_loss, training_time = train.train(
+        decorrupter,
+        x_dataloader,
+        {"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk},
+        optimizer,
+        epochs=dtf_params["epochs"],
+        verbose=True,
+        use_best="mle",
+        clip_grad_norm=5.0,
+        restore_loss_threshold=50.0,
+    )
     print("Done.\n")
 
     #dtf_trained = MaskedRQSNFTF.copy_from_trainable(dtf).to(device)
-    dtf = IdentityTF(system.dim()).to(device)
+    #dtf = IdentityTF(system.dim()).to(device)
 
     x_k_data = x_k_data.to(device)
     x_kp1_data = x_kp1_data.to(device)
@@ -408,28 +408,24 @@ def main() -> None:
     x_k_transformed, _ = dtf(x_k_data)
     x_kp1_transformed, _ = dtf(x_kp1_data)
     x0_transformed, _ = dtf(x0_data)
-    joint_kernel_bandwidth = GaussianKernelBasis.ss_bandwidth(torch.cat([x_k_transformed, x_kp1_transformed], dim=1))
-    joint_kernel_bandwidth_param = torch.nn.Parameter(joint_kernel_bandwidth * kernel_bandwidth_factor)
+    
+    # Optimize the joint bandwidth
+    joint_data = torch.cat([x_k_transformed, x_kp1_transformed], dim=1)
+    joint_train_data, joint_val_data = train_test_split(joint_data, test_size=0.2)
+    joint_kde = GaussianKDE(joint_train_data)
+    best_bandwidth_joint, _ = joint_kde.fit_bandwidth_validation_mle(joint_val_data, epochs=200, threshold=0.5, lr=1e-1, min_step=1e-2, verbose=True)
+    #best_bandwidth_joint = 0.5 * best_bandwidth_joint
 
-    init_kernel_bandwidth = GaussianKernelBasis.ss_bandwidth(x0_transformed)
-    init_kernel_bandwidth_param = torch.nn.Parameter(init_kernel_bandwidth * kernel_bandwidth_factor)
+    init_train_data, init_val_data = train_test_split(x0_transformed, test_size=0.2)
+    init_kde = GaussianKDE(init_train_data)
+    best_bandwidth_init, _ = init_kde.fit_bandwidth_validation_mle(init_val_data, epochs=200, threshold=0.5, lr=1e-1, min_step=1e-2, verbose=True)
 
-    #phi_basis = GaussianKernelBasis(x_k_transformed, kernel_bandwidth=joint_kernel_bandwidth_param, trainable=False)
-    #psi_basis = GaussianKernelBasis(x_kp1_transformed, kernel_bandwidth=joint_kernel_bandwidth_param, trainable=False)
-    #psi0_basis = GaussianKernelBasis(x0_transformed, kernel_bandwidth=init_kernel_bandwidth_param, trainable=True)
-    phi_basis = GaussianKernelBasis(x_k_transformed, trainable=False)
-    psi_basis = GaussianKernelBasis(x_kp1_transformed, trainable=False)
-    psi0_basis = GaussianKernelBasis(x0_transformed, trainable=True)
-    phi_basis.kernel_bandwidth *= kernel_bandwidth_factor
-    psi_basis.kernel_bandwidth *= kernel_bandwidth_factor
+    phi_basis = GaussianKernelBasis(x_k_transformed, kernel_bandwidth=best_bandwidth_joint, trainable=False)
+    psi_basis = GaussianKernelBasis(x_kp1_transformed, kernel_bandwidth=best_bandwidth_joint, trainable=False)
+    psi0_basis = GaussianKernelBasis(x0_transformed, kernel_bandwidth=best_bandwidth_init, trainable=True)
 
     lrff = LinearRFF(phi_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance).to(device)
     tran_model = CompositeConditionalModel([dtf], lrff).to(device)
-
-    lrff_b = lrff.get_b()
-    lrff_a = lrff.get_a()
-    print("Lrff b: ", lrff_b, " max: ", lrff_b.max(), " min: ", lrff_b.min())
-    print("Lrff a: ", lrff_a, " max: ", lrff_a.max(), " min: ", lrff_a.min())
 
     ff = LinearFF.from_rff(lrff, psi0_basis).to(device)
     init_model = CompositeDensityModel([dtf], ff).to(device)
@@ -439,7 +435,6 @@ def main() -> None:
         "weights": torch.optim.Adam(
             [
                 {"params": init_model.density_model.weight_params(), "lr": init_params["lr_weights"]},
-                #{"params": init_kernel_bandwidth_param, "lr": init_params["lr_kernel_bandwidth"]},
             ]
         ),
     }
@@ -462,8 +457,6 @@ def main() -> None:
     cpu = torch.device("cpu")
     init_model.to(cpu)
     tran_model.to(cpu)
-    joint_kernel_bandwidth_param.to(cpu)
-    init_kernel_bandwidth_param.to(cpu)
     dtf.to(cpu)
     print("Propagating beliefs...")
     base_belief_seq = propagate.propagate(

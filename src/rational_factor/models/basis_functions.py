@@ -1650,10 +1650,7 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         # Preserve sample/dimension alignment as (d, n_basis, 1).
         # NOTE: reshape would reinterpret memory and scramble centers; use transpose.
         x_stored = x.detach().transpose(0, 1).unsqueeze(-1).clone()  # (d, n_params, n_params_per_basis=1)
-        #if trainable:
-        #    super().__init__(uparams_init=x_stored, coeffs_init=coeffs_init)
-        #else:
-        #    super().__init__(fixed_params=x_stored, coeffs_init=coeffs_init)
+        
         super().__init__(fixed_params=x_stored, coeffs_init=coeffs_init)
 
         if kernel_bandwidth is None:

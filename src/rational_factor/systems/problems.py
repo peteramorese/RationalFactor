@@ -104,14 +104,14 @@ FULLY_OBSERVABLE_PROBLEMS = {
             mean=torch.tensor([0.2, 0.1]),
             covariance=torch.diag(torch.tensor([0.2, 0.2])),
         ),
-        #prev_state_sampler=make_mvnormal_state_sampler(
-        #    mean=torch.tensor([0.0, 0.0]),
-        #    covariance=torch.diag(2.0 * torch.ones(2)),
-        #),
-        prev_state_sampler=make_uniform_state_sampler(
-            low=torch.tensor([-5.0, -5.0]),
-            high=torch.tensor([5.0, 5.0]),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0]),
+            covariance=torch.diag(2.0 * torch.ones(2)),
         ),
+        #prev_state_sampler=make_uniform_state_sampler(
+        #    low=torch.tensor([-5.0, -5.0]),
+        #    high=torch.tensor([5.0, 5.0]),
+        #),
         n_timesteps=10,
         n_trajectories_test=5000,
         n_data_tran=10000,

@@ -12,13 +12,13 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianKernelBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import MaskedRQSNFTF, IdentityTF
+from rational_factor.models.domain_transformation import MaskedRQSNFTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.models.density_model import LogisticSigmoid
-from normalizing_flow.normalizing_flow import NormalizingFlow
+from rational_factor.models.kde import GaussianKDE
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
-from rational_factor.tools.misc import data_bounds, data_mean_std
+from rational_factor.tools.misc import data_bounds, train_test_split
 from rational_factor.tools.visualization import plot_marginal_trajectory_comparison
 
 
@@ -120,8 +120,7 @@ def main() -> None:
         "epochs": 20,
         "lr": 1e-3,
     }
-    ls_temp = 0.01
-    kernel_bandwidth_factor = 0.9
+    ls_temp = 0.1
 
     init_params = {
         "n_epochs_per_group": [1],
@@ -129,6 +128,11 @@ def main() -> None:
         "lr_weights": 1e-1,
         "lr_kernel_bandwidth": 1e-3,
     }
+
+    bw_val_thresh_tran = 60.0
+    bw_val_thresh_init = 10.0
+    bw_val_lr_tran = 1e-3
+    bw_val_lr_init = 1e-2
 
     ######## SETUP ########
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -140,42 +144,23 @@ def main() -> None:
     test_traj_data = problem.test_data()
 
     x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    xp_dataloader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     loc, scale = data_bounds(x_k_data, mode="center_lengths")
-    #loc, scale = data_mean_std(torch.cat([x0_data, x_k_data, x_kp1_data], dim=0))
     loc = loc.to(device)
     scale = scale.to(device)
-    print("scale: ", scale)
     base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
     dtf = MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=5).to(device)
     decorrupter = CompositeDensityModel([dtf], base_distribution).to(device)
 
     ######## TRAIN LCM ########
-
     print("Training NF decorrupter")
-
-    optimizer = torch.optim.Adam(decorrupter.parameters(), lr=dtf_params["lr"])
-
-    dtf_concentration_loss_xk = lambda composite_model, x: 1.0 * loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
-    #dtf_concentration_loss_xkp1 = lambda composite_model, x: 100.0 *loss.dtf_data_concentration_loss(composite_model.domain_tfs[0], x, concentration_point=loc, radius=scale)
-    #decorrupter, best_loss, training_time = train.train_multiset(
-    #    decorrupter,
-    #    [x_dataloader, x_kp1_dataloader],
-    #    [{"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk}, {"dtf_conc": dtf_concentration_loss_xkp1}],
-    #    optimizer,
-    #    epochs=dtf_params["epochs"],
-    #    verbose=True,
-    #    use_best="mle",
-    #    clip_grad_norm=5.0,
-    #    restore_loss_threshold=50.0,
-    #)
+    optimizer = torch.optim.Adam(decorrupter.parameters(), lr=dtf_params["lr"], weight_decay=1e-3)
 
     decorrupter, best_loss, training_time = train.train(
         decorrupter,
         x_dataloader,
-        {"mle": loss.mle_loss, "dtf_conc": dtf_concentration_loss_xk},
+        {"mle": loss.mle_loss},
         optimizer,
         epochs=dtf_params["epochs"],
         verbose=True,
@@ -191,46 +176,47 @@ def main() -> None:
     x_k_data = x_k_data.to(device)
     x_kp1_data = x_kp1_data.to(device)
     x0_data = x0_data.to(device)
-    x_k_transformed, _ = dtf_trained(x_k_data)
-    x_kp1_transformed, _ = dtf_trained(x_kp1_data)
-    x0_transformed, _ = dtf_trained(x0_data)
-    joint_kernel_bandwidth = GaussianKernelBasis.ss_bandwidth(torch.cat([x_k_transformed, x_kp1_transformed], dim = 1))
-    joint_kernel_bandwidth_param = torch.nn.Parameter(joint_kernel_bandwidth * kernel_bandwidth_factor)
+    with torch.no_grad():
+        x_k_transformed, _ = dtf_trained(x_k_data)
+        x_kp1_transformed, _ = dtf_trained(x_kp1_data)
+        x0_transformed, _ = dtf_trained(x0_data)
+    
+    # Optimize joint bandwidth
+    joint_data = torch.cat([x_k_transformed, x_kp1_transformed], dim=1)
+    joint_train_data, joint_val_data = train_test_split(joint_data, test_size=0.1)
+    joint_kde = GaussianKDE(joint_train_data)
+    best_bandwidth_joint, _ = joint_kde.fit_bandwidth_validation_mle(joint_val_data, 
+            epochs=200, 
+            threshold=bw_val_thresh_tran, 
+            lr=bw_val_lr_tran, 
+            min_step=1e-3, 
+            verbose=True, 
+            block_size=128)
+    #best_bandwidth_joint = 0.5 * best_bandwidth_joint
 
-    init_kernel_bandwidth = GaussianKernelBasis.ss_bandwidth(x0_transformed)
-    init_kernel_bandwidth_param = torch.nn.Parameter(init_kernel_bandwidth * kernel_bandwidth_factor)
+    # Optimize init bandwidth
+    init_train_data, init_val_data = train_test_split(x0_transformed, test_size=0.1)
+    init_kde = GaussianKDE(init_train_data)
+    best_bandwidth_init, _ = init_kde.fit_bandwidth_validation_mle(init_val_data, 
+            epochs=200, 
+            threshold=bw_val_thresh_init, 
+            lr=bw_val_lr_init, 
+            min_step=1e-3, 
+            verbose=True, 
+            block_size=128)
 
-    phi_basis = GaussianKernelBasis(x_k_transformed, kernel_bandwidth=joint_kernel_bandwidth_param, trainable=False)
-    psi_basis = GaussianKernelBasis(x_kp1_transformed, kernel_bandwidth=joint_kernel_bandwidth_param, trainable=False)
-    psi0_basis = GaussianKernelBasis(x0_transformed, kernel_bandwidth=init_kernel_bandwidth_param, trainable=True)
+    phi_basis = GaussianKernelBasis(x_k_transformed, kernel_bandwidth=best_bandwidth_joint, trainable=False)
+    psi_basis = GaussianKernelBasis(x_kp1_transformed, kernel_bandwidth=best_bandwidth_joint, trainable=False)
+    psi0_basis = GaussianKernelBasis(x0_transformed, kernel_bandwidth=best_bandwidth_init, trainable=True)
 
     lrff = LinearRFF(phi_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance).to(device)
     tran_model = CompositeConditionalModel([dtf_trained], lrff).to(device)
 
-    #print("Training transition model kernel and weights")
-    #optimizer = torch.optim.Adam([joint_kernel_bandwidth_param], lr=init_params["lr_kernel_bandwidth"])
-    #tran_model, best_loss_tran, training_time_tran = train.train(
-    #    tran_model,
-    #    xp_dataloader,
-    #    {"mle": loss.conditional_mle_loss},
-    #    optimizer,
-    #    epochs=dtf_params["epochs"],
-    #    verbose=True,
-    #    use_best="mle",
-    #)
-    #print("Done.\n")
-    #print(f"Transition model loss: {best_loss_tran:.6f}, training time: {training_time_tran:.2f}s")
-
     ff = LinearFF.from_rff(lrff, psi0_basis).to(device)
     init_model = CompositeDensityModel([dtf_trained], ff).to(device)
-    
 
     print("Training initial model weights")
-    optimizers = {
-        "weights": torch.optim.Adam([
-            {"params":init_model.density_model.weight_params(),"lr": init_params["lr_weights"]}, 
-            {"params": init_kernel_bandwidth_param, "lr": init_params["lr_kernel_bandwidth"]}]),
-    }
+    optimizers = { "weights": torch.optim.Adam([{"params":init_model.density_model.weight_params(),"lr": init_params["lr_weights"]}]) }
     init_model, best_loss_init, training_time_init = train.train_iterate(
         init_model,
         x0_dataloader,
@@ -250,8 +236,6 @@ def main() -> None:
     cpu = torch.device("cpu")
     init_model.to(cpu)
     tran_model.to(cpu)
-    joint_kernel_bandwidth_param.to(cpu)
-    init_kernel_bandwidth_param.to(cpu)
     dtf_trained.to(cpu)
     print("Propagating beliefs...")
     base_belief_seq = propagate.propagate(
@@ -265,7 +249,6 @@ def main() -> None:
 
     ll_per_step = []
     for i in range(problem.n_timesteps):
-        #data_i = test_traj_data[i].to(cpu)
         data_i = test_traj_data[i].to(cpu)
         ll = avg_log_likelihood(belief_seq[i], data_i)
         ll_per_step.append(ll.detach().cpu().reshape(()))
