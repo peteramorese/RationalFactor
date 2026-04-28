@@ -6,7 +6,9 @@ from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
+from rational_factor.models.density_model import LogisticSigmoid
 import rational_factor.tools.propagate as propagate
+from rational_factor.tools.misc import data_bounds
 from rational_factor.tools.visualization import plot_belief
 from rational_factor.tools.analysis import mc_integral_box
 from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSeparableTF
@@ -39,9 +41,14 @@ def _plot_state_vs_latent_grid(
     gx = np.linspace(lo[0], hi[0], n_grid_lines)
     gy = np.linspace(lo[1], hi[1], n_grid_lines)
 
+    try:
+        transform_device = next(transform.parameters()).device
+    except StopIteration:
+        transform_device = torch.device("cpu")
+
     with torch.no_grad():
         transform.eval()
-        z_data, _ = transform(x_cpu.to(dtype=torch.float32))
+        z_data, _ = transform(x_cpu.to(device=transform_device, dtype=torch.float32))
         z_cpu = z_data.detach().cpu()
     z_lo = z_cpu.quantile(quantile_pad, dim=0).numpy()
     z_hi = z_cpu.quantile(1.0 - quantile_pad, dim=0).numpy()
@@ -58,7 +65,7 @@ def _plot_state_vs_latent_grid(
         transform.eval()
         for i, xv in enumerate(gx):
             line_xy = np.stack([np.full_like(y_vals, xv), y_vals], axis=1)
-            line_t = torch.from_numpy(line_xy).to(dtype=torch.float32)
+            line_t = torch.from_numpy(line_xy).to(device=transform_device, dtype=torch.float32)
             z_line, _ = transform(line_t)
             z_np = z_line.detach().cpu().numpy()
             ax_state.plot(line_xy[:, 0], line_xy[:, 1], color=colors[i], lw=1.4)
@@ -66,7 +73,7 @@ def _plot_state_vs_latent_grid(
 
         for i, yv in enumerate(gy):
             line_xy = np.stack([x_vals, np.full_like(x_vals, yv)], axis=1)
-            line_t = torch.from_numpy(line_xy).to(dtype=torch.float32)
+            line_t = torch.from_numpy(line_xy).to(device=transform_device, dtype=torch.float32)
             z_line, _ = transform(line_t)
             z_np = z_line.detach().cpu().numpy()
             ax_state.plot(line_xy[:, 0], line_xy[:, 1], color=colors[i], lw=1.4, alpha=0.8)
@@ -104,34 +111,37 @@ if __name__ == "__main__":
         tran_params = {
             "n_epochs_per_group": [5, 5], # dtf_params and basis, weights
             "iterations": 40,
+            "pre_train_epochs": 10,
             "lr_basis": 5e-3,
-            "lr_weights": 1e-2,
+            "lr_weights": 1e-3,
             "lr_dtf": 5e-4,
         }
         init_params = {
             "n_epochs_per_group": [20, 5], # basis, weights
             "iterations": 50,
             "lr_basis": 5e-3,
-            "lr_weights": 1e-2,
+            "lr_weights": 1e-3,
         }
     else:
         tran_params = {
             "n_epochs_per_group": [5, 5], # basis, weights
             "iterations": 40,
             "lr_basis": 5e-3,
-            "lr_weights": 1e-2,
+            "lr_weights": 1e-3,
         }
         init_params = {
             "n_epochs_per_group": [20, 5], # basis, weights
             "iterations": 50,
             "lr_basis": 5e-3,
-            "lr_weights": 1e-2,
+            "lr_weights": 1e-3,
         }
 
     batch_size = 256
     n_timesteps_prop = problem.n_timesteps
+    reg_covar_joint = 1e-3
     #var_reg_strength = 5e-3
     var_reg_strength = 5e-1
+    ls_temp = 0.1
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -139,20 +149,60 @@ if __name__ == "__main__":
     print("Device: ", device)
 
     system = problem.system
-    x0 = problem.train_initial_state_data()
-    x_k, x_kp1 = problem.train_state_transition_data()
+    x0_data = problem.train_initial_state_data()
+    x_k_data, x_kp1_data = problem.train_state_transition_data()
     traj_data = problem.test_data()
 
-    x0_dataloader = DataLoader(TensorDataset(x0), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    xp_dataloader = DataLoader(TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-
-    # Create basis functions
-    phi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
-    psi_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
-    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
+    x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    xp_dataloader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    x_k_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create separable domain transformation
     nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=8).to(device) if use_dtf else None
+
+    # Pre train the dtf
+    print("Pre training the dtf")
+    loc, scale = data_bounds(x_k_data, mode="center_lengths")
+    loc = loc.to(device)
+    scale = scale.to(device)
+    base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
+    decorrupter_density = CompositeDensityModel([nftf], base_distribution).to(device)
+    optimizer = torch.optim.Adam(nftf.parameters(), lr=tran_params["lr_dtf"], weight_decay=tran_params["lr_dtf"])
+    decorrupter_density, best_loss, training_time = train.train(
+        decorrupter_density,
+        x_k_dataloader,
+        {"mle": loss.mle_loss},
+        optimizer,
+        epochs=tran_params["pre_train_epochs"],
+        verbose=True,
+        use_best="mle",
+    )
+    print("Done.\n")
+
+    # Prefit the basis functions
+    print("Prefitting the basis functions")
+    with torch.no_grad():
+        y_k_data, _ = nftf(x_k_data.to(device))
+        y_kp1_data, _ = nftf(x_kp1_data.to(device))
+        y0_data, _ = nftf(x0_data.to(device))
+        y_k_data = y_k_data.to(torch.device("cpu"))
+        y_kp1_data = y_kp1_data.to(torch.device("cpu"))
+        y0_data = y0_data.to(torch.device("cpu"))
+    y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
+    gmm_lf = train.fit_gaussian_lf_em(y_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_joint, max_iter=100)
+    weights = gmm_lf.get_w()
+    phi_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
+    phi_means, phi_stds = phi_marginal.means_stds()
+    phi_params = torch.stack([phi_means, phi_stds], dim=-1)
+
+    psi_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
+    psi_means, psi_stds = psi_marginal.means_stds()
+    psi_params = torch.stack([psi_means, psi_stds], dim=-1)
+
+    phi_basis = GaussianBasis(uparams_init=phi_params).to(device)
+    psi_basis = GaussianBasis(uparams_init=psi_params).to(device)
+    psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
+    print("Done.\n")
 
     # Create and train the transition model
     if use_dtf:
@@ -237,7 +287,7 @@ if __name__ == "__main__":
         grid_morph_out_path = out_dir / "vdp_nftf_group_gaussian__state_vs_latent_grid.png"
         _plot_state_vs_latent_grid(
             trained_nftf,
-            x_k.detach().cpu(),
+            x_k_data.detach().cpu(),
             grid_morph_out_path,
             n_grid_lines=11,
             n_points_per_line=280,

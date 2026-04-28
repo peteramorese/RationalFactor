@@ -18,42 +18,40 @@ from rational_factor.tools.benchmark import Benchmark
 
 CONTEXT_USE_DTF_FALSE = {
     "use_dtf": False,
-    "n_basis": 2000,
+    "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [10, 5],
-        "iterations": 40,
-        "lr_basis": 5e-2,
+        "n_epochs_per_group": [5, 5],
+        "iterations": 60,
+        "lr_basis": 5e-3,
         "lr_weights": 1e-2,
     },
     "init_params": {
-        "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
+        "n_epochs_per_group": [10, 5],
+        "iterations": 100,
+        "lr_basis": 1e-3,
         "lr_weights": 1e-2,
     },
     "batch_size": 256,
-    "var_reg_strength": 5e-1,
     "verbose": True,
 }
 
 CONTEXT_USE_DTF_TRUE = {
     "use_dtf": True,
-    "n_basis": 2000,
+    "n_basis": 500,
     "tran_params": {
-        "n_epochs_per_group": [10, 5],
-        "iterations": 40,
-        "lr_basis": 5e-2,
+        "n_epochs_per_group": [5, 5],
+        "iterations": 60,
+        "lr_basis": 5e-3,
         "lr_weights": 1e-2,
         "lr_dtf": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
-        "lr_basis": 1e-2,
+        "iterations": 100,
+        "lr_basis": 1e-3,
         "lr_weights": 1e-2,
     },
     "batch_size": 256,
-    "var_reg_strength": 5e-1,
     "verbose": True,
 }
 
@@ -81,7 +79,6 @@ def main() -> None:
         tran_params: dict,
         init_params: dict,
         batch_size: int,
-        var_reg_strength: float,
         verbose: bool = True,
     ):
         x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
@@ -118,10 +115,6 @@ def main() -> None:
 
         mle_loss_fn = loss.conditional_mle_loss
         if use_dtf:
-            var_reg_loss_fn = lambda model, x, xp: var_reg_strength * (
-                loss.gaussian_basis_var_reg_loss(model.conditional_density_model.phi_basis, mean=True)
-                + loss.gaussian_basis_var_reg_loss(model.conditional_density_model.psi_basis, mean=True)
-            )
             optimizers = {
                 "dtf_and_basis": torch.optim.Adam(
                     [
@@ -134,10 +127,6 @@ def main() -> None:
                 ),
             }
         else:
-            var_reg_loss_fn = lambda model, x, xp: var_reg_strength * (
-                loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True)
-                + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True)
-            )
             optimizers = {
                 "basis": torch.optim.Adam(tran_model.basis_params(), lr=tran_params["lr_basis"]),
                 "weights": torch.optim.Adam(tran_model.weight_params(), lr=tran_params["lr_weights"]),
@@ -146,7 +135,7 @@ def main() -> None:
         tran_model, best_loss_tran, training_time_tran = train.train_iterate(
             tran_model,
             xp_dataloader,
-            {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn},
+            {"mle": mle_loss_fn},
             optimizers,
             epochs_per_group=tran_params["n_epochs_per_group"],
             iterations=tran_params["iterations"],
@@ -165,17 +154,11 @@ def main() -> None:
 
         mle_loss_fn = loss.mle_loss
         if use_dtf:
-            var_reg_loss_fn = lambda model, x: var_reg_strength * loss.gaussian_basis_var_reg_loss(
-                model.density_model.psi0_basis, mean=True
-            )
             optimizers = {
                 "basis": torch.optim.Adam(init_model.density_model.basis_params(), lr=init_params["lr_basis"]),
                 "weights": torch.optim.Adam(init_model.density_model.weight_params(), lr=init_params["lr_weights"]),
             }
         else:
-            var_reg_loss_fn = lambda model, x: var_reg_strength * loss.gaussian_basis_var_reg_loss(
-                model.psi0_basis, mean=True
-            )
             optimizers = {
                 "basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]),
                 "weights": torch.optim.Adam(init_model.weight_params(), lr=init_params["lr_weights"]),
@@ -184,7 +167,7 @@ def main() -> None:
         init_model, best_loss_init, training_time_init = train.train_iterate(
             init_model,
             x0_dataloader,
-            {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn},
+            {"mle": mle_loss_fn},
             optimizers,
             epochs_per_group=init_params["n_epochs_per_group"],
             iterations=init_params["iterations"],

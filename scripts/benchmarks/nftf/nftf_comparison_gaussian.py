@@ -18,7 +18,7 @@ from rational_factor.tools.benchmark import Benchmark
 
 CONTEXT_MASKED_AFFINE = {
     "nftf_type": "masked_affine",
-    "n_basis": 1000,
+    "n_basis": 500,
     "tran_params": {
         "n_epochs_per_group": [10, 5],
         "iterations": 20,
@@ -39,7 +39,7 @@ CONTEXT_MASKED_AFFINE = {
 
 CONTEXT_MASKED_RQS = {
     "nftf_type": "masked_rqs",
-    "n_basis": 1000,
+    "n_basis": 500,
     "tran_params": {
         "n_epochs_per_group": [10, 5],
         "iterations": 20,
