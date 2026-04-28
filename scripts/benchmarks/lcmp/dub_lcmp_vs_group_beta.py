@@ -100,13 +100,13 @@ def main() -> None:
         init_params: dict,
         verbose: bool,
     ):
-        x_dataloader = DataLoader(xp_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
         loc, scale = data_bounds(x_k_data, mode="center_lengths")
         loc = loc.to(device)
         scale = scale.to(device)
         base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
-        decorrupter = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=3).to(device)
+        decorrupter = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
         decorrupter_density = CompositeDensityModel([decorrupter], base_distribution).to(device)
 
         optimizer = torch.optim.Adam(
@@ -140,7 +140,7 @@ def main() -> None:
         y_kp1_data, _ = decorrupter_trained(x_kp1_data_device)
         y0_data, _ = decorrupter_trained(x0_data_device)
 
-        mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=3).to(device)
+        mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
         y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
         mover_joint = StackedTF([mover, mover])
 
