@@ -32,26 +32,30 @@ def main() -> None:
     decorrupter_params = {
         "epochs": 50,
         "lr": 1e-3,
-        "weight_decay": 1e-3,
+        "weight_decay": 5e-3,
     }
 
     mover_params = {
-        "epochs": 20,
-        "lr": 1e-3,
-        "weight_decay": 1e-3,
+        "epochs": 50,
+        "lr": 5e-4,
+        "weight_decay": 5e-3,
     }
 
     init_params = {
         "n_epochs_per_group": [15, 5],
         "iterations": 100,
-        "lr_basis": 5e-2,
+        "lr_basis": 1e-2,
         "lr_weights": 1e-1,
+        #"lr_basis": 1e-4,
+        #"lr_weights": 1e-4,
     }
 
     ls_temp = 0.1
     n_basis = 1000
-    mover_iterations = 5
-    reg_covar = 5e-2
+    mover_iterations = 3
+    reg_covar_joint = 2e-1
+    reg_covar_init = 1e-3
+    em_iterations = 100
 
     ######## SETUP ########
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -71,7 +75,7 @@ def main() -> None:
     loc = loc.to(device)
     scale = scale.to(device)
     base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
-    decorrupter = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
+    decorrupter = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=3).to(device)
     decorrupter_density = CompositeDensityModel([decorrupter], base_distribution).to(device)
 
     print("Training NF decorrupter")
@@ -102,7 +106,7 @@ def main() -> None:
     
     ######## TRAIN MOVER ########
     print("Training mover")
-    mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
+    mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=3).to(device)
     
     # Initialize base density to LF GMM
     y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
@@ -112,7 +116,7 @@ def main() -> None:
     z_joint_data = y_joint_data
     for i in range(mover_iterations):
         print(f"Fitting GMM LF (iteration {i+1} out of {mover_iterations})")
-        gmm_lf = train.fit_gaussian_lf_em(z_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar, max_iter=100)
+        gmm_lf = train.fit_gaussian_lf_em(z_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_joint, max_iter=em_iterations)
         mover_density = CompositeDensityModel([mover_joint], gmm_lf).to(device)
         y_joint_dataloader = DataLoader(TensorDataset(y_joint_data.to(torch.device("cpu"))), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
@@ -137,22 +141,32 @@ def main() -> None:
     weights = gmm_lf.get_w()
     z_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
     z_means, z_stds = z_marginal.means_stds()
-    z_params = torch.stack([z_means, z_stds], dim=-1)
+    phi_params = torch.stack([z_means, z_stds], dim=-1)
 
     zp_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
     zp_means, zp_stds = zp_marginal.means_stds()
-    zp_params = torch.stack([zp_means, zp_stds], dim=-1)
+    psi_params = torch.stack([zp_means, zp_stds], dim=-1)
     
 
-    phi_basis = GaussianBasis(fixed_params=z_params).to(device)
-    psi_basis = GaussianBasis(fixed_params=zp_params).to(device)
+    phi_basis = GaussianBasis(fixed_params=phi_params).to(device)
+    psi_basis = GaussianBasis(fixed_params=psi_params).to(device)
+    
+    z0_data, _ = mover_trained(y0_data)
+    z0_data = z0_data.to(torch.device("cpu"))
+
     psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
+
+    # Prefit psi0 bases using EM
+    #print("Prefitting psi0 bases using EM")
+    #gmm_z0_lf = train.fit_gaussian_lf_em(z0_data, n_components=n_basis, reg_covar=reg_covar_init, max_iter=em_iterations)
+    #z0_means, z0_stds = gmm_z0_lf.basis.means_stds()
+    #psi0_params = torch.stack([z0_means, z0_stds], dim=-1)
+    #psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
 
     lrff = LinearRFF(phi_basis, psi_basis, a_fixed=weights.to(device)).to(device)
     ff = LinearFF(lrff.get_a(), phi_basis, psi0_basis).to(device)
 
-    z0_data, _ = mover_trained(y0_data)
-    z0_dataloader = DataLoader(TensorDataset(z0_data.to(torch.device("cpu"))), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    z0_dataloader = DataLoader(TensorDataset(z0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     optimizers = {
         "basis": torch.optim.Adam(ff.basis_params(), lr=init_params["lr_basis"]),

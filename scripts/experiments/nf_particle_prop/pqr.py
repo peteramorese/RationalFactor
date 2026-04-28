@@ -30,7 +30,7 @@ def main() -> None:
 
     n_particles = 4000
     batch_size = 256
-    tran_epochs = 40
+    tran_epochs = 15
     init_epochs = 40
     lr = 1e-3
     num_layers = 5

@@ -19,7 +19,7 @@ from rational_factor.tools.visualization import plot_marginal_trajectory_compari
 
 
 def main() -> None:
-    problem = FULLY_OBSERVABLE_PROBLEMS["planar_quadrotor"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["dubins_trailer"]
 
     ######## USER CONFIG ########
     use_gpu = torch.cuda.is_available()
