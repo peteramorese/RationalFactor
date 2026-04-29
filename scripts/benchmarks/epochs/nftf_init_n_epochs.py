@@ -17,7 +17,7 @@ from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
-from rational_factor.tools.misc import data_bounds
+from rational_factor.tools.misc import data_bounds, train_test_split
 
 PROBLEM = "quadcopter"
 
@@ -126,8 +126,13 @@ def main() -> None:
     x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj_data = problem.test_data()
 
-    x0_dataset = TensorDataset(x0_data)
-    xp_dataset = TensorDataset(x_kp1_data, x_k_data)
+    x0_train, x0_val = train_test_split(x0_data, test_size=0.2)
+    x_k_train, x_k_val, x_kp1_train, x_kp1_val = train_test_split(x_k_data, x_kp1_data, test_size=0.2)
+
+    x0_dataset = TensorDataset(x0_train)
+    x0_val_dataset = TensorDataset(x0_val)
+    xp_dataset = TensorDataset(x_kp1_train, x_k_train)
+    xp_val_dataset = TensorDataset(x_kp1_val, x_k_val)
 
     def experiment(
         use_nftf: bool,
@@ -142,7 +147,9 @@ def main() -> None:
     ):
         x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
         xp_dataloader = DataLoader(xp_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-        x_k_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x0_val_dataloader = DataLoader(x0_val_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        xp_val_dataloader = DataLoader(xp_val_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x_k_dataloader = DataLoader(TensorDataset(x_k_train), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
         nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=8).to(device) if use_nftf else None
 
@@ -245,10 +252,12 @@ def main() -> None:
             xp_dataloader,
             {"mle": loss.conditional_mle_loss},
             optimizers,
+            labeled_validation_loss_fns={"val_mle": loss.conditional_mle_loss},
+            validation_data_loader=xp_val_dataloader,
             epochs_per_group=tran_params["n_epochs_per_group"],
             iterations=tran_params["iterations"],
             verbose=verbose,
-            use_best="mle",
+            use_best="val_mle",
         )
 
         if use_nftf:
@@ -273,10 +282,12 @@ def main() -> None:
             x0_dataloader,
             {"mle": loss.mle_loss},
             init_optimizers,
+            labeled_validation_loss_fns={"val_mle": loss.mle_loss},
+            validation_data_loader=x0_val_dataloader,
             epochs_per_group=init_params["n_epochs_per_group"],
             iterations=init_params["iterations"],
             verbose=verbose,
-            use_best="mle",
+            use_best="val_mle",
         )
 
         analysis_device = torch.device("cpu")

@@ -14,6 +14,7 @@ from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
+from rational_factor.tools.misc import train_test_split
 
 USE_DTF = False
 
@@ -68,8 +69,12 @@ def main() -> None:
     x0_data, x_k_data, x_kp1_data = problem.train_data()
     test_traj_data = problem.test_data()
 
-    x0_dataset = TensorDataset(x0_data)
-    xp_dataset = TensorDataset(x_kp1_data, x_k_data)
+    x0_train, x0_val = train_test_split(x0_data, test_size=0.2)
+    x_k_train, x_k_val, x_kp1_train, x_kp1_val = train_test_split(x_k_data, x_kp1_data, test_size=0.2)
+    x0_dataset = TensorDataset(x0_train)
+    x0_val_dataset = TensorDataset(x0_val)
+    xp_dataset = TensorDataset(x_kp1_train, x_k_train)
+    xp_val_dataset = TensorDataset(x_kp1_val, x_k_val)
 
     def experiment(
         use_dtf: bool,
@@ -82,6 +87,8 @@ def main() -> None:
     ):
         x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
         xp_dataloader = DataLoader(xp_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x0_val_dataloader = DataLoader(x0_val_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        xp_val_dataloader = DataLoader(xp_val_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
         offsets = torch.tensor([10.0, 10.0], device=device)
         phi_basis = BetaBasis.random_init(
@@ -151,10 +158,12 @@ def main() -> None:
             xp_dataloader,
             {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn},
             optimizers,
+            labeled_validation_loss_fns={"val_mle": mle_loss_fn},
+            validation_data_loader=xp_val_dataloader,
             epochs_per_group=tran_params["n_epochs_per_group"],
             iterations=tran_params["iterations"],
             verbose=verbose,
-            use_best="mle",
+            use_best="val_mle",
         )
 
         trained_nftf = MaskedRQSNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
@@ -185,10 +194,12 @@ def main() -> None:
             x0_dataloader,
             {"mle": mle_loss_fn, "var_reg": var_reg_loss_fn},
             optimizers,
+            labeled_validation_loss_fns={"val_mle": mle_loss_fn},
+            validation_data_loader=x0_val_dataloader,
             epochs_per_group=init_params["n_epochs_per_group"],
             iterations=init_params["iterations"],
             verbose=verbose,
-            use_best="mle",
+            use_best="val_mle",
         )
 
         base_belief_seq = propagate.propagate(

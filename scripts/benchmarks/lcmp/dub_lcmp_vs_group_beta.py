@@ -21,7 +21,7 @@ from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
-from rational_factor.tools.misc import data_bounds
+from rational_factor.tools.misc import data_bounds, train_test_split
 
 TRIALS = 5
 BENCHMARK_ROOT = "benchmark_data"
@@ -85,9 +85,13 @@ def main() -> None:
     x0_data = problem.train_initial_state_data()
     x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj_data = problem.test_data()
+    x0_train, x0_val = train_test_split(x0_data, test_size=0.2)
+    x_k_train, x_k_val, x_kp1_train, x_kp1_val = train_test_split(x_k_data, x_kp1_data, test_size=0.2)
 
-    x0_dataset = TensorDataset(x0_data)
-    xp_dataset = TensorDataset(x_kp1_data, x_k_data)
+    x0_dataset = TensorDataset(x0_train)
+    x0_val_dataset = TensorDataset(x0_val)
+    xp_dataset = TensorDataset(x_kp1_train, x_k_train)
+    xp_val_dataset = TensorDataset(x_kp1_val, x_k_val)
 
     def run_lcmp(
         batch_size: int,
@@ -100,9 +104,9 @@ def main() -> None:
         init_params: dict,
         verbose: bool,
     ):
-        x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x_dataloader = DataLoader(TensorDataset(x_k_train), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-        loc, scale = data_bounds(x_k_data, mode="center_lengths")
+        loc, scale = data_bounds(x_k_train, mode="center_lengths")
         loc = loc.to(device)
         scale = scale.to(device)
         base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
@@ -133,12 +137,18 @@ def main() -> None:
         )
         decorrupter_trained = MaskedAffineNFTF.copy_from_trainable(decorrupter).to(device)
 
-        x_k_data_device = x_k_data.to(device)
-        x_kp1_data_device = x_kp1_data.to(device)
-        x0_data_device = x0_data.to(device)
+        x_k_data_device = x_k_train.to(device)
+        x_kp1_data_device = x_kp1_train.to(device)
+        x0_data_device = x0_train.to(device)
+        x_k_val_device = x_k_val.to(device)
+        x_kp1_val_device = x_kp1_val.to(device)
+        x0_val_device = x0_val.to(device)
         y_k_data, _ = decorrupter_trained(x_k_data_device)
         y_kp1_data, _ = decorrupter_trained(x_kp1_data_device)
         y0_data, _ = decorrupter_trained(x0_data_device)
+        y_k_val, _ = decorrupter_trained(x_k_val_device)
+        y_kp1_val, _ = decorrupter_trained(x_kp1_val_device)
+        y0_val, _ = decorrupter_trained(x0_val_device)
 
         mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
         y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
@@ -161,6 +171,13 @@ def main() -> None:
                 shuffle=True,
                 pin_memory=use_gpu,
             )
+            y_joint_val_data = torch.cat([y_k_val, y_kp1_val], dim=1)
+            y_joint_val_dataloader = DataLoader(
+                TensorDataset(y_joint_val_data.to(cpu)),
+                batch_size=batch_size,
+                shuffle=True,
+                pin_memory=use_gpu,
+            )
             optimizer = torch.optim.Adam(
                 mover_density.domain_tfs[0].parameters(),
                 lr=mover_params["lr"],
@@ -171,9 +188,11 @@ def main() -> None:
                 y_joint_dataloader,
                 {"mle": loss.mle_loss},
                 optimizer,
+                labeled_validation_loss_fns={"val_mle": loss.mle_loss},
+                validation_data_loader=y_joint_val_dataloader,
                 epochs=mover_params["epochs"],
                 verbose=verbose,
-                use_best="mle",
+                use_best="val_mle",
                 clip_grad_norm=5.0,
                 restore_loss_threshold=50.0,
             )
@@ -206,7 +225,9 @@ def main() -> None:
         ff = LinearFF(lrff.get_a(), phi_basis, psi0_basis).to(device)
 
         z0_data, _ = mover_trained(y0_data)
+        z0_val, _ = mover_trained(y0_val)
         z0_dataloader = DataLoader(TensorDataset(z0_data.to(cpu)), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        z0_val_dataloader = DataLoader(TensorDataset(z0_val.to(cpu)), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
         optimizers = {
             "basis": torch.optim.Adam(ff.basis_params(), lr=init_params["lr_basis"]),
             "weights": torch.optim.Adam(ff.weight_params(), lr=init_params["lr_weights"]),
@@ -216,10 +237,12 @@ def main() -> None:
             z0_dataloader,
             {"mle": loss.mle_loss},
             optimizers,
+            labeled_validation_loss_fns={"val_mle": loss.mle_loss},
+            validation_data_loader=z0_val_dataloader,
             epochs_per_group=init_params["n_epochs_per_group"],
             iterations=init_params["iterations"],
             verbose=verbose,
-            use_best="mle",
+            use_best="val_mle",
         )
 
         base_belief_seq = propagate.propagate(ff, lrff, n_steps=problem.n_timesteps)
@@ -234,7 +257,9 @@ def main() -> None:
         verbose: bool,
     ):
         x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x0_val_dataloader = DataLoader(x0_val_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
         xp_dataloader = DataLoader(xp_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        xp_val_dataloader = DataLoader(xp_val_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
         offsets = torch.tensor([-1.0, -1.0], device=device)
         variance = 1.0
@@ -279,10 +304,12 @@ def main() -> None:
             xp_dataloader,
             {"mle": loss.conditional_mle_loss},
             optimizers,
+            labeled_validation_loss_fns={"val_mle": loss.conditional_mle_loss},
+            validation_data_loader=xp_val_dataloader,
             epochs_per_group=tran_params["n_epochs_per_group"],
             iterations=tran_params["iterations"],
             verbose=verbose,
-            use_best="mle",
+            use_best="val_mle",
         )
 
         trained_domain_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
@@ -299,10 +326,12 @@ def main() -> None:
             x0_dataloader,
             {"mle": loss.mle_loss},
             optimizers,
+            labeled_validation_loss_fns={"val_mle": loss.mle_loss},
+            validation_data_loader=x0_val_dataloader,
             epochs_per_group=init_params["n_epochs_per_group"],
             iterations=init_params["iterations"],
             verbose=verbose,
-            use_best="mle",
+            use_best="val_mle",
         )
 
         base_belief_seq = propagate.propagate(

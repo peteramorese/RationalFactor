@@ -226,13 +226,14 @@ class LinearR2FF(ConditionalDensityModel):
         
         a = self.get_a()
         b = self.get_b(a=a)
+        d = self.get_d()
         
         # Calculate g(x)
         log_g_x = torch.log(phi_x @ a + self.numerical_tolerance) # (n_data)
         log_g_xp = torch.log(phi_xp @ a + self.numerical_tolerance) # (n_data)
 
         # Calculate r(x')
-        log_r_xp = torch.log(xi_xp @ self.d + self.numerical_tolerance) # (n_data)
+        log_r_xp = torch.log(xi_xp @ d + self.numerical_tolerance) # (n_data)
 
         # Calculate f(x, x')
         log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
@@ -246,20 +247,110 @@ class LinearR2FF(ConditionalDensityModel):
         if a is None:
             a = self.get_a()
 
+        if d is None:
+            d = self.get_d()
+
         if Omega is not None:
-            denom = torch.einsum('i,j,ijk->k', self.d, a, Omega)
+            denom = torch.einsum('i,j,ijk->k', d, a, Omega)
         else:
-            denom = self.xi_basis.Omega3_contract(self.phi_basis, self.psi_basis, self.d, a)
+            denom = self.xi_basis.Omega3_contract(self.phi_basis, self.psi_basis, d, a)
 
         b = a / (denom + self.numerical_tolerance)
 
         return b
+    
+    def get_d(self):
+        return self.d
 
     def weight_params(self):
         return [self.__au]
     
     def basis_params(self):
         return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
+
+class LinearRFandR2FF(LinearR2FF):
+    """
+    Linear Rational Form and Two-Factor Form 
+
+    Used for combined Markov transition distribution and observation distribution for filtering models
+
+    Treated as state transition conditional distribution with special observation methods
+    """
+    def __init__(self, xi_basis : SeparableBasis, zeta_basis : Basis, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-20):
+        assert phi_basis.dim() == psi_basis.dim(), "Input bases must have the same dimension"
+        assert phi_basis.dim() == xi_basis.dim(), "Input bases must have the same dimension"
+        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
+        assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
+        assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
+        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
+        assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
+        assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
+        ConditionalDensityModel().__init__(phi_basis.dim(), psi_basis.dim())
+
+
+        assert phi_basis.n_basis_functions() == psi_basis.n_basis_functions(), "phi_basis and psi_basis must have the same number of basis functions"
+        assert xi_basis.n_basis_functions() == zeta_basis.n_basis_functions(), "xi_basis and zeta_basis must have the same number of basis functions"
+
+        self.xi_basis = xi_basis
+        self.zeta_basis = zeta_basis
+        self.phi_basis = phi_basis
+        self.psi_basis = psi_basis
+
+        self.__du = torch.nn.Parameter(torch.ones(xi_basis.n_basis_functions())) # d
+        self.__au = torch.nn.Parameter(torch.ones(phi_basis.n_basis_functions())) # g
+
+        self.numerical_tolerance = numerical_tolerance
+
+    def get_d(self):
+        return torch.nn.functional.softmax(self.__du, dim=0)
+    
+    def get_e(self, d : torch.Tensor = None):
+        if d is None:
+            d = self.get_d()
+
+        if not self.zeta_basis.normalized():
+            Omega = self.zeta_basis.Omega1()
+            return d / (Omega + self.numerical_tolerance)
+        return d
+
+    def log_observation_density(self, o : torch.Tensor, *, conditioner : torch.Tensor):
+        x = conditioner
+        xi_x = self.xi_basis(x)
+        zeta_o = self.zeta_basis(o)
+
+        d = self.get_d()
+        e = self.get_e(d=d)
+
+        log_r_x = torch.log(xi_x @ d + self.numerical_tolerance) # (n_data)
+        log_l_o_x = torch.log((zeta_o * xi_x) @ e + self.numerical_tolerance) # (n_data)
+
+        return log_l_o_x - log_r_x
+
+    def weight_params(self):
+        return [self.__au]
+    
+    def basis_params(self):
+        return itertools.chain(self.xi_basis.parameters(), self.zeta_basis.parameters(), self.phi_basis.parameters(), self.psi_basis.parameters())
+    
+    def tran_weight_params(self):
+        return [self.__au]
+    
+    def obs_weight_params(self):
+        return [self.__du]
+    
+    def tran_basis_params(self):
+        return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
+    
+    def obs_basis_params(self):
+        return itertools.chain(self.xi_basis.parameters(), self.zeta_basis.parameters())
+
+    def rf(self):
+        return LinearRF(self.xi_basis, self.zeta_basis, numerical_tolerance=self.numerical_tolerance)
+
+    def r2ff(self):
+        return LinearR2FF(self.d.detach().clone(), self.xi_basis, self.phi_basis, self.psi_basis, numerical_tolerance=self.numerical_tolerance)
+    
+
 
 
 class LinearFF(DensityModel):
@@ -303,7 +394,7 @@ class LinearFF(DensityModel):
         return cls(a, phi_basis, psi0_basis, numerical_tolerance=rff.numerical_tolerance)
 
     @classmethod
-    def from_r2ff(cls, r2ff : LinearR2FF, psi0_basis : SeparableBasis):
+    def from_r2ff(cls, r2ff : LinearR2FF | LinearRFandR2FF, psi0_basis : SeparableBasis):
         phi_basis = r2ff.phi_basis.freeze_params()
         a = r2ff.get_a().detach().clone()
         return cls(a, phi_basis, psi0_basis, numerical_tolerance=r2ff.numerical_tolerance)
@@ -394,14 +485,15 @@ class Linear2FF(DensityModel):
             self.__c0u = torch.nn.Parameter(torch.ones(psi0_basis.n_basis_functions()))
     
     @classmethod
-    def from_r2ff(cls, r2ff : LinearRFF, psi0_basis : SeparableBasis):
+    def from_r2ff(cls, r2ff : LinearR2FF | LinearRFandR2FF, psi0_basis : SeparableBasis):
         # g(x)
         phi_basis = r2ff.phi_basis.freeze_params()
         a = r2ff.get_a().detach().clone()
 
         # r(x)
         xi_basis = r2ff.xi_basis.freeze_params()
-        d = r2ff.d.detach().clone()
+        d = r2ff.d.detach().clone() if isinstance(r2ff, LinearR2FF) else r2ff.get_d().detach().clone()
+
         return cls(d, xi_basis, a, phi_basis, psi0_basis, numerical_tolerance=r2ff.numerical_tolerance)
 
     def get_c0(self, Omega3_0 : torch.Tensor = None):

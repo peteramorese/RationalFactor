@@ -5,8 +5,16 @@ from .basis_functions import UnnormalizedBetaBasis
 
 #### General ####
 
-def conditional_mle_loss(model : ConditionalDensityModel, x : torch.Tensor, conditioner : torch.Tensor):
-    return -model.log_density(x, conditioner=conditioner).mean()
+def conditional_mle_loss(
+    model : ConditionalDensityModel,
+    x : torch.Tensor,
+    conditioner : torch.Tensor,
+    method_name : str = "log_density",
+):
+    loss_method = getattr(model, method_name, None)
+    if loss_method is None or not callable(loss_method):
+        raise AttributeError(f"{type(model).__name__} has no callable method '{method_name}'")
+    return -loss_method(x, conditioner=conditioner).mean()
 
 def mle_loss(model : DensityModel, x : torch.Tensor):
     return -model.log_density(x).mean()
@@ -60,4 +68,3 @@ def dtf_data_concentration_loss(dtf, x : torch.Tensor, concentration_point : tor
     distance_from_center = torch.abs(x_transformed - concentration_point.unsqueeze(0))
     outside_distance = torch.relu(distance_from_center - radius)
     return outside_distance.mean()
-

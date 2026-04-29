@@ -13,7 +13,7 @@ PropagateAndUpdateFn = Callable[
 ]
 
 
-class Filter:
+class Filter(torch.nn.Module):
     """
     Thin wrapper around a concrete `propagate_and_update` implementation.
 
@@ -28,6 +28,7 @@ class Filter:
         observation_model: ConditionalDensityModel,
         prop_and_upd_fn: PropagateAndUpdateFn,
     ):
+        super().__init__()
         if not callable(prop_and_upd_fn):
             raise TypeError("prop_and_upd_fn must be callable")
         if transition_model.conditioner_dim != transition_model.dim:
@@ -79,16 +80,3 @@ class Filter:
         if return_priors:
             return priors, posteriors
         return posteriors
-
-    def __call__(
-        self,
-        initial_belief: DensityModel,
-        observations: Sequence[torch.Tensor | None],
-        *,
-        return_priors: bool = True,
-    ) -> tuple[list[DensityModel], list[DensityModel]] | list[DensityModel]:
-        return self.filter(
-            initial_belief=initial_belief,
-            observations=observations,
-            return_priors=return_priors,
-        )

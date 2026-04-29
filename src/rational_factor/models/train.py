@@ -11,6 +11,33 @@ from sklearn.mixture import GaussianMixture
 def _is_bad_epoch_loss(loss_value: float, threshold: float) -> bool:
     return torch.isnan(torch.tensor(loss_value)).item() or loss_value > threshold
 
+def _batch_to_device(batch, dev):
+    if isinstance(batch, list):
+        return [b.to(dev) for b in batch]
+    if isinstance(batch, tuple):
+        return tuple(b.to(dev) for b in batch)
+    return batch.to(dev)
+
+@torch.no_grad()
+def _evaluate_labeled_losses(
+    model: DensityModel | ConditionalDensityModel,
+    data_loader: DataLoader,
+    labeled_loss_fns: dict[str, callable],
+) -> dict[str, float]:
+    sums = {label: 0.0 for label in labeled_loss_fns.keys()}
+    n_batches = 0
+    dev = next(model.parameters()).device
+    for batch in data_loader:
+        batch = _batch_to_device(batch, dev)
+        for label, loss_fn in labeled_loss_fns.items():
+            sums[label] += loss_fn(model, *batch).item()
+        n_batches += 1
+
+    if n_batches == 0:
+        raise RuntimeError("validation_data_loader is empty.")
+
+    return {label: loss_sum / n_batches for label, loss_sum in sums.items()}
+
 class TrainingTimer:
     def __init__(self, n_groups : int, iterations : int, epochs_per_group : int):
         self.n_groups = n_groups
@@ -78,11 +105,14 @@ class TrainingTimer:
 def train(model : DensityModel | ConditionalDensityModel, 
         data_loader : DataLoader, 
         labeled_loss_fns : dict[str, callable], 
-        optimizer, epochs=100, 
+        optimizer, 
+        labeled_validation_loss_fns : dict[str, callable] = None, 
+        validation_data_loader : DataLoader = None,
+        epochs=100, 
         verbose=True, 
         use_best : str = "total",
         clip_grad_norm : float = 5.0,
-        restore_loss_threshold : float = 29.0):
+        restore_loss_threshold : float = 50.0):
     
     torch.autograd.set_detect_anomaly(True)
 
@@ -90,8 +120,18 @@ def train(model : DensityModel | ConditionalDensityModel,
 
     loss_labels = list(labeled_loss_fns.keys())
     loss_fns = list(labeled_loss_fns.values())
+    validation_loss_labels = list(labeled_validation_loss_fns.keys()) if labeled_validation_loss_fns is not None else []
 
-    assert use_best in loss_labels, f"use_best must be one of {loss_labels}"
+    if (labeled_validation_loss_fns is None) != (validation_data_loader is None):
+        raise ValueError("labeled_validation_loss_fns and validation_data_loader must both be provided together.")
+    if validation_loss_labels:
+        overlapping_labels = set(loss_labels).intersection(validation_loss_labels)
+        if overlapping_labels:
+            raise ValueError(
+                f"Training and validation loss labels must be unique. Overlap: {sorted(overlapping_labels)}"
+            )
+    selectable_loss_labels = loss_labels + validation_loss_labels + ["total"]
+    assert use_best in selectable_loss_labels, f"use_best must be one of {selectable_loss_labels}"
 
     training_timer = TrainingTimer(n_groups=1, iterations=1, epochs_per_group=epochs)
     training_timer.initialize()
@@ -105,7 +145,7 @@ def train(model : DensityModel | ConditionalDensityModel,
         optimizer.step()
         return total_loss.item(), losses
 
-    best_loss = float('inf')
+    best_loss = restore_loss_threshold
     best_state = None
 
     for epoch in range(epochs):
@@ -114,12 +154,7 @@ def train(model : DensityModel | ConditionalDensityModel,
         sum_losses = [0.0 for _ in loss_fns]
         for batch in data_loader:
             dev = next(model.parameters()).device
-            if isinstance(batch, list):
-                batch = [b.to(dev) for b in batch]
-            elif isinstance(batch, tuple):
-                batch = tuple(b.to(dev) for b in batch)
-            else:
-                batch = batch.to(dev)
+            batch = _batch_to_device(batch, dev)
 
             total_loss, losses = train_step(*batch)
             total_sum_loss += total_loss
@@ -131,6 +166,12 @@ def train(model : DensityModel | ConditionalDensityModel,
         avg_losses = [loss_sum / len(data_loader) for loss_sum in sum_losses]
         loss_dict = {label: value for label, value in zip(loss_labels, avg_losses)}
         loss_dict["total"] = avg_total_loss
+        validation_loss_dict = {}
+        if labeled_validation_loss_fns is not None:
+            model.eval()
+            validation_loss_dict = _evaluate_labeled_losses(model, validation_data_loader, labeled_validation_loss_fns)
+            model.train()
+            loss_dict.update(validation_loss_dict)
 
         epoch_time = end_time - start_time
 
@@ -158,9 +199,14 @@ def train(model : DensityModel | ConditionalDensityModel,
             )
             if not valid:
                 loss_details += " <invld>"
+            validation_loss_details = ""
+            if validation_loss_dict:
+                validation_loss_details = ", val: " + ", ".join(
+                    f"{label}:{value:.4f}" for label, value in validation_loss_dict.items()
+                )
             print(
                 f"Epoch {epoch+1}, Time: {epoch_time:.2f}s, Loss: tot:{avg_total_loss:.4f}, "
-                f"{loss_details}, etr: {training_timer.get_predicted_etr_str()}"
+                f"{loss_details}{validation_loss_details}, etr: {training_timer.get_predicted_etr_str()}"
             )
         else:
             print(f"Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")
@@ -180,7 +226,7 @@ def train_multiset(model : DensityModel | ConditionalDensityModel,
         verbose=True,
         use_best : str = "total",
         clip_grad_norm : float = 5.0,
-        restore_loss_threshold : float = 29.0):
+        restore_loss_threshold : float = 50.0):
     
     torch.autograd.set_detect_anomaly(True)
 
@@ -232,7 +278,7 @@ def train_multiset(model : DensityModel | ConditionalDensityModel,
         optimizer.step()
         return total_loss.item(), combined_losses, dataset_losses
 
-    best_loss = float('inf')
+    best_loss = restore_loss_threshold
     best_state = None
 
     for epoch in range(epochs):
@@ -327,7 +373,7 @@ def train_to_valid(model : DensityModel | ConditionalDensityModel,
         epochs=100, 
         verbose=True, 
         use_best : str = "total", 
-        restore_loss_threshold : float = 29.0):
+        restore_loss_threshold : float = 50.0):
     
     torch.autograd.set_detect_anomaly(True)
 
@@ -346,7 +392,7 @@ def train_to_valid(model : DensityModel | ConditionalDensityModel,
         optimizer.step()
         return total_loss.item(), losses
 
-    best_loss = float('inf')
+    best_loss = restore_loss_threshold
     best_state = None
 
     for epoch in range(epochs):
@@ -408,12 +454,14 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
         data_loader : DataLoader, 
         labeled_loss_fns : dict[str, callable], 
         labeled_optimizers : dict[str, torch.optim.Optimizer], 
+        labeled_validation_loss_fns : dict[str, callable] = None, 
+        validation_data_loader : DataLoader = None,
         epochs_per_group=10, 
         iterations=10, 
         verbose=True, 
         use_best : str = "total",
         clip_grad_norm : float = 0.5,
-        restore_loss_threshold : float = 29.0):
+        restore_loss_threshold : float = 50.0):
     
     torch.autograd.set_detect_anomaly(False)
 
@@ -421,10 +469,20 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
 
     loss_labels = list(labeled_loss_fns.keys())
     loss_fns = list(labeled_loss_fns.values())
+    validation_loss_labels = list(labeled_validation_loss_fns.keys()) if labeled_validation_loss_fns is not None else []
     optimizer_labels = list(labeled_optimizers.keys())
     optimizers = list(labeled_optimizers.values())
 
-    assert use_best in loss_labels, f"use_best must be one of {loss_labels}"
+    if (labeled_validation_loss_fns is None) != (validation_data_loader is None):
+        raise ValueError("labeled_validation_loss_fns and validation_data_loader must both be provided together.")
+    if validation_loss_labels:
+        overlapping_labels = set(loss_labels).intersection(validation_loss_labels)
+        if overlapping_labels:
+            raise ValueError(
+                f"Training and validation loss labels must be unique. Overlap: {sorted(overlapping_labels)}"
+            )
+    selectable_loss_labels = loss_labels + validation_loss_labels + ["total"]
+    assert use_best in selectable_loss_labels, f"use_best must be one of {selectable_loss_labels}"
 
     def train_step(*args, optimizer : torch.optim.Optimizer, param_groups : list[list[torch.nn.Parameter]]): 
         optimizer.zero_grad()
@@ -436,7 +494,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
         optimizer.step()
         return total_loss.item(), losses
 
-    best_loss = float('inf')
+    best_loss = restore_loss_threshold
     best_state = None
 
     if isinstance(epochs_per_group, list):
@@ -465,12 +523,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
                 
                 for batch in data_loader:
                     dev = next(model.parameters()).device
-                    if isinstance(batch, list):
-                        batch = [b.to(dev) for b in batch]
-                    elif isinstance(batch, tuple):
-                        batch = tuple(b.to(dev) for b in batch)
-                    else:
-                        batch = batch.to(dev)
+                    batch = _batch_to_device(batch, dev)
 
                     total_loss, losses = train_step(*batch, optimizer=optimizer, param_groups=param_groups)
                     total_sum_loss += total_loss
@@ -482,6 +535,12 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
                 avg_losses = [loss_sum / len(data_loader) for loss_sum in sum_losses]
                 loss_dict = {label: value for label, value in zip(loss_labels, avg_losses)}
                 loss_dict["total"] = avg_total_loss
+                validation_loss_dict = {}
+                if labeled_validation_loss_fns is not None:
+                    model.eval()
+                    validation_loss_dict = _evaluate_labeled_losses(model, validation_data_loader, labeled_validation_loss_fns)
+                    model.train()
+                    loss_dict.update(validation_loss_dict)
 
                 epoch_time = end_time - start_time
 
@@ -509,9 +568,14 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
                     )
                     if not valid:
                         loss_details += " <invld>"
+                    validation_loss_details = ""
+                    if validation_loss_dict:
+                        validation_loss_details = ", val: " + ", ".join(
+                            f"{label}:{value:.4f}" for label, value in validation_loss_dict.items()
+                        )
                     print(
                         f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, Time: {epoch_time:.2f}s, Loss: tot:{avg_total_loss:.4f}, "
-                        f"{loss_details}, etr: {training_timer.get_predicted_etr_str()}"
+                        f"{loss_details}{validation_loss_details}, etr: {training_timer.get_predicted_etr_str()}"
                     )
                 else:
                     print(f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")

@@ -17,7 +17,7 @@ from rational_factor.models.kde import GaussianKDE
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
-from rational_factor.tools.misc import data_bounds
+from rational_factor.tools.misc import data_bounds, train_test_split
 
 TRIALS = 3
 BENCHMARK_ROOT = "benchmark_data"
@@ -51,6 +51,8 @@ def main() -> None:
     x0_data = problem.train_initial_state_data()
     x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj_data = problem.test_data()
+    x0_train, x0_val = train_test_split(x0_data, test_size=0.2)
+    x_k_train, x_k_val, x_kp1_train, x_kp1_val = train_test_split(x_k_data, x_kp1_data, test_size=0.2)
 
     def experiment(
         dtf_params: dict,
@@ -60,10 +62,11 @@ def main() -> None:
         bandwidth_factor: float,
         verbose: bool = True,
     ):
-        x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-        x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x_dataloader = DataLoader(TensorDataset(x_k_train), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x0_dataloader = DataLoader(TensorDataset(x0_train), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+        x0_val_dataloader = DataLoader(TensorDataset(x0_val), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-        loc, scale = data_bounds(x_k_data, mode="center_lengths")
+        loc, scale = data_bounds(x_k_train, mode="center_lengths")
         loc = loc.to(device)
         scale = scale.to(device)
         base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
@@ -85,9 +88,9 @@ def main() -> None:
 
         dtf_trained = MaskedRQSNFTF.copy_from_trainable(dtf).to(device)
 
-        x_k_data_device = x_k_data.to(device)
-        x_kp1_data_device = x_kp1_data.to(device)
-        x0_data_device = x0_data.to(device)
+        x_k_data_device = x_k_train.to(device)
+        x_kp1_data_device = x_kp1_train.to(device)
+        x0_data_device = x0_train.to(device)
         with torch.no_grad():
             x_k_transformed, _ = dtf_trained(x_k_data_device)
             x_kp1_transformed, _ = dtf_trained(x_kp1_data_device)
@@ -120,10 +123,12 @@ def main() -> None:
             x0_dataloader,
             {"mle": loss.mle_loss},
             optimizers,
+            labeled_validation_loss_fns={"val_mle": loss.mle_loss},
+            validation_data_loader=x0_val_dataloader,
             epochs_per_group=init_params["n_epochs_per_group"],
             iterations=init_params["iterations"],
             verbose=verbose,
-            use_best="mle",
+            use_best="val_mle",
             clip_grad_norm=5.0,
             restore_loss_threshold=50.0,
         )
