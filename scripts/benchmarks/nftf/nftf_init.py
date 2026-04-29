@@ -25,7 +25,7 @@ CONTEXT_WITH_NFTF = {
     "n_basis": 500,
     "tran_params": {
         "n_epochs_per_group": [5, 5],
-        "iterations": 50,
+        "iterations": 200,
         "pre_train_epochs": 10,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
@@ -33,7 +33,7 @@ CONTEXT_WITH_NFTF = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
+        "iterations": 500,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
@@ -48,13 +48,13 @@ CONTEXT_WITHOUT_NFTF = {
     "n_basis": 500,
     "tran_params": {
         "n_epochs_per_group": [5, 5],
-        "iterations": 50,
+        "iterations": 200,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 50,
+        "iterations": 500,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
@@ -64,7 +64,7 @@ CONTEXT_WITHOUT_NFTF = {
     "verbose": True,
 }
 
-TRIALS = 5
+TRIALS = 10
 BENCHMARK_ROOT = "benchmark_data"
 
 
