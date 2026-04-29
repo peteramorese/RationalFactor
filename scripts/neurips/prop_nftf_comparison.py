@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import torch
@@ -17,8 +18,6 @@ from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
 from rational_factor.tools.misc import data_bounds, train_test_split
-
-PROBLEM = "dubins_trailer"
 
 CONTEXT_WITH_NFTF = {
     "use_nftf": True,
@@ -89,14 +88,26 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "verbose": True,
 }
 
-TRIALS = 5
+TRIALS = 10
 BENCHMARK_ROOT = "benchmark_data"
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Benchmark propagation with vs without NFTF on a fully observable problem."
+    )
+    parser.add_argument(
+        "problem",
+        type=str,
+        choices=sorted(FULLY_OBSERVABLE_PROBLEMS.keys()),
+        help="Key in FULLY_OBSERVABLE_PROBLEMS.",
+    )
+    args = parser.parse_args()
+    problem_key = args.problem
+
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
-    problem = FULLY_OBSERVABLE_PROBLEMS[PROBLEM]
+    problem = FULLY_OBSERVABLE_PROBLEMS[problem_key]
     system = problem.system
 
     x0_data = problem.train_initial_state_data()
@@ -310,7 +321,7 @@ def main() -> None:
         {"name": "No DTF", "params": CONTEXT_WITHOUT_NFTF},
     ]
 
-    benchmark = Benchmark(name=Path(__file__).stem + "_" + PROBLEM)
+    benchmark = Benchmark(name=Path(__file__).stem + "_" + problem_key)
     benchmark.set_experiment_fn(experiment)
     benchmark.set_contexts(contexts)
 
@@ -322,7 +333,9 @@ def main() -> None:
     benchmark.set_numerical_result(5, "training_time_transition", json_raw_data=False)
     benchmark.set_numerical_result(6, "training_time_initial", json_raw_data=False)
 
-    print(f"Running benchmark ({len(contexts)} contexts, {TRIALS} trial(s) each)...")
+    print(
+        f"Running benchmark problem={problem_key} ({len(contexts)} contexts, {TRIALS} trial(s) each)..."
+    )
     benchmark.run(trials=TRIALS, verbose=True)
     run_dir = benchmark.process_and_save_results(root_dir=BENCHMARK_ROOT)
     print(f"Saved to {run_dir}")
