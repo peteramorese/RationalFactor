@@ -21,7 +21,7 @@ from rational_factor.tools.misc import data_bounds
 
 PROBLEM = "quadcopter"
 
-TRAN_ITERATION_VALUES = [20, 50, 100]
+TRAN_ITERATION_VALUES = [20, 30, 50, 100]
 
 CONTEXT_WITH_NFTF = {
     "use_nftf": True,
@@ -37,7 +37,7 @@ CONTEXT_WITH_NFTF = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 500,
+        "iterations": 200,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
@@ -59,7 +59,7 @@ CONTEXT_WITHOUT_NFTF = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 500,
+        "iterations": 200,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
@@ -82,7 +82,7 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 500,
+        "iterations": 200,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
@@ -92,7 +92,7 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "verbose": True,
 }
 
-TRIALS = 3
+TRIALS = 1
 BENCHMARK_ROOT = "benchmark_data"
 
 

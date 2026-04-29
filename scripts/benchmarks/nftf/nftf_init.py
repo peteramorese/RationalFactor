@@ -34,7 +34,7 @@ CONTEXT_WITH_NFTF = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 500,
+        "iterations": 100,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
@@ -56,7 +56,7 @@ CONTEXT_WITHOUT_NFTF = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 500,
+        "iterations": 100,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
@@ -79,7 +79,7 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
-        "iterations": 500,
+        "iterations": 100,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
     },
