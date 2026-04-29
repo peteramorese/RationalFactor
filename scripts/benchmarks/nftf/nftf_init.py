@@ -22,6 +22,7 @@ PROBLEM = "dubins_trailer"
 
 CONTEXT_WITH_NFTF = {
     "use_nftf": True,
+    "use_nftf_prefit": True,
     "n_basis": 500,
     "tran_params": {
         "n_epochs_per_group": [5, 5],
@@ -45,12 +46,36 @@ CONTEXT_WITH_NFTF = {
 
 CONTEXT_WITHOUT_NFTF = {
     "use_nftf": False,
+    "use_nftf_prefit": False,
     "n_basis": 500,
     "tran_params": {
         "n_epochs_per_group": [5, 5],
         "iterations": 200,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
+    },
+    "init_params": {
+        "n_epochs_per_group": [20, 5],
+        "iterations": 500,
+        "lr_basis": 5e-3,
+        "lr_weights": 1e-3,
+    },
+    "batch_size": 256,
+    "ls_temp": 0.1,
+    "reg_covar_joint": 1e-3,
+    "verbose": True,
+}
+
+CONTEXT_WITH_NFTF_NO_PREFIT = {
+    "use_nftf": True,
+    "use_nftf_prefit": False,
+    "n_basis": 500,
+    "tran_params": {
+        "n_epochs_per_group": [5, 5],
+        "iterations": 200,
+        "lr_basis": 5e-3,
+        "lr_weights": 1e-3,
+        "lr_dtf": 5e-4,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
@@ -83,6 +108,7 @@ def main() -> None:
 
     def experiment(
         use_nftf: bool,
+        use_nftf_prefit: bool,
         n_basis: int,
         tran_params: dict,
         init_params: dict,
@@ -97,7 +123,7 @@ def main() -> None:
 
         nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=8).to(device) if use_nftf else None
 
-        if use_nftf:
+        if use_nftf and use_nftf_prefit:
             loc, scale = data_bounds(x_k_data, mode="center_lengths")
             base_distribution = LogisticSigmoid(
                 system.dim(),
@@ -269,6 +295,7 @@ def main() -> None:
 
     contexts = [
         {"name": "w_nftf", "params": CONTEXT_WITH_NFTF},
+        {"name": "w_nftf_no_prefit", "params": CONTEXT_WITH_NFTF_NO_PREFIT},
         {"name": "wo_nftf", "params": CONTEXT_WITHOUT_NFTF},
     ]
 
