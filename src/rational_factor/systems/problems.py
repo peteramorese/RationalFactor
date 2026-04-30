@@ -137,7 +137,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         ),
         prev_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
-            covariance=torch.diag(torch.tensor([0.2, 0.2, 0.2, 0.2])),
+            covariance=torch.diag(6.0*torch.ones(4)),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
@@ -145,8 +145,8 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0]),
+        plot_bounds_low=torch.tensor([-6.0, -6.0, -6.0, -6.0]),
+        plot_bounds_high=torch.tensor([6.0, 6.0, 6.0, 6.0]),
         plot_marginals_list=[(0, 1), (2, 3)],
     ),
     "dubins_trailer": FullyObservableProblem(
