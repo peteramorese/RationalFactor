@@ -116,8 +116,8 @@ if __name__ == "__main__":
     if use_dtf:
         
         obs_and_tran_params = {
-            "n_epochs_per_group": [5, 5], # basis, weights
-            "iterations": 15,
+            "n_epochs_per_group": [5, 5, 5, 5], # tran_basis+dtf, tran_weights, obs_basis, obs_weights
+            "iterations": 25,
             "pre_train_epochs": 2,
             "lr_basis_tran": 5e-3,
             "lr_basis_obs": 5e-3,
@@ -133,7 +133,7 @@ if __name__ == "__main__":
         }
     else:
         obs_and_tran_params = {
-            "n_epochs_per_group": [20, 5], # basis, weights
+            "n_epochs_per_group": [5, 5, 5, 5], # tran_basis, tran_weights, obs_basis, obs_weights
             "iterations": 50,
             "lr_basis_tran": 5e-2,
             "lr_basis_obs": 5e-2,
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     block_size = None
 
     reg_covar_joint = 1e-1
-    reg_covar_obs = 1e-0
+    reg_covar_obs = 1e-1
     reg_covar_init = 1e-0
     ls_temp = 0.1
 
@@ -159,6 +159,7 @@ if __name__ == "__main__":
     n_simulation_tests = 3
     n_particles_true_pf = 5000
     figure_prefix = "vdp_nftf_filter_gaussian"
+    gmm_init = False
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -257,23 +258,46 @@ if __name__ == "__main__":
     zeta_basis = GaussianBasis(uparams_init=zeta_params).to(device)
 
     # Initial model basis functions (fit to p(y))
-    init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
-    weights = init_gmm_lf.get_w()
-    psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
-    psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
+    if gmm_init:
+        init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
+        weights = init_gmm_lf.get_w()
+        psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
+        psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
 
-    psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
+        psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
+    else:
+        psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
 
     # Train the transition model and observation model simultaneously
     if use_dtf:
         tran_obs_model = CompositeRFandR2FF([nftf], LinearRFandR2FF(xi_basis, zeta_basis, phi_basis, psi_basis)).to(device)
-        optimizers ={"dtf_and_basis": torch.optim.Adam([{'params': tran_obs_model.conditional_density_model.basis_params(), 'lr': obs_and_tran_params["lr_basis_tran"]}, {'params':tran_obs_model.domain_tfs.parameters(), 'lr': obs_and_tran_params["lr_dtf"], 'weight_decay': obs_and_tran_params["dtf_weight_decay"]}]), 
-            "weights": torch.optim.Adam(tran_obs_model.conditional_density_model.weight_params(), lr=obs_and_tran_params["lr_weights"])} 
+        optimizers = {
+            "tran_basis_and_dtf": torch.optim.Adam(
+                [
+                    {"params": tran_obs_model.tran_basis_params(), "lr": obs_and_tran_params["lr_basis_tran"]},
+                    {"params": tran_obs_model.domain_tf_params(), "lr": obs_and_tran_params["lr_dtf"], "weight_decay": obs_and_tran_params["dtf_weight_decay"]},
+                ]
+            ),
+            "tran_weights": torch.optim.Adam(
+                tran_obs_model.tran_weight_params(), lr=obs_and_tran_params["lr_weights"]
+            ),
+            "obs_basis": torch.optim.Adam(
+                tran_obs_model.obs_basis_params(), lr=obs_and_tran_params["lr_basis_obs"]
+            ),
+            "obs_weights": torch.optim.Adam(
+                tran_obs_model.obs_weight_params(), lr=obs_and_tran_params["lr_weights"]
+            ),
+        }
         tran_conditional_mle_loss_fn = lambda model, xp, x : loss.conditional_mle_loss(model, xp, x, method_name="log_density")
         obs_conditional_mle_loss_fn = lambda model, o, x : obs_loss_weight * loss.conditional_mle_loss(model, o, x, method_name="log_observation_density")
     else:
         tran_obs_model = LinearRFandR2FF(xi_basis, zeta_basis, phi_basis, psi_basis).to(device)
-        optimizers ={"basis": torch.optim.Adam(tran_obs_model.basis_params(), lr=obs_and_tran_params["lr_basis_tran"]), "weights": torch.optim.Adam(tran_obs_model.weight_params(), lr=obs_and_tran_params["lr_weights"])} 
+        optimizers = {
+            "tran_basis": torch.optim.Adam(tran_obs_model.tran_basis_params(), lr=obs_and_tran_params["lr_basis_tran"]),
+            "tran_weights": torch.optim.Adam(tran_obs_model.tran_weight_params(), lr=obs_and_tran_params["lr_weights"]),
+            "obs_basis": torch.optim.Adam(tran_obs_model.obs_basis_params(), lr=obs_and_tran_params["lr_basis_obs"]),
+            "obs_weights": torch.optim.Adam(tran_obs_model.obs_weight_params(), lr=obs_and_tran_params["lr_weights"]),
+        }
         tran_conditional_mle_loss_fn = lambda model, xp, x : loss.conditional_mle_loss(model, xp, x, method_name="log_density")
         obs_conditional_mle_loss_fn = lambda model, o, x : obs_loss_weight * loss.conditional_mle_loss(model, o, x, method_name="log_observation_density")
 

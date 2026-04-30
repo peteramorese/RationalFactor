@@ -79,16 +79,17 @@ class ParticleSet(DensityModel):
 
 
 class WeightedParticleSet(ParticleSet):
-    def __init__(self, particles: torch.Tensor, weights: torch.Tensor, resample: bool = True):
+    def __init__(self, particles: torch.Tensor, weights: torch.Tensor, enable_resampling: bool = True):
         super().__init__(particles)
         self.register_buffer("weights", weights)
         self.normalize_weights()
-        self.resample = resample
+        self.enable_resampling = enable_resampling
 
     def clone(self):
         return WeightedParticleSet(
             particles=self.particles.clone(),
-            weights=self.weights.clone()
+            weights=self.weights.clone(),
+            enable_resampling=self.enable_resampling,
         )
     
     def marginal(self, marginal_dims: tuple[int, ...]):
@@ -96,6 +97,7 @@ class WeightedParticleSet(ParticleSet):
         return WeightedParticleSet(
             particles=marginal_particles,
             weights=self.weights.clone(),
+            enable_resampling=self.enable_resampling,
         )
     
     def sample(self, n_samples: int):
@@ -172,7 +174,7 @@ class WeightedParticleSet(ParticleSet):
         """
         Multinomial resampling.
         """
-        if not self.resample:
+        if not self.enable_resampling:
             return
         idx = torch.multinomial(self.weights, self.n_particles(), replacement=True)
         self.particles = self.particles[idx]

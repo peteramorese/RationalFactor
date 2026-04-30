@@ -243,7 +243,7 @@ class LinearR2FF(ConditionalDensityModel):
     def get_a(self):
         return torch.nn.functional.softmax(self.__au, dim=0)
 
-    def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
+    def get_b(self, a : torch.Tensor = None, d : torch.Tensor = None, Omega : torch.Tensor = None):
         if a is None:
             a = self.get_a()
 
@@ -285,7 +285,7 @@ class LinearRFandR2FF(LinearR2FF):
         assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
         assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
         assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
-        ConditionalDensityModel().__init__(phi_basis.dim(), psi_basis.dim())
+        ConditionalDensityModel.__init__(self, phi_basis.dim(), psi_basis.dim())
 
 
         assert phi_basis.n_basis_functions() == psi_basis.n_basis_functions(), "phi_basis and psi_basis must have the same number of basis functions"
@@ -297,7 +297,7 @@ class LinearRFandR2FF(LinearR2FF):
         self.psi_basis = psi_basis
 
         self.__du = torch.nn.Parameter(torch.ones(xi_basis.n_basis_functions())) # d
-        self.__au = torch.nn.Parameter(torch.ones(phi_basis.n_basis_functions())) # g
+        self._LinearR2FF__au = torch.nn.Parameter(torch.ones(phi_basis.n_basis_functions()))  # g TODO FIX THIS
 
         self.numerical_tolerance = numerical_tolerance
 
@@ -324,16 +324,30 @@ class LinearRFandR2FF(LinearR2FF):
         log_r_x = torch.log(xi_x @ d + self.numerical_tolerance) # (n_data)
         log_l_o_x = torch.log((zeta_o * xi_x) @ e + self.numerical_tolerance) # (n_data)
 
+        #print("log_r_x min: ", log_r_x.min(), "max: ", log_r_x.max())
+        #print("log_l_o_x min: ", log_l_o_x.min(), "max: ", log_l_o_x.max())
+
+        if torch.abs(log_l_o_x - log_r_x).max() < 1e-8:
+            _, xi_stds = self.xi_basis.means_stds()
+            _, zeta_stds = self.zeta_basis.means_stds()
+            print(
+                "obs basis scales | "
+                f"xi std min/max: {xi_stds.min().item():.3e}/{xi_stds.max().item():.3e}, "
+                f"zeta std min/max: {zeta_stds.min().item():.3e}/{zeta_stds.max().item():.3e}"
+            )
+            print("x min: ", x.min(), "max: ", x.max())
+            print("o min: ", o.min(), "max: ", o.max())
+
         return log_l_o_x - log_r_x
 
     def weight_params(self):
-        return [self.__au]
+        return [self._LinearR2FF__au]
     
     def basis_params(self):
         return itertools.chain(self.xi_basis.parameters(), self.zeta_basis.parameters(), self.phi_basis.parameters(), self.psi_basis.parameters())
     
     def tran_weight_params(self):
-        return [self.__au]
+        return [self._LinearR2FF__au]
     
     def obs_weight_params(self):
         return [self.__du]
@@ -348,8 +362,14 @@ class LinearRFandR2FF(LinearR2FF):
         return LinearRF(self.xi_basis, self.zeta_basis, numerical_tolerance=self.numerical_tolerance)
 
     def r2ff(self):
-        return LinearR2FF(self.d.detach().clone(), self.xi_basis, self.phi_basis, self.psi_basis, numerical_tolerance=self.numerical_tolerance)
-    
+        return LinearR2FF(
+            self.get_d().detach().clone(),
+            self.xi_basis,
+            self.phi_basis,
+            self.psi_basis,
+            numerical_tolerance=self.numerical_tolerance,
+        )
+
 
 
 
@@ -475,7 +495,6 @@ class Linear2FF(DensityModel):
         if c0_fixed is not None:
             if renormalize_c0_fixed:
                 # Renormalize for numerical stability
-                Omega3_0 = self.xi_basis.Omega3(self.phi_basis, self.psi0_basis)
                 denom_vec = self.xi_basis.Omega3_contract(self.phi_basis, self.psi0_basis, self.d, self.a)
                 norm_denom = denom_vec @ c0_fixed
                 norm_constant = 1.0 / (norm_denom + self.numerical_tolerance)

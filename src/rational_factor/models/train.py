@@ -38,6 +38,29 @@ def _evaluate_labeled_losses(
 
     return {label: loss_sum / n_batches for label, loss_sum in sums.items()}
 
+@torch.no_grad()
+def _evaluate_multiset_labeled_losses(
+    model: DensityModel | ConditionalDensityModel,
+    data_loaders: list[DataLoader],
+    labeled_loss_fns_list: list[dict[str, callable]],
+) -> dict[str, float]:
+    """Average labeled losses over zipped batches (one batch tuple per loader)."""
+    flat_labels: list[str] = []
+    for labeled_loss_fns in labeled_loss_fns_list:
+        flat_labels.extend(labeled_loss_fns.keys())
+    sums = {label: 0.0 for label in flat_labels}
+    n_batches = 0
+    dev = next(model.parameters()).device
+    for batches in zip(*data_loaders):
+        batches = [_batch_to_device(b, dev) for b in batches]
+        for batch, labeled_loss_fns in zip(batches, labeled_loss_fns_list):
+            for label, loss_fn in labeled_loss_fns.items():
+                sums[label] += loss_fn(model, *batch).item()
+        n_batches += 1
+    if n_batches == 0:
+        raise RuntimeError("Multiset validation loaders produced no batches.")
+    return {label: loss_sum / n_batches for label, loss_sum in sums.items()}
+
 class TrainingTimer:
     def __init__(self, n_groups : int, iterations : int, epochs_per_group : int):
         self.n_groups = n_groups
@@ -584,6 +607,191 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
             
         training_timer.update_iteration()
         
+    if verbose:
+        print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
+    if use_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
+
+    return model, best_loss, training_timer.total_since_start()
+
+
+def train_iterate_multiset(
+    model: DensityModel | ConditionalDensityModel,
+    data_loaders: list[DataLoader],
+    labeled_loss_fns_list: list[dict[str, callable]],
+    labeled_optimizers: dict[str, torch.optim.Optimizer],
+    labeled_validation_loss_fns_list: list[dict[str, callable]] | None = None,
+    validation_data_loaders: list[DataLoader] | None = None,
+    epochs_per_group=10,
+    iterations=10,
+    verbose=True,
+    use_best: str = "total",
+    clip_grad_norm: float = 0.5,
+    restore_loss_threshold: float = 50.0,
+):
+    """
+    Like ``train_iterate``, but each loss dict is paired with its own ``DataLoader``.
+    Each training step zips one batch from every loader and sums the corresponding losses.
+
+    ``labeled_loss_fns_list[i]`` applies to ``data_loaders[i]``; loss labels must be
+    unique across all dicts.
+    """
+    torch.autograd.set_detect_anomaly(False)
+
+    model.train()
+
+    assert len(data_loaders) == len(labeled_loss_fns_list), (
+        "data_loaders and labeled_loss_fns_list must have the same length"
+    )
+    flat_train_labels: list[str] = []
+    for labeled_loss_fns in labeled_loss_fns_list:
+        flat_train_labels.extend(labeled_loss_fns.keys())
+    if len(flat_train_labels) != len(set(flat_train_labels)):
+        raise ValueError(
+            "Multiset training loss labels must be unique across loaders; "
+            f"got {flat_train_labels}"
+        )
+
+    optimizer_labels = list(labeled_optimizers.keys())
+    optimizers = list(labeled_optimizers.values())
+
+    if (labeled_validation_loss_fns_list is None) != (validation_data_loaders is None):
+        raise ValueError(
+            "labeled_validation_loss_fns_list and validation_data_loaders must both be provided together."
+        )
+    if labeled_validation_loss_fns_list is not None:
+        assert len(labeled_validation_loss_fns_list) == len(validation_data_loaders), (
+            "validation multiset lists must match length"
+        )
+        assert len(labeled_validation_loss_fns_list) == len(labeled_loss_fns_list), (
+            "validation and training multiset lists must have the same length"
+        )
+        flat_val_labels: list[str] = []
+        for d in labeled_validation_loss_fns_list:
+            flat_val_labels.extend(d.keys())
+        overlap = set(flat_train_labels).intersection(flat_val_labels)
+        if overlap:
+            raise ValueError(
+                f"Training and validation loss labels must be unique. Overlap: {sorted(overlap)}"
+            )
+
+    selectable_loss_labels = flat_train_labels + flat_val_labels + ["total"] if labeled_validation_loss_fns_list else flat_train_labels + ["total"]
+    assert use_best in selectable_loss_labels, f"use_best must be one of {selectable_loss_labels}"
+
+    def train_step(batches_on_dev: list, optimizer: torch.optim.Optimizer, param_groups: list[list[torch.nn.Parameter]]):
+        optimizer.zero_grad()
+        per_label: dict[str, torch.Tensor] = {}
+        total_loss = None
+        for batch, labeled_loss_fns in zip(batches_on_dev, labeled_loss_fns_list):
+            for label, loss_fn in labeled_loss_fns.items():
+                L = loss_fn(model, *batch)
+                per_label[label] = L
+                total_loss = L if total_loss is None else total_loss + L
+        total_loss.backward()
+        for params in param_groups:
+            torch.nn.utils.clip_grad_norm_(params, max_norm=clip_grad_norm)
+        optimizer.step()
+        loss_items = [per_label[label].item() for label in flat_train_labels]
+        return total_loss.item(), loss_items
+
+    best_loss = restore_loss_threshold
+    best_state = None
+
+    if isinstance(epochs_per_group, list):
+        assert len(epochs_per_group) == len(labeled_optimizers), (
+            "epochs_per_group must be a list of the same length as labeled_optimizers"
+        )
+    else:
+        epochs_per_group = [epochs_per_group for _ in range(len(labeled_optimizers))]
+
+    training_timer = TrainingTimer(n_groups=len(optimizers), iterations=iterations, epochs_per_group=epochs_per_group)
+    training_timer.initialize()
+
+    for iteration in range(iterations):
+        for optimizer, optimizer_label, epochs in zip(optimizers, optimizer_labels, epochs_per_group):
+            set_requires_grad(model.parameters(), False)
+            param_groups = [g["params"] for g in optimizer.param_groups]
+            for params in param_groups:
+                set_requires_grad(params, True)
+
+            for epoch in range(epochs):
+                start_time = time.time()
+                total_sum_loss = 0.0
+                sum_losses = [0.0 for _ in flat_train_labels]
+                n_steps = 0
+
+                for batches in zip(*data_loaders):
+                    dev = next(model.parameters()).device
+                    batches_on_dev = [_batch_to_device(b, dev) for b in batches]
+
+                    total_loss, losses = train_step(batches_on_dev, optimizer=optimizer, param_groups=param_groups)
+                    total_sum_loss += total_loss
+                    for i, loss in enumerate(losses):
+                        sum_losses[i] += loss
+                    n_steps += 1
+
+                end_time = time.time()
+                avg_total_loss = total_sum_loss / n_steps if n_steps else float("nan")
+                avg_losses = [loss_sum / n_steps for loss_sum in sum_losses] if n_steps else []
+                loss_dict = {label: value for label, value in zip(flat_train_labels, avg_losses)}
+                loss_dict["total"] = avg_total_loss
+                validation_loss_dict = {}
+                if labeled_validation_loss_fns_list is not None:
+                    model.eval()
+                    validation_loss_dict = _evaluate_multiset_labeled_losses(
+                        model, validation_data_loaders, labeled_validation_loss_fns_list
+                    )
+                    model.train()
+                    loss_dict.update(validation_loss_dict)
+
+                epoch_time = end_time - start_time
+
+                valid = model.valid()
+                if valid and loss_dict[use_best] < best_loss:
+                    best_loss = loss_dict[use_best]
+                    best_state = deepcopy(model.state_dict())
+
+                if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
+                    if best_state is not None:
+                        model.load_state_dict(best_state)
+                        print(
+                            f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
+                            f"after unstable epoch loss: {avg_total_loss}"
+                        )
+                    else:
+                        print(
+                            f"\n Unstable epoch loss detected ({avg_total_loss}), but no best_state to restore."
+                        )
+
+                training_timer.update_epoch()
+
+                if verbose:
+                    loss_details = ", ".join(
+                        f"{label}:{value:.4f}" for label, value in zip(flat_train_labels, avg_losses)
+                    )
+                    if not valid:
+                        loss_details += " <invld>"
+                    validation_loss_details = ""
+                    if validation_loss_dict:
+                        validation_loss_details = ", val: " + ", ".join(
+                            f"{label}:{value:.4f}" for label, value in validation_loss_dict.items()
+                        )
+                    print(
+                        f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, "
+                        f"Time: {epoch_time:.2f}s, Loss: tot:{avg_total_loss:.4f}, "
+                        f"{loss_details}{validation_loss_details}, etr: {training_timer.get_predicted_etr_str()}"
+                    )
+                else:
+                    print(
+                        f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, "
+                        f"Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s"
+                    )
+
+            training_timer.update_group()
+
+        training_timer.update_iteration()
+
     if verbose:
         print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
     if use_best and best_state is not None:

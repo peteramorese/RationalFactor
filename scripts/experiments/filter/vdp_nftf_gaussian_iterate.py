@@ -116,9 +116,10 @@ if __name__ == "__main__":
     if use_dtf:
         
         obs_and_tran_params = {
-            "n_epochs_per_group": [5, 5], # basis, weights
-            "iterations": 15,
-            "pre_train_epochs": 2,
+            "n_epochs_per_group": [5, 5, 5, 5], # tran_basis+dtf, tran_weights, obs_basis, obs_weights
+            "outer_iterations": 3,
+            "iterations": 5,
+            "pre_train_epochs": 5,
             "lr_basis_tran": 5e-3,
             "lr_basis_obs": 5e-3,
             "lr_weights": 1e-3,
@@ -127,13 +128,14 @@ if __name__ == "__main__":
         }
         init_params = {
             "n_epochs_per_group": [20, 5], # basis, weights
-            "iterations": 100,
+            "iterations": 500,
             "lr_basis": 1e-2,
             "lr_weights": 1e-3,
         }
     else:
         obs_and_tran_params = {
-            "n_epochs_per_group": [20, 5], # basis, weights
+            "n_epochs_per_group": [5, 5, 5, 5], # tran_basis, tran_weights, obs_basis, obs_weights
+            "outer_iterations": 1,
             "iterations": 50,
             "lr_basis_tran": 5e-2,
             "lr_basis_obs": 5e-2,
@@ -150,7 +152,7 @@ if __name__ == "__main__":
     block_size = None
 
     reg_covar_joint = 1e-1
-    reg_covar_obs = 1e-0
+    reg_covar_obs = 1e-1
     reg_covar_init = 1e-0
     ls_temp = 0.1
 
@@ -159,6 +161,7 @@ if __name__ == "__main__":
     n_simulation_tests = 3
     n_particles_true_pf = 5000
     figure_prefix = "vdp_nftf_filter_gaussian"
+    gmm_init = False
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -257,47 +260,97 @@ if __name__ == "__main__":
     zeta_basis = GaussianBasis(uparams_init=zeta_params).to(device)
 
     # Initial model basis functions (fit to p(y))
-    init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
-    weights = init_gmm_lf.get_w()
-    psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
-    psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
+    if gmm_init:
+        init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
+        weights = init_gmm_lf.get_w()
+        psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
+        psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
 
-    psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
+        psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
+    else:
+        psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
 
     # Train the transition model and observation model simultaneously
     if use_dtf:
         tran_obs_model = CompositeRFandR2FF([nftf], LinearRFandR2FF(xi_basis, zeta_basis, phi_basis, psi_basis)).to(device)
-        optimizers ={"dtf_and_basis": torch.optim.Adam([{'params': tran_obs_model.conditional_density_model.basis_params(), 'lr': obs_and_tran_params["lr_basis_tran"]}, {'params':tran_obs_model.domain_tfs.parameters(), 'lr': obs_and_tran_params["lr_dtf"], 'weight_decay': obs_and_tran_params["dtf_weight_decay"]}]), 
-            "weights": torch.optim.Adam(tran_obs_model.conditional_density_model.weight_params(), lr=obs_and_tran_params["lr_weights"])} 
+        optimizers = {
+            "tran_basis_and_dtf": torch.optim.Adam(
+                [
+                    {"params": tran_obs_model.tran_basis_params(), "lr": obs_and_tran_params["lr_basis_tran"]},
+                    {"params": tran_obs_model.domain_tf_params(), "lr": obs_and_tran_params["lr_dtf"], "weight_decay": obs_and_tran_params["dtf_weight_decay"]},
+                ]
+            ),
+            "tran_weights": torch.optim.Adam(
+                tran_obs_model.tran_weight_params(), lr=obs_and_tran_params["lr_weights"]
+            ),
+            "obs_basis": torch.optim.Adam(
+                tran_obs_model.obs_basis_params(), lr=obs_and_tran_params["lr_basis_obs"]
+            ),
+            "obs_weights": torch.optim.Adam(
+                tran_obs_model.obs_weight_params(), lr=obs_and_tran_params["lr_weights"]
+            ),
+        }
         tran_conditional_mle_loss_fn = lambda model, xp, x : loss.conditional_mle_loss(model, xp, x, method_name="log_density")
         obs_conditional_mle_loss_fn = lambda model, o, x : obs_loss_weight * loss.conditional_mle_loss(model, o, x, method_name="log_observation_density")
     else:
         tran_obs_model = LinearRFandR2FF(xi_basis, zeta_basis, phi_basis, psi_basis).to(device)
-        optimizers ={"basis": torch.optim.Adam(tran_obs_model.basis_params(), lr=obs_and_tran_params["lr_basis_tran"]), "weights": torch.optim.Adam(tran_obs_model.weight_params(), lr=obs_and_tran_params["lr_weights"])} 
+        optimizers = {
+            "tran_basis": torch.optim.Adam(tran_obs_model.tran_basis_params(), lr=obs_and_tran_params["lr_basis_tran"]),
+            "tran_weights": torch.optim.Adam(tran_obs_model.tran_weight_params(), lr=obs_and_tran_params["lr_weights"]),
+            "obs_basis": torch.optim.Adam(tran_obs_model.obs_basis_params(), lr=obs_and_tran_params["lr_basis_obs"]),
+            "obs_weights": torch.optim.Adam(tran_obs_model.obs_weight_params(), lr=obs_and_tran_params["lr_weights"]),
+        }
         tran_conditional_mle_loss_fn = lambda model, xp, x : loss.conditional_mle_loss(model, xp, x, method_name="log_density")
         obs_conditional_mle_loss_fn = lambda model, o, x : obs_loss_weight * loss.conditional_mle_loss(model, o, x, method_name="log_observation_density")
 
     print("Training transition and observation model")
+    epochs_per_group = obs_and_tran_params["n_epochs_per_group"]
+    if not isinstance(epochs_per_group, list):
+        epochs_per_group = [epochs_per_group] * 4
+    assert len(epochs_per_group) == 4, "Expected 4 epoch groups: tran_basis+dtf, tran_weights, obs_basis, obs_weights"
+    outer_iterations = obs_and_tran_params.get("outer_iterations", 1)
+    inner_iterations = obs_and_tran_params["iterations"]
 
-    # Transition MLE uses (x_{k+1}, x_k); observation MLE uses (o, x) — separate loaders zipped per step.
-    tran_obs_model, best_loss_tran_obs, training_time_tran_obs = train.train_iterate_multiset(
-        tran_obs_model,
-        data_loaders=[xp_dataloader, o_dataloader],
-        labeled_loss_fns_list=[
-            {"mle": tran_conditional_mle_loss_fn},
-            {"obs_mle": obs_conditional_mle_loss_fn},
-        ],
-        labeled_optimizers=optimizers,
-        labeled_validation_loss_fns_list=[
-            {"val_mle": tran_conditional_mle_loss_fn},
-            {"val_obs_mle": obs_conditional_mle_loss_fn},
-        ],
-        validation_data_loaders=[xp_val_dataloader, o_val_dataloader],
-        epochs_per_group=obs_and_tran_params["n_epochs_per_group"],
-        iterations=obs_and_tran_params["iterations"],
-        verbose=True,
-        use_best="val_mle",
-    )
+    best_loss_tran_obs = float("inf")
+    training_time_tran_obs = 0.0
+    for outer_iter in range(outer_iterations):
+        print(f"\n=== Outer iteration {outer_iter + 1}/{outer_iterations} ===")
+
+        tran_basis_key = "tran_basis_and_dtf" if use_dtf else "tran_basis"
+        tran_obs_model, best_loss_phase, phase_time = train.train_iterate(
+            tran_obs_model,
+            xp_dataloader,
+            labeled_loss_fns={"mle": tran_conditional_mle_loss_fn},
+            labeled_optimizers={
+                tran_basis_key: optimizers[tran_basis_key],
+                "tran_weights": optimizers["tran_weights"],
+            },
+            labeled_validation_loss_fns={"val_mle": tran_conditional_mle_loss_fn},
+            validation_data_loader=xp_val_dataloader,
+            epochs_per_group=[epochs_per_group[0], epochs_per_group[1]],
+            iterations=inner_iterations,
+            verbose=True,
+            use_best="val_mle",
+        )
+        best_loss_tran_obs = min(best_loss_tran_obs, best_loss_phase)
+        training_time_tran_obs += phase_time
+
+        tran_obs_model, _, phase_time = train.train_iterate(
+            tran_obs_model,
+            o_dataloader,
+            labeled_loss_fns={"obs_mle": obs_conditional_mle_loss_fn},
+            labeled_optimizers={
+                "obs_basis": optimizers["obs_basis"],
+                "obs_weights": optimizers["obs_weights"],
+            },
+            labeled_validation_loss_fns={"val_obs_mle": obs_conditional_mle_loss_fn},
+            validation_data_loader=o_val_dataloader,
+            epochs_per_group=[epochs_per_group[2], epochs_per_group[3]],
+            iterations=inner_iterations,
+            verbose=True,
+            use_best="val_obs_mle",
+        )
+        training_time_tran_obs += phase_time
     print("Done! \n")
     print("Valid: ", tran_obs_model.valid())
 

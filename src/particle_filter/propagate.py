@@ -54,7 +54,7 @@ def update(
     unchanged. Otherwise, this mutates `belief` in place and also returns it.
     """
     belief_next = belief.clone() if copy_belief else belief
-    N = belief_next.n_particles
+    N = belief_next.n_particles()
 
     if observation.ndim == 1:
         obs = observation.unsqueeze(0).expand(N, -1)

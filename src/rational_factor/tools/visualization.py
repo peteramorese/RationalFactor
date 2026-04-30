@@ -57,7 +57,7 @@ def plot_particle_belief(ax: plt.Axes, belief : WeightedParticleSet, x_range: tu
         default_sizes = np.full(weights.shape[0], 5.5, dtype=np.float64)
     else:
         w_norm = (weights - w_min) / w_range
-        default_sizes = (1.0 + 10.0 * w_norm).numpy()
+        default_sizes = 0.2 * (1.0 + 10.0 * w_norm).numpy()
 
     default_scatter_kwargs = dict(
         cmap="viridis",

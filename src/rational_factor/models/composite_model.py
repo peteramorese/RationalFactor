@@ -2,6 +2,7 @@ import torch
 from .domain_transformation import DomainTF
 from .density_model import DensityModel, ConditionalDensityModel
 from collections.abc import Sequence
+from .factor_forms import LinearRFandR2FF
 
 
 class CompositeDensityModel(DensityModel):
@@ -77,3 +78,33 @@ def _validate_transform_sequence(domain_tfs: list[DomainTF], dim: int):
     assert len(domain_tfs) > 0, "At least one domain transformation must be provided"
     for tf in domain_tfs:
         assert tf.dim == dim, "Domain TF and density model must have the same dimension"
+
+class CompositeRFandR2FF(CompositeConditionalModel):
+    def __init__(self, domain_tfs: DomainTF | Sequence[DomainTF], rf_and_r2ff: LinearRFandR2FF):
+        super().__init__(domain_tfs, rf_and_r2ff)
+        self.rf_and_r2ff = rf_and_r2ff
+
+    def log_density(self, xp : torch.Tensor, *, conditioner: torch.Tensor):
+        return self.rf_and_r2ff.log_density(xp, conditioner=conditioner)
+    
+    def log_observation_density(self, o : torch.Tensor, *, conditioner: torch.Tensor):
+        # Only transform the conditioner
+        z = conditioner
+        for tf in self.domain_tfs:
+            z, _ = tf(z)
+        return self.rf_and_r2ff.log_observation_density(o, conditioner=z)
+
+    def tran_weight_params(self):
+        return self.rf_and_r2ff.tran_weight_params()
+
+    def obs_weight_params(self):
+        return self.rf_and_r2ff.obs_weight_params()
+
+    def tran_basis_params(self):
+        return self.rf_and_r2ff.tran_basis_params()
+
+    def obs_basis_params(self):
+        return self.rf_and_r2ff.obs_basis_params()
+
+    def domain_tf_params(self):
+        return self.domain_tfs.parameters()
