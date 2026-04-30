@@ -131,6 +131,7 @@ def train(model : DensityModel | ConditionalDensityModel,
         optimizer, 
         labeled_validation_loss_fns : dict[str, callable] = None, 
         validation_data_loader : DataLoader = None,
+        validation_early_stopping_patience : int = None,
         epochs=100, 
         verbose=True, 
         use_best : str = "total",
@@ -147,6 +148,13 @@ def train(model : DensityModel | ConditionalDensityModel,
 
     if (labeled_validation_loss_fns is None) != (validation_data_loader is None):
         raise ValueError("labeled_validation_loss_fns and validation_data_loader must both be provided together.")
+    if validation_early_stopping_patience is not None:
+        if labeled_validation_loss_fns is None:
+            raise ValueError(
+                "validation_early_stopping_patience requires labeled_validation_loss_fns and validation_data_loader."
+            )
+        if validation_early_stopping_patience <= 0:
+            raise ValueError("validation_early_stopping_patience must be a positive integer.")
     if validation_loss_labels:
         overlapping_labels = set(loss_labels).intersection(validation_loss_labels)
         if overlapping_labels:
@@ -170,6 +178,9 @@ def train(model : DensityModel | ConditionalDensityModel,
 
     best_loss = restore_loss_threshold
     best_state = None
+    best_tracked_loss = float("inf")
+    early_stopping_counter = 0
+    early_stopping_triggered = False
 
     for epoch in range(epochs):
         start_time = time.time()
@@ -199,8 +210,15 @@ def train(model : DensityModel | ConditionalDensityModel,
         epoch_time = end_time - start_time
 
         valid = model.valid()
-        if valid and loss_dict[use_best] < best_loss:
-            best_loss = loss_dict[use_best]
+        current_use_best_loss = loss_dict[use_best]
+        if current_use_best_loss < best_tracked_loss:
+            best_tracked_loss = current_use_best_loss
+            early_stopping_counter = 0
+        elif validation_early_stopping_patience is not None:
+            early_stopping_counter += 1
+
+        if valid and current_use_best_loss < best_loss:
+            best_loss = current_use_best_loss
             best_state = deepcopy(model.state_dict())
 
         if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
@@ -233,10 +251,28 @@ def train(model : DensityModel | ConditionalDensityModel,
             )
         else:
             print(f"Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")
+
+        if (
+            validation_early_stopping_patience is not None
+            and early_stopping_counter >= validation_early_stopping_patience
+        ):
+            early_stopping_triggered = True
+            if best_state is not None:
+                model.load_state_dict(best_state)
+                print(
+                    f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
+                    f"on '{use_best}'. Restored best model ({use_best} loss={best_loss:.4f})."
+                )
+            else:
+                print(
+                    f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
+                    f"on '{use_best}', but no best_state is available to restore."
+                )
+            break
         
     if verbose:
         print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
-    if use_best and best_state is not None:
+    if use_best and best_state is not None and not early_stopping_triggered:
         model.load_state_dict(best_state)
         print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
 
@@ -479,6 +515,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
         labeled_optimizers : dict[str, torch.optim.Optimizer], 
         labeled_validation_loss_fns : dict[str, callable] = None, 
         validation_data_loader : DataLoader = None,
+        validation_early_stopping_patience : int = None,
         epochs_per_group=10, 
         iterations=10, 
         verbose=True, 
@@ -498,6 +535,13 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
 
     if (labeled_validation_loss_fns is None) != (validation_data_loader is None):
         raise ValueError("labeled_validation_loss_fns and validation_data_loader must both be provided together.")
+    if validation_early_stopping_patience is not None:
+        if labeled_validation_loss_fns is None:
+            raise ValueError(
+                "validation_early_stopping_patience requires labeled_validation_loss_fns and validation_data_loader."
+            )
+        if validation_early_stopping_patience <= 0:
+            raise ValueError("validation_early_stopping_patience must be a positive integer.")
     if validation_loss_labels:
         overlapping_labels = set(loss_labels).intersection(validation_loss_labels)
         if overlapping_labels:
@@ -519,6 +563,9 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
 
     best_loss = restore_loss_threshold
     best_state = None
+    best_tracked_loss = float("inf")
+    early_stopping_counter = 0
+    early_stopping_triggered = False
 
     if isinstance(epochs_per_group, list):
         assert len(epochs_per_group) == len(labeled_optimizers), "epochs_per_group must be a list of the same length as n_groups"
@@ -568,8 +615,15 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
                 epoch_time = end_time - start_time
 
                 valid = model.valid()
-                if valid and loss_dict[use_best] < best_loss:
-                    best_loss = loss_dict[use_best]
+                current_use_best_loss = loss_dict[use_best]
+                if current_use_best_loss < best_tracked_loss:
+                    best_tracked_loss = current_use_best_loss
+                    early_stopping_counter = 0
+                elif validation_early_stopping_patience is not None:
+                    early_stopping_counter += 1
+
+                if valid and current_use_best_loss < best_loss:
+                    best_loss = current_use_best_loss
                     best_state = deepcopy(model.state_dict())
 
                 if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
@@ -603,13 +657,37 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
                 else:
                     print(f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")
 
+                if (
+                    validation_early_stopping_patience is not None
+                    and early_stopping_counter >= validation_early_stopping_patience
+                ):
+                    early_stopping_triggered = True
+                    if best_state is not None:
+                        model.load_state_dict(best_state)
+                        print(
+                            f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
+                            f"on '{use_best}'. Restored best model ({use_best} loss={best_loss:.4f})."
+                        )
+                    else:
+                        print(
+                            f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
+                            f"on '{use_best}', but no best_state is available to restore."
+                        )
+                    break
+
+            if early_stopping_triggered:
+                break
+
             training_timer.update_group()
+
+        if early_stopping_triggered:
+            break
             
         training_timer.update_iteration()
         
     if verbose:
         print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
-    if use_best and best_state is not None:
+    if use_best and best_state is not None and not early_stopping_triggered:
         model.load_state_dict(best_state)
         print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
 
@@ -623,6 +701,7 @@ def train_iterate_multiset(
     labeled_optimizers: dict[str, torch.optim.Optimizer],
     labeled_validation_loss_fns_list: list[dict[str, callable]] | None = None,
     validation_data_loaders: list[DataLoader] | None = None,
+    validation_early_stopping_patience: int | None = None,
     epochs_per_group=10,
     iterations=10,
     verbose=True,
@@ -660,6 +739,14 @@ def train_iterate_multiset(
         raise ValueError(
             "labeled_validation_loss_fns_list and validation_data_loaders must both be provided together."
         )
+    if validation_early_stopping_patience is not None:
+        if labeled_validation_loss_fns_list is None:
+            raise ValueError(
+                "validation_early_stopping_patience requires labeled_validation_loss_fns_list and validation_data_loaders."
+            )
+        if validation_early_stopping_patience <= 0:
+            raise ValueError("validation_early_stopping_patience must be a positive integer.")
+    flat_val_labels: list[str] = []
     if labeled_validation_loss_fns_list is not None:
         assert len(labeled_validation_loss_fns_list) == len(validation_data_loaders), (
             "validation multiset lists must match length"
@@ -667,7 +754,6 @@ def train_iterate_multiset(
         assert len(labeled_validation_loss_fns_list) == len(labeled_loss_fns_list), (
             "validation and training multiset lists must have the same length"
         )
-        flat_val_labels: list[str] = []
         for d in labeled_validation_loss_fns_list:
             flat_val_labels.extend(d.keys())
         overlap = set(flat_train_labels).intersection(flat_val_labels)
@@ -697,6 +783,9 @@ def train_iterate_multiset(
 
     best_loss = restore_loss_threshold
     best_state = None
+    best_tracked_loss = float("inf")
+    early_stopping_counter = 0
+    early_stopping_triggered = False
 
     if isinstance(epochs_per_group, list):
         assert len(epochs_per_group) == len(labeled_optimizers), (
@@ -748,8 +837,15 @@ def train_iterate_multiset(
                 epoch_time = end_time - start_time
 
                 valid = model.valid()
-                if valid and loss_dict[use_best] < best_loss:
-                    best_loss = loss_dict[use_best]
+                current_use_best_loss = loss_dict[use_best]
+                if current_use_best_loss < best_tracked_loss:
+                    best_tracked_loss = current_use_best_loss
+                    early_stopping_counter = 0
+                elif validation_early_stopping_patience is not None:
+                    early_stopping_counter += 1
+
+                if valid and current_use_best_loss < best_loss:
+                    best_loss = current_use_best_loss
                     best_state = deepcopy(model.state_dict())
 
                 if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
@@ -788,13 +884,37 @@ def train_iterate_multiset(
                         f"Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s"
                     )
 
+                if (
+                    validation_early_stopping_patience is not None
+                    and early_stopping_counter >= validation_early_stopping_patience
+                ):
+                    early_stopping_triggered = True
+                    if best_state is not None:
+                        model.load_state_dict(best_state)
+                        print(
+                            f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
+                            f"on '{use_best}'. Restored best model ({use_best} loss={best_loss:.4f})."
+                        )
+                    else:
+                        print(
+                            f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
+                            f"on '{use_best}', but no best_state is available to restore."
+                        )
+                    break
+
+            if early_stopping_triggered:
+                break
+
             training_timer.update_group()
+
+        if early_stopping_triggered:
+            break
 
         training_timer.update_iteration()
 
     if verbose:
         print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
-    if use_best and best_state is not None:
+    if use_best and best_state is not None and not early_stopping_triggered:
         model.load_state_dict(best_state)
         print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
 

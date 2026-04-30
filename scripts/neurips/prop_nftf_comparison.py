@@ -40,6 +40,7 @@ CONTEXT_WITH_NFTF = {
     "batch_size": 256,
     "ls_temp": 0.1,
     "reg_covar_joint": 1e-3,
+    "validation_early_stopping_patience": 10,
     "verbose": True,
 }
 
@@ -62,6 +63,7 @@ CONTEXT_WITHOUT_NFTF = {
     "batch_size": 256,
     "ls_temp": 0.1,
     "reg_covar_joint": 1e-3,
+    "validation_early_stopping_patience": 10,
     "verbose": True,
 }
 
@@ -85,6 +87,7 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "batch_size": 256,
     "ls_temp": 0.1,
     "reg_covar_joint": 1e-3,
+    "validation_early_stopping_patience": 10,
     "verbose": True,
 }
 
@@ -131,6 +134,7 @@ def main() -> None:
         batch_size: int,
         ls_temp: float,
         reg_covar_joint: float,
+        validation_early_stopping_patience: int,
         verbose: bool = True,
     ):
         x0_dataloader = DataLoader(x0_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
@@ -242,6 +246,7 @@ def main() -> None:
             optimizers,
             labeled_validation_loss_fns={"val_mle": loss.conditional_mle_loss},
             validation_data_loader=xp_val_dataloader,
+            validation_early_stopping_patience=validation_early_stopping_patience,
             epochs_per_group=tran_params["n_epochs_per_group"],
             iterations=tran_params["iterations"],
             verbose=verbose,
@@ -272,6 +277,7 @@ def main() -> None:
             init_optimizers,
             labeled_validation_loss_fns={"val_mle": loss.mle_loss},
             validation_data_loader=x0_val_dataloader,
+            validation_early_stopping_patience=validation_early_stopping_patience,
             epochs_per_group=init_params["n_epochs_per_group"],
             iterations=init_params["iterations"],
             verbose=verbose,
