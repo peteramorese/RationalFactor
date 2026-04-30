@@ -103,6 +103,105 @@ def _plot_state_vs_latent_grid(
     plt.close(fig)
 
 
+def _plot_initial_distribution_comparison(
+    x0_data: torch.Tensor,
+    y0_data: torch.Tensor,
+    init_model: torch.nn.Module,
+    out_path: Path,
+    *,
+    init_gmm_lf: torch.nn.Module | None = None,
+    r_basis: torch.nn.Module | None = None,
+    r_coeffs: torch.Tensor | None = None,
+    g_basis: torch.nn.Module | None = None,
+    g_coeffs: torch.Tensor | None = None,
+    title: str = "",
+) -> None:
+    if x0_data.shape[1] != 2 or y0_data.shape[1] != 2:
+        raise ValueError("_plot_initial_distribution_comparison expects 2D data.")
+
+    x0_cpu = x0_data.detach().cpu()
+    y0_cpu = y0_data.detach().cpu()
+    all_xy = torch.cat([x0_cpu, y0_cpu], dim=0)
+    lo = all_xy.quantile(0.01, dim=0).numpy()
+    hi = all_xy.quantile(0.99, dim=0).numpy()
+    x_range = (float(lo[0]), float(hi[0]))
+    y_range = (float(lo[1]), float(hi[1]))
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9), squeeze=False)
+    ax_y0, ax_xy, ax_rx = axes[0, 0], axes[0, 1], axes[0, 2]
+    ax_gmm, ax_init, ax_gx = axes[1, 0], axes[1, 1], axes[1, 2]
+
+    ax_y0.scatter(y0_cpu[:, 0].numpy(), y0_cpu[:, 1].numpy(), s=3, alpha=0.25, c="tab:green", rasterized=True)
+    ax_y0.set_title("y0 data")
+
+    ax_xy.scatter(x0_cpu[:, 0].numpy(), x0_cpu[:, 1].numpy(), s=3, alpha=0.2, c="tab:blue", label="x0", rasterized=True)
+    ax_xy.scatter(y0_cpu[:, 0].numpy(), y0_cpu[:, 1].numpy(), s=3, alpha=0.2, c="tab:orange", label="y0", rasterized=True)
+    ax_xy.set_title("x0 vs y0 data")
+    ax_xy.legend(loc="upper right", fontsize=8)
+
+    if init_gmm_lf is not None:
+        plot_belief(ax_gmm, init_gmm_lf, x_range=x_range, y_range=y_range)
+        ax_gmm.set_title("GMM init density")
+    else:
+        ax_gmm.text(0.5, 0.5, "GMM init disabled\n(gmm_init=False)", ha="center", va="center", fontsize=10)
+        ax_gmm.set_title("GMM init density")
+
+    plot_belief(ax_init, init_model, x_range=x_range, y_range=y_range)
+    ax_init.set_title("Trained init model density")
+
+    x_lin = np.linspace(x_range[0], x_range[1], 120)
+    y_lin = np.linspace(y_range[0], y_range[1], 120)
+    X, Y = np.meshgrid(x_lin, y_lin)
+    xy = np.stack([X.ravel(), Y.ravel()], axis=1)
+
+    if r_basis is not None and r_coeffs is not None:
+        with torch.no_grad():
+            basis_param = next(iter(r_basis.parameters()), None)
+            basis_buffer = next(iter(r_basis.buffers()), None)
+            basis_device = basis_param.device if basis_param is not None else (basis_buffer.device if basis_buffer is not None else torch.device("cpu"))
+            basis_dtype = basis_param.dtype if basis_param is not None else (basis_buffer.dtype if basis_buffer is not None else torch.get_default_dtype())
+            phi = r_basis(torch.tensor(xy, dtype=basis_dtype, device=basis_device))
+            d = r_coeffs.to(device=basis_device, dtype=basis_dtype)
+            r_vals = (phi @ d).detach().cpu().numpy().reshape(X.shape)
+        ax_rx.contourf(X, Y, r_vals, levels=12)
+        ax_rx.contour(X, Y, r_vals, levels=12, colors="white", linewidths=0.4)
+        ax_rx.set_title("r(x) = xi(x)^T d")
+    else:
+        ax_rx.text(0.5, 0.5, "r(x) unavailable", ha="center", va="center", fontsize=10)
+        ax_rx.set_title("r(x) = xi(x)^T d")
+
+    if g_basis is not None and g_coeffs is not None:
+        with torch.no_grad():
+            basis_param = next(iter(g_basis.parameters()), None)
+            basis_buffer = next(iter(g_basis.buffers()), None)
+            basis_device = basis_param.device if basis_param is not None else (basis_buffer.device if basis_buffer is not None else torch.device("cpu"))
+            basis_dtype = basis_param.dtype if basis_param is not None else (basis_buffer.dtype if basis_buffer is not None else torch.get_default_dtype())
+            phi = g_basis(torch.tensor(xy, dtype=basis_dtype, device=basis_device))
+            a = g_coeffs.to(device=basis_device, dtype=basis_dtype)
+            g_vals = (phi @ a).detach().cpu().numpy().reshape(X.shape)
+        ax_gx.contourf(X, Y, g_vals, levels=12)
+        ax_gx.contour(X, Y, g_vals, levels=12, colors="white", linewidths=0.4)
+        ax_gx.set_title("g(x) = phi(x)^T a")
+    else:
+        ax_gx.text(0.5, 0.5, "g(x) unavailable", ha="center", va="center", fontsize=10)
+        ax_gx.set_title("g(x) = phi(x)^T a")
+
+    for ax in [ax_y0, ax_xy, ax_gmm, ax_init, ax_rx, ax_gx]:
+        ax.set_xlim(*x_range)
+        ax.set_ylim(*y_range)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.25)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.tick_params(axis="both", which="both", labelbottom=False, labelleft=False, bottom=False, left=False)
+
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=260, bbox_inches="tight")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     
     ###
@@ -111,7 +210,7 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     use_dtf = True
     n_basis = 300
-    n_obs_basis = 100
+    n_obs_basis = 300
 
     if use_dtf:
         
@@ -128,7 +227,7 @@ if __name__ == "__main__":
         }
         init_params = {
             "n_epochs_per_group": [20, 5], # basis, weights
-            "iterations": 500,
+            "iterations": 200,
             "lr_basis": 1e-2,
             "lr_weights": 1e-3,
         }
@@ -153,7 +252,7 @@ if __name__ == "__main__":
 
     reg_covar_joint = 1e-1
     reg_covar_obs = 1e-1
-    reg_covar_init = 1e-0
+    reg_covar_init = 1e-1
     ls_temp = 0.1
 
     obs_loss_weight = 1.0
@@ -161,7 +260,7 @@ if __name__ == "__main__":
     n_simulation_tests = 3
     n_particles_true_pf = 5000
     figure_prefix = "vdp_nftf_filter_gaussian"
-    gmm_init = False
+    gmm_init = True
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -260,6 +359,7 @@ if __name__ == "__main__":
     zeta_basis = GaussianBasis(uparams_init=zeta_params).to(device)
 
     # Initial model basis functions (fit to p(y))
+    init_gmm_lf = None
     if gmm_init:
         init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
         weights = init_gmm_lf.get_w()
@@ -354,8 +454,11 @@ if __name__ == "__main__":
     print("Done! \n")
     print("Valid: ", tran_obs_model.valid())
 
+    figure_dir = Path("figures")
+    figure_dir.mkdir(parents=True, exist_ok=True)
+
     if use_dtf:
-        grid_figure_path = Path("figures") / f"{figure_prefix}__state_vs_latent_grid.png"
+        grid_figure_path = figure_dir / f"{figure_prefix}__state_vs_latent_grid.png"
         _plot_state_vs_latent_grid(
             nftf,
             x_k_data,
@@ -379,6 +482,23 @@ if __name__ == "__main__":
         verbose=True,
         use_best="mle")
     print("Done! \n")
+    if x0_data.shape[1] == 2 and y0_data.shape[1] == 2:
+        init_compare_figure_path = figure_dir / f"{figure_prefix}__initial_distribution_comparison.png"
+        _plot_initial_distribution_comparison(
+            x0_data,
+            y0_data,
+            init_model,
+            init_compare_figure_path,
+            init_gmm_lf=init_gmm_lf if gmm_init else None,
+            r_basis=base_tran_obs_model.xi_basis,
+            r_coeffs=base_tran_obs_model.get_d().detach().cpu(),
+            g_basis=base_tran_obs_model.phi_basis,
+            g_coeffs=base_tran_obs_model.get_a().detach().cpu(),
+            title=f"{figure_prefix}: initial distribution comparison",
+        )
+        print(f"Saved initial distribution comparison figure to {init_compare_figure_path}")
+    else:
+        print("Skipping initial distribution comparison plot (only implemented for 2D state).")
 
     print(f"Observation model loss : {best_loss_tran_obs:.4f}, training time: {training_time_tran_obs:.2f} seconds")
     print(f"Initial model loss     : {best_loss_init:.4f}, training time: {training_time_init:.2f} seconds")
@@ -394,8 +514,6 @@ if __name__ == "__main__":
     # Analysis across repeated simulation tests using the same learned filter
     box_lows = (-5.0, -5.0)
     box_highs = (5.0, 5.0)
-    figure_dir = Path("figures")
-    figure_dir.mkdir(parents=True, exist_ok=True)
     t_dist = SystemTransitionDistribution(system).to(device=device)
     o_dist = SystemObservationDistribution(system).to(device=device)
 
