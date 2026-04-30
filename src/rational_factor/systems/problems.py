@@ -137,7 +137,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         ),
         prev_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
-            covariance=torch.diag(6.0*torch.ones(4)),
+            covariance=torch.diag(6.0*torch.ones(4, dtype=torch.float32)),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
@@ -198,7 +198,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         ),
         prev_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-            covariance=torch.diag(torch.tensor([5.0, 10.0, 3.0, 10.0, 10.0, 15.0], dtype=torch.float32)),
+            covariance=torch.diag(torch.tensor([5.0, 5.0, 3.0, 15.0, 15.0, 20.0], dtype=torch.float32)),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
@@ -206,8 +206,8 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-5.0, -5.0, -4.0, -10.0, -10.0, -15.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0, 4.0, 10.0, 10.0, 15.0]),
+        plot_bounds_low=torch.tensor([-5.0, -5.0, -4.0, -15.0, -15.0, -20.0]),
+        plot_bounds_high=torch.tensor([5.0, 5.0, 4.0, 15.0, 15.0, 20.0]),
         #plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -5.0]),
         #plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 5.0]),
         plot_marginals_list=[(0, 1), (3, 4), (2, 5)],
@@ -228,7 +228,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         ),
         prev_state_sampler=make_mvnormal_state_sampler(
             mean=torch.zeros(12),
-            covariance=torch.diag(torch.tensor([2.0, 2.0, 1.5, 1.5, 1.5, 1.5, 0.6, 0.6, 1.2, 1.5, 1.5, 1.5], dtype=torch.float32)),
+            covariance=torch.diag(5.0*torch.ones(12, dtype=torch.float32)),
         ),
         n_timesteps=15,
         n_trajectories_test=5000,
@@ -236,8 +236,8 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=5000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]),
+        plot_bounds_low=torch.tensor([-10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0]),
+        plot_bounds_high=torch.tensor([10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
     ),
 }
