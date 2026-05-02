@@ -1,0 +1,335 @@
+{
+  "name": "prop_nftf_comparison_cartpole",
+  "contexts": {
+    "DTF w/ Init": {
+      "name": "DTF w/ Init",
+      "params": {
+        "use_nftf": true,
+        "use_nftf_prefit": true,
+        "n_basis": 500,
+        "tran_params": {
+          "n_epochs_per_group": [
+            5,
+            5
+          ],
+          "iterations": 50,
+          "pre_train_epochs": 10,
+          "lr_basis": 0.005,
+          "lr_weights": 0.001,
+          "lr_dtf": 0.0005
+        },
+        "init_params": {
+          "n_epochs_per_group": [
+            20,
+            5
+          ],
+          "iterations": 100,
+          "lr_basis": 0.005,
+          "lr_weights": 0.001
+        },
+        "batch_size": 256,
+        "ls_temp": 0.1,
+        "reg_covar_joint": 0.001,
+        "validation_early_stopping_patience": 10,
+        "verbose": true
+      },
+      "n_trials_total": 10,
+      "n_trials_valid": 10,
+      "results": {
+        "avg_log_likelihood_per_timestep": {
+          "mean": [
+            -2.8903748989105225,
+            -4.745386600494385,
+            -5.596465110778809,
+            -6.206679821014404,
+            -6.757420539855957,
+            -7.318000793457031,
+            -8.039669036865234,
+            -8.819231033325195,
+            -9.66657829284668,
+            -10.628250122070312
+          ],
+          "std": [
+            0.1271563321352005,
+            0.16677738726139069,
+            0.12276093661785126,
+            0.11307454109191895,
+            0.11426736414432526,
+            0.11066652089357376,
+            0.12409698963165283,
+            0.1854381561279297,
+            0.2566445469856262,
+            0.3480369448661804
+          ]
+        },
+        "best_loss_pretrain_decorrupter": {
+          "mean": [
+            9.360360145568848
+          ],
+          "std": [
+            0.017810896039009094
+          ]
+        },
+        "training_time_pretrain_decorrupter": {
+          "mean": [
+            17.33086585998535
+          ],
+          "std": [
+            0.1474941521883011
+          ]
+        },
+        "best_loss_transition": {
+          "mean": [
+            4.69779109954834
+          ],
+          "std": [
+            0.11627953499555588
+          ]
+        },
+        "best_loss_initial": {
+          "mean": [
+            3.0234649181365967
+          ],
+          "std": [
+            0.11847919970750809
+          ]
+        },
+        "training_time_transition": {
+          "mean": [
+            27.717052459716797
+          ],
+          "std": [
+            6.180898189544678
+          ]
+        },
+        "training_time_initial": {
+          "mean": [
+            33.129886627197266
+          ],
+          "std": [
+            4.90365743637085
+          ]
+        }
+      }
+    },
+    "DTF w/o Init": {
+      "name": "DTF w/o Init",
+      "params": {
+        "use_nftf": true,
+        "use_nftf_prefit": false,
+        "n_basis": 500,
+        "tran_params": {
+          "n_epochs_per_group": [
+            5,
+            5
+          ],
+          "iterations": 50,
+          "lr_basis": 0.005,
+          "lr_weights": 0.001,
+          "lr_dtf": 0.0005
+        },
+        "init_params": {
+          "n_epochs_per_group": [
+            20,
+            5
+          ],
+          "iterations": 100,
+          "lr_basis": 0.005,
+          "lr_weights": 0.001
+        },
+        "batch_size": 256,
+        "ls_temp": 0.1,
+        "reg_covar_joint": 0.001,
+        "validation_early_stopping_patience": 10,
+        "verbose": true
+      },
+      "n_trials_total": 10,
+      "n_trials_valid": 10,
+      "results": {
+        "avg_log_likelihood_per_timestep": {
+          "mean": [
+            -3.0343077182769775,
+            -6.055734634399414,
+            -6.745429992675781,
+            -7.1984124183654785,
+            -7.548699855804443,
+            -7.9365668296813965,
+            -8.473695755004883,
+            -9.119600296020508,
+            -9.801773071289062,
+            -10.49106216430664
+          ],
+          "std": [
+            0.054792243987321854,
+            0.33961158990859985,
+            0.2440362125635147,
+            0.14421287178993225,
+            0.07380779832601547,
+            0.0714413970708847,
+            0.1222999095916748,
+            0.16521762311458588,
+            0.19442850351333618,
+            0.2212333232164383
+          ]
+        },
+        "best_loss_pretrain_decorrupter": {
+          "mean": [
+            NaN
+          ],
+          "std": [
+            NaN
+          ]
+        },
+        "training_time_pretrain_decorrupter": {
+          "mean": [
+            0.0
+          ],
+          "std": [
+            0.0
+          ]
+        },
+        "best_loss_transition": {
+          "mean": [
+            6.821755409240723
+          ],
+          "std": [
+            0.15458369255065918
+          ]
+        },
+        "best_loss_initial": {
+          "mean": [
+            3.166738986968994
+          ],
+          "std": [
+            0.053658563643693924
+          ]
+        },
+        "training_time_transition": {
+          "mean": [
+            113.29476165771484
+          ],
+          "std": [
+            18.34398651123047
+          ]
+        },
+        "training_time_initial": {
+          "mean": [
+            29.448999404907227
+          ],
+          "std": [
+            1.0028446912765503
+          ]
+        }
+      }
+    },
+    "No DTF": {
+      "name": "No DTF",
+      "params": {
+        "use_nftf": false,
+        "use_nftf_prefit": false,
+        "n_basis": 500,
+        "tran_params": {
+          "n_epochs_per_group": [
+            5,
+            5
+          ],
+          "iterations": 100,
+          "lr_basis": 0.005,
+          "lr_weights": 0.001
+        },
+        "init_params": {
+          "n_epochs_per_group": [
+            20,
+            5
+          ],
+          "iterations": 100,
+          "lr_basis": 0.005,
+          "lr_weights": 0.001
+        },
+        "batch_size": 256,
+        "ls_temp": 0.1,
+        "reg_covar_joint": 0.001,
+        "validation_early_stopping_patience": 10,
+        "verbose": true
+      },
+      "n_trials_total": 10,
+      "n_trials_valid": 10,
+      "results": {
+        "avg_log_likelihood_per_timestep": {
+          "mean": [
+            -2.7409441471099854,
+            -5.750146389007568,
+            -6.275776386260986,
+            -6.77013635635376,
+            -7.207547187805176,
+            -7.663412570953369,
+            -8.26220989227295,
+            -8.964284896850586,
+            -9.686391830444336,
+            -10.424443244934082
+          ],
+          "std": [
+            0.37704506516456604,
+            0.4982824921607971,
+            0.35531002283096313,
+            0.24675214290618896,
+            0.15484780073165894,
+            0.1137576550245285,
+            0.11267749220132828,
+            0.11648652702569962,
+            0.11314746737480164,
+            0.13016213476657867
+          ]
+        },
+        "best_loss_pretrain_decorrupter": {
+          "mean": [
+            NaN
+          ],
+          "std": [
+            NaN
+          ]
+        },
+        "training_time_pretrain_decorrupter": {
+          "mean": [
+            0.0
+          ],
+          "std": [
+            0.0
+          ]
+        },
+        "best_loss_transition": {
+          "mean": [
+            7.277500152587891
+          ],
+          "std": [
+            0.12569747865200043
+          ]
+        },
+        "best_loss_initial": {
+          "mean": [
+            2.8315646648406982
+          ],
+          "std": [
+            0.3725547790527344
+          ]
+        },
+        "training_time_transition": {
+          "mean": [
+            81.12773895263672
+          ],
+          "std": [
+            11.943641662597656
+          ]
+        },
+        "training_time_initial": {
+          "mean": [
+            8.46031379699707
+          ],
+          "std": [
+            2.983062505722046
+          ]
+        }
+      }
+    }
+  }
+}

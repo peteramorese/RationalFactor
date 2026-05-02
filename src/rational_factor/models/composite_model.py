@@ -38,21 +38,23 @@ class CompositeDensityModel(DensityModel):
         )
 
 class CompositeConditionalModel(ConditionalDensityModel):
-    def __init__(self, domain_tfs: DomainTF | Sequence[DomainTF], conditional_density_model: ConditionalDensityModel):
+    def __init__(self, domain_tfs: DomainTF | Sequence[DomainTF], conditional_density_model: ConditionalDensityModel, tf_conditioner_only: bool = False):
         domain_tfs = _as_transform_sequence(domain_tfs)
         _validate_transform_sequence(domain_tfs, conditional_density_model.dim)
         super().__init__(conditional_density_model.dim, conditional_density_model.conditioner_dim)
         self.domain_tfs = torch.nn.ModuleList(domain_tfs)
         self.conditional_density_model = conditional_density_model
-
+        self.tf_conditioner_only = tf_conditioner_only
+        
     def log_density(self, xp : torch.Tensor, *, conditioner: torch.Tensor):
         z = conditioner
         zp = xp
         total_ladj = xp.new_zeros(xp.shape[0])
         for tf in self.domain_tfs:
             z, _ = tf(z)
-            zp, ladj = tf(zp)
-            total_ladj = total_ladj + ladj
+            if not self.tf_conditioner_only:
+                zp, ladj = tf(zp)
+                total_ladj = total_ladj + ladj
         return self._clip_log_density(self.conditional_density_model.log_density(zp, conditioner=z) + total_ladj)
     
     def valid(self):
