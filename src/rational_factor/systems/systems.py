@@ -726,3 +726,406 @@ class Quadcopter(DiscreteTimeStochasticSystem):
         mean[7] = torch.remainder(mean[7] + math.pi, 2 * math.pi) - math.pi
         mean[8] = torch.remainder(mean[8] + math.pi, 2 * math.pi) - math.pi
         return mean, self.cov
+
+
+class Aircraft(DiscreteTimeStochasticSystem):
+    """
+    Full twelve-state rigid fixed-wing aircraft with nonlinear aerodynamics and
+    multiplicative process noise.
+
+    State x = [px, py, pz, u, v, w, phi, theta, psi, p, q, r]
+        - (px, py, pz): position in world frame (z-up, same convention as Quadcopter)
+        - (u, v, w): translational velocity in body frame (x forward, y starboard, z down)
+        - (phi, theta, psi): roll, pitch, yaw (ZYX Euler, radians)
+        - (p, q, r): angular rates in body frame
+
+    Dynamics use classical flat-earth 6-DOF kinematics with thrust along body x,
+    gravity transformed into body axes, and simplified stability-axis aerodynamic
+    forces/moments (lift/drag/sideforce + rolling/pitching/yawing moments).
+
+    Process noise is multiplicative on thrust, elevator/aileron/rudder commands,
+    and on effective lift and pitching-moment coefficients (six noise channels).
+    """
+
+    def __init__(
+        self,
+        dt: float,
+        waypoint: torch.Tensor | None = None,
+        V_ref: float = 22.0,
+        m: float = 25.0,
+        S: float = 0.55,
+        b: float = 2.2,
+        c_bar: float = 0.18,
+        rho: float = 1.225,
+        g: float = 9.81,
+        J: torch.Tensor | None = None,
+        thrust_min: float = 5.0,
+        thrust_max: float = 600.0,
+        delta_max: float = 0.35,
+        sigma_thrust: float = 0.04,
+        sigma_surface: float = 0.05,
+        sigma_CL: float = 0.03,
+        sigma_CM: float = 0.04,
+        noise_cov_scale: float = 1.0,
+        # Autopilot gains (waypoint in world frame)
+        kp_xy: float = 0.06,
+        kd_vxy: float = 0.35,
+        kp_z: float = 0.45,
+        kd_vz: float = 0.55,
+        kp_bank: float = 1.2,
+        kp_theta: float = 2.8,
+        kd_theta: float = 0.85,
+        kp_psi: float = 1.5,
+        kd_r: float = 0.35,
+        kp_V: float = 45.0,
+        phi_cmd_limit: float = 0.65,
+        theta_cmd_limit: float = 0.42,
+    ):
+        cov = noise_cov_scale * torch.eye(6, dtype=torch.float32)
+        dist = torch.distributions.MultivariateNormal(torch.zeros(6), cov)
+        super().__init__(
+            dim=12,
+            state_labels=[
+                "px",
+                "py",
+                "pz",
+                "u",
+                "v",
+                "w",
+                "phi",
+                "theta",
+                "psi",
+                "p",
+                "q",
+                "r",
+            ],
+            v_dist=dist,
+        )
+
+        self.dt = dt
+        self.m = m
+        self.S = S
+        self.b = b
+        self.c_bar = c_bar
+        self.rho = rho
+        self.g = g
+        self.V_ref = V_ref
+        self.thrust_min = thrust_min
+        self.thrust_max = thrust_max
+        self.delta_max = delta_max
+
+        self.sigma_thrust = sigma_thrust
+        self.sigma_surface = sigma_surface
+        self.sigma_CL = sigma_CL
+        self.sigma_CM = sigma_CM
+
+        self.kp_xy = kp_xy
+        self.kd_vxy = kd_vxy
+        self.kp_z = kp_z
+        self.kd_vz = kd_vz
+        self.kp_bank = kp_bank
+        self.kp_theta = kp_theta
+        self.kd_theta = kd_theta
+        self.kp_psi = kp_psi
+        self.kd_r = kd_r
+        self.kp_V = kp_V
+        self.phi_cmd_limit = phi_cmd_limit
+        self.theta_cmd_limit = theta_cmd_limit
+
+        if J is None:
+            J = torch.diag(torch.tensor([15.0, 22.0, 32.0], dtype=torch.float32))
+        self.J = torch.as_tensor(J, dtype=torch.float32).reshape(3, 3)
+        self.Jinv = torch.linalg.inv(self.J)
+
+        if waypoint is None:
+            waypoint = torch.tensor([800.0, 400.0, 120.0], dtype=torch.float32)
+        self.waypoint = torch.as_tensor(waypoint, dtype=torch.float32).reshape(3)
+
+        # Aerodynamic coefficients (stable conventional configuration)
+        self.CL0 = 0.28
+        self.CLa = 5.1
+        self.CD0 = 0.028
+        self.k_ind = 0.045
+        self.CY_beta = -0.95
+
+        self.Cm0 = -0.05
+        self.Cma = -0.65
+        self.Cmq = -18.0
+        self.Cmd = -1.35
+
+        self.Clb = -0.12
+        self.Clp = -0.55
+        self.Clda = 0.14
+
+        self.Cnb = 0.12
+        self.Cnr = -0.18
+        self.Cndr = -0.085
+
+    def set_waypoint(self, waypoint: torch.Tensor):
+        self.waypoint = torch.as_tensor(waypoint, dtype=torch.float32).reshape(3)
+
+    @staticmethod
+    def _rot_zyx(phi: torch.Tensor, theta: torch.Tensor, psi: torch.Tensor, device, dtype):
+        cphi, sphi = torch.cos(phi), torch.sin(phi)
+        cth, sth = torch.cos(theta), torch.sin(theta)
+        cpsi, spsi = torch.cos(psi), torch.sin(psi)
+
+        Rz = torch.stack(
+            [
+                torch.stack([cpsi, -spsi, torch.zeros((), device=device, dtype=dtype)]),
+                torch.stack([spsi, cpsi, torch.zeros((), device=device, dtype=dtype)]),
+                torch.stack(
+                    [
+                        torch.zeros((), device=device, dtype=dtype),
+                        torch.zeros((), device=device, dtype=dtype),
+                        torch.ones((), device=device, dtype=dtype),
+                    ]
+                ),
+            ]
+        )
+        Ry = torch.stack(
+            [
+                torch.stack([cth, torch.zeros((), device=device, dtype=dtype), sth]),
+                torch.stack(
+                    [
+                        torch.zeros((), device=device, dtype=dtype),
+                        torch.ones((), device=device, dtype=dtype),
+                        torch.zeros((), device=device, dtype=dtype),
+                    ]
+                ),
+                torch.stack([-sth, torch.zeros((), device=device, dtype=dtype), cth]),
+            ]
+        )
+        Rx = torch.stack(
+            [
+                torch.stack(
+                    [
+                        torch.ones((), device=device, dtype=dtype),
+                        torch.zeros((), device=device, dtype=dtype),
+                        torch.zeros((), device=device, dtype=dtype),
+                    ]
+                ),
+                torch.stack([torch.zeros((), device=device, dtype=dtype), cphi, -sphi]),
+                torch.stack([torch.zeros((), device=device, dtype=dtype), sphi, cphi]),
+            ]
+        )
+        return Rz @ Ry @ Rx
+
+    @staticmethod
+    def _euler_rate_matrix(phi: torch.Tensor, theta: torch.Tensor, device, dtype):
+        cphi, sphi = torch.cos(phi), torch.sin(phi)
+        cth, sth = torch.cos(theta), torch.sin(theta)
+        cth_safe = torch.where(
+            cth.abs() < 0.12,
+            torch.where(cth >= 0, cth.new_tensor(0.12), cth.new_tensor(-0.12)),
+            cth,
+        )
+
+        row0 = torch.stack(
+            [
+                torch.ones((), device=device, dtype=dtype),
+                sphi * sth / cth_safe,
+                cphi * sth / cth_safe,
+            ]
+        )
+        row1 = torch.stack([torch.zeros((), device=device, dtype=dtype), cphi, -sphi])
+        row2 = torch.stack(
+            [torch.zeros((), device=device, dtype=dtype), sphi / cth_safe, cphi / cth_safe]
+        )
+        return torch.stack([row0, row1, row2])
+
+    @staticmethod
+    def _wrap_pi(a: torch.Tensor) -> torch.Tensor:
+        return torch.remainder(a + math.pi, 2 * math.pi) - math.pi
+
+    def _autopilot(self, x: torch.Tensor):
+        """Waypoint outer loop -> thrust and commanded control surfaces."""
+        x = x.flatten()
+        device, dtype = x.device, x.dtype
+        px, py, pz = x[0], x[1], x[2]
+        u, vb, w = x[3], x[4], x[5]
+        phi, theta, psi = x[6], x[7], x[8]
+        p, q, r = x[9], x[10], x[11]
+
+        wp = self.waypoint.to(device=device, dtype=dtype)
+
+        R = self._rot_zyx(phi, theta, psi, device, dtype)
+        v_world = R @ torch.stack([u, vb, w])
+        vx_w, vy_w, vz_w = v_world[0], v_world[1], v_world[2]
+
+        ex = wp[0] - px
+        ey = wp[1] - py
+        ez = wp[2] - pz
+
+        vx_des = self.kp_xy * ex
+        vy_des = self.kp_xy * ey
+        ax_cmd = self.kd_vxy * (vx_des - vx_w)
+        ay_cmd = self.kd_vxy * (vy_des - vy_w)
+        az_cmd = self.kp_z * ez + self.kd_vz * (-vz_w)
+
+        g_t = x.new_tensor(self.g)
+        phi_cmd = torch.clamp(
+            self.kp_bank * (ay_cmd / g_t), -self.phi_cmd_limit, self.phi_cmd_limit
+        )
+        # Pitch: altitude/climb via az_cmd; gentle along-track coupling via ax_cmd
+        theta_cmd = torch.clamp(
+            self.kp_theta * (az_cmd / g_t)
+            + 0.12 * (ax_cmd / g_t)
+            - self.kd_theta * q,
+            -self.theta_cmd_limit,
+            self.theta_cmd_limit,
+        )
+
+        psi_des = torch.atan2(ey, ex)
+        e_psi = self._wrap_pi(psi_des - psi)
+        da = torch.clamp(self.kp_bank * (phi_cmd - phi) - 0.25 * p, -self.delta_max, self.delta_max)
+        de = torch.clamp(self.kp_theta * (theta_cmd - theta) - 0.45 * q, -self.delta_max, self.delta_max)
+        dr = torch.clamp(self.kp_psi * e_psi - self.kd_r * r, -self.delta_max, self.delta_max)
+
+        V = torch.sqrt(u * u + vb * vb + w * w + 1.0e-6)
+        T_trim = 0.5 * self.rho * V * V * self.S * (self.CD0 + self.k_ind * self.CL0**2) + 0.55 * self.m * g_t * torch.sin(theta)
+        e_V = self.V_ref - V
+        T = torch.clamp(T_trim + self.kp_V * e_V, min=self.thrust_min, max=self.thrust_max)
+
+        return T, de, da, dr
+
+    def _forces_moments(
+        self,
+        x: torch.Tensor,
+        T: torch.Tensor,
+        de: torch.Tensor,
+        da: torch.Tensor,
+        dr: torch.Tensor,
+        CL_scale: torch.Tensor,
+        CM_scale: torch.Tensor,
+    ):
+        """Body-axis forces and moments (including thrust and gravity)."""
+        x = x.flatten()
+        device, dtype = x.device, x.dtype
+        u, vb, w = x[3], x[4], x[5]
+        phi, theta, psi = x[6], x[7], x[8]
+        p, q, r_b = x[9], x[10], x[11]
+
+        m = x.new_tensor(self.m)
+        g = x.new_tensor(self.g)
+        rho = x.new_tensor(self.rho)
+        S, b, c = x.new_tensor(self.S), x.new_tensor(self.b), x.new_tensor(self.c_bar)
+
+        R = self._rot_zyx(phi, theta, psi, device, dtype)
+        e3 = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+        F_gravity_body = R.T @ (-m * g * e3)
+
+        V = torch.sqrt(u * u + vb * vb + w * w + 1.0e-8)
+        alpha = torch.atan2(w, u)
+        beta = torch.asin(torch.clamp(vb / V, -0.999, 0.999))
+
+        CL = CL_scale * (self.CL0 + self.CLa * alpha)
+        CD = self.CD0 + self.k_ind * CL**2
+        CY = self.CY_beta * beta
+
+        qbar = 0.5 * rho * V * V
+        L_a = qbar * S * CL
+        D_a = qbar * S * CD
+        Y_a = qbar * S * CY
+
+        ca, sa = torch.cos(alpha), torch.sin(alpha)
+        Fx_a = -D_a * ca + L_a * sa
+        Fz_a = -D_a * sa - L_a * ca
+        Fy_a = Y_a
+
+        Fx = Fx_a + T + F_gravity_body[0]
+        Fy = Fy_a + F_gravity_body[1]
+        Fz = Fz_a + F_gravity_body[2]
+
+        V_safe = torch.clamp(V, min=1.0)
+        p_hat = p * b / (2.0 * V_safe)
+        q_hat = q * c / (2.0 * V_safe)
+        r_hat = r_b * b / (2.0 * V_safe)
+
+        Cm = CM_scale * (self.Cm0 + self.Cma * alpha + self.Cmq * q_hat + self.Cmd * de)
+        Cl_tot = self.Clb * beta + self.Clp * p_hat + self.Clda * da
+        Cn_tot = self.Cnb * beta + self.Cnr * r_hat + self.Cndr * dr
+
+        M_aero = qbar * S * c * Cm
+        L_roll = qbar * S * b * Cl_tot
+        N_aero = qbar * S * b * Cn_tot
+
+        tau = torch.stack([L_roll, M_aero, N_aero])
+        F_b = torch.stack([Fx, Fy, Fz])
+        return F_b, tau
+
+    def _dynamics(self, x: torch.Tensor, T: torch.Tensor, de: torch.Tensor, da: torch.Tensor, dr: torch.Tensor, CL_scale: torch.Tensor, CM_scale: torch.Tensor):
+        x = x.flatten()
+        device, dtype = x.device, x.dtype
+        u, vb, w = x[3], x[4], x[5]
+        phi, theta, psi = x[6], x[7], x[8]
+        p, q, r_b = x[9], x[10], x[11]
+
+        m = self.m
+        J = self.J.to(device=device, dtype=dtype)
+        Jinv = self.Jinv.to(device=device, dtype=dtype)
+
+        F_b, tau = self._forces_moments(x, T, de, da, dr, CL_scale, CM_scale)
+
+        u_dot = r_b * vb - q * w + F_b[0] / m
+        v_dot = p * w - r_b * u + F_b[1] / m
+        w_dot = q * u - p * vb + F_b[2] / m
+
+        Omega = torch.stack([p, q, r_b])
+        J_omega = J @ Omega
+        Omega_dot = Jinv @ (tau - torch.cross(Omega, J_omega, dim=0))
+
+        E = self._euler_rate_matrix(phi, theta, device, dtype)
+        euler_dot = E @ Omega
+
+        R = self._rot_zyx(phi, theta, psi, device, dtype)
+        v_body = torch.stack([u, vb, w])
+        p_dot_world = R @ v_body
+
+        xdot = torch.zeros(12, device=device, dtype=dtype)
+        xdot[0:3] = p_dot_world
+        xdot[3] = u_dot
+        xdot[4] = v_dot
+        xdot[5] = w_dot
+        xdot[6:9] = euler_dot
+        xdot[9:12] = Omega_dot
+        return xdot
+
+    def next_state(self, x: torch.Tensor, v: torch.Tensor):
+        """
+        Forward Euler with multiplicative noise:
+            xi = v ∈ R^6 ,  v ~ N(0, noise_cov_scale * I)
+            T  <- T * (1 + sigma_thrust * xi_0)
+            de <- de * (1 + sigma_surface * xi_1), similarly da, dr
+            CL_scale <- 1 + sigma_CL * xi_4
+            CM_scale <- 1 + sigma_CM * xi_5
+        """
+        x = x.flatten()
+        v = v.flatten()
+        assert v.numel() == 6, "noise vector must be 6-dimensional"
+
+        T, de, da, dr = self._autopilot(x)
+
+        xi = v
+        T_n = T * (1.0 + self.sigma_thrust * xi[0])
+        T_n = torch.clamp(T_n, min=self.thrust_min, max=self.thrust_max)
+
+        de_n = de * (1.0 + self.sigma_surface * xi[1])
+        da_n = da * (1.0 + self.sigma_surface * xi[2])
+        dr_n = dr * (1.0 + self.sigma_surface * xi[3])
+        de_n = torch.clamp(de_n, -self.delta_max, self.delta_max)
+        da_n = torch.clamp(da_n, -self.delta_max, self.delta_max)
+        dr_n = torch.clamp(dr_n, -self.delta_max, self.delta_max)
+
+        CL_scale = 1.0 + self.sigma_CL * xi[4]
+        CM_scale = 1.0 + self.sigma_CM * xi[5]
+
+        xdot = self._dynamics(x, T_n, de_n, da_n, dr_n, CL_scale, CM_scale)
+        x_next = x + self.dt * xdot
+
+        x_next = x_next.clone()
+        x_next[6] = torch.remainder(x_next[6] + math.pi, 2 * math.pi) - math.pi
+        x_next[7] = torch.remainder(x_next[7] + math.pi, 2 * math.pi) - math.pi
+        x_next[8] = torch.remainder(x_next[8] + math.pi, 2 * math.pi) - math.pi
+
+        return x_next

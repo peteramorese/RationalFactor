@@ -67,6 +67,18 @@ class PartiallyObservableProblem(FullyObservableProblem):
             return traj_data, obs_data
 
 
+# Aircraft training: diagonal covariances are diag(std**2) per axis. The previous-state marginal
+# for transition data should be at least as wide as the initial-state marginal (cf. `quadcopter`)
+# so the transition model sees a representative envelope, not a tighter subset of the state box.
+_AIRCRAFT_INIT_STD = torch.tensor(
+    [100.0, 100.0, 32.0, 8.0, 3.5, 5.5, 0.06, 0.08, 0.35, 0.45, 0.45, 0.45],
+    dtype=torch.float32,
+)
+_AIRCRAFT_PREV_STD = torch.tensor(
+    [340.0, 340.0, 95.0, 30.0, 20.0, 20.0, 0.55, 0.52, 2.2, 3.0, 3.0, 3.0],
+    dtype=torch.float32,
+)
+
 FULLY_OBSERVABLE_PROBLEMS = {
     "scalar_nonlinear_drift": FullyObservableProblem(
         system=systems.ScalarNonlinearDrift(
@@ -238,6 +250,36 @@ FULLY_OBSERVABLE_PROBLEMS = {
         numerical_tolerance=1e-10,
         plot_bounds_low=torch.tensor([-10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0]),
         plot_bounds_high=torch.tensor([10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+        plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
+    ),
+    "aircraft": FullyObservableProblem(
+        system=systems.Aircraft(
+            dt=0.5,
+            waypoint=torch.tensor([800.0, 400.0, 120.0]),
+            V_ref=22.0,
+            sigma_thrust=0.04,
+            sigma_surface=0.05,
+            sigma_CL=0.03,
+            sigma_CM=0.04,
+            noise_cov_scale=1.0,
+        ),
+        # Trim-adjacent cruise near origin; body velocities (u,v,w); Euler rates last three
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 100.0, 21.5, 0.0, -1.2, 0.0, 0.06, 0.45, 0.0, 0.0, 0.0], dtype=torch.float32),
+            covariance=torch.diag(_AIRCRAFT_INIT_STD ** 2),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([150.0, 80.0, 95.0, 20.0, 0.0, -1.0, 0.0, 0.05, 0.4, 0.0, 0.0, 0.0], dtype=torch.float32),
+            covariance=torch.diag(_AIRCRAFT_PREV_STD ** 2),
+        ),
+        n_timesteps=10,
+        n_trajectories_test=5000,
+        n_data_tran=50000,
+        n_data_init=5000,
+        seed=42,
+        numerical_tolerance=1e-10,
+        plot_bounds_low=torch.tensor([-300.0, -300.0, 10.0, 5.0, -25.0, -25.0, -1.0, -0.75, -3.2, -3.5, -3.5, -3.5]),
+        plot_bounds_high=torch.tensor([1400.0, 1100.0, 260.0, 42.0, 25.0, 25.0, 1.0, 0.75, 3.2, 3.5, 3.5, 3.5]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
     ),
 }
