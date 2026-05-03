@@ -79,6 +79,35 @@ _AIRCRAFT_PREV_STD = torch.tensor(
     dtype=torch.float32,
 )
 
+# Per-axis SI → dimensionless state: x_phys = x_norm * scale. Keeps typical states near [-10, 10]
+# while dynamics, waypoint, and V_ref remain in physical units inside `Aircraft`.
+_AIRCRAFT_STATE_SCALE = torch.tensor(
+    [140.0, 110.0, 26.0, 4.5, 4.5, 4.0, 1.0, 1.0, 1.0, 0.55, 0.55, 0.55],
+    dtype=torch.float32,
+)
+_AIRCRAFT_INIT_MEAN_PHYS = torch.tensor(
+    [0.0, 0.0, 100.0, 21.5, 0.0, -1.2, 0.0, 0.06, 0.45, 0.0, 0.0, 0.0],
+    dtype=torch.float32,
+)
+_AIRCRAFT_PREV_MEAN_PHYS = torch.tensor(
+    [150.0, 80.0, 95.0, 20.0, 0.0, -1.0, 0.0, 0.05, 0.4, 0.0, 0.0, 0.0],
+    dtype=torch.float32,
+)
+_AIRCRAFT_INIT_MEAN = _AIRCRAFT_INIT_MEAN_PHYS / _AIRCRAFT_STATE_SCALE
+_AIRCRAFT_PREV_MEAN = _AIRCRAFT_PREV_MEAN_PHYS / _AIRCRAFT_STATE_SCALE
+_AIRCRAFT_INIT_STD_NORM = _AIRCRAFT_INIT_STD / _AIRCRAFT_STATE_SCALE
+_AIRCRAFT_PREV_STD_NORM = _AIRCRAFT_PREV_STD / _AIRCRAFT_STATE_SCALE
+_AIRCRAFT_PLOT_LOW_PHYS = torch.tensor(
+    [-300.0, -300.0, 10.0, 5.0, -25.0, -25.0, -1.0, -0.75, -3.2, -3.5, -3.5, -3.5],
+    dtype=torch.float32,
+)
+_AIRCRAFT_PLOT_HIGH_PHYS = torch.tensor(
+    [1400.0, 1100.0, 260.0, 42.0, 25.0, 25.0, 1.0, 0.75, 3.2, 3.5, 3.5, 3.5],
+    dtype=torch.float32,
+)
+_AIRCRAFT_PLOT_LOW = _AIRCRAFT_PLOT_LOW_PHYS / _AIRCRAFT_STATE_SCALE
+_AIRCRAFT_PLOT_HIGH = _AIRCRAFT_PLOT_HIGH_PHYS / _AIRCRAFT_STATE_SCALE
+
 FULLY_OBSERVABLE_PROBLEMS = {
     "scalar_nonlinear_drift": FullyObservableProblem(
         system=systems.ScalarNonlinearDrift(
@@ -254,23 +283,24 @@ FULLY_OBSERVABLE_PROBLEMS = {
     ),
     "aircraft": FullyObservableProblem(
         system=systems.Aircraft(
-            dt=0.5,
+            dt=0.1,
             waypoint=torch.tensor([800.0, 400.0, 120.0]),
             V_ref=22.0,
             sigma_thrust=0.04,
             sigma_surface=0.05,
             sigma_CL=0.03,
             sigma_CM=0.04,
-            noise_cov_scale=1.0,
+            noise_cov_scale=5.0,
+            state_scale=_AIRCRAFT_STATE_SCALE,
         ),
-        # Trim-adjacent cruise near origin; body velocities (u,v,w); Euler rates last three
+        # States are dimensionless (SI / _AIRCRAFT_STATE_SCALE); same closed-loop dynamics in SI inside the system.
         initial_state_sampler=make_mvnormal_state_sampler(
-            mean=torch.tensor([0.0, 0.0, 100.0, 21.5, 0.0, -1.2, 0.0, 0.06, 0.45, 0.0, 0.0, 0.0], dtype=torch.float32),
-            covariance=torch.diag(_AIRCRAFT_INIT_STD ** 2),
+            mean=_AIRCRAFT_INIT_MEAN,
+            covariance=torch.diag(_AIRCRAFT_INIT_STD_NORM**2),
         ),
         prev_state_sampler=make_mvnormal_state_sampler(
-            mean=torch.tensor([150.0, 80.0, 95.0, 20.0, 0.0, -1.0, 0.0, 0.05, 0.4, 0.0, 0.0, 0.0], dtype=torch.float32),
-            covariance=torch.diag(_AIRCRAFT_PREV_STD ** 2),
+            mean=_AIRCRAFT_PREV_MEAN,
+            covariance=torch.diag(_AIRCRAFT_PREV_STD_NORM**2),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
@@ -278,8 +308,8 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=5000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-300.0, -300.0, 10.0, 5.0, -25.0, -25.0, -1.0, -0.75, -3.2, -3.5, -3.5, -3.5]),
-        plot_bounds_high=torch.tensor([1400.0, 1100.0, 260.0, 42.0, 25.0, 25.0, 1.0, 0.75, 3.2, 3.5, 3.5, 3.5]),
+        plot_bounds_low=_AIRCRAFT_PLOT_LOW,
+        plot_bounds_high=_AIRCRAFT_PLOT_HIGH,
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
     ),
 }

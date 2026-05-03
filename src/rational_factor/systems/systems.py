@@ -745,6 +745,11 @@ class Aircraft(DiscreteTimeStochasticSystem):
 
     Process noise is multiplicative on thrust, elevator/aileron/rudder commands,
     and on effective lift and pitching-moment coefficients (six noise channels).
+
+    Optional ``state_scale`` (length-12, positive): external state is dimensionless
+    with ``x_physical = x * state_scale`` elementwise; all internal dynamics, the
+    waypoint, ``V_ref``, masses, etc. stay in SI. Returned states are again divided
+    by ``state_scale``. Default is all ones (physical state in SI).
     """
 
     def __init__(
@@ -767,6 +772,7 @@ class Aircraft(DiscreteTimeStochasticSystem):
         sigma_CL: float = 0.03,
         sigma_CM: float = 0.04,
         noise_cov_scale: float = 1.0,
+        state_scale: torch.Tensor | None = None,
         # Autopilot gains (waypoint in world frame)
         kp_xy: float = 0.06,
         kd_vxy: float = 0.35,
@@ -819,6 +825,11 @@ class Aircraft(DiscreteTimeStochasticSystem):
         self.sigma_CL = sigma_CL
         self.sigma_CM = sigma_CM
 
+        if state_scale is None:
+            state_scale = torch.ones(12, dtype=torch.float32)
+        state_scale = torch.as_tensor(state_scale, dtype=torch.float32).reshape(12).clamp_min(1e-6)
+        self.register_buffer("state_scale", state_scale)
+
         self.kp_xy = kp_xy
         self.kd_vxy = kd_vxy
         self.kp_z = kp_z
@@ -863,6 +874,16 @@ class Aircraft(DiscreteTimeStochasticSystem):
 
     def set_waypoint(self, waypoint: torch.Tensor):
         self.waypoint = torch.as_tensor(waypoint, dtype=torch.float32).reshape(3)
+
+    def _to_physical(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.flatten()
+        s = self.state_scale.to(device=x.device, dtype=x.dtype)
+        return x * s
+
+    def _to_normalized(self, x_phys: torch.Tensor) -> torch.Tensor:
+        x_phys = x_phys.flatten()
+        s = self.state_scale.to(device=x_phys.device, dtype=x_phys.dtype)
+        return x_phys / s
 
     @staticmethod
     def _rot_zyx(phi: torch.Tensor, theta: torch.Tensor, psi: torch.Tensor, device, dtype):
@@ -1100,11 +1121,12 @@ class Aircraft(DiscreteTimeStochasticSystem):
             CL_scale <- 1 + sigma_CL * xi_4
             CM_scale <- 1 + sigma_CM * xi_5
         """
-        x = x.flatten()
+        x_phys = self._to_physical(x)
+        x_phys = x_phys.flatten()
         v = v.flatten()
         assert v.numel() == 6, "noise vector must be 6-dimensional"
 
-        T, de, da, dr = self._autopilot(x)
+        T, de, da, dr = self._autopilot(x_phys)
 
         xi = v
         T_n = T * (1.0 + self.sigma_thrust * xi[0])
@@ -1120,12 +1142,12 @@ class Aircraft(DiscreteTimeStochasticSystem):
         CL_scale = 1.0 + self.sigma_CL * xi[4]
         CM_scale = 1.0 + self.sigma_CM * xi[5]
 
-        xdot = self._dynamics(x, T_n, de_n, da_n, dr_n, CL_scale, CM_scale)
-        x_next = x + self.dt * xdot
+        xdot = self._dynamics(x_phys, T_n, de_n, da_n, dr_n, CL_scale, CM_scale)
+        x_next_phys = x_phys + self.dt * xdot
 
-        x_next = x_next.clone()
-        x_next[6] = torch.remainder(x_next[6] + math.pi, 2 * math.pi) - math.pi
-        x_next[7] = torch.remainder(x_next[7] + math.pi, 2 * math.pi) - math.pi
-        x_next[8] = torch.remainder(x_next[8] + math.pi, 2 * math.pi) - math.pi
+        x_next_phys = x_next_phys.clone()
+        x_next_phys[6] = torch.remainder(x_next_phys[6] + math.pi, 2 * math.pi) - math.pi
+        x_next_phys[7] = torch.remainder(x_next_phys[7] + math.pi, 2 * math.pi) - math.pi
+        x_next_phys[8] = torch.remainder(x_next_phys[8] + math.pi, 2 * math.pi) - math.pi
 
-        return x_next
+        return self._to_normalized(x_next_phys)
