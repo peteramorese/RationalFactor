@@ -315,7 +315,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
 }
 
 PARTIALLY_OBSERVABLE_PROBLEMS = {
-    "po_van_der_pol": PartiallyObservableProblem(
+    "van_der_pol": PartiallyObservableProblem(
         system=po_systems.PartiallyObservableVanDerPol(
             dt=0.3,
             mu=0.9,
@@ -335,7 +335,7 @@ PARTIALLY_OBSERVABLE_PROBLEMS = {
             covariance=torch.diag(2.0 * torch.ones(2)),
         ),
         n_timesteps=10,
-        n_trajectories_test=5000,
+        n_trajectories_test=100,
         n_data_tran=10000,
         n_data_init=1000,
         n_data_obs=10000,
@@ -344,5 +344,142 @@ PARTIALLY_OBSERVABLE_PROBLEMS = {
         plot_bounds_low=torch.tensor([-5.0, -5.0]),
         plot_bounds_high=torch.tensor([5.0, 5.0]),
         plot_marginals_list=[(0, 1)],
+    ),
+    "bad_sensor_van_der_pol": PartiallyObservableProblem(
+        system=po_systems.BadSensorVanDerPol(
+            dt=0.3,
+            mu=0.9,
+            process_covariance=0.1 * torch.eye(2),
+            observation_covariance=0.1 * torch.eye(2),
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.2, 0.1]),
+            covariance=torch.diag(torch.tensor([0.2, 0.2])),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0]),
+            covariance=torch.diag(2.0 * torch.ones(2)),
+        ),
+        obs_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0]),
+            covariance=torch.diag(2.0 * torch.ones(2)),
+        ),
+        n_timesteps=10,
+        n_trajectories_test=100,
+        n_data_tran=10000,
+        n_data_init=1000,
+        n_data_obs=10000,
+        seed=42,
+        numerical_tolerance=1e-20,
+        plot_bounds_low=torch.tensor([-5.0, -5.0]),
+        plot_bounds_high=torch.tensor([5.0, 5.0]),
+        plot_marginals_list=[(0, 1)],
+    ),
+    "cartpole": PartiallyObservableProblem(
+        system=po_systems.PartiallyObservableCartPole(
+            dt=0.2,
+            m_c=1.0,
+            m_p=0.5,
+            l=1.5,
+            g=9.81,
+            process_covariance=0.1 * torch.eye(4),
+            observation_covariance=0.1 * torch.eye(4),
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
+            covariance=torch.diag(torch.tensor([0.2, 0.2, 0.2, 0.2])),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
+            covariance=torch.diag(6.0 * torch.ones(4, dtype=torch.float32)),
+        ),
+        obs_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
+            covariance=torch.diag(6.0 * torch.ones(4, dtype=torch.float32)),
+        ),
+        n_timesteps=10,
+        n_trajectories_test=100,
+        n_data_tran=10000,
+        n_data_init=1000,
+        n_data_obs=10000,
+        seed=42,
+        numerical_tolerance=1e-20,
+        plot_bounds_low=torch.tensor([-6.0, -6.0, -6.0, -6.0]),
+        plot_bounds_high=torch.tensor([6.0, 6.0, 6.0, 6.0]),
+        plot_marginals_list=[(0, 1), (2, 3)],
+    ),
+    "dubins_trailer": PartiallyObservableProblem(
+        system=po_systems.PartiallyObservableDubinsTrailer(
+            dt=0.3,
+            L_t=0.5,
+            v_ref=1.0,
+            k_v=1.0,
+            k_theta=2.2,
+            sigma_v=0.12,
+            sigma_omega=0.15,
+            sigma_speed_state=0.08,
+            cov_scale=0.1,
+            observation_covariance=0.1 * torch.eye(6),
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.35, 0.2, -0.85, 1.0]),
+            covariance=torch.diag(
+                torch.tensor([0.4, 0.4, 0.25, 0.35, 0.6, 0.4], dtype=torch.float32) ** 2
+            ),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            covariance=torch.diag(torch.tensor([3.0, 3.0, 1.8, 1.8, 1.2, 2.0], dtype=torch.float32)),
+        ),
+        obs_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            covariance=torch.diag(torch.tensor([3.0, 3.0, 1.8, 1.8, 1.2, 2.0], dtype=torch.float32)),
+        ),
+        n_timesteps=15,
+        n_trajectories_test=100,
+        n_data_tran=30000,
+        n_data_init=3000,
+        n_data_obs=30000,
+        seed=42,
+        numerical_tolerance=1e-10,
+        plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -10.0]),
+        plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 10.0]),
+        plot_marginals_list=[(0, 1), (2, 3), (4, 5)],
+    ),
+    "aircraft": PartiallyObservableProblem(
+        system=po_systems.PartiallyObservableAircraft(
+            dt=0.1,
+            waypoint=torch.tensor([800.0, 400.0, 120.0]),
+            V_ref=22.0,
+            sigma_thrust=0.04,
+            sigma_surface=0.05,
+            sigma_CL=0.03,
+            sigma_CM=0.04,
+            noise_cov_scale=5.0,
+            state_scale=_AIRCRAFT_STATE_SCALE,
+            observation_covariance=0.1 * torch.eye(12),
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=_AIRCRAFT_INIT_MEAN,
+            covariance=torch.diag(_AIRCRAFT_INIT_STD_NORM**2),
+        ),
+        prev_state_sampler=make_mvnormal_state_sampler(
+            mean=_AIRCRAFT_PREV_MEAN,
+            covariance=torch.diag(_AIRCRAFT_PREV_STD_NORM**2),
+        ),
+        obs_state_sampler=make_mvnormal_state_sampler(
+            mean=_AIRCRAFT_PREV_MEAN,
+            covariance=torch.diag(_AIRCRAFT_PREV_STD_NORM**2),
+        ),
+        n_timesteps=10,
+        n_trajectories_test=100,
+        n_data_tran=50000,
+        n_data_init=5000,
+        n_data_obs=50000,
+        seed=42,
+        numerical_tolerance=1e-10,
+        plot_bounds_low=_AIRCRAFT_PLOT_LOW,
+        plot_bounds_high=_AIRCRAFT_PLOT_HIGH,
+        plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
     ),
 }

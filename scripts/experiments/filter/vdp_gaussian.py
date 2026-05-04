@@ -48,7 +48,7 @@ if __name__ == "__main__":
     batch_size = 256
     block_size = None
 
-    problem = PARTIALLY_OBSERVABLE_PROBLEMS["po_van_der_pol"]
+    problem = PARTIALLY_OBSERVABLE_PROBLEMS["van_der_pol"]
     n_data_init = problem.n_data_init
     n_data_tran = problem.n_data_tran
     n_data_obs = problem.n_data_obs
@@ -100,10 +100,6 @@ if __name__ == "__main__":
 
     # Create and train the observation model
     obs_model = LinearRF(xi_basis, zeta_basis).to(device)
-    reg_loss_fn = lambda model, o, x: var_reg_strength * (
-        loss.gaussian_basis_var_reg_loss(model.xi_basis, mean=True)
-        + loss.gaussian_basis_var_reg_loss(model.zeta_basis, mean=True)
-    )
     optimizers = {
         "basis": torch.optim.Adam(obs_model.basis_params(), lr=obs_params["lr_basis"]),
         "weights": torch.optim.Adam(obs_model.weight_params(), lr=obs_params["lr_weights"]),
@@ -111,7 +107,7 @@ if __name__ == "__main__":
     print("Training observation model")
     obs_model, best_loss_obs, training_time_obs = train.train_iterate(obs_model, 
         o_dataloader, 
-        {"mle": loss.conditional_mle_loss, "var_reg": reg_loss_fn}, 
+        {"mle": loss.conditional_mle_loss}, 
         optimizers,
         epochs_per_group=obs_params["n_epochs_per_group"],
         iterations=obs_params["iterations"],
@@ -121,7 +117,6 @@ if __name__ == "__main__":
 
     # Create and train the transition model
     tran_model = LinearR2FF.from_rf(obs_model, phi_basis, psi_basis).to(device)
-    reg_loss_fn = lambda model, xp, x : var_reg_strength * (loss.gaussian_basis_var_reg_loss(model.phi_basis, mean=True) + loss.gaussian_basis_var_reg_loss(model.psi_basis, mean=True))
     optimizers = {
         "basis": torch.optim.Adam(tran_model.basis_params(), lr=tran_params["lr_basis"]),
         "weights": torch.optim.Adam(tran_model.weight_params(), lr=tran_params["lr_weights"]),
@@ -129,7 +124,7 @@ if __name__ == "__main__":
     print("Training transition model")
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(tran_model, 
         xp_dataloader, 
-        {"mle": loss.conditional_mle_loss, "var_reg": reg_loss_fn}, 
+        {"mle": loss.conditional_mle_loss}, 
         optimizers,
         epochs_per_group=tran_params["n_epochs_per_group"],
         iterations=tran_params["iterations"],
@@ -138,7 +133,6 @@ if __name__ == "__main__":
     print("Done! \n")
 
     init_model = LinearFF.from_r2ff(tran_model, psi0_basis).to(device)
-    reg_loss_fn = lambda model, x : var_reg_strength * loss.gaussian_basis_var_reg_loss(model.psi0_basis, mean=True)
     optimizers = {
         "basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]),
         "weights": torch.optim.Adam(init_model.weight_params(), lr=init_params["lr_weights"]),
@@ -146,7 +140,7 @@ if __name__ == "__main__":
     print("Training initial model")
     init_model, best_loss_init, training_time_init = train.train_iterate(init_model, 
         x0_dataloader, 
-        {"mle": loss.mle_loss, "var_reg": reg_loss_fn}, 
+        {"mle": loss.mle_loss}, 
         optimizers,
         epochs_per_group=init_params["n_epochs_per_group"],
         iterations=init_params["iterations"],

@@ -106,7 +106,7 @@ def _plot_state_vs_latent_grid(
 if __name__ == "__main__":
     
     ###
-    problem = PARTIALLY_OBSERVABLE_PROBLEMS["po_van_der_pol"]
+    problem = PARTIALLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     use_gpu = torch.cuda.is_available()
     use_dtf = True
