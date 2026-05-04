@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -15,15 +16,18 @@ from rational_factor.models.density_model import LogisticSigmoid
 from rational_factor.models.domain_transformation import MaskedAffineNFTF
 from rational_factor.models.factor_forms import LinearFF, LinearRFandR2FF
 from rational_factor.models.filter import Filter
+from particle_filter.particle_set import WeightedParticleSet
+from particle_filter.propagate import propagate_and_update as pf_propagate_and_update
+from rational_factor.systems.base import SystemObservationDistribution, SystemTransitionDistribution
 from rational_factor.systems.problems import PARTIALLY_OBSERVABLE_PROBLEMS
-from rational_factor.tools.analysis import avg_log_filter_score
+from rational_factor.tools.analysis import avg_log_filter_score, avg_log_likelihood
 from rational_factor.tools.benchmark import Benchmark
 from rational_factor.tools.misc import data_bounds, train_test_split
 
 CONTEXT_WITH_NFTF = {
     "use_nftf": True,
     "use_nftf_prefit": True,
-    "n_basis": 700,
+    "n_basis": 500,
     "n_obs_basis": 100,
     "obs_and_tran_params": {
         "n_epochs_per_group": [5, 5],
@@ -106,8 +110,10 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "verbose": True,
 }
 
-TRIALS = 10
+TRIALS = 1
 BENCHMARK_ROOT = "benchmark_data"
+# True-model particle filter used only as a reference measure when scoring learned beliefs.
+N_PF_PARTICLES = 3000
 
 
 def main() -> None:
@@ -370,6 +376,77 @@ def main() -> None:
             filter=filter_model,
             initial_belief=init_model,
         )
+
+        t_dist = SystemTransitionDistribution(system).to(device).eval()
+        o_dist = SystemObservationDistribution(system).to(device).eval()
+        pf_filter = Filter(
+            transition_model=t_dist,
+            observation_model=o_dist,
+            prop_and_upd_fn=pf_propagate_and_update,
+        )
+
+        if use_nftf:
+
+            def belief_to_state_space(belief):
+                return CompositeDensityModel([nftf], belief).to(device).eval()
+
+        else:
+
+            def belief_to_state_space(belief):
+                return belief
+
+        n_pf_steps = len(test_obs_data_eval)
+        n_pf_traj = test_obs_data_eval[0].shape[0]
+        pf_ref_dtype = test_obs_data_eval[0].dtype
+        pf_ref_prior_scores = torch.zeros(n_pf_steps, device=device, dtype=pf_ref_dtype)
+        pf_ref_post_scores = torch.zeros(n_pf_steps + 1, device=device, dtype=pf_ref_dtype)
+        with torch.no_grad():
+            for i_pf in range(n_pf_traj):
+                trajectory_obs_pf: list[torch.Tensor | None] = []
+                for k_pf in range(n_pf_steps):
+                    ok_pf = test_obs_data_eval[k_pf]
+                    if ok_pf is None:
+                        trajectory_obs_pf.append(None)
+                    else:
+                        trajectory_obs_pf.append(ok_pf[i_pf])
+
+                particles0 = problem.initial_state_sampler(N_PF_PARTICLES).to(
+                    device=device, dtype=pf_ref_dtype
+                )
+                pf_init = WeightedParticleSet(
+                    particles=particles0,
+                    weights=torch.ones(N_PF_PARTICLES, device=device, dtype=pf_ref_dtype)
+                    / N_PF_PARTICLES,
+                )
+                learned_priors_pf, learned_posts_pf = filter_model.filter(
+                    initial_belief=deepcopy(init_model),
+                    observations=trajectory_obs_pf,
+                    return_priors=True,
+                )
+                pf_priors, pf_posts = pf_filter.filter(
+                    initial_belief=pf_init,
+                    observations=trajectory_obs_pf,
+                    return_priors=True,
+                )
+                if len(learned_priors_pf) != n_pf_steps or len(learned_posts_pf) != n_pf_steps + 1:
+                    raise RuntimeError("Learned filter returned unexpected prior/posterior counts")
+                if len(pf_priors) != n_pf_steps or len(pf_posts) != n_pf_steps + 1:
+                    raise RuntimeError("PF returned unexpected prior/posterior counts")
+
+                for k_pf in range(n_pf_steps):
+                    wps = pf_priors[k_pf]
+                    b = belief_to_state_space(learned_priors_pf[k_pf])
+                    pf_ref_prior_scores[k_pf] += avg_log_likelihood(
+                        b, wps.particles, wps.weights
+                    )
+                for k_pf in range(n_pf_steps + 1):
+                    wps = pf_posts[k_pf]
+                    b = belief_to_state_space(learned_posts_pf[k_pf])
+                    pf_ref_post_scores[k_pf] += avg_log_likelihood(
+                        b, wps.particles, wps.weights
+                    )
+            pf_ref_prior_scores = pf_ref_prior_scores / n_pf_traj
+            pf_ref_post_scores = pf_ref_post_scores / n_pf_traj
         print("Done. \n")
 
         return (
@@ -381,6 +458,8 @@ def main() -> None:
             torch.tensor([float(best_loss_init)], dtype=torch.float32),
             torch.tensor([float(training_time_tran_obs)], dtype=torch.float32),
             torch.tensor([float(training_time_init)], dtype=torch.float32),
+            pf_ref_prior_scores.detach().cpu().to(dtype=torch.float32),
+            pf_ref_post_scores.detach().cpu().to(dtype=torch.float32),
         )
 
     contexts = [
@@ -401,6 +480,16 @@ def main() -> None:
     benchmark.set_numerical_result(5, "best_loss_initial", json_raw_data=False)
     benchmark.set_numerical_result(6, "training_time_transition_observation", json_raw_data=False)
     benchmark.set_numerical_result(7, "training_time_initial", json_raw_data=False)
+    benchmark.set_numerical_result(
+        8,
+        "avg_log_likelihood_prior_under_pf_reference_per_timestep",
+        json_raw_data=False,
+    )
+    benchmark.set_numerical_result(
+        9,
+        "avg_log_likelihood_posterior_under_pf_reference_per_timestep",
+        json_raw_data=False,
+    )
 
     print(
         f"Running benchmark problem={problem_key} ({len(contexts)} contexts, {TRIALS} trial(s) each)..."
