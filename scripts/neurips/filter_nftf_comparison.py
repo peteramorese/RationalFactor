@@ -23,7 +23,7 @@ from rational_factor.tools.misc import data_bounds, train_test_split
 CONTEXT_WITH_NFTF = {
     "use_nftf": True,
     "use_nftf_prefit": True,
-    "n_basis": 300,
+    "n_basis": 700,
     "n_obs_basis": 100,
     "obs_and_tran_params": {
         "n_epochs_per_group": [5, 5],
@@ -53,7 +53,7 @@ CONTEXT_WITH_NFTF = {
 CONTEXT_WITHOUT_NFTF = {
     "use_nftf": False,
     "use_nftf_prefit": False,
-    "n_basis": 300,
+    "n_basis": 500,
     "n_obs_basis": 100,
     "obs_and_tran_params": {
         "n_epochs_per_group": [20, 5],
@@ -80,7 +80,7 @@ CONTEXT_WITHOUT_NFTF = {
 CONTEXT_WITH_NFTF_NO_PREFIT = {
     "use_nftf": True,
     "use_nftf_prefit": False,
-    "n_basis": 300,
+    "n_basis": 500,
     "n_obs_basis": 100,
     "obs_and_tran_params": {
         "n_epochs_per_group": [5, 5],
@@ -106,7 +106,7 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "verbose": True,
 }
 
-TRIALS = 1
+TRIALS = 10
 BENCHMARK_ROOT = "benchmark_data"
 
 

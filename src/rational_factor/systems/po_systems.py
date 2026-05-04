@@ -179,7 +179,7 @@ class PartiallyObservableCartPole(PartiallyObservableSystem):
         else:
             observation_covariance = torch.as_tensor(observation_covariance, dtype=torch.float32)
 
-        self.state_system = systems.CartPole(
+        state_system = systems.CartPole(
             dt=dt,
             m_c=m_c,
             m_p=m_p,
@@ -192,9 +192,10 @@ class PartiallyObservableCartPole(PartiallyObservableSystem):
         super().__init__(
             state_dim=4,
             observation_dim=4,
-            v_dist=self.state_system._v_dist,
+            v_dist=state_system._v_dist,
             w_dist=observation_dist,
         )
+        self.state_system = state_system
         self.observation_cov = observation_covariance
 
     def next_state(self, x: torch.Tensor, v: torch.Tensor):
@@ -241,7 +242,7 @@ class PartiallyObservableDubinsTrailer(PartiallyObservableSystem):
         cov_scale: float = 0.01,
         observation_covariance: torch.Tensor = None,
     ):
-        self.state_system = systems.SecondOrderDubinsTrailer(
+        state_system = systems.SecondOrderDubinsTrailer(
             dt=dt,
             L_t=L_t,
             v_ref=v_ref,
@@ -263,9 +264,10 @@ class PartiallyObservableDubinsTrailer(PartiallyObservableSystem):
         super().__init__(
             state_dim=6,
             observation_dim=6,
-            v_dist=self.state_system._v_dist,
+            v_dist=state_system._v_dist,
             w_dist=observation_dist,
         )
+        self.state_system = state_system
         self.observation_cov = observation_covariance
 
     def next_state(self, x: torch.Tensor, v: torch.Tensor):
@@ -316,7 +318,7 @@ class PartiallyObservableAircraft(PartiallyObservableSystem):
         state_scale: torch.Tensor | None = None,
         observation_covariance: torch.Tensor = None,
     ):
-        self.state_system = systems.Aircraft(
+        state_system = systems.Aircraft(
             dt=dt,
             waypoint=waypoint,
             V_ref=V_ref,
@@ -337,9 +339,10 @@ class PartiallyObservableAircraft(PartiallyObservableSystem):
         super().__init__(
             state_dim=12,
             observation_dim=12,
-            v_dist=self.state_system._v_dist,
+            v_dist=state_system._v_dist,
             w_dist=observation_dist,
         )
+        self.state_system = state_system
         self.observation_cov = observation_covariance
 
     def next_state(self, x: torch.Tensor, v: torch.Tensor):
