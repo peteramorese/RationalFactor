@@ -24,11 +24,14 @@ from rational_factor.tools.analysis import avg_log_filter_score, avg_log_likelih
 from rational_factor.tools.benchmark import Benchmark
 from rational_factor.tools.misc import data_bounds, train_test_split
 
+N_BASIS = 600
+N_OBS_BASIS = 100
+
 CONTEXT_WITH_NFTF = {
     "use_nftf": True,
     "use_nftf_prefit": True,
-    "n_basis": 500,
-    "n_obs_basis": 100,
+    "n_basis": N_BASIS,
+    "n_obs_basis": N_OBS_BASIS,
     "obs_and_tran_params": {
         "n_epochs_per_group": [5, 5],
         "iterations": 15,
@@ -57,8 +60,8 @@ CONTEXT_WITH_NFTF = {
 CONTEXT_WITHOUT_NFTF = {
     "use_nftf": False,
     "use_nftf_prefit": False,
-    "n_basis": 500,
-    "n_obs_basis": 100,
+    "n_basis": N_BASIS,
+    "n_obs_basis": N_OBS_BASIS,
     "obs_and_tran_params": {
         "n_epochs_per_group": [20, 5],
         "iterations": 50,
@@ -84,8 +87,8 @@ CONTEXT_WITHOUT_NFTF = {
 CONTEXT_WITH_NFTF_NO_PREFIT = {
     "use_nftf": True,
     "use_nftf_prefit": False,
-    "n_basis": 500,
-    "n_obs_basis": 100,
+    "n_basis": N_BASIS,
+    "n_obs_basis": N_OBS_BASIS,
     "obs_and_tran_params": {
         "n_epochs_per_group": [5, 5],
         "iterations": 15,
@@ -110,10 +113,10 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "verbose": True,
 }
 
-TRIALS = 1
+TRIALS = 10
 BENCHMARK_ROOT = "benchmark_data"
 # True-model particle filter used only as a reference measure when scoring learned beliefs.
-N_PF_PARTICLES = 3000
+N_PF_PARTICLES = 5000
 
 
 def main() -> None:
