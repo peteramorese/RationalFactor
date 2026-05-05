@@ -1,7 +1,7 @@
 import torch
 from copy import deepcopy
 from collections.abc import Sequence
-from ..models.loss import mle_loss
+
 from ..models.density_model import DensityModel, ConditionalDensityModel
 from ..models.filter import Filter
 
@@ -17,10 +17,34 @@ def mc_integral_box(f, domain_bounds, n_samples=1000, device=None):
     vol = torch.prod(highs - lows)
     return vol * y.mean()
 
-def avg_log_likelihood(belief : DensityModel, test_data : torch.Tensor):
+def avg_log_likelihood(
+    belief: DensityModel,
+    test_data: torch.Tensor,
+    weights: torch.Tensor | None = None,
+):
+    """
+    Average log-density of ``test_data`` rows under ``belief``.
+
+    If ``weights`` is ``None`` (default), returns the arithmetic mean of
+    ``log p(x_i)``. If ``weights`` is a length-``n`` tensor aligned with
+    ``test_data`` rows, returns ``sum_i w_i log p(x_i)`` after renormalizing
+    ``weights`` to sum to 1 (e.g. PF particle weights).
+    """
     with torch.no_grad():
         belief.eval()
-        return -mle_loss(belief, test_data).mean()
+        logp = belief.log_density(test_data)
+        if weights is None:
+            return logp.mean()
+        w = weights.to(device=logp.device, dtype=logp.dtype).reshape(-1)
+        if w.shape[0] != logp.shape[0]:
+            raise ValueError(
+                f"weights length {w.shape[0]} must match number of test rows {logp.shape[0]}"
+            )
+        w_sum = w.sum()
+        if not torch.isfinite(w_sum) or w_sum <= 0:
+            raise ValueError("weights must be finite and sum to a positive value")
+        w = w / w_sum
+        return (w * logp).sum()
 
 def avg_log_filter_score(
     test_traj_data: Sequence[torch.Tensor],
@@ -125,6 +149,7 @@ def avg_log_filter_score(
     prior_scores = prior_scores / n_trajectories
     posterior_scores = posterior_scores / n_trajectories
     return prior_scores, posterior_scores
+
 
 def check_pdf_valid(pdf : DensityModel | ConditionalDensityModel, domain_bounds, n_samples=1000, atol=0.2, device=None):
     assert isinstance(pdf, DensityModel)

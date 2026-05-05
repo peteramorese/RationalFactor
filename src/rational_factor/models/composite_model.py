@@ -87,7 +87,8 @@ class CompositeRFandR2FF(CompositeConditionalModel):
         self.rf_and_r2ff = rf_and_r2ff
 
     def log_density(self, xp : torch.Tensor, *, conditioner: torch.Tensor):
-        return self.rf_and_r2ff.log_density(xp, conditioner=conditioner)
+        # Preserve CompositeConditionalModel behavior: transform both xp and conditioner.
+        return super().log_density(xp, conditioner=conditioner)
     
     def log_observation_density(self, o : torch.Tensor, *, conditioner: torch.Tensor):
         # Only transform the conditioner

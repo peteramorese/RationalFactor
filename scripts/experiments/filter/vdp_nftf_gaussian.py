@@ -12,12 +12,14 @@ from rational_factor.models.density_model import LogisticSigmoid
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel, CompositeRFandR2FF
 from rational_factor.models.domain_transformation import MaskedAffineNFTF
 from rational_factor.tools.visualization import plot_belief, plot_particle_belief
-from rational_factor.tools.analysis import check_pdf_valid
+from rational_factor.tools.analysis import check_pdf_valid, avg_log_filter_score
 from rational_factor.tools.misc import data_bounds, train_test_split
+from rational_factor.models.filter import Filter
 from particle_filter.particle_set import WeightedParticleSet
-from particle_filter.propagate import propagate_and_update
+from particle_filter.propagate import propagate_and_update as pf_propagate_and_update
 import matplotlib.pyplot as plt
 from pathlib import Path
+from copy import deepcopy
 
 
 def _plot_state_vs_latent_grid(
@@ -103,10 +105,115 @@ def _plot_state_vs_latent_grid(
     plt.close(fig)
 
 
+def _plot_initial_distribution_comparison(
+    x0_data: torch.Tensor,
+    y0_data: torch.Tensor,
+    init_model_untrained: torch.nn.Module,
+    init_model_trained: torch.nn.Module,
+    out_path: Path,
+    *,
+    init_gmm_lf: torch.nn.Module | None = None,
+    r_basis: torch.nn.Module | None = None,
+    r_coeffs: torch.Tensor | None = None,
+    g_basis: torch.nn.Module | None = None,
+    g_coeffs: torch.Tensor | None = None,
+    title: str = "",
+) -> None:
+    if x0_data.shape[1] != 2 or y0_data.shape[1] != 2:
+        raise ValueError("_plot_initial_distribution_comparison expects 2D data.")
+
+    x0_cpu = x0_data.detach().cpu()
+    y0_cpu = y0_data.detach().cpu()
+    all_xy = torch.cat([x0_cpu, y0_cpu], dim=0)
+    lo = all_xy.quantile(0.01, dim=0).numpy()
+    hi = all_xy.quantile(0.99, dim=0).numpy()
+    x_range = (float(lo[0]), float(hi[0]))
+    y_range = (float(lo[1]), float(hi[1]))
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9), squeeze=False)
+    ax_y0, ax_xy, ax_rx, ax_gx = axes[0, 0], axes[0, 1], axes[0, 2], axes[0, 3]
+    ax_gmm, ax_init_untrained, ax_init_trained, ax_blank = axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3]
+
+    ax_y0.scatter(y0_cpu[:, 0].numpy(), y0_cpu[:, 1].numpy(), s=3, alpha=0.25, c="tab:green", rasterized=True)
+    ax_y0.set_title("y0 data")
+
+    ax_xy.scatter(x0_cpu[:, 0].numpy(), x0_cpu[:, 1].numpy(), s=3, alpha=0.2, c="tab:blue", label="x0", rasterized=True)
+    ax_xy.scatter(y0_cpu[:, 0].numpy(), y0_cpu[:, 1].numpy(), s=3, alpha=0.2, c="tab:orange", label="y0", rasterized=True)
+    ax_xy.set_title("x0 vs y0 data")
+    ax_xy.legend(loc="upper right", fontsize=8)
+
+    if init_gmm_lf is not None:
+        plot_belief(ax_gmm, init_gmm_lf, x_range=x_range, y_range=y_range)
+        ax_gmm.set_title("GMM init density")
+    else:
+        ax_gmm.text(0.5, 0.5, "GMM init disabled", ha="center", va="center", fontsize=10)
+        ax_gmm.set_title("GMM init density")
+
+    plot_belief(ax_init_untrained, init_model_untrained, x_range=x_range, y_range=y_range)
+    ax_init_untrained.set_title("Init model (before training)")
+
+    plot_belief(ax_init_trained, init_model_trained, x_range=x_range, y_range=y_range)
+    ax_init_trained.set_title("Init model (after training)")
+
+    x_lin = np.linspace(x_range[0], x_range[1], 120)
+    y_lin = np.linspace(y_range[0], y_range[1], 120)
+    X, Y = np.meshgrid(x_lin, y_lin)
+    xy = np.stack([X.ravel(), Y.ravel()], axis=1)
+
+    if r_basis is not None and r_coeffs is not None:
+        with torch.no_grad():
+            basis_param = next(iter(r_basis.parameters()), None)
+            basis_buffer = next(iter(r_basis.buffers()), None)
+            basis_device = basis_param.device if basis_param is not None else (basis_buffer.device if basis_buffer is not None else torch.device("cpu"))
+            basis_dtype = basis_param.dtype if basis_param is not None else (basis_buffer.dtype if basis_buffer is not None else torch.get_default_dtype())
+            phi = r_basis(torch.tensor(xy, dtype=basis_dtype, device=basis_device))
+            d = r_coeffs.to(device=basis_device, dtype=basis_dtype)
+            r_vals = (phi @ d).detach().cpu().numpy().reshape(X.shape)
+        ax_rx.contourf(X, Y, r_vals, levels=12)
+        ax_rx.contour(X, Y, r_vals, levels=12, colors="white", linewidths=0.4)
+        ax_rx.set_title("r(x) = xi(x)^T d")
+    else:
+        ax_rx.text(0.5, 0.5, "r(x) unavailable", ha="center", va="center", fontsize=10)
+        ax_rx.set_title("r(x) = xi(x)^T d")
+
+    if g_basis is not None and g_coeffs is not None:
+        with torch.no_grad():
+            basis_param = next(iter(g_basis.parameters()), None)
+            basis_buffer = next(iter(g_basis.buffers()), None)
+            basis_device = basis_param.device if basis_param is not None else (basis_buffer.device if basis_buffer is not None else torch.device("cpu"))
+            basis_dtype = basis_param.dtype if basis_param is not None else (basis_buffer.dtype if basis_buffer is not None else torch.get_default_dtype())
+            phi = g_basis(torch.tensor(xy, dtype=basis_dtype, device=basis_device))
+            a = g_coeffs.to(device=basis_device, dtype=basis_dtype)
+            g_vals = (phi @ a).detach().cpu().numpy().reshape(X.shape)
+        ax_gx.contourf(X, Y, g_vals, levels=12)
+        ax_gx.contour(X, Y, g_vals, levels=12, colors="white", linewidths=0.4)
+        ax_gx.set_title("g(x) = phi(x)^T a")
+    else:
+        ax_gx.text(0.5, 0.5, "g(x) unavailable", ha="center", va="center", fontsize=10)
+        ax_gx.set_title("g(x) = phi(x)^T a")
+
+    ax_blank.axis("off")
+
+    for ax in [ax_y0, ax_xy, ax_gmm, ax_init_untrained, ax_init_trained, ax_rx, ax_gx]:
+        ax.set_xlim(*x_range)
+        ax.set_ylim(*y_range)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.25)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.tick_params(axis="both", which="both", labelbottom=False, labelleft=False, bottom=False, left=False)
+
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=260, bbox_inches="tight")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     
     ###
-    problem = PARTIALLY_OBSERVABLE_PROBLEMS["po_van_der_pol"]
+    problem = PARTIALLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     use_gpu = torch.cuda.is_available()
     use_dtf = True
@@ -128,7 +235,7 @@ if __name__ == "__main__":
         init_params = {
             "n_epochs_per_group": [20, 5], # basis, weights
             "iterations": 100,
-            "lr_basis": 1e-2,
+            "lr_basis": 1e-3,
             "lr_weights": 1e-3,
         }
     else:
@@ -214,16 +321,13 @@ if __name__ == "__main__":
         with torch.no_grad():
             y_k_data, _ = nftf(x_k_data.to(device))
             y_kp1_data, _ = nftf(x_kp1_data.to(device))
-            y0_data, _ = nftf(x0_data.to(device))
             yo_data, _ = nftf(xo_data.to(device))
             y_k_data = y_k_data.to(torch.device("cpu"))
             y_kp1_data = y_kp1_data.to(torch.device("cpu"))
-            y0_data = y0_data.to(torch.device("cpu"))
             yo_data = yo_data.to(torch.device("cpu"))
     else:
         y_k_data = x_k_data.to(torch.device("cpu"))
         y_kp1_data = x_kp1_data.to(torch.device("cpu"))
-        y0_data = x0_data.to(torch.device("cpu"))
         yo_data = xo_data.to(torch.device("cpu"))
 
     # Transition model basis functions (fit to p(y, y'))
@@ -255,14 +359,6 @@ if __name__ == "__main__":
 
     xi_basis = GaussianBasis(uparams_init=xi_params).to(device)
     zeta_basis = GaussianBasis(uparams_init=zeta_params).to(device)
-
-    # Initial model basis functions (fit to p(y))
-    init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
-    weights = init_gmm_lf.get_w()
-    psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
-    psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
-
-    psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
 
     # Train the transition model and observation model simultaneously
     if use_dtf:
@@ -311,14 +407,31 @@ if __name__ == "__main__":
         )
         print(f"Saved state-vs-latent grid figure to {grid_figure_path}")
 
+    if use_dtf:
+        y0_data, _ = nftf(x0_data.to(device))
+        y0_data = y0_data.to(torch.device("cpu"))
+    else:
+        y0_data = x0_data.to(torch.device("cpu"))
+
+    # Initial model basis functions (fit to p(y))
+    init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
+    weights = init_gmm_lf.get_w()
+    psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
+    psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
+
+    psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
+
+
     base_tran_obs_model = tran_obs_model.conditional_density_model if use_dtf else tran_obs_model
     init_model = LinearFF.from_r2ff(base_tran_obs_model, psi0_basis).to(device)
+    init_model_untrained = deepcopy(init_model).to(device).eval()
     optimizers = {"basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]), "weights": torch.optim.Adam(init_model.weight_params(), lr=init_params["lr_weights"])}
 
     print("Training initial model")
     y0_dataloader = DataLoader(TensorDataset(y0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu) if use_dtf else x0_dataloader
     init_model, best_loss_init, training_time_init = train.train_iterate(init_model, 
-        y0_dataloader, 
+        #y0_dataloader, 
+        x0_dataloader,
         {"mle": loss.mle_loss}, 
         optimizers,
         epochs_per_group=init_params["n_epochs_per_group"],
@@ -327,24 +440,54 @@ if __name__ == "__main__":
         use_best="mle")
     print("Done! \n")
 
-    print(f"Observation model loss : {best_loss_tran_obs:.4f}, training time: {training_time_tran_obs:.2f} seconds")
+    print(f"Observation/transition model loss : {best_loss_tran_obs:.4f}, training time: {training_time_tran_obs:.2f} seconds")
     print(f"Initial model loss     : {best_loss_init:.4f}, training time: {training_time_init:.2f} seconds")
 
     # Extract the individual models for filtering
     if use_dtf:
+        trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device).eval()
         tran_model = tran_obs_model.conditional_density_model.r2ff().to(device)
         obs_model = tran_obs_model.conditional_density_model.rf().to(device)
     else:
+        trained_nftf = None
         tran_model = tran_obs_model.r2ff().to(device)
         obs_model = tran_obs_model.rf().to(device)
+
+    figure_dir = Path("figures")
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    if x0_data.shape[1] == 2 and y0_data.shape[1] == 2:
+        init_compare_figure_path = figure_dir / f"{figure_prefix}__initial_distribution_comparison.png"
+        if use_dtf:
+            init_untrained_plot = CompositeDensityModel([trained_nftf], init_model_untrained).to(device).eval()
+            init_trained_plot = CompositeDensityModel([trained_nftf], init_model).to(device).eval()
+        else:
+            init_untrained_plot = init_model_untrained
+            init_trained_plot = init_model
+
+        _plot_initial_distribution_comparison(
+            x0_data,
+            y0_data,
+            init_untrained_plot,
+            init_trained_plot,
+            init_compare_figure_path,
+            init_gmm_lf=init_gmm_lf,
+            r_basis=base_tran_obs_model.xi_basis,
+            r_coeffs=base_tran_obs_model.get_d().detach().cpu(),
+            g_basis=base_tran_obs_model.phi_basis,
+            g_coeffs=base_tran_obs_model.get_a().detach().cpu(),
+            title=f"{figure_prefix}: initial distribution comparison",
+        )
+        print(f"Saved initial distribution comparison figure to {init_compare_figure_path}")
+    else:
+        print("Skipping initial distribution comparison plot (only implemented for 2D state).")
 
     # Analysis across repeated simulation tests using the same learned filter
     box_lows = (-5.0, -5.0)
     box_highs = (5.0, 5.0)
-    figure_dir = Path("figures")
-    figure_dir.mkdir(parents=True, exist_ok=True)
     t_dist = SystemTransitionDistribution(system).to(device=device)
     o_dist = SystemObservationDistribution(system).to(device=device)
+    sim_true_states_list: list[torch.Tensor] = []
+    sim_observations_list: list[torch.Tensor] = []
 
     for sim_idx in range(n_simulation_tests):
         # Simulate a random true trajectory and observations
@@ -354,6 +497,8 @@ if __name__ == "__main__":
             n_timesteps=n_timesteps_prop,
             device=device,
         )
+        sim_true_states_list.append(sim_true_states)
+        sim_observations_list.append(sim_observations)
 
         # Run learned filter
         with torch.no_grad():
@@ -365,12 +510,21 @@ if __name__ == "__main__":
             )
         print(f"[sim {sim_idx + 1}/{n_simulation_tests}] priors: {len(priors)}, posteriors: {len(posteriors)}")
 
+        # Beliefs are learned/propagated in latent space when use_dtf=True.
+        # Wrap them for visualization in original state space.
+        if use_dtf:
+            priors_plot = [CompositeDensityModel([trained_nftf], belief).to(device).eval() for belief in priors]
+            posteriors_plot = [CompositeDensityModel([trained_nftf], belief).to(device).eval() for belief in posteriors]
+        else:
+            priors_plot = priors
+            posteriors_plot = posteriors
+
         # Run truth-model weighted particle filter baseline
         initial_particle_belief = WeightedParticleSet(
             particles=init_state_sampler(n_particles_true_pf).to(device=device),
             weights=torch.ones(n_particles_true_pf).to(device=device) / n_particles_true_pf,
         )
-        _, wpf_posteriors = propagate_and_update(
+        _, wpf_posteriors = pf_propagate_and_update(
             belief=initial_particle_belief,
             transition_model=t_dist,
             observation_model=o_dist,
@@ -387,13 +541,13 @@ if __name__ == "__main__":
                     #print("Testing prior ", i)
                     #check_pdf_valid(priors[i - 1], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
 
-                    plot_belief(axes[i, 0], priors[i - 1], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+                    plot_belief(axes[i, 0], priors_plot[i - 1], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
                     axes[i, 0].set_title(f"Prior at k={i}", fontsize=8)
 
                 #print("Testing posterior", i)
                 #check_pdf_valid(posteriors[i], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
 
-                plot_belief(axes[i, 1], posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+                plot_belief(axes[i, 1], posteriors_plot[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
                 axes[i, 1].set_title(f"Posterior at k={i}", fontsize=8)
 
                 plot_particle_belief(axes[i, 2], wpf_posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
@@ -421,4 +575,82 @@ if __name__ == "__main__":
         plt.close(fig)
         print(f"Saved figure to {figure_path}")
 
+    # Numerical comparison with avg_log_filter_score over the generated test trajectories.
+    if len(sim_true_states_list) > 0:
+        test_traj_data_state = [
+            torch.stack([traj[k] for traj in sim_true_states_list], dim=0).to(device)
+            for k in range(n_timesteps_prop)
+        ]
+        test_obs_data = [
+            torch.stack([obs[k] for obs in sim_observations_list], dim=0).to(device)
+            for k in range(n_timesteps_prop - 1)
+        ]
+
+        if use_dtf:
+            with torch.no_grad():
+                test_traj_data_learned = [trained_nftf(xk)[0] for xk in test_traj_data_state]
+            learned_init_eval = init_model
+        else:
+            test_traj_data_learned = test_traj_data_state
+            learned_init_eval = init_model
+
+        learned_filter = Filter(
+            transition_model=tran_model,
+            observation_model=obs_model,
+            prop_and_upd_fn=propagate.propagate_and_update,
+        )
+        learned_prior_scores, learned_posterior_scores = avg_log_filter_score(
+            test_traj_data=test_traj_data_learned,
+            test_obs_data=test_obs_data,
+            filter=learned_filter,
+            initial_belief=learned_init_eval,
+        )
+
+        initial_particle_belief_eval = WeightedParticleSet(
+            particles=init_state_sampler(n_particles_true_pf).to(device=device),
+            weights=torch.ones(n_particles_true_pf, device=device) / n_particles_true_pf,
+        )
+        particle_filter_model = Filter(
+            transition_model=t_dist,
+            observation_model=o_dist,
+            prop_and_upd_fn=pf_propagate_and_update,
+        )
+        pf_prior_scores, pf_posterior_scores = avg_log_filter_score(
+            test_traj_data=test_traj_data_state,
+            test_obs_data=test_obs_data,
+            filter=particle_filter_model,
+            initial_belief=initial_particle_belief_eval,
+        )
+
+        print("=== avg_log_filter_score comparison ===")
+
+        print("Learned posterior scores by timestep:")
+        for k, score in enumerate(learned_posterior_scores):
+            print(f"  k={k:02d}: {score.item():.4f}")
+
+        print("True posterior scores by timestep:")
+        for k, score in enumerate(pf_posterior_scores):
+            print(f"  k={k:02d}: {score.item():.4f}")
+
+        # Plot posterior score comparison over time.
+        k_axis = np.arange(learned_posterior_scores.numel())
+        learned_post_np = learned_posterior_scores.detach().cpu().numpy()
+        pf_post_np = pf_posterior_scores.detach().cpu().numpy()
+        delta_post_np = learned_post_np - pf_post_np
+
+        fig, ax = plt.subplots(figsize=(8.5, 4.8))
+        ax.plot(k_axis, learned_post_np, marker="o", linewidth=1.8, label="Learned posterior")
+        ax.plot(k_axis, pf_post_np, marker="s", linewidth=1.8, label="Particle posterior")
+        ax.plot(k_axis, delta_post_np, linestyle="--", linewidth=1.2, label="Delta (learned - particle)")
+        ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.6)
+        ax.set_xlabel("Time step k")
+        ax.set_ylabel("Average log filter score")
+        ax.set_title("Posterior avg_log_filter_score over time")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        score_plot_path = figure_dir / f"{figure_prefix}__posterior_score_comparison.png"
+        fig.savefig(score_plot_path, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved posterior score comparison plot to {score_plot_path}")
 

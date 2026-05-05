@@ -1,4 +1,5 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
+from rational_factor.models.composite_model import CompositeConditionalModel
 import torch
 from copy import deepcopy
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
@@ -6,6 +7,9 @@ from rational_factor.models.factor_forms import LinearFF, LinearRFF, QuadraticFF
 def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
     if device is None:
         device = next(init_belief.parameters()).device
+
+    if isinstance(transition_model, CompositeConditionalModel):
+        return propagate(init_belief, transition_model.conditional_density_model, n_steps, device)
 
     if isinstance(transition_model, LinearRFF):
         assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
@@ -95,6 +99,9 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
 def update(belief : DensityModel, observation_model : ConditionalDensityModel, observation : torch.Tensor, device : torch.device = None):
     if device is None:
         device = next(belief.parameters()).device
+
+    if isinstance(observation_model, CompositeConditionalModel):
+        return update(belief, observation_model.conditional_density_model, observation, device)
 
     if isinstance(observation_model, LinearRF):
         assert isinstance(belief, Linear2FF), "Belief must be Linear2FF for LinearRF observation model"
