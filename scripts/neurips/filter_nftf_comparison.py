@@ -27,7 +27,7 @@ from rational_factor.tools.benchmark import Benchmark
 from rational_factor.tools.misc import data_bounds, train_test_split
 
 N_BASIS = 500
-N_OBS_BASIS = 200
+N_OBS_BASIS = 300
 TRIALS = 10
 BENCHMARK_ROOT = "benchmark_data"
 N_PF_PARTICLES = 1000
@@ -44,8 +44,8 @@ CONTEXT_WITH_NFTF = {
         "lr_basis_tran": 5e-3,
         "lr_basis_obs": 5e-3,
         "lr_weights": 1e-3,
-        "lr_dtf": 5e-5,
-        "dtf_weight_decay": 1e-2,
+        "lr_dtf": 5e-4,
+        "dtf_weight_decay": 0.0,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
@@ -70,15 +70,15 @@ CONTEXT_WITHOUT_NFTF = {
     "obs_and_tran_params": {
         "n_epochs_per_group": [20, 5],
         "iterations": 50,
-        "lr_basis_tran": 5e-2,
-        "lr_basis_obs": 5e-2,
-        "lr_weights": 1e-2,
+        "lr_basis_tran": 5e-3,
+        "lr_basis_obs": 5e-3,
+        "lr_weights": 1e-3,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],
         "iterations": 100,
         "lr_basis": 1e-3,
-        "lr_weights": 1e-2,
+        "lr_weights": 1e-3,
     },
     "batch_size": 256,
     "ls_temp": 0.1,
@@ -100,8 +100,8 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
         "lr_basis_tran": 5e-3,
         "lr_basis_obs": 5e-3,
         "lr_weights": 1e-3,
-        "lr_dtf": 5e-5,
-        "dtf_weight_decay": 1e-2,
+        "lr_dtf": 5e-4,
+        "dtf_weight_decay": 0.0,
     },
     "init_params": {
         "n_epochs_per_group": [20, 5],

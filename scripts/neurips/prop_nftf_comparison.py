@@ -26,7 +26,7 @@ CONTEXT_WITH_NFTF = {
     "tran_params": {
         "n_epochs_per_group": [5, 5],
         "iterations": 50,
-        "pre_train_epochs": 10,
+        "pre_train_epochs": 5,
         "lr_basis": 5e-3,
         "lr_weights": 1e-3,
         "lr_dtf": 5e-4,

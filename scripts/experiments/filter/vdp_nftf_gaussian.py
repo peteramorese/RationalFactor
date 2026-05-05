@@ -216,7 +216,7 @@ if __name__ == "__main__":
     problem = PARTIALLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     use_gpu = torch.cuda.is_available()
-    use_dtf = True
+    use_dtf = False
     n_basis = 300
     n_obs_basis = 100
 
@@ -230,7 +230,7 @@ if __name__ == "__main__":
             "lr_basis_obs": 5e-3,
             "lr_weights": 1e-3,
             "lr_dtf": 5e-5,
-            "dtf_weight_decay": 1e-2,
+            "dtf_weight_decay": 0.0,
         }
         init_params = {
             "n_epochs_per_group": [20, 5], # basis, weights
