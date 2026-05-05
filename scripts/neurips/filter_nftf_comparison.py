@@ -28,7 +28,7 @@ from rational_factor.tools.misc import data_bounds, train_test_split
 
 N_BASIS = 500
 N_OBS_BASIS = 200
-TRIALS = 1
+TRIALS = 10
 BENCHMARK_ROOT = "benchmark_data"
 N_PF_PARTICLES = 1000
 
