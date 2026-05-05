@@ -151,6 +151,121 @@ def avg_log_filter_score(
     return prior_scores, posterior_scores
 
 
+def avg_log_likelihood_under_particle_belief_reference(
+    test_traj_data: Sequence[torch.Tensor],
+    test_obs_data: Sequence[torch.Tensor | None],
+    filter: Filter,
+    initial_belief: DensityModel,
+    *,
+    reference_filter: Filter | None = None,
+    reference_initial_belief_fn=None,
+    belief_to_reference_space=None,
+):
+    """
+    Evaluate learned filter beliefs against particle-set reference beliefs.
+
+    Required arguments match ``avg_log_filter_score``. The optional keyword
+    arguments provide the particle reference generator and conversion from the
+    learned belief space to the particle-reference space.
+
+    Returns:
+        prior_scores:
+            Tensor of shape ``(T,)`` with averaged prior log-likelihoods under
+            per-trajectory particle priors.
+        posterior_scores:
+            Tensor of shape ``(T+1,)`` with averaged posterior log-likelihoods
+            under per-trajectory particle posteriors.
+    """
+    if len(test_traj_data) == 0:
+        raise ValueError("test_traj_data must contain at least one timestep")
+
+    n_trajectories = test_traj_data[0].shape[0]
+    state_dim = test_traj_data[0].shape[1]
+    n_steps = len(test_traj_data) - 1
+
+    if initial_belief.dim != state_dim:
+        raise ValueError(
+            "initial_belief.dim must match state dimension in test_traj_data"
+        )
+    if len(test_obs_data) != n_steps:
+        raise ValueError(
+            "test_obs_data length must be len(test_traj_data) - 1"
+        )
+    for k, xk in enumerate(test_traj_data):
+        if xk.ndim != 2 or xk.shape[0] != n_trajectories or xk.shape[1] != state_dim:
+            raise ValueError(
+                f"test_traj_data[{k}] must have shape ({n_trajectories}, {state_dim})"
+            )
+    for k, ok in enumerate(test_obs_data):
+        if ok is None:
+            continue
+        if ok.ndim != 2 or ok.shape[0] != n_trajectories:
+            raise ValueError(
+                f"test_obs_data[{k}] must have shape ({n_trajectories}, obs_dim) or be None"
+            )
+
+    if reference_filter is None:
+        reference_filter = filter
+    if reference_initial_belief_fn is None:
+        reference_initial_belief_fn = lambda _i: deepcopy(initial_belief)  # noqa: E731
+    if belief_to_reference_space is None:
+        belief_to_reference_space = lambda b: b  # noqa: E731
+
+    scores_dtype = test_traj_data[0].dtype
+    scores_device = test_traj_data[0].device
+    prior_scores = torch.zeros(n_steps, dtype=scores_dtype, device=scores_device)
+    posterior_scores = torch.zeros(n_steps + 1, dtype=scores_dtype, device=scores_device)
+
+    with torch.no_grad():
+        filter.transition_model.eval()
+        filter.observation_model.eval()
+        initial_belief.eval()
+        reference_filter.transition_model.eval()
+        reference_filter.observation_model.eval()
+
+        for i in range(n_trajectories):
+            trajectory_obs = []
+            for k in range(n_steps):
+                ok = test_obs_data[k]
+                if ok is None:
+                    trajectory_obs.append(None)
+                else:
+                    trajectory_obs.append(ok[i])
+
+            learned_priors, learned_posts = filter.filter(
+                initial_belief=deepcopy(initial_belief),
+                observations=trajectory_obs,
+                return_priors=True,
+            )
+            reference_priors, reference_posts = reference_filter.filter(
+                initial_belief=reference_initial_belief_fn(i),
+                observations=trajectory_obs,
+                return_priors=True,
+            )
+
+            if len(learned_priors) != n_steps or len(learned_posts) != n_steps + 1:
+                raise RuntimeError("Filter returned unexpected prior/posterior counts")
+            if len(reference_priors) != n_steps or len(reference_posts) != n_steps + 1:
+                raise RuntimeError("Reference filter returned unexpected prior/posterior counts")
+
+            for k in range(n_steps):
+                particle_belief = reference_priors[k]
+                b = belief_to_reference_space(learned_priors[k])
+                prior_scores[k] += avg_log_likelihood(
+                    b, particle_belief.particles, particle_belief.weights
+                )
+            for k in range(n_steps + 1):
+                particle_belief = reference_posts[k]
+                b = belief_to_reference_space(learned_posts[k])
+                posterior_scores[k] += avg_log_likelihood(
+                    b, particle_belief.particles, particle_belief.weights
+                )
+
+    prior_scores = prior_scores / n_trajectories
+    posterior_scores = posterior_scores / n_trajectories
+    return prior_scores, posterior_scores
+
+
 def check_pdf_valid(pdf : DensityModel | ConditionalDensityModel, domain_bounds, n_samples=1000, atol=0.2, device=None):
     assert isinstance(pdf, DensityModel)
     integral = mc_integral_box(pdf.forward, domain_bounds, n_samples, device=device)

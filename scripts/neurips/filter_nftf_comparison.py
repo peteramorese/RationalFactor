@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -20,12 +19,18 @@ from particle_filter.particle_set import WeightedParticleSet
 from particle_filter.propagate import propagate_and_update as pf_propagate_and_update
 from rational_factor.systems.base import SystemObservationDistribution, SystemTransitionDistribution
 from rational_factor.systems.problems import PARTIALLY_OBSERVABLE_PROBLEMS
-from rational_factor.tools.analysis import avg_log_filter_score, avg_log_likelihood
+from rational_factor.tools.analysis import (
+    avg_log_filter_score,
+    avg_log_likelihood_under_particle_belief_reference,
+)
 from rational_factor.tools.benchmark import Benchmark
 from rational_factor.tools.misc import data_bounds, train_test_split
 
-N_BASIS = 600
-N_OBS_BASIS = 100
+N_BASIS = 500
+N_OBS_BASIS = 200
+TRIALS = 1
+BENCHMARK_ROOT = "benchmark_data"
+N_PF_PARTICLES = 1000
 
 CONTEXT_WITH_NFTF = {
     "use_nftf": True,
@@ -34,8 +39,8 @@ CONTEXT_WITH_NFTF = {
     "n_obs_basis": N_OBS_BASIS,
     "obs_and_tran_params": {
         "n_epochs_per_group": [5, 5],
-        "iterations": 15,
-        "pre_train_epochs": 2,
+        "iterations": 50,
+        "pre_train_epochs": 5,
         "lr_basis_tran": 5e-3,
         "lr_basis_obs": 5e-3,
         "lr_weights": 1e-3,
@@ -51,8 +56,8 @@ CONTEXT_WITH_NFTF = {
     "batch_size": 256,
     "ls_temp": 0.1,
     "reg_covar_joint": 1e-1,
-    "reg_covar_obs": 1.0,
-    "validation_early_stopping_patience": 10,
+    "reg_covar_obs": 1e-1,
+    "validation_early_stopping_patience": 30,
     "obs_loss_weight": 1.0,
     "verbose": True,
 }
@@ -78,8 +83,8 @@ CONTEXT_WITHOUT_NFTF = {
     "batch_size": 256,
     "ls_temp": 0.1,
     "reg_covar_joint": 1e-1,
-    "reg_covar_obs": 1.0,
-    "validation_early_stopping_patience": 10,
+    "reg_covar_obs": 1e-1,
+    "validation_early_stopping_patience": 30,
     "obs_loss_weight": 1.0,
     "verbose": True,
 }
@@ -91,7 +96,7 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "n_obs_basis": N_OBS_BASIS,
     "obs_and_tran_params": {
         "n_epochs_per_group": [5, 5],
-        "iterations": 15,
+        "iterations": 50,
         "lr_basis_tran": 5e-3,
         "lr_basis_obs": 5e-3,
         "lr_weights": 1e-3,
@@ -107,16 +112,12 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "batch_size": 256,
     "ls_temp": 0.1,
     "reg_covar_joint": 1e-1,
-    "reg_covar_obs": 1.0,
-    "validation_early_stopping_patience": 10,
+    "reg_covar_obs": 1e-1,
+    "validation_early_stopping_patience": 30,
     "obs_loss_weight": 1.0,
     "verbose": True,
 }
 
-TRIALS = 10
-BENCHMARK_ROOT = "benchmark_data"
-# True-model particle filter used only as a reference measure when scoring learned beliefs.
-N_PF_PARTICLES = 5000
 
 
 def main() -> None:
@@ -129,8 +130,14 @@ def main() -> None:
         choices=sorted(PARTIALLY_OBSERVABLE_PROBLEMS.keys()),
         help="Key in PARTIALLY_OBSERVABLE_PROBLEMS.",
     )
+    parser.add_argument(
+        "--use-pf-reference",
+        action="store_true",
+        help="Enable particle-filter reference evaluation (disabled by default).",
+    )
     args = parser.parse_args()
     problem_key = args.problem
+    eval_pf_reference = args.use_pf_reference
 
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -359,20 +366,40 @@ def main() -> None:
             obs_model = tran_obs_model.rf().to(device).eval()
 
         init_model = init_model.to(device).eval()
+        if use_nftf:
+            nftf_eval = MaskedAffineNFTF.copy_from_trainable(nftf).to(device).eval()
+
+            def prop_and_upd_nf(initial_belief, transition_model, observation_model, observations):
+                latent_priors, latent_posteriors = propagate.propagate_and_update(
+                    initial_belief,
+                    transition_model,
+                    observation_model,
+                    observations,
+                )
+                priors = [
+                    CompositeDensityModel([nftf_eval], belief).to(device).eval()
+                    for belief in latent_priors
+                ]
+                posteriors = [
+                    CompositeDensityModel([nftf_eval], belief).to(device).eval()
+                    for belief in latent_posteriors
+                ]
+                return priors, posteriors
+
+            filter_prop_and_upd_fn = prop_and_upd_nf
+        else:
+            filter_prop_and_upd_fn = propagate.propagate_and_update
+
         filter_model = Filter(
             transition_model=tran_model,
             observation_model=obs_model,
-            prop_and_upd_fn=propagate.propagate_and_update,
+            prop_and_upd_fn=filter_prop_and_upd_fn,
         )
 
-        if use_nftf:
-            with torch.no_grad():
-                test_traj_data_eval = [nftf(x_k.to(device))[0] for x_k in test_traj_data]
-        else:
-            test_traj_data_eval = [x_k.to(device) for x_k in test_traj_data]
+        test_traj_data_eval = [x_k.to(device) for x_k in test_traj_data]
         test_obs_data_eval = [obs_k.to(device) if obs_k is not None else None for obs_k in test_obs_data]
 
-        print("Evaluating filter...")
+        print("Evaluating filter with avg_log_filter_score...")
         prior_scores, posterior_scores = avg_log_filter_score(
             test_traj_data=test_traj_data_eval,
             test_obs_data=test_obs_data_eval,
@@ -380,76 +407,48 @@ def main() -> None:
             initial_belief=init_model,
         )
 
-        t_dist = SystemTransitionDistribution(system).to(device).eval()
-        o_dist = SystemObservationDistribution(system).to(device).eval()
-        pf_filter = Filter(
-            transition_model=t_dist,
-            observation_model=o_dist,
-            prop_and_upd_fn=pf_propagate_and_update,
-        )
-
-        if use_nftf:
-
-            def belief_to_state_space(belief):
-                return CompositeDensityModel([nftf], belief).to(device).eval()
-
-        else:
+        if eval_pf_reference:
+            t_dist = SystemTransitionDistribution(system).to(device).eval()
+            o_dist = SystemObservationDistribution(system).to(device).eval()
+            pf_filter = Filter(
+                transition_model=t_dist,
+                observation_model=o_dist,
+                prop_and_upd_fn=pf_propagate_and_update,
+            )
 
             def belief_to_state_space(belief):
                 return belief
 
-        n_pf_steps = len(test_obs_data_eval)
-        n_pf_traj = test_obs_data_eval[0].shape[0]
-        pf_ref_dtype = test_obs_data_eval[0].dtype
-        pf_ref_prior_scores = torch.zeros(n_pf_steps, device=device, dtype=pf_ref_dtype)
-        pf_ref_post_scores = torch.zeros(n_pf_steps + 1, device=device, dtype=pf_ref_dtype)
-        with torch.no_grad():
-            for i_pf in range(n_pf_traj):
-                trajectory_obs_pf: list[torch.Tensor | None] = []
-                for k_pf in range(n_pf_steps):
-                    ok_pf = test_obs_data_eval[k_pf]
-                    if ok_pf is None:
-                        trajectory_obs_pf.append(None)
-                    else:
-                        trajectory_obs_pf.append(ok_pf[i_pf])
-
-                particles0 = problem.initial_state_sampler(N_PF_PARTICLES).to(
-                    device=device, dtype=pf_ref_dtype
-                )
-                pf_init = WeightedParticleSet(
-                    particles=particles0,
-                    weights=torch.ones(N_PF_PARTICLES, device=device, dtype=pf_ref_dtype)
-                    / N_PF_PARTICLES,
-                )
-                learned_priors_pf, learned_posts_pf = filter_model.filter(
-                    initial_belief=deepcopy(init_model),
-                    observations=trajectory_obs_pf,
-                    return_priors=True,
-                )
-                pf_priors, pf_posts = pf_filter.filter(
-                    initial_belief=pf_init,
-                    observations=trajectory_obs_pf,
-                    return_priors=True,
-                )
-                if len(learned_priors_pf) != n_pf_steps or len(learned_posts_pf) != n_pf_steps + 1:
-                    raise RuntimeError("Learned filter returned unexpected prior/posterior counts")
-                if len(pf_priors) != n_pf_steps or len(pf_posts) != n_pf_steps + 1:
-                    raise RuntimeError("PF returned unexpected prior/posterior counts")
-
-                for k_pf in range(n_pf_steps):
-                    wps = pf_priors[k_pf]
-                    b = belief_to_state_space(learned_priors_pf[k_pf])
-                    pf_ref_prior_scores[k_pf] += avg_log_likelihood(
-                        b, wps.particles, wps.weights
-                    )
-                for k_pf in range(n_pf_steps + 1):
-                    wps = pf_posts[k_pf]
-                    b = belief_to_state_space(learned_posts_pf[k_pf])
-                    pf_ref_post_scores[k_pf] += avg_log_likelihood(
-                        b, wps.particles, wps.weights
-                    )
-            pf_ref_prior_scores = pf_ref_prior_scores / n_pf_traj
-            pf_ref_post_scores = pf_ref_post_scores / n_pf_traj
+            pf_ref_dtype = test_obs_data_eval[0].dtype
+            ref_particles0 = test_traj_data[0].to(device=device, dtype=pf_ref_dtype)
+            ref_weights0 = torch.ones(ref_particles0.shape[0], device=device, dtype=pf_ref_dtype) / ref_particles0.shape[0]
+            pf_ref_prior_scores, pf_ref_post_scores = avg_log_likelihood_under_particle_belief_reference(
+                test_traj_data=test_traj_data_eval,
+                test_obs_data=test_obs_data_eval,
+                filter=filter_model,
+                initial_belief=init_model,
+                reference_filter=pf_filter,
+                reference_initial_belief_fn=lambda _i: WeightedParticleSet(
+                    particles=ref_particles0.clone(),
+                    weights=ref_weights0.clone(),
+                ),
+                belief_to_reference_space=belief_to_state_space,
+            )
+        else:
+            n_pf_steps = len(test_obs_data_eval)
+            pf_ref_dtype = test_obs_data_eval[0].dtype
+            pf_ref_prior_scores = torch.full(
+                (n_pf_steps,),
+                float("nan"),
+                device=device,
+                dtype=pf_ref_dtype,
+            )
+            pf_ref_post_scores = torch.full(
+                (n_pf_steps + 1,),
+                float("nan"),
+                device=device,
+                dtype=pf_ref_dtype,
+            )
         print("Done. \n")
 
         return (

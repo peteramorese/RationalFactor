@@ -316,16 +316,13 @@ if __name__ == "__main__":
         with torch.no_grad():
             y_k_data, _ = nftf(x_k_data.to(device))
             y_kp1_data, _ = nftf(x_kp1_data.to(device))
-            y0_data, _ = nftf(x0_data.to(device))
             yo_data, _ = nftf(xo_data.to(device))
             y_k_data = y_k_data.to(torch.device("cpu"))
             y_kp1_data = y_kp1_data.to(torch.device("cpu"))
-            y0_data = y0_data.to(torch.device("cpu"))
             yo_data = yo_data.to(torch.device("cpu"))
     else:
         y_k_data = x_k_data.to(torch.device("cpu"))
         y_kp1_data = x_kp1_data.to(torch.device("cpu"))
-        y0_data = x0_data.to(torch.device("cpu"))
         yo_data = xo_data.to(torch.device("cpu"))
 
     # Transition model basis functions (fit to p(y, y'))
@@ -357,18 +354,6 @@ if __name__ == "__main__":
 
     xi_basis = GaussianBasis(uparams_init=xi_params).to(device)
     zeta_basis = GaussianBasis(uparams_init=zeta_params).to(device)
-
-    # Initial model basis functions (fit to p(y))
-    init_gmm_lf = None
-    if gmm_init:
-        init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
-        weights = init_gmm_lf.get_w()
-        psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
-        psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
-
-        psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
-    else:
-        psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
 
     # Train the transition model and observation model simultaneously
     if use_dtf:
@@ -467,6 +452,35 @@ if __name__ == "__main__":
         )
         print(f"Saved state-vs-latent grid figure to {grid_figure_path}")
 
+    if use_dtf:
+        with torch.no_grad():
+            y0_data, _ = nftf(x0_data.to(device))
+            y0_data = y0_data.to(torch.device("cpu"))
+    else:
+        y0_data = x0_data.to(torch.device("cpu"))
+
+    # Initial model basis functions (fit to p(y)) after transition/observation training.
+    init_gmm_lf = None
+    if gmm_init:
+        init_gmm_lf = train.fit_gaussian_lf_em(
+            y0_data.to(torch.device("cpu")),
+            n_components=n_basis,
+            reg_covar=reg_covar_init,
+            max_iter=100,
+        )
+        weights = init_gmm_lf.get_w()
+        psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
+        psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
+        psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
+    else:
+        psi0_basis = GaussianBasis.random_init(
+            system.dim(),
+            n_basis=n_basis,
+            offsets=torch.tensor([0.0, 20.0], device=device),
+            variance=30.0,
+            min_std=1e-4,
+        ).to(device)
+
     base_tran_obs_model = tran_obs_model.conditional_density_model if use_dtf else tran_obs_model
     init_model = LinearFF.from_r2ff(base_tran_obs_model, psi0_basis).to(device)
     optimizers = {"basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]), "weights": torch.optim.Adam(init_model.weight_params(), lr=init_params["lr_weights"])}
@@ -507,9 +521,11 @@ if __name__ == "__main__":
     if use_dtf:
         tran_model = tran_obs_model.conditional_density_model.r2ff().to(device)
         obs_model = tran_obs_model.conditional_density_model.rf().to(device)
+        trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device).eval()
     else:
         tran_model = tran_obs_model.r2ff().to(device)
         obs_model = tran_obs_model.rf().to(device)
+        trained_nftf = None
 
     # Analysis across repeated simulation tests using the same learned filter
     box_lows = (-5.0, -5.0)
@@ -534,6 +550,9 @@ if __name__ == "__main__":
                 obs_model,
                 [obs for obs in sim_observations],
             )
+            if use_dtf:
+                priors = [CompositeDensityModel([trained_nftf], belief).to(device).eval() for belief in priors]
+                posteriors = [CompositeDensityModel([trained_nftf], belief).to(device).eval() for belief in posteriors]
         print(f"[sim {sim_idx + 1}/{n_simulation_tests}] priors: {len(priors)}, posteriors: {len(posteriors)}")
 
         # Run truth-model weighted particle filter baseline
