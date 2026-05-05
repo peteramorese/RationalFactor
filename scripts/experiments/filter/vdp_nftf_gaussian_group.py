@@ -12,8 +12,9 @@ from rational_factor.models.density_model import LogisticSigmoid
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel, CompositeRFandR2FF
 from rational_factor.models.domain_transformation import MaskedAffineNFTF
 from rational_factor.tools.visualization import plot_belief, plot_particle_belief
-from rational_factor.tools.analysis import check_pdf_valid
+from rational_factor.tools.analysis import avg_log_filter_score, check_pdf_valid
 from rational_factor.tools.misc import data_bounds, train_test_split
+from rational_factor.models.filter import Filter
 from particle_filter.particle_set import WeightedParticleSet
 from particle_filter.propagate import propagate_and_update
 import matplotlib.pyplot as plt
@@ -369,6 +370,8 @@ if __name__ == "__main__":
     figure_dir.mkdir(parents=True, exist_ok=True)
     t_dist = SystemTransitionDistribution(system).to(device=device)
     o_dist = SystemObservationDistribution(system).to(device=device)
+    sim_state_trajectories: list[torch.Tensor] = []
+    sim_observation_trajectories: list[torch.Tensor] = []
 
     for sim_idx in range(n_simulation_tests):
         # Simulate a random true trajectory and observations
@@ -378,6 +381,8 @@ if __name__ == "__main__":
             n_timesteps=n_timesteps_prop,
             device=device,
         )
+        sim_state_trajectories.append(sim_true_states.detach())
+        sim_observation_trajectories.append(sim_observations.detach())
 
         # Run learned filter
         with torch.no_grad():
@@ -444,5 +449,32 @@ if __name__ == "__main__":
         plt.savefig(figure_path, dpi=500, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved figure to {figure_path}")
+
+    # Evaluate filtering quality with average per-timestep log-filter scores.
+    # posterior_scores[k]    = E[log p(x_k | o_0,...,o_{k-1})]
+    # prior_scores[k]        = E[log p(x_{k+1} | o_0,...,o_{k-1})]
+    learned_filter = Filter(
+        transition_model=tran_model,
+        observation_model=obs_model,
+        prop_and_upd_fn=propagate.propagate_and_update,
+    ).to(device)
+
+    traj_states = torch.stack(sim_state_trajectories, dim=0)  # [n_sim, T+1, state_dim]
+    traj_obs = torch.stack(sim_observation_trajectories, dim=0)  # [n_sim, T, obs_dim]
+    test_traj_data = [traj_states[:, k, :] for k in range(traj_states.shape[1])]
+    test_obs_data = [traj_obs[:, k, :] for k in range(traj_obs.shape[1])]
+
+    prior_scores, posterior_scores = avg_log_filter_score(
+        test_traj_data=test_traj_data,
+        test_obs_data=test_obs_data,
+        filter=learned_filter,
+        initial_belief=init_model,
+    )
+
+    print("\nAvg log filter scores by timestep:")
+    for k, score in enumerate(posterior_scores):
+        print(f"  posterior[k={k}] = {score.item():.6f}")
+    for k, score in enumerate(prior_scores, start=1):
+        print(f"  prior[k={k}]     = {score.item():.6f}")
 
 
