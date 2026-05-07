@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
+import argparse
 from rational_factor.systems.base import simulate, SystemObservationDistribution, SystemTransitionDistribution
 from rational_factor.systems.problems import PARTIALLY_OBSERVABLE_PROBLEMS
 from rational_factor.models.basis_functions import GaussianBasis
@@ -105,12 +106,21 @@ def _plot_state_vs_latent_grid(
 
 
 if __name__ == "__main__":
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--no-dtf",
+        dest="use_dtf",
+        action="store_false",
+        default=True,
+        help="Disable domain transformation flow (DTF).",
+    )
+    args = parser.parse_args()
+
     ###
     problem = PARTIALLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     use_gpu = torch.cuda.is_available()
-    use_dtf = False
+    use_dtf = args.use_dtf
     n_basis = 300
     n_obs_basis = 100
 
@@ -156,8 +166,11 @@ if __name__ == "__main__":
     ls_temp = 0.1
 
     obs_loss_weight = 1.0
+    tran_patience = 30
+    init_patience = 30
 
     n_simulation_tests = 3
+    n_test_sims = 30
     n_particles_true_pf = 5000
     figure_prefix = "vdp_nftf_filter_gaussian"
     gmm_init = False
@@ -308,6 +321,7 @@ if __name__ == "__main__":
         iterations=obs_and_tran_params["iterations"],
         verbose=True,
         use_best="val_mle",
+        validation_early_stopping_patience=tran_patience,
     )
     print("Done! \n")
     print("Valid: ", tran_obs_model.valid())
@@ -325,9 +339,12 @@ if __name__ == "__main__":
     if use_dtf:
         with torch.no_grad():
             y0_data, _ = nftf(x0_data.to(device))
+            y0_val_data, _ = nftf(x0_val.to(device))
             y0_data = y0_data.to(torch.device("cpu"))
+            y0_val_data = y0_val_data.to(torch.device("cpu"))
     else:
         y0_data = x0_data.to(torch.device("cpu"))
+        y0_val_data = x0_val.to(torch.device("cpu"))
 
     # Initial model basis functions (fit to p(y)) after transition/observation training.
     if gmm_init:
@@ -355,15 +372,19 @@ if __name__ == "__main__":
     optimizers = {"basis": torch.optim.Adam(init_model.basis_params(), lr=init_params["lr_basis"]), "weights": torch.optim.Adam(init_model.weight_params(), lr=init_params["lr_weights"])}
 
     print("Training initial model")
-    y0_dataloader = DataLoader(TensorDataset(y0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu) if use_dtf else x0_dataloader
+    y0_dataloader = DataLoader(TensorDataset(y0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    y0_val_dataloader = DataLoader(TensorDataset(y0_val_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     init_model, best_loss_init, training_time_init = train.train_iterate(init_model, 
         y0_dataloader, 
         {"mle": loss.mle_loss}, 
         optimizers,
+        labeled_validation_loss_fns={"val_mle": loss.mle_loss},
+        validation_data_loader=y0_val_dataloader,
         epochs_per_group=init_params["n_epochs_per_group"],
         iterations=init_params["iterations"],
         verbose=True,
-        use_best="mle")
+        use_best="val_mle",
+        validation_early_stopping_patience=init_patience)
     print("Done! \n")
 
     print(f"Observation model loss : {best_loss_tran_obs:.4f}, training time: {training_time_tran_obs:.2f} seconds")
@@ -386,9 +407,9 @@ if __name__ == "__main__":
     figure_dir.mkdir(parents=True, exist_ok=True)
     t_dist = SystemTransitionDistribution(system).to(device=device)
     o_dist = SystemObservationDistribution(system).to(device=device)
-    sim_state_trajectories: list[torch.Tensor] = []
-    sim_observation_trajectories: list[torch.Tensor] = []
-
+    belief_plots_ok = system.dim() == 2
+    if not belief_plots_ok:
+        print("Skipping belief trajectory figures (only implemented for 2D state).")
     for sim_idx in range(n_simulation_tests):
         # Simulate a random true trajectory and observations
         sim_true_states, sim_observations = simulate(
@@ -397,9 +418,6 @@ if __name__ == "__main__":
             n_timesteps=n_timesteps_prop,
             device=device,
         )
-        sim_state_trajectories.append(sim_true_states.detach())
-        sim_observation_trajectories.append(sim_observations.detach())
-
         # Run learned filter
         with torch.no_grad():
             priors, posteriors = propagate.propagate_and_update(
@@ -425,49 +443,43 @@ if __name__ == "__main__":
             observations=[obs for obs in sim_observations],
         )
 
-
-        fig, axes = plt.subplots(n_timesteps_prop, 3, figsize=(10, max(3 * n_timesteps_prop, 15)))
-        fig.delaxes(axes[0, 0])  # no prior exists at k=0
-        fig.suptitle(f"Beliefs at each time step ({figure_prefix}, sim {sim_idx + 1})")
-        with torch.no_grad():
-            for i in range(n_timesteps_prop):
-                if i > 0:
-                    #print("Testing prior ", i)
-                    #check_pdf_valid(priors[i - 1], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
-
-                    plot_belief(axes[i, 0], priors[i - 1], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-                    axes[i, 0].set_title(f"Prior at k={i}", fontsize=8)
-
-                #print("Testing posterior", i)
-                #check_pdf_valid(posteriors[i], domain_bounds=(box_lows, box_highs), n_samples=100000, device=device)
-
-                plot_belief(axes[i, 1], posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-                axes[i, 1].set_title(f"Posterior at k={i}", fontsize=8)
-
-                plot_particle_belief(axes[i, 2], wpf_posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
-                axes[i, 2].set_title(f"WPF Posterior at k={i}", fontsize=8)
-                cols = [1, 2] if i == 0 else [0, 1, 2]
-                for j in cols:
-                    if j > 0:  # Skip first prior plot
-                        axes[i, j].scatter(sim_true_states[i, 0].item(), sim_true_states[i, 1].item(), marker="o", s=10, c="red")
+        if belief_plots_ok:
+            fig, axes = plt.subplots(n_timesteps_prop, 3, figsize=(10, max(3 * n_timesteps_prop, 15)))
+            fig.delaxes(axes[0, 0])  # no prior exists at k=0
+            fig.suptitle(f"Beliefs at each time step ({figure_prefix}, sim {sim_idx + 1})")
+            with torch.no_grad():
+                for i in range(n_timesteps_prop):
                     if i > 0:
-                        axes[i, j].scatter(sim_observations[i - 1, 0].item(), sim_observations[i - 1, 1].item(), marker="o", s=10, c="blue")
-                    axes[i, j].set_xlabel("")
-                    axes[i, j].set_ylabel("")
-                    axes[i, j].tick_params(
-                        axis="both",
-                        which="both",
-                        labelbottom=False,
-                        labelleft=False,
-                        bottom=False,
-                        left=False,
-                    )
-                    axes[i, j].grid(alpha=0.25)
+                        plot_belief(axes[i, 0], priors[i - 1], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+                        axes[i, 0].set_title(f"Prior at k={i}", fontsize=8)
 
-        figure_path = figure_dir / f"{figure_prefix}__sim_{sim_idx + 1:02d}.png"
-        plt.savefig(figure_path, dpi=500, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved figure to {figure_path}")
+                    plot_belief(axes[i, 1], posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+                    axes[i, 1].set_title(f"Posterior at k={i}", fontsize=8)
+
+                    plot_particle_belief(axes[i, 2], wpf_posteriors[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
+                    axes[i, 2].set_title(f"WPF Posterior at k={i}", fontsize=8)
+                    cols = [1, 2] if i == 0 else [0, 1, 2]
+                    for j in cols:
+                        if j > 0:  # Skip first prior plot
+                            axes[i, j].scatter(sim_true_states[i, 0].item(), sim_true_states[i, 1].item(), marker="o", s=10, c="red")
+                        if i > 0 and system.observation_dim() == 2:
+                            axes[i, j].scatter(sim_observations[i - 1, 0].item(), sim_observations[i - 1, 1].item(), marker="o", s=10, c="blue")
+                        axes[i, j].set_xlabel("")
+                        axes[i, j].set_ylabel("")
+                        axes[i, j].tick_params(
+                            axis="both",
+                            which="both",
+                            labelbottom=False,
+                            labelleft=False,
+                            bottom=False,
+                            left=False,
+                        )
+                        axes[i, j].grid(alpha=0.25)
+
+            figure_path = figure_dir / f"{figure_prefix}__sim_{sim_idx + 1:02d}.png"
+            plt.savefig(figure_path, dpi=500, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved figure to {figure_path}")
 
     # Evaluate filtering quality with average per-timestep log-filter scores.
     # posterior_scores[k]    = E[log p(x_k | o_0,...,o_{k-1})]
@@ -493,8 +505,20 @@ if __name__ == "__main__":
         prop_and_upd_fn=prop_and_upd_fn,
     ).to(device)
 
-    traj_states = torch.stack(sim_state_trajectories, dim=0)  # [n_sim, T+1, state_dim]
-    traj_obs = torch.stack(sim_observation_trajectories, dim=0)  # [n_sim, T, obs_dim]
+    test_state_trajectories: list[torch.Tensor] = []
+    test_observation_trajectories: list[torch.Tensor] = []
+    for _ in range(n_test_sims):
+        sim_true_states, sim_observations = simulate(
+            system,
+            init_state_sampler,
+            n_timesteps=n_timesteps_prop,
+            device=device,
+        )
+        test_state_trajectories.append(sim_true_states.detach())
+        test_observation_trajectories.append(sim_observations.detach())
+
+    traj_states = torch.stack(test_state_trajectories, dim=0)  # [n_test_sims, T+1, state_dim]
+    traj_obs = torch.stack(test_observation_trajectories, dim=0)  # [n_test_sims, T, obs_dim]
     test_traj_data = [traj_states[:, k, :] for k in range(traj_states.shape[1])]
     test_obs_data = [traj_obs[:, k, :] for k in range(traj_obs.shape[1])]
 
