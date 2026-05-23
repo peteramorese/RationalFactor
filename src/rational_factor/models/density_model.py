@@ -14,11 +14,11 @@ class DensityModel(torch.nn.Module):
     def _clip_log_density(self, log_density : torch.Tensor):
         return torch.nan_to_num(log_density, nan=self.min_log_density, neginf=self.min_log_density)
     
-    def forward(self, x : torch.Tensor):    
+    def forward(self, x : torch.Tensor, **contexts : torch.Tensor):
         assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        return torch.exp(self.log_density(x))
+        return torch.exp(self.log_density(x, **contexts))
 
-    def log_density(self, x : torch.Tensor):
+    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
         raise NotImplementedError("log_density not implemented")
 
     def valid(self):
@@ -27,7 +27,7 @@ class DensityModel(torch.nn.Module):
     def marginal(self, marginal_dims : tuple[int, ...]):
         raise NotImplementedError("marginal not implemented")
     
-    def sample(self, n_samples : int):
+    def sample(self, n_samples : int, **contexts : torch.Tensor):
         raise NotImplementedError("sample not implemented")
 
 class ConditionalDensityModel(torch.nn.Module):
@@ -40,25 +40,25 @@ class ConditionalDensityModel(torch.nn.Module):
     def _clip_log_density(self, log_density : torch.Tensor):
         return torch.nan_to_num(log_density, nan=self.min_log_density, neginf=self.min_log_density)
 
-    def forward(self, x : torch.Tensor, *, conditioner : torch.Tensor):
+    def forward(self, x : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
         """
-        Returns density of p(x | conditioner)
+        Returns density of p(x | conditioner, contexts).
         """
         assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
         assert conditioner.shape[1] == self.conditioner_dim, "conditioner must have shape (n_data, conditioner_dim)"
         assert x.shape[0] == conditioner.shape[0], "x and conditioner must have the same number of data points"
         
-        return torch.exp(self.log_density(x, conditioner=conditioner))
+        return torch.exp(self.log_density(x, conditioner=conditioner, **contexts))
 
-    def log_density(self, x : torch.Tensor, *, conditioner : torch.Tensor):
+    def log_density(self, x : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
         raise NotImplementedError("log_density not implemented")
 
     def valid(self):
         return True
     
-    def sample(self, conditioner : torch.Tensor):
+    def sample(self, conditioner : torch.Tensor, **contexts : torch.Tensor):
         """
-        Returns (n_samples, dim) tensor of samples
+        Returns (n_samples, dim) tensor of samples.
         """
         raise NotImplementedError("sample not implemented")
     
@@ -86,7 +86,7 @@ class LogisticSigmoid(DensityModel):
         self.register_buffer("loc", loc)
         self.register_buffer("scale", scale)
 
-    def log_density(self, x: torch.Tensor):
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor):
         tau = torch.as_tensor(self.temperature, dtype=x.dtype, device=x.device)
 
         loc = self.loc.to(dtype=x.dtype, device=x.device)

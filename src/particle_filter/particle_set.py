@@ -47,7 +47,7 @@ class ParticleSet(DensityModel):
         h = torch.clamp(std * factor, min=eps)
         return h
 
-    def log_density(self, x: torch.Tensor):
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor):
         """
         Standard Gaussian KDE with diagonal bandwidth.
         """
@@ -100,7 +100,7 @@ class WeightedParticleSet(ParticleSet):
             enable_resampling=self.enable_resampling,
         )
     
-    def sample(self, n_samples: int):
+    def sample(self, n_samples: int, **contexts: torch.Tensor):
         idx = torch.multinomial(self.weights, n_samples, replacement=True)
         return self.particles[idx]
 
@@ -131,7 +131,7 @@ class WeightedParticleSet(ParticleSet):
         h = torch.clamp(std * factor, min=eps)
         return h
     
-    def log_density(self, x: torch.Tensor):
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor):
         """
         Weighted Gaussian KDE with diagonal bandwidth.
 

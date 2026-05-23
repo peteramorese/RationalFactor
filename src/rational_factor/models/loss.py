@@ -10,11 +10,12 @@ def conditional_mle_loss(
     x : torch.Tensor,
     conditioner : torch.Tensor,
     method_name : str = "log_density",
+    **contexts : torch.Tensor,
 ):
     loss_method = getattr(model, method_name, None)
     if loss_method is None or not callable(loss_method):
         raise AttributeError(f"{type(model).__name__} has no callable method '{method_name}'")
-    return -loss_method(x, conditioner=conditioner).mean()
+    return -loss_method(x, conditioner=conditioner, **contexts).mean()
 
 def mle_loss(model : DensityModel, x : torch.Tensor):
     return -model.log_density(x).mean()

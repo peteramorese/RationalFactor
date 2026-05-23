@@ -3,6 +3,7 @@ from copy import deepcopy
 import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
+from .meta_forms import MLPMetaForm
 
 # Linear models #
 
@@ -33,7 +34,7 @@ class LinearForm(DensityModel):
         w = w_unnormalized / (Omega @ w_unnormalized + self.numerical_tolerance)
         return w
     
-    def log_density(self, x : torch.Tensor):
+    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
         w = self.get_w()
         log_g_x = torch.log(self.basis(x) @ w + self.numerical_tolerance) # (n_data)
 
@@ -83,7 +84,7 @@ class LinearRFF(ConditionalDensityModel):
 
         self.numerical_tolerance = numerical_tolerance
     
-    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
         x = conditioner
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
@@ -128,6 +129,83 @@ class LinearRFF(ConditionalDensityModel):
         return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
 
 
+
+class MLPContextLinearRFF(ConditionalDensityModel):
+    """
+    MLP Context Linear Rational Factor Form
+
+    Used for Markov transition with variable future factor dependencies dependent on a given context
+    """
+    def __init__(self, 
+            phi_mlp_form : MLPMetaForm,
+            psi_mlp_form : MLPMetaForm,
+            a_unconstrained_mlp_form : MLPMetaForm,
+            numerical_tolerance : float = 1e-20):
+
+        phi_dims = phi_mlp_form.context_dims()
+        psi_dims = psi_mlp_form.context_dims()
+        a_dims = a_unconstrained_mlp_form.context_dims()
+        phi_basis = phi_mlp_form.instantiate(**{key: torch.zeros(dim) for key, dim in phi_dims.items()})
+        psi_basis = psi_mlp_form.instantiate(**{key: torch.zeros(dim) for key, dim in psi_dims.items()})
+        a = a_unconstrained_mlp_form.instantiate(**{key: torch.zeros(dim) for key, dim in a_dims.items()})
+        assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
+        assert phi_basis.n_basis_functions() == psi_basis.n_basis_functions(), "phi_basis and psi_basis must have the same number of basis functions"
+        assert a.shape[0] == phi_basis.n_basis_functions(), "a must have n_phi elements"
+
+        super().__init__(phi_basis.dim(), psi_basis.dim())
+
+        self.phi_mlp_form = phi_mlp_form
+        self.psi_mlp_form = psi_mlp_form
+        self.a_unconstrained_mlp_form = a_unconstrained_mlp_form
+
+        self.numerical_tolerance = numerical_tolerance
+    
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
+        x = conditioner
+        u = contexts["u"]
+        up = contexts["up"]
+        phi_x = self.phi_mlp_form(u=u, x=x) # (n_data, n_phi)
+        phi_xp = self.phi_mlp_form(u=up, x=xp) # (n_data, n_phi)
+        psi_xp = self.psi_mlp_form(u=u, up=up, x=xp) # (n_data, n_psi)
+        
+        a_curr = self.get_a(u)
+        a_next = self.get_a(up)
+        b = self.get_b(a_curr=a_curr, a_next=a_next, u=u, up=up)
+        
+        # Calculate g(x)
+        log_g_x = torch.log(phi_x @ a_curr + self.numerical_tolerance) # (n_data)
+        log_g_xp = torch.log(phi_xp @ a_next + self.numerical_tolerance) # (n_data)
+
+        # Calculate f(x, x')
+        log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
+
+        return log_g_xp + log_f - log_g_x
+
+    def get_a(self, u : torch.Tensor):
+        au = self.a_unconstrained_mlp_form(u=u)
+        return torch.nn.functional.softmax(au, dim=0)
+
+    def get_b(self, u : torch.Tensor, up : torch.Tensor, a_curr : torch.Tensor = None, a_next : torch.Tensor = None, Omega : torch.Tensor = None):
+        if Omega is None:
+            next_phi_basis = self.phi_mlp_form.instantiate(u=up)
+            psi_basis = self.psi_mlp_form.instantiate(u=u, up=up)
+            Omega = next_phi_basis.Omega2(psi_basis)
+
+        if a_curr is None:
+            a_curr = self.get_a(u)
+        if a_next is None:
+            a_next = self.get_a(up)
+
+        b = a_curr / (Omega.T @ a_next + self.numerical_tolerance)
+
+        return b
+
+    def weight_params(self):
+        return self.a_unconstrained_mlp_form.parameters()
+    
+    def basis_params(self):
+        return itertools.chain(self.phi_mlp_form.parameters(), self.psi_mlp_form.parameters())
+
 class LinearRF(ConditionalDensityModel):
     """
     Linear Rational Form
@@ -162,7 +240,7 @@ class LinearRF(ConditionalDensityModel):
             return d / (Omega + self.numerical_tolerance)
         return d
 
-    def log_density(self, o : torch.Tensor, *, conditioner : torch.Tensor):
+    def log_density(self, o : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
         x = conditioner
         xi_x = self.xi_basis(x)
         zeta_o = self.zeta_basis(o)
@@ -217,7 +295,7 @@ class LinearR2FF(ConditionalDensityModel):
         d = rf.get_d().detach().clone()
         return cls(d, xi_basis, phi_basis, psi_basis, rf.numerical_tolerance)
     
-    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
         x = conditioner
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         xi_xp = self.xi_basis(xp)  # (n_data, n_xi)
@@ -313,7 +391,7 @@ class LinearRFandR2FF(LinearR2FF):
             return d / (Omega + self.numerical_tolerance)
         return d
 
-    def log_observation_density(self, o : torch.Tensor, *, conditioner : torch.Tensor):
+    def log_observation_density(self, o : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
         x = conditioner
         xi_x = self.xi_basis(x)
         zeta_o = self.zeta_basis(o)
@@ -369,8 +447,6 @@ class LinearRFandR2FF(LinearR2FF):
             self.psi_basis,
             numerical_tolerance=self.numerical_tolerance,
         )
-
-
 
 
 class LinearFF(DensityModel):
@@ -432,7 +508,7 @@ class LinearFF(DensityModel):
 
         return norm_constant * c0_unnormalized
         
-    def log_density(self, x : torch.Tensor):
+    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         psi0_x = self.psi0_basis(x) # (n_data, n_psi)
 
@@ -465,6 +541,63 @@ class LinearFF(DensityModel):
     
     def basis_params(self):
         return self.psi0_basis.parameters()
+
+
+class MLPContextLinearFF(ConditionalDensityModel):
+    """
+    Linear Factor Form
+
+    Used for belief representation for propagation only models
+    """
+    def __init__(self, a_unconstrained_mlp_form : MLPMetaForm, phi_mlp_form : MLPMetaForm, psi0_mlp_form : MLPMetaForm, c0_unconstrained_mlp_form : MLPMetaForm, numerical_tolerance : float = 1e-20):
+        super().__init__(phi_mlp_form.dim(), psi0_mlp_form.dim())
+
+        self.phi_mlp_form = phi_mlp_form.freeze_params() 
+        self.a_unconstrained_mlp_form = a_unconstrained_mlp_form.freeze_params()
+        self.psi0_mlp_form = psi0_mlp_form
+        self.c0_unconstrained_mlp_form = c0_unconstrained_mlp_form
+        
+        self.numerical_tolerance = numerical_tolerance
+    
+    @classmethod
+    def from_rff(cls, rff : MLPContextLinearRFF, psi0_mlp_form : MLPMetaForm, c0_unconstrained_mlp_form : MLPMetaForm):
+        return cls(rff.a_unconstrained_mlp_form, rff.phi_mlp_form, psi0_mlp_form, c0_unconstrained_mlp_form, numerical_tolerance=rff.numerical_tolerance)
+
+    def get_a(self, up : torch.Tensor):
+        return torch.nn.functional.softmax(self.a_unconstrained_mlp_form(u=up), dim=0)
+
+    def get_c0(self, up : torch.Tensor, Omega_0 : torch.Tensor = None, a : torch.Tensor = None):
+        if Omega_0 is None:
+            phi_basis = self.phi_mlp_form.instantiate(u=up)
+            psi0_basis = self.psi0_mlp_form.instantiate(up=up)
+            Omega_0 = phi_basis.Omega2(psi0_basis)
+        
+        c0_unnormalized = torch.nn.functional.softplus(self.c0_unconstrained_mlp_form(up=up))
+        if a is None:
+            a = self.get_a(up=up)
+        
+        norm_constant = 1.0 / (a @ Omega_0 @ c0_unnormalized + self.numerical_tolerance)
+
+        return norm_constant * c0_unnormalized
+        
+    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
+        up = contexts["up"]
+        phi_x = self.phi_mlp_form(u=up, x=x) # (n_data, n_phi)
+        psi0_x = self.psi0_mlp_form(up=up, x=x) # (n_data, n_psi)
+
+        a = self.get_a(up=up)
+        c0 = self.get_c0(up=up, a=a)
+
+        log_g_x = torch.log(phi_x @ a + self.numerical_tolerance) # (n_data)
+        log_h0_x = torch.log(psi0_x @ c0 + self.numerical_tolerance)
+
+        return log_g_x + log_h0_x
+
+    def weight_params(self):
+        return self.c0_unconstrained_mlp_form.parameters()
+    
+    def basis_params(self):
+        return self.psi0_mlp_form.parameters()
 
 
 class Linear2FF(DensityModel):
@@ -531,7 +664,7 @@ class Linear2FF(DensityModel):
 
         return norm_constant * c0_unnormalized
         
-    def log_density(self, x : torch.Tensor):
+    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
         xi_x = self.xi_basis(x) # (n_data, n_xi)
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         psi0_x = self.psi0_basis(x) # (n_data, n_psi)
@@ -607,7 +740,7 @@ class QuadraticRFF(ConditionalDensityModel):
 
         return B
 
-    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
         x = conditioner
         phi_x = self.phi_basis(x) # (n_data, n_phi)
         phi_xp = self.phi_basis(xp) # (n_data, n_phi)
@@ -679,7 +812,7 @@ class QuadraticFF(DensityModel):
         
         return norm_constant * C0_unnormalized
     
-    def log_density(self, x : torch.Tensor):
+    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
         phi_x = self.phi_basis(x)
         psi0_x = self.psi0_basis(x) # (n_data, n_psi)
 

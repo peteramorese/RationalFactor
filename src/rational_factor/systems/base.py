@@ -44,6 +44,35 @@ class DiscreteTimeStochasticSystem(torch.nn.Module):
     def state_label(self, i : int):
         return self._state_labels[i]
 
+class ControllableStochasticSystem(DiscreteTimeStochasticSystem):
+    def __init__(self, state_dim : int, control_dim : int, state_labels : list[str] = None, control_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None):
+        super().__init__(state_dim, state_labels, v_dist)
+        self._control_dim = control_dim
+        if control_labels is not None:
+            assert len(control_labels) == control_dim, "control_labels must be a list of length control_dim"
+            self._control_labels = control_labels
+        else:
+            self._control_labels = [f"u{i}" for i in range(control_dim)]
+
+    def next_state(self, x : torch.Tensor, u : torch.Tensor, v : torch.Tensor):
+        """
+        Args:
+            x : current state
+            u : control input
+            v : realization of the noise parameters
+        """
+        raise NotImplementedError("next_state not implemented")
+
+    def forward(self, x : torch.Tensor, u : torch.Tensor):
+        v = self._sample_v()  # Sample a random v to be plugged into the difference function
+        return self.next_state(x, u, v.to(device=x.device, dtype=x.dtype))
+
+    def control_dim(self):
+        return self._control_dim
+
+    def control_label(self, i : int):
+        return self._control_labels[i]
+
 class PartiallyObservableSystem(DiscreteTimeStochasticSystem):
     def __init__(self, state_dim : int, observation_dim : int, state_labels : list[str] = None, observation_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None, w_dist : torch.distributions.Distribution | None = None):
         super().__init__(state_dim, state_labels, v_dist)
@@ -107,11 +136,11 @@ class SystemObservationDistribution(ConditionalDensityModel):
         super().__init__(system.observation_dim(), system.dim())
         self._system = system
 
-    def log_density(self, o : torch.Tensor, *, conditioner : torch.Tensor):
+    def log_density(self, o: torch.Tensor, *, conditioner: torch.Tensor):
         x = conditioner
         return self._system.log_observation_likelihood(x, o)
     
-    def sample(self, conditioner : torch.Tensor):
+    def sample(self, conditioner: torch.Tensor):
         x = conditioner
         return self._system.observe(x)
 
@@ -136,7 +165,7 @@ def simulate(system, initial_state_sampler, n_timesteps: int, device : torch.dev
     else:
         return torch.stack(true_states).to(device=device)
 
-def sample_trajectories(system : DiscreteTimeStochasticSystem, initial_state_sampler, n_timesteps : int, n_trajectories : int):
+def sample_trajectories(system : DiscreteTimeStochasticSystem | ControllableStochasticSystem, initial_state_sampler, n_timesteps : int, n_trajectories : int, controller = None):
     """
     Sample trajectory data from a system under an initial state distribution
 
@@ -145,13 +174,17 @@ def sample_trajectories(system : DiscreteTimeStochasticSystem, initial_state_sam
         initial_state_sampler : callable that takes in an integer n and returns n randomly sampled initial states
         n_timesteps : time horizon of each trajectory
         n_trajectories : number of trajectories to sample
+        controller : callable that takes in a time step k and returns the control input u_k applied when advancing x_k -> x_{k+1}, default is None
 
     Returns:
         traj_data (list) : list of length n_timesteps marginal data sets indexed by time step
     """
+    if controller is not None:
+        assert isinstance(system, ControllableStochasticSystem), "System must be a ControllableStochasticSystem if controller is not None"
 
     dim = system.dim()
     traj_data = [torch.zeros((n_trajectories, dim)) for _ in range(n_timesteps + 1)]
+
 
     # Sample initial conditions
     traj_data[0] = initial_state_sampler(n_trajectories)
@@ -159,19 +192,23 @@ def sample_trajectories(system : DiscreteTimeStochasticSystem, initial_state_sam
     for k in range(n_timesteps):
         for i in range(n_trajectories):
             xk = traj_data[k][i, :]
-            xkp1 = system(xk)
+            if controller is None:
+                xkp1 = system(xk)
+            else:
+                u_k = controller(k)
+                xkp1 = system(xk, u_k)
             traj_data[k + 1][i, :] = xkp1
 
     return traj_data
 
 def sample_io_pairs(system : DiscreteTimeStochasticSystem, prev_state_sampler, n_pairs : int):
     """
-    Sample input (x', x) pairs from a system model, where the starting state x is sampled uniformly from a specified region
+    Sample input (x, x') pairs from a system model, where the starting state x is sampled from prev_state_sampler
 
     Args:
         system : system model 
         prev_state_sampler : callable that takes in an integer n and returns n randomly sampled previous states
-        n_pairs : number of input (x', x) pairs to sample
+        n_pairs : number of input (x, x') pairs to sample
     """
     x_data = prev_state_sampler(n_pairs)
     xp_data = torch.zeros_like(x_data)
@@ -179,6 +216,18 @@ def sample_io_pairs(system : DiscreteTimeStochasticSystem, prev_state_sampler, n
         xp_data[i, :] = system(x_data[i, :])
     
     return x_data, xp_data
+
+def sample_uio_tuples(system : ControllableStochasticSystem, prev_state_sampler, control_sampler, n_pairs : int):
+    """
+    Sample input (x, x', u) tuples from a system model, where the starting state x is sampled from prev_state_sampler
+    and the control input u is sampled from control_sampler
+    """
+    u_data = control_sampler(n_pairs)
+    x_data = prev_state_sampler(n_pairs)
+    xp_data = torch.zeros_like(x_data)
+    for i in range(n_pairs):
+        xp_data[i, :] = system(x_data[i, :], u_data[i, :])
+    return u_data, x_data, xp_data
 
 def sample_observation_pairs(system : PartiallyObservableSystem, state_sampler, n_pairs : int):
     """

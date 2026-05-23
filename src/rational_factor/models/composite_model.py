@@ -13,19 +13,19 @@ class CompositeDensityModel(DensityModel):
         self.domain_tfs = torch.nn.ModuleList(domain_tfs)
         self.density_model = density_model
     
-    def log_density(self, x: torch.Tensor, debug = False):
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor):
         z_i = x
         total_ladj = x.new_zeros(x.shape[0])
         for tf in self.domain_tfs:
             z_i, ladj = tf(z_i)
             total_ladj = total_ladj + ladj
-        return self._clip_log_density(self.density_model.log_density(z_i) + total_ladj)
+        return self._clip_log_density(self.density_model.log_density(z_i, **contexts) + total_ladj)
     
     def valid(self):
         return self.density_model.valid()
     
-    def sample(self, n_samples: int):
-        z_samples = self.density_model.sample(n_samples)
+    def sample(self, n_samples: int, **contexts: torch.Tensor):
+        z_samples = self.density_model.sample(n_samples, **contexts)
         x = z_samples
         for tf in reversed(self.domain_tfs):
             x, _ = tf.inverse(x)
@@ -46,7 +46,7 @@ class CompositeConditionalModel(ConditionalDensityModel):
         self.conditional_density_model = conditional_density_model
         self.tf_conditioner_only = tf_conditioner_only
         
-    def log_density(self, xp : torch.Tensor, *, conditioner: torch.Tensor):
+    def log_density(self, xp: torch.Tensor, *, conditioner: torch.Tensor, **contexts: torch.Tensor):
         z = conditioner
         zp = xp
         total_ladj = xp.new_zeros(xp.shape[0])
@@ -55,16 +55,18 @@ class CompositeConditionalModel(ConditionalDensityModel):
             if not self.tf_conditioner_only:
                 zp, ladj = tf(zp)
                 total_ladj = total_ladj + ladj
-        return self._clip_log_density(self.conditional_density_model.log_density(zp, conditioner=z) + total_ladj)
+        return self._clip_log_density(
+            self.conditional_density_model.log_density(zp, conditioner=z, **contexts) + total_ladj
+        )
     
     def valid(self):
         return self.conditional_density_model.valid()
     
-    def sample(self, conditioner: torch.Tensor):
+    def sample(self, conditioner: torch.Tensor, **contexts: torch.Tensor):
         z = conditioner
         for tf in self.domain_tfs:
             z, _ = tf(z)
-        zp = self.conditional_density_model.sample(z)
+        zp = self.conditional_density_model.sample(z, **contexts)
         xpi = zp
         for tf in reversed(self.domain_tfs):
             xpi, _ = tf.inverse(xpi)
@@ -86,16 +88,14 @@ class CompositeRFandR2FF(CompositeConditionalModel):
         super().__init__(domain_tfs, rf_and_r2ff)
         self.rf_and_r2ff = rf_and_r2ff
 
-    def log_density(self, xp : torch.Tensor, *, conditioner: torch.Tensor):
-        # Preserve CompositeConditionalModel behavior: transform both xp and conditioner.
-        return super().log_density(xp, conditioner=conditioner)
+    def log_density(self, xp: torch.Tensor, *, conditioner: torch.Tensor, **contexts: torch.Tensor):
+        return super().log_density(xp, conditioner=conditioner, **contexts)
     
-    def log_observation_density(self, o : torch.Tensor, *, conditioner: torch.Tensor):
-        # Only transform the conditioner
+    def log_observation_density(self, o: torch.Tensor, *, conditioner: torch.Tensor, **contexts: torch.Tensor):
         z = conditioner
         for tf in self.domain_tfs:
             z, _ = tf(z)
-        return self.rf_and_r2ff.log_observation_density(o, conditioner=z)
+        return self.rf_and_r2ff.log_observation_density(o, conditioner=z, **contexts)
 
     def tran_weight_params(self):
         return self.rf_and_r2ff.tran_weight_params()

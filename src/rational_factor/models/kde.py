@@ -29,14 +29,14 @@ class BaseGaussianKDE(DensityModel):
         log_norm = -0.5 * d * math.log(2.0 * math.pi) - d * torch.log(kernel_bandwidths)[None, :]
         return log_norm - 0.5 * sq_norm
 
-    def log_density(self, x: torch.Tensor):
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor):
         assert x.ndim == 2 and x.shape[1] == self.dim, f"x must have shape (n_data, {self.dim})"
         n = self.data.shape[0]
         h = self._kernel_bandwidths(dtype=x.dtype, device=x.device).clamp_min(self._eps)
         log_k = self._log_kernel(x=x, centers=self.data, kernel_bandwidths=h)
         return torch.logsumexp(log_k, dim=1) - math.log(n)
 
-    def sample(self, n_samples: int):
+    def sample(self, n_samples: int, **contexts: torch.Tensor):
         assert n_samples > 0, "n_samples must be positive"
         idx = torch.randint(low=0, high=self.data.shape[0], size=(n_samples,), device=self.data.device)
         h = self._kernel_bandwidths(dtype=self.data.dtype, device=self.data.device).clamp_min(self._eps)

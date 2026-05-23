@@ -750,7 +750,49 @@ class Aircraft(DiscreteTimeStochasticSystem):
     with ``x_physical = x * state_scale`` elementwise; all internal dynamics, the
     waypoint, ``V_ref``, masses, etc. stay in SI. Returned states are again divided
     by ``state_scale``. Default is all ones (physical state in SI).
+
+    Class attributes ``STATE_SCALE``, ``INIT_*``, ``PREV_*``, and ``PLOT_BOUNDS_*``
+    hold the training-problem configuration (physical SI units unless noted).
     """
+
+    # Per-axis SI → dimensionless state: x_phys = x_norm * scale.
+    STATE_SCALE = torch.tensor(
+        [140.0, 110.0, 26.0, 4.5, 4.5, 4.0, 1.0, 1.0, 1.0, 0.55, 0.55, 0.55],
+        dtype=torch.float32,
+    )
+    # Diagonal training covariances are diag(std**2) per axis (physical units).
+    INIT_STD = torch.tensor(
+        [100.0, 100.0, 32.0, 8.0, 3.5, 5.5, 0.06, 0.08, 0.35, 0.45, 0.45, 0.45],
+        dtype=torch.float32,
+    )
+    PREV_STD = torch.tensor(
+        [340.0, 340.0, 95.0, 30.0, 20.0, 20.0, 0.55, 0.52, 2.2, 3.0, 3.0, 3.0],
+        dtype=torch.float32,
+    )
+    INIT_MEAN_PHYS = torch.tensor(
+        [0.0, 0.0, 100.0, 21.5, 0.0, -1.2, 0.0, 0.06, 0.45, 0.0, 0.0, 0.0],
+        dtype=torch.float32,
+    )
+    PREV_MEAN_PHYS = torch.tensor(
+        [150.0, 80.0, 95.0, 20.0, 0.0, -1.0, 0.0, 0.05, 0.4, 0.0, 0.0, 0.0],
+        dtype=torch.float32,
+    )
+    PLOT_BOUNDS_LOW_PHYS = torch.tensor(
+        [-300.0, -300.0, 10.0, 5.0, -25.0, -25.0, -1.0, -0.75, -3.2, -3.5, -3.5, -3.5],
+        dtype=torch.float32,
+    )
+    PLOT_BOUNDS_HIGH_PHYS = torch.tensor(
+        [1400.0, 1100.0, 260.0, 42.0, 25.0, 25.0, 1.0, 0.75, 3.2, 3.5, 3.5, 3.5],
+        dtype=torch.float32,
+    )
+    DEFAULT_WAYPOINT = torch.tensor([800.0, 400.0, 120.0], dtype=torch.float32)
+
+    INIT_MEAN = INIT_MEAN_PHYS / STATE_SCALE
+    PREV_MEAN = PREV_MEAN_PHYS / STATE_SCALE
+    INIT_STD_NORM = INIT_STD / STATE_SCALE
+    PREV_STD_NORM = PREV_STD / STATE_SCALE
+    PLOT_BOUNDS_LOW = PLOT_BOUNDS_LOW_PHYS / STATE_SCALE
+    PLOT_BOUNDS_HIGH = PLOT_BOUNDS_HIGH_PHYS / STATE_SCALE
 
     def __init__(
         self,
@@ -849,7 +891,7 @@ class Aircraft(DiscreteTimeStochasticSystem):
         self.Jinv = torch.linalg.inv(self.J)
 
         if waypoint is None:
-            waypoint = torch.tensor([800.0, 400.0, 120.0], dtype=torch.float32)
+            waypoint = self.DEFAULT_WAYPOINT
         self.waypoint = torch.as_tensor(waypoint, dtype=torch.float32).reshape(3)
 
         # Aerodynamic coefficients (stable conventional configuration)
