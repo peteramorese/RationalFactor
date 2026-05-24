@@ -57,8 +57,9 @@ class Parameters(torch.nn.Module):
     def forward(self):
         return self._p
 
-    def freeze_params(self):
-        return self.__class__(fixed_values=self.forward().detach().clone())
+    def set_requires_grad(self, requires_grad: bool):
+        if self._p.is_leaf:
+            self._p.requires_grad_(requires_grad)
 
 
 class PositiveParameters(Parameters):
@@ -66,7 +67,7 @@ class PositiveParameters(Parameters):
         self,
         trainable_init_values: torch.Tensor = None,
         fixed_values: torch.Tensor = None,
-        normalized: bool = True,
+        normalized: bool = False,
         epsilon: float = 0.0,
     ):
         super().__init__(trainable_init_values=trainable_init_values, fixed_values=fixed_values)
@@ -75,7 +76,8 @@ class PositiveParameters(Parameters):
         if not self._trainable:
             assert torch.all(fixed_values >= 0), "fixed_values must be nonnegative"
             if normalized:
-                self._p = self._normalize(self._p)
+                with torch.no_grad():
+                    self._p.copy_(self._normalize(self._p, dim=-1))
     
     @classmethod
     def random_init(
@@ -84,7 +86,7 @@ class PositiveParameters(Parameters):
         trainable: bool = True,
         mean: float = 0.0,
         std: float = 1.0,
-        normalized: bool = True,
+        normalized: bool = False,
         epsilon: float = 0.0,
     ):
         values = torch.randn(*shape) * std + mean
@@ -93,25 +95,25 @@ class PositiveParameters(Parameters):
         return cls(fixed_values=values, normalized=normalized, epsilon=epsilon)
 
     @classmethod
-    def set_init(cls, shape: tuple[int, ...], value: float, trainable: bool = True, normalized: bool = True, epsilon: float = 0.0):
+    def set_init(cls, shape: tuple[int, ...], value: float, trainable: bool = True, normalized: bool = False, epsilon: float = 0.0):
         values = torch.ones(shape) * value
         if trainable:
             return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
         return cls(fixed_values=values, normalized=normalized, epsilon=epsilon)
 
     @classmethod
-    def from_values(cls, values: torch.Tensor, trainable: bool = True, normalized: bool = True, epsilon: float = 0.0):
+    def from_values(cls, values: torch.Tensor, trainable: bool = True, normalized: bool = False, epsilon: float = 0.0):
         if trainable:
             return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
         return cls(fixed_values=values.detach().clone(), normalized=normalized, epsilon=epsilon)
 
-    def _normalize(self, p: torch.Tensor, dim: int = 0):
+    def _normalize(self, p: torch.Tensor, dim: int = -1):
         return self._epsilon + (1.0 - p.shape[dim] * self._epsilon) * torch.nn.functional.softmax(p, dim=dim)
 
     def forward(self):
         if self._trainable:
             if self._normalized:
-                return self._normalize(self._p)
+                return self._normalize(self._p, dim=-1)
             return self._epsilon + torch.nn.functional.softplus(self._p)
         return self._p
 
@@ -344,6 +346,11 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         highs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Inner product matrix Omega2 from mean/std tensors, optionally batched over leading dim."""
+        if mu1.dim() != mu2.dim() or std1.dim() != std2.dim():
+            raise ValueError(
+                f"means/stds batch ranks must match: mu1 {mu1.dim()}D, mu2 {mu2.dim()}D, "
+                f"std1 {std1.dim()}D, std2 {std2.dim()}D."
+            )
         if mu1.dim() == 2:
             mu1_b = mu1[:, :, None]
             std1_b = std1[:, :, None]

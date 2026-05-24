@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 from torch.func import functional_call
@@ -5,14 +7,81 @@ from collections import OrderedDict
 from typing import Mapping
 from copy import copy, deepcopy
 from .domain_transformation import MLP
-from .basis_functions import PositiveParameters, GaussianBasis, Parameters
+from .basis_functions import Parameters
+
+def _holder_path_from_param_name(param_name: str) -> str:
+    if param_name.endswith("._p"):
+        return param_name[: -len("._p")]
+    return param_name
 
 
-def _coeff_param_name(param_shapes: dict[str, tuple[int, ...]]) -> str:
-    coeff_names = [name for name in param_shapes if name.endswith("coeffs._p")]
-    if not coeff_names:
-        raise ValueError("Target module has no coefficient parameters in the meta-form layout.")
-    return coeff_names[0]
+def layout_param_shapes(target_module: nn.Module) -> OrderedDict[str, tuple[int, ...]]:
+    """
+    Shapes of all ``._p`` tensors the hypernetwork predicts for ``target_module``.
+
+    Includes ``Parameters`` holders stored as buffers (``trainable=False``) as well as
+    ``nn.Parameter`` entries, so ``functional_call`` can replace every layout slot.
+    """
+    shapes = OrderedDict((name, tuple(param.shape)) for name, param in target_module.named_parameters())
+    for name, module in target_module.named_modules():
+        if not isinstance(module, Parameters):
+            continue
+        key = f"{name}._p" if name else "_p"
+        if key not in shapes:
+            shapes[key] = tuple(module._p.shape)
+    return shapes
+
+
+def _clone_module(module: nn.Module) -> nn.Module:
+    """Clone an ``nn.Module`` tree with detached leaf parameter/buffer tensors."""
+    cloned = module.__new__(type(module))
+    nn.Module.__init__(cloned)
+
+    for name, child in module.named_children():
+        cloned.add_module(name, _clone_module(child))
+
+    for name, param in module._parameters.items():
+        if param is not None:
+            cloned.register_parameter(
+                name,
+                nn.Parameter(param.detach().clone(), requires_grad=param.requires_grad),
+            )
+
+    for name, buf in module._buffers.items():
+        if buf is not None:
+            cloned.register_buffer(name, buf.detach().clone())
+
+    skip_names = {
+        "_parameters",
+        "_buffers",
+        "_modules",
+        "_backward_hooks",
+        "_backward_pre_hooks",
+        "_forward_hooks",
+        "_forward_hooks_with_kwargs",
+        "_forward_pre_hooks",
+        "_forward_pre_hooks_with_kwargs",
+        "_state_dict_hooks",
+        "_state_dict_pre_hooks",
+        "_load_state_dict_pre_hooks",
+        "_non_persistent_buffers_set",
+    }
+    for name, value in vars(module).items():
+        if name in skip_names or isinstance(value, nn.Module):
+            continue
+        if isinstance(value, torch.Tensor):
+            setattr(cloned, name, value.detach().clone())
+            continue
+        if isinstance(value, dict):
+            setattr(cloned, name, deepcopy(value))
+            continue
+        if isinstance(value, (list, tuple)):
+            setattr(cloned, name, type(value)(deepcopy(value)))
+            continue
+        setattr(cloned, name, copy.copy(value))
+
+    return cloned
+
 
 class MethodCaller(nn.Module):
     """Invoke a method on ``target_module`` under ``functional_call`` param swapping."""
@@ -122,12 +191,8 @@ class MLPMetaForm(nn.Module):
         for param in self.target_module.parameters():
             param.requires_grad_(False)
 
-        self.param_shapes = {
-            name: p.shape for name, p in target_module.named_parameters()
-        }
-        self.param_sizes = {
-            name: p.numel() for name, p in target_module.named_parameters()
-        }
+        self.param_shapes = dict(layout_param_shapes(target_module))
+        self.param_sizes = {name: math.prod(shape) for name, shape in self.param_shapes.items()}
 
         self._dim = target_module_dim
         output_dim = sum(self.param_sizes.values())
@@ -232,60 +297,25 @@ class MLPMetaForm(nn.Module):
 
         return params
 
-    def coeff_values(self, **context) -> torch.Tensor:
-        """Return normalized basis coefficients for single or batched context."""
-        params = self.get_params(**context)
-        raw = params[_coeff_param_name(self.param_shapes)]
-        coeffs_holder = self.target_module.coeffs
-        if isinstance(coeffs_holder, PositiveParameters):
-            normalize_dim = -1 if raw.dim() > 1 else 0
-            if coeffs_holder.is_normalized():
-                return coeffs_holder._normalize(raw, dim=normalize_dim)
-            return coeffs_holder._epsilon + torch.nn.functional.softplus(raw)
-        return raw
-
-    def means_stds(self, **context) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decoded mean/std tensors for single or batched context."""
-        params = self.get_params(**context)
-        mean = params["_params.0._p"]
-        std_raw = params["_params.1._p"]
-        std_holder = self.target_module._params[1]
-        if isinstance(std_holder, PositiveParameters):
-            std = std_holder._epsilon + torch.nn.functional.softplus(std_raw)
-        else:
-            std = std_raw
-        return mean, std
-
-    def omega2(
+    def decode_params(
         self,
-        other: "MLPMetaForm",
-        ignore_coeffs: bool = False,
-        lows: torch.Tensor | None = None,
-        highs: torch.Tensor | None = None,
+        params: Mapping[str, torch.Tensor] | None = None,
         **context: torch.Tensor,
-    ) -> torch.Tensor:
-        """Vectorized Omega2 between this basis and another meta-form basis."""
-        self_ctx = {key: context[key] for key in self._context_keys}
-        other_ctx = {key: context[key] for key in other._context_keys}
-        mu1, std1 = self.means_stds(**self_ctx)
-        mu2, std2 = other.means_stds(**other_ctx)
+    ) -> dict[str, torch.Tensor]:
+        """
+        Apply each layout holder's ``forward`` to raw MLP outputs (same decode as inference).
 
-        coeffs1 = None
-        coeffs2 = None
-        if not ignore_coeffs:
-            if self.target_module.has_coeffs():
-                coeffs1 = self.coeff_values(**self_ctx)
-            if other.target_module.has_coeffs():
-                coeffs2 = other.coeff_values(**other_ctx)
+        Keys match ``get_params`` / ``param_shapes``. Gradients flow through softplus,
+        softmax, etc., into the MLP when ``params`` comes from ``get_params``.
+        """
+        if params is None:
+            params = self.get_params(**context)
 
-        return GaussianBasis.omega2_from_means_stds(
-            mu1, std1, mu2, std2,
-            ignore_coeffs=ignore_coeffs,
-            coeffs1=coeffs1,
-            coeffs2=coeffs2,
-            lows=lows,
-            highs=highs,
-        )
+        decoded: dict[str, torch.Tensor] = {}
+        for name in self.param_shapes:
+            holder = self.target_module.get_submodule(_holder_path_from_param_name(name))
+            decoded[name] = functional_call(holder, {"_p": params[name]}, (), strict=False)
+        return decoded
 
     def forward(self, *inputs, **kwargs) -> torch.Tensor:
         """
@@ -301,14 +331,13 @@ class MLPMetaForm(nn.Module):
         return functional_call(self.target_module, params, inputs, kwargs)
 
     def instantiate(self, **context) -> FunctionalModuleProxy:
-        context = self._validate_context_kwargs(**context)
-        for key, value in context.items():
-            if value.ndim > 1:
-                raise ValueError(
-                    f"instantiate expects a single context for '{key}'. "
-                    "Use get_params for batched contexts."
-                )
+        """
+        Build a functional proxy for the target module at the given context.
 
+        Context may be scalar or batched (leading batch dimension); batched params
+        are passed through ``functional_call`` so target methods (e.g. ``coeff_values``,
+        ``Omega2``) run with the correct per-context decode.
+        """
         params = self.get_params(**context)
         buffers = dict(self.target_module.named_buffers())
 
@@ -320,20 +349,42 @@ class MLPMetaForm(nn.Module):
         )
     
     def freeze_params(self) -> "MLPMetaForm":
-        """Deep copy with MLP and target frozen for use as a fixed hypernetwork."""
-        frozen = deepcopy(self)
+        """Detached copy with all parameters frozen for use as a fixed hypernetwork."""
+        frozen = _clone_module(self)
         for param in frozen.parameters():
             param.requires_grad_(False)
         return frozen
 
+    def set_requires_grad(self, requires_grad: bool):
+        """
+        Toggle gradients on the hypernetwork MLP only.
+
+        ``target_module`` layout tensors are placeholders (overwritten by
+        ``functional_call``); they are already frozen in ``__init__`` and may
+        include non-leaf storages if misconfigured.
+        """
+        for param in self.mlp.parameters():
+            param.requires_grad_(requires_grad)
+
     @staticmethod
-    def target_param_dict_from_basis(basis: nn.Module) -> dict[str, torch.Tensor]:
-        """Snapshot basis layout tensors for MSE targets (matches ``param_shapes`` keys)."""
-        targets = {name: param.detach().clone() for name, param in basis.named_parameters()}
-        for name, module in basis.named_modules():
-            if not isinstance(module, Parameters):
-                continue
-            key = f"{name}._p" if name else "_p"
-            if key not in targets:
-                targets[key] = module._p.detach().clone()
+    def target_param_dict_from_basis(
+        basis: nn.Module,
+        layout: nn.Module | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Decoded parameter targets for meta-form MSE pretraining (keys match ``layout``).
+
+        Each entry is ``basis`` holder ``forward()`` output (e.g. EM std scales, mixture
+        weights), aligned with ``decode_params`` on MLP-predicted raw ``_p`` values.
+        """
+        layout = layout if layout is not None else basis
+        targets: dict[str, torch.Tensor] = {}
+
+        for name in layout_param_shapes(layout):
+            holder = basis.get_submodule(_holder_path_from_param_name(name))
+            if not isinstance(holder, Parameters):
+                raise TypeError(
+                    f"Expected Parameters holder for '{name}', got {type(holder).__name__}."
+                )
+            targets[name] = holder().detach()
         return targets

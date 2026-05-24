@@ -18,6 +18,13 @@ def _batch_to_device(batch, dev):
         return tuple(b.to(dev) for b in batch)
     return batch.to(dev)
 
+
+def _clip_grad_norm(model: torch.nn.Module, max_norm: float) -> None:
+    """Clip gradients for trainable leaf parameters only (avoids frozen/non-leaf warnings)."""
+    params = [p for p in model.parameters() if p.requires_grad and p.is_leaf]
+    if params:
+        torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
+
 @torch.no_grad()
 def _evaluate_labeled_losses(
     model: DensityModel | ConditionalDensityModel,
@@ -217,7 +224,7 @@ def train(model : DensityModel | ConditionalDensityModel,
         losses = [loss_fn(model, *args) for loss_fn in loss_fns]
         total_loss = sum(losses)
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+        _clip_grad_norm(model, clip_grad_norm)
         optimizer.step()
         return total_loss.item(), losses
 
@@ -378,7 +385,7 @@ def train_multiset(model : DensityModel | ConditionalDensityModel,
             dataset_losses.append(curr_dataset_losses)
 
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+        _clip_grad_norm(model, clip_grad_norm)
         optimizer.step()
         return total_loss.item(), combined_losses, dataset_losses
 

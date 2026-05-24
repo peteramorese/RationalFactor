@@ -26,8 +26,9 @@ def mlp_init_mle_loss(model, x, up):
 
 
 def mlp_meta_form_param_mse_loss(mlp_form, target_params, **context):
-    """MSE between ``mlp_form.get_params`` and fixed targets (meta-form layout)."""
-    pred_params = mlp_form.get_params(**context)
+    """MSE between decoded MLP parameters and fixed decoded targets."""
+    raw_params = mlp_form.get_params(**context)
+    pred_params = mlp_form.decode_params(raw_params)
     return loss.mse_loss(
         pred_params,
         target_params,
@@ -98,7 +99,9 @@ if __name__ == "__main__":
     basis_shape = (d, n_basis)
 
     g_means = Parameters.random_init(basis_shape, trainable=True, mean=0.0, std=1.0).to(device)
-    g_stds = PositiveParameters.random_init(basis_shape, trainable=True, mean=1.0, std=0.1, epsilon=1e-6).to(device)
+    g_stds = PositiveParameters.set_init(
+        basis_shape, value=1.0, trainable=False, normalized=False, epsilon=1e-6
+    ).to(device)
     g_coeffs = PositiveParameters.random_init((n_basis,), trainable=True, mean=1.0, std=0.1, normalized=True).to(device)
     g = GaussianBasis(mean_params=g_means, std_params=g_stds, coeffs=g_coeffs).to(device)
     g_mlp_form = MLPMetaForm(
@@ -110,7 +113,9 @@ if __name__ == "__main__":
     ).to(device)
 
     psi_means = Parameters.random_init(basis_shape, trainable=True, mean=0.0, std=1.0).to(device)
-    psi_stds = PositiveParameters.random_init(basis_shape, trainable=True, mean=1.0, std=0.1, epsilon=1e-6).to(device)
+    psi_stds = PositiveParameters.set_init(
+        basis_shape, value=1.0, trainable=False, normalized=False, epsilon=1e-6
+    ).to(device)
     psi = GaussianBasis(mean_params=psi_means, std_params=psi_stds).to(device)
     psi_mlp_form = MLPMetaForm(
         target_module_dim=system.dim(),
@@ -148,8 +153,8 @@ if __name__ == "__main__":
             pre_psi_stds.to(device), trainable=False, normalized=False, epsilon=1e-6
         ),
     ).to(device)
-    g_target_params = MLPMetaForm.target_param_dict_from_basis(pre_g_basis)
-    psi_target_params = MLPMetaForm.target_param_dict_from_basis(pre_psi_basis)
+    g_target_params = MLPMetaForm.target_param_dict_from_basis(pre_g_basis, layout=g)
+    psi_target_params = MLPMetaForm.target_param_dict_from_basis(pre_psi_basis, layout=psi)
 
     u_g_train_dataloader = DataLoader(
         train.MixedAlignedRandomDataset((u_k_train,), randomized_indices=()),
@@ -208,7 +213,9 @@ if __name__ == "__main__":
     print("Done! \n")
 
     h0_means = Parameters.random_init(basis_shape, trainable=True, mean=0.0, std=1.0).to(device)
-    h0_stds = PositiveParameters.random_init(basis_shape, trainable=True, mean=1.0, std=0.1, epsilon=1e-6).to(device)
+    h0_stds = PositiveParameters.set_init(
+        basis_shape, value=1.0, trainable=False, normalized=False, epsilon=1e-6
+    ).to(device)
     h0_coeffs = PositiveParameters.random_init((n_basis,), trainable=True, mean=1.0, std=0.1, normalized=True).to(device)
     h0 = GaussianBasis(mean_params=h0_means, std_params=h0_stds, coeffs=h0_coeffs).to(device)
     h0_mlp_form = MLPMetaForm(

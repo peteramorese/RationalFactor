@@ -37,70 +37,54 @@ class LinearRFF(ConditionalDensityModel):
 
     Used for Markov transition distribution for propagation only models
     """
-    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-20, a_fixed : torch.Tensor = None):
-        assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
-        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
-        assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
-        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
-        assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
-        super().__init__(phi_basis.dim(), psi_basis.dim())
+    def __init__(self, g : SeparableBasis, psi : SeparableBasis, numerical_tolerance : float = 1e-20):
+        assert g.dim() == psi.dim(), "g and psi must have the same dimension"
+        assert isinstance(g, SeparableBasis), "g must be a SeparableBasis"
+        assert isinstance(psi, SeparableBasis), "psi must be a SeparableBasis"
+        assert isinstance(g, NonnegativeBasis), "g must be a NonnegativeBasis"
+        assert isinstance(psi, NonnegativeBasis), "psi must be a NonnegativeBasis"
+        super().__init__(g.dim(), psi.dim())
 
-        self.n_phi = phi_basis.n_basis_functions()
-        self.n_psi = psi_basis.n_basis_functions()
-        assert self.n_phi == self.n_psi, "Currently only supported for n_phi == n_psi"
-
-        self.phi_basis = phi_basis
-        self.psi_basis = psi_basis
-
-        if a_fixed is not None:
-            self.register_buffer("a_fixed", a_fixed)
-        else:
-            self.__au = torch.nn.Parameter(torch.ones(self.n_phi)) # g
+        self.g = g
+        self.psi = psi
 
         self.numerical_tolerance = numerical_tolerance
     
-    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         x = conditioner
-        phi_x = self.phi_basis(x) # (n_data, n_phi)
-        phi_xp = self.phi_basis(xp) # (n_data, n_phi)
-        psi_xp = self.psi_basis(xp) # (n_data, n_psi)
-        
-        a = self.get_a()
-        b = self.get_b(a=a)
-        
-        # Calculate g(x)
-        log_g_x = torch.log(phi_x @ a + self.numerical_tolerance) # (n_data)
-        log_g_xp = torch.log(phi_xp @ a + self.numerical_tolerance) # (n_data)
+        phi_x = self.g(x, ignore_coeffs=True)  # (n_data, n_basis)
+        phi_xp = self.g(xp, ignore_coeffs=True)  # (n_data, n_basis)
+        psi_xp = self.psi(xp, ignore_coeffs=True)  # (n_data, n_basis)
 
-        # Calculate f(x, x')
-        log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
+        a = self.g.coeff_values()
+        b = self.get_b(a=a)
+
+        log_g_x = torch.log(phi_x @ a + self.numerical_tolerance)  # (n_data)
+        log_g_xp = torch.log(phi_xp @ a + self.numerical_tolerance)  # (n_data)
+        log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance)  # (n_data)
 
         return log_g_xp + log_f - log_g_x
 
-    def get_a(self):
-        if hasattr(self, "a_fixed"):
-            return self.a_fixed
-
-        return torch.nn.functional.softmax(self.__au, dim=0)
-
     def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
         if Omega is None:
-            Omega = self.phi_basis.Omega2(self.psi_basis)
+            Omega = self.g.Omega2(self.psi, ignore_coeffs=True)
 
         if a is None:
-            a = self.get_a()
+            a = self.g.coeff_values()
 
         b = a / (Omega.T @ a + self.numerical_tolerance)
 
         return b
 
     def weight_params(self):
+        #TODO
         if hasattr(self, "a_fixed"):
             return [self.a_fixed]
         else:
             return [self.__au]
     
     def basis_params(self):
+        #TODO
         return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
 
 
@@ -133,13 +117,13 @@ class MLPContextLinearRFF(ConditionalDensityModel):
         psi_xp = self.psi_mlp_form(xp, u=u, up=up) # (n_data, n_psi)
         phi_xp = self.g_mlp_form(xp, u=up, ignore_coeffs=True) # (n_data, n_phi)
 
-        means, stds = self.psi_mlp_form.means_stds(u=u, up=up)
+        #means, stds = self.psi_mlp_form.means_stds(u=u, up=up)
         #print("psi Means: ", means)
         #print("psi Stds: ", stds)
 
         a_curr = self.get_a(u)
         a_next = self.get_a(up)
-        b = self.get_b(a_curr=a_curr, a_next=a_next, u=u, up=up)
+        b = self.get_b(u=u, up=up, a_curr=a_curr, a_next=a_next)
 
         if a_curr.dim() == 1:
             log_g_x = torch.log(phi_x @ a_curr + self.numerical_tolerance) # (n_data)
@@ -153,7 +137,7 @@ class MLPContextLinearRFF(ConditionalDensityModel):
         return log_g_xp + log_f - log_g_x
 
     def get_a(self, u : torch.Tensor):
-        return self.g_mlp_form.coeff_values(u=u)
+        return self.g_mlp_form.instantiate(u=u).coeff_values()
 
     def get_b(self, u : torch.Tensor, up : torch.Tensor, a_curr : torch.Tensor = None, a_next : torch.Tensor = None, Omega : torch.Tensor = None):
         u = torch.as_tensor(u)
@@ -165,11 +149,9 @@ class MLPContextLinearRFF(ConditionalDensityModel):
             a_next = self.get_a(up)
 
         if Omega is None:
-            Omega = self.g_mlp_form.omega2(
-                self.psi_mlp_form,
+            Omega = self.g_mlp_form.instantiate(u=u).Omega2(
+                self.psi_mlp_form.instantiate(u=u, up=up),
                 ignore_coeffs=True,
-                u=u,
-                up=up,
             )
 
         if u.ndim == 1:
@@ -508,7 +490,7 @@ class MLPContextLinearFF(DensityModel):
         super().__init__(g_dim)
 
         # Transition factor g is fixed; only h is trained (MLP weights; target layout frozen in MLPMetaForm).
-        self.g_mlp_form = g_mlp_form.freeze_params()
+        self.g_mlp_form = g_mlp_form
         self.h_mlp_form = h_mlp_form
         
         self.numerical_tolerance = numerical_tolerance
@@ -518,29 +500,19 @@ class MLPContextLinearFF(DensityModel):
         return cls(rff.g_mlp_form, h_mlp_form, numerical_tolerance=rff.numerical_tolerance)
 
     def get_a(self, up : torch.Tensor):
-        return self.g_mlp_form.coeff_values(u=up)
+        return self.g_mlp_form.instantiate(u=up).coeff_values()
 
     def log_norm_constant(self, up : torch.Tensor, Omega_0 : torch.Tensor = None, a : torch.Tensor = None):
         up = torch.as_tensor(up)
         if Omega_0 is None:
+            g_inst = self.g_mlp_form.instantiate(u=up)
+            h_inst = self.h_mlp_form.instantiate(up=up)
+            weighted_Omega = g_inst.Omega2(h_inst, ignore_coeffs=False)
             if up.ndim == 1:
-                weighted_Omega = self.g_mlp_form.omega2(
-                    self.h_mlp_form,
-                    ignore_coeffs=False,
-                    u=up,
-                    up=up,
-                )
                 return -torch.log(torch.sum(weighted_Omega) + self.numerical_tolerance)
-
-            weighted_Omega = self.g_mlp_form.omega2(
-                self.h_mlp_form,
-                ignore_coeffs=False,
-                u=up,
-                up=up,
-            )
             return -torch.log(torch.sum(weighted_Omega, dim=(-2, -1)) + self.numerical_tolerance)
 
-        c_unnormalized = self.h_mlp_form.coeff_values(up=up)
+        c_unnormalized = self.h_mlp_form.instantiate(up=up).coeff_values()
         if a is None:
             a = self.get_a(up)
 
@@ -554,7 +526,7 @@ class MLPContextLinearFF(DensityModel):
     def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
         up = contexts["up"]
         a_g = self.get_a(up)
-        c_h = self.h_mlp_form.coeff_values(up=up)
+        c_h = self.h_mlp_form.instantiate(up=up).coeff_values()
         phi_g = self.g_mlp_form(x, u=up, ignore_coeffs=True)
         phi_h = self.h_mlp_form(x, up=up, ignore_coeffs=True)
 

@@ -288,8 +288,6 @@ def check_conditional_pdf_valid(pdf : ConditionalDensityModel, domain_bounds, co
     conditioner_lows = torch.as_tensor(conditioner_domain_bounds[0], device=device)
     conditioner_highs = torch.as_tensor(conditioner_domain_bounds[1], device=device)
     conditioner_samples = torch.rand(n_conditioner_samples, conditioner_lows.numel(), device=device, dtype=conditioner_lows.dtype) * (conditioner_highs - conditioner_lows) + conditioner_lows
-    print("num samples: ", n_samples)
-    print("num conditioner samples: ", n_conditioner_samples)
     integrals = []
     with torch.no_grad():
         pdf.eval()
