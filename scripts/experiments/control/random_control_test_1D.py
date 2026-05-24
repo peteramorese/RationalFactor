@@ -8,7 +8,6 @@ import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
 from rational_factor.tools.misc import train_test_split
-from rational_factor.tools.visualization import plot_belief
 from rational_factor.tools.analysis import check_pdf_valid
 from rational_factor.models.meta_forms import MLPMetaForm
 from rational_factor.systems.problems import OPEN_LOOP_OBSERVABLE_PROBLEMS
@@ -43,23 +42,119 @@ def psi_mlp_pretrain_loss(mlp_form, u, up, *, target_params):
     return mlp_meta_form_param_mse_loss(mlp_form, target_params, u=u, up=up)
 
 
+def plot_transition_u_up_comparison(
+    tran_model,
+    x_k_data,
+    x_kp1_data,
+    u_k_data,
+    problem,
+    out_path,
+    *,
+    u_up_pairs=None,
+    n_pairs=4,
+    n_grid=120,
+    u_tol=0.3,
+    random_seed=0,
+):
+    """Compare model p(x'|x, u, u') with empirical (x, x') samples near u."""
+    lo = float(problem.plot_bounds_low[0].item())
+    hi = float(problem.plot_bounds_high[0].item())
+    control_dim = problem.system.control_dim()
+
+    analysis_device = torch.device("cpu")
+    tran_model = tran_model.to(analysis_device).eval()
+
+    x_k_cpu = x_k_data.detach().cpu()
+    x_kp1_cpu = x_kp1_data.detach().cpu()
+    u_k_cpu = u_k_data.detach().cpu().view(-1, control_dim)
+
+    if u_up_pairs is None:
+        g = torch.Generator().manual_seed(random_seed)
+        idx_u = torch.randint(0, len(u_k_cpu), (n_pairs,), generator=g)
+        idx_up = torch.randint(0, len(u_k_cpu), (n_pairs,), generator=g)
+        u_up_pairs = [(u_k_cpu[i].clone(), u_k_cpu[j].clone()) for i, j in zip(idx_u, idx_up)]
+
+    nx = n_grid
+    nxp = n_grid
+    x_1d = torch.linspace(lo, hi, nx, device=analysis_device)
+    xp_1d = torch.linspace(lo, hi, nxp, device=analysis_device)
+    x_cond = x_1d.unsqueeze(1).expand(nx, nxp).reshape(-1, 1)
+    xp_flat = xp_1d.unsqueeze(0).expand(nx, nxp).reshape(-1, 1)
+
+    n_rows = len(u_up_pairs)
+    fig, axes = plt.subplots(n_rows, 2, figsize=(10, 4 * n_rows), squeeze=False)
+    cmap = "viridis"
+
+    for row, (u_vec, up_vec) in enumerate(u_up_pairs):
+        n_pts = x_cond.shape[0]
+        u_batch = u_vec.unsqueeze(0).expand(n_pts, -1).to(analysis_device)
+        up_batch = up_vec.unsqueeze(0).expand(n_pts, -1).to(analysis_device)
+
+        with torch.no_grad():
+            log_pdf = tran_model.log_density(xp_flat, conditioner=x_cond, u=u_batch, up=up_batch)
+            pdf = log_pdf.exp().reshape(nx, nxp).cpu().numpy()
+
+        x_np = x_1d.cpu().numpy()
+        xp_np = xp_1d.cpu().numpy()
+
+        ax_model = axes[row, 0]
+        cf = ax_model.contourf(x_np, xp_np, pdf.T, levels=40, cmap=cmap)
+        fig.colorbar(cf, ax=ax_model, fraction=0.046, pad=0.04)
+        ax_model.set_xlabel("x")
+        ax_model.set_ylabel("x'")
+        u_s, up_s = float(u_vec[0]), float(up_vec[0])
+        ax_model.set_title(f"model p(x'|x, u={u_s:.2f}, u'={up_s:.2f})")
+        ax_model.set_xlim(lo, hi)
+        ax_model.set_ylim(lo, hi)
+
+        u_diff = (u_k_cpu - u_vec).abs()
+        mask = (u_diff.max(dim=-1).values if u_diff.dim() > 1 else u_diff.squeeze(-1)) < u_tol
+        x_slice = x_k_cpu[mask, 0].numpy()
+        xp_slice = x_kp1_cpu[mask, 0].numpy()
+
+        ax_data = axes[row, 1]
+        if mask.any():
+            ax_data.scatter(
+                x_slice,
+                xp_slice,
+                s=6,
+                alpha=0.35,
+                c="C1",
+                edgecolors="none",
+                rasterized=True,
+            )
+        ax_data.set_xlim(lo, hi)
+        ax_data.set_ylim(lo, hi)
+        ax_data.set_aspect("auto")
+        ax_data.set_xlabel("x")
+        ax_data.set_ylabel("x'")
+        ax_data.set_title(f"data with |u - {u_s:.2f}| < {u_tol:.2f}, n={int(mask.sum())}")
+
+    fig.suptitle("Transition model vs data (1D)", y=1.01)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved transition comparison figure to {out_path}")
+
+
 if __name__ == "__main__":
-    problem = OPEN_LOOP_OBSERVABLE_PROBLEMS["van_der_pol"]
+    problem = OPEN_LOOP_OBSERVABLE_PROBLEMS["scalar_nonlinear_drift"]
 
     use_gpu = torch.cuda.is_available()
-    n_basis = 500
+    n_basis = 5
     control_dim = problem.system.control_dim()
 
     pretrain_params = {
-        "epochs": 30,
+        "epochs": 20,
         "lr": 1e-3,
     }
     tran_params = {
-        "epochs": 50,
+        "epochs": 0,
         "lr": 5e-5,
     }
     init_params = {
-        "epochs": 50,
+        "epochs": 0,
         "lr": 5e-5,
     }
 
@@ -132,6 +227,11 @@ if __name__ == "__main__":
     psi_marginal = gmm_lf.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
     pre_psi_means, pre_psi_stds = psi_marginal.w.means_stds()
     #pre_psi_params = torch.stack([pre_psi_means, pre_psi_stds], dim=-1)
+    print("Pre g means: ", pre_g_means)
+    print("Pre g stds: ", pre_g_stds)
+    print("Pre g weights: ", pre_g_weights)
+    print("Pre psi means: ", pre_psi_means)
+    print("Pre psi stds: ", pre_psi_stds)
 
     pre_g_basis = GaussianBasis(
         mean_params=Parameters.from_values(pre_g_means.to(device), trainable=False),
@@ -158,7 +258,7 @@ if __name__ == "__main__":
         pin_memory=use_gpu,
     )
     u_psi_train_dataloader = DataLoader(
-        train.MixedAlignedRandomDataset((u_k_train, u_k_train_copy), randomized_indices=()),
+        train.MixedAlignedRandomDataset((u_k_train, u_k_train_copy), randomized_indices=(1,)),
         batch_size=train_batch_size,
         shuffle=True,
         pin_memory=use_gpu,
@@ -251,6 +351,7 @@ if __name__ == "__main__":
         transition_model,
         out_path,
         n_steps,
+        n_grid=400,
     ):
         analysis_device = torch.device("cpu")
         init_belief = init_belief.to(analysis_device).eval()
@@ -260,29 +361,31 @@ if __name__ == "__main__":
         belief_seq = propagate.propagate_with_control(init_belief, transition_model, controls)
 
         n_cols = min(len(true_traj), len(belief_seq))
-        x_range = (problem.plot_bounds_low[0].item(), problem.plot_bounds_high[0].item())
-        y_range = (problem.plot_bounds_low[1].item(), problem.plot_bounds_high[1].item())
+        x_lo = problem.plot_bounds_low[0].item()
+        x_hi = problem.plot_bounds_high[0].item()
+        x_grid = torch.linspace(x_lo, x_hi, n_grid, device=analysis_device).unsqueeze(1)
 
-        fig, axes = plt.subplots(2, n_cols, figsize=(2.8 * n_cols, 5.5), squeeze=False)
+        fig, axes = plt.subplots(n_cols, 1, figsize=(9, 2.4 * n_cols), squeeze=False)
         fig.suptitle(f"Controller {controller_idx}: true trajectories vs LRFF belief propagation")
 
         for t in range(n_cols):
-            ax_true = axes[0, t]
-            ax_belief = axes[1, t]
-
-            states = true_traj[t].detach().cpu()
-            ax_true.scatter(states[:, 0], states[:, 1], s=0.6, alpha=0.35, c="C0")
-            ax_true.set_aspect("equal")
-            ax_true.set_xlim(*x_range)
-            ax_true.set_ylim(*y_range)
-            ax_true.set_title(f"t={t} true")
-
+            ax = axes[t, 0]
+            samples = true_traj[t][:, 0].detach().cpu().numpy()
             belief_t = belief_seq[t].to(analysis_device).eval()
             print(f"Controller {controller_idx}, t={t}:")
             check_pdf_valid(belief_t, domain_bounds=domain_bounds, n_samples=10000, device=analysis_device)
-            plot_belief(ax_belief, belief_t, x_range=x_range, y_range=y_range, n_points=50)
-            ax_belief.set_title(f"t={t} belief")
+            with torch.no_grad():
+                pdf = belief_t(x_grid).squeeze(-1).detach().cpu().numpy()
+            x_np = x_grid.squeeze(-1).detach().cpu().numpy()
+            ax.plot(x_np, pdf, color="C0", lw=2.0, label="propagated belief")
+            ax.hist(samples, bins=50, density=True, alpha=0.35, color="C1", label="test traj.")
+            ax.set_xlim(x_lo, x_hi)
+            ax.set_ylabel("density")
+            ax.set_title(f"t={t}")
+            ax.grid(True, alpha=0.25)
+            ax.legend(loc="upper right", fontsize=8)
 
+        axes[-1, 0].set_xlabel(problem.system.state_label(0))
         fig.tight_layout()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=300, bbox_inches="tight")
@@ -294,7 +397,20 @@ if __name__ == "__main__":
     tran_model = tran_model.to(analysis_device).eval()
 
     n_plot_steps = min(problem.n_timesteps, n_timesteps_prop)
-    out_dir = Path("figures") / "random_control_test"
+    out_dir = Path("figures") / "random_control_test_1D"
+
+    plot_transition_u_up_comparison(
+        tran_model,
+        x_k_data,
+        x_kp1_data,
+        u_k_data,
+        problem,
+        out_dir / "transition_model_vs_data.png",
+        n_pairs=4,
+        n_grid=120,
+        u_tol=0.3,
+        random_seed=42,
+    )
 
     for controller_idx, (controller, true_traj) in enumerate(zip(test_controllers, test_traj_data)):
         plot_controller_comparison(

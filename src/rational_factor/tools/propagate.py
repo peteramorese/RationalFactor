@@ -3,6 +3,7 @@ from rational_factor.models.composite_model import CompositeConditionalModel
 import torch
 from copy import deepcopy
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
+from rational_factor.models.factor_forms import MLPContextLinearFF, MLPContextLinearRFF
 
 def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
     if device is None:
@@ -91,10 +92,53 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         for _ in range(0, n_steps):
             belief_seq.append(_prop(belief_seq[-1]))
         return belief_seq
-
+    
     else:
         raise ValueError(f"Unrecognized transition model type '{type(transition_model)}'")
 
+def propagate_with_control(init_belief : DensityModel, transition_model : ConditionalDensityModel, controls : list[torch.Tensor]):
+    if isinstance(transition_model, MLPContextLinearRFF):
+        assert isinstance(init_belief, MLPContextLinearFF), "Belief must be MLPContextLinearFF for MLPContextLinearRFF transition model"
+
+
+        g_mlp_form = transition_model.g_mlp_form # same g as in init
+
+        curr_g = g_mlp_form.instantiate(u=controls[0])
+        curr_h_inst = init_belief.h_mlp_form.instantiate(up=controls[0])
+        init_norm_constant = torch.exp(init_belief.log_norm_constant(up=controls[0]))
+
+        Omega_curr = curr_g.Omega2(curr_h_inst, ignore_coeffs=True)
+        c_curr = init_norm_constant * curr_h_inst.get_coeffs()
+        if c_curr is None:
+            raise ValueError(
+                "Initial h0 basis must have coeffs set on the template before propagation "
+                "(psi_mlp_form uses coeffs=None; h_mlp_form should provide c_curr)."
+            )
+
+        init_belief = LinearFF(curr_g, curr_h_inst, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=True)
+        belief_seq = [init_belief]
+
+        for k, u in enumerate(controls[:-1]):
+            up = controls[k + 1]
+
+            curr_g = g_mlp_form.instantiate(u=up)
+            curr_psi_inst = transition_model.psi_mlp_form.instantiate(u=u, up=up)
+            Omega_next = curr_g.Omega2(curr_psi_inst, ignore_coeffs=True)
+            b_curr = transition_model.get_b(u=u, up=up, Omega=Omega_next)
+
+            c_next = torch.einsum("i,ij,j->i", b_curr, Omega_curr, c_curr)
+            curr_h = curr_psi_inst.shallow_copy_target_module()
+            curr_h.set_coeffs(c_next)
+            belief_seq.append(LinearFF(curr_g, curr_h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False))
+
+            Omega_curr = Omega_next
+            c_curr = c_next
+
+
+        return belief_seq
+    
+    else:
+        raise ValueError(f"Unrecognized transition model type '{type(transition_model)}'")
 
 def update(belief : DensityModel, observation_model : ConditionalDensityModel, observation : torch.Tensor, device : torch.device = None):
     if device is None:
@@ -113,14 +157,14 @@ def update(belief : DensityModel, observation_model : ConditionalDensityModel, o
         zeta_o = observation_model.zeta_basis(observation).squeeze(0)
         d_unnormalized = observation_model.get_e() * zeta_o
 
-        c0_fixed = belief.c0_fixed
+        c_fixed = belief.c_fixed
         denom_vec = belief.xi_basis.Omega3_contract(
             belief.phi_basis,
             belief.psi0_basis,
             d_unnormalized,
             belief.a,
         )
-        norm_constant = 1.0 / (denom_vec @ c0_fixed)
+        norm_constant = 1.0 / (denom_vec @ c_fixed)
         d_updated = norm_constant * d_unnormalized
 
         belief_posterior = Linear2FF(d_updated, 
@@ -128,7 +172,7 @@ def update(belief : DensityModel, observation_model : ConditionalDensityModel, o
             belief.a, 
             belief.phi_basis, 
             belief.psi0_basis, 
-            c0_fixed=belief.c0_fixed, 
+            c_fixed=belief.c_fixed, 
             numerical_tolerance=belief.numerical_tolerance).to(device=device)
         return belief_posterior
     else:

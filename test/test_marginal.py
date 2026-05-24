@@ -151,7 +151,6 @@ def _random_basis(
             n_basis,
             offsets=off,
             variance=VARIANCE,
-            min_concentration=UNNORMALIZED_BETA_MIN_CONCENTRATION,
             eps=UNNORMALIZED_BETA_EPS,
         ).to(device=device, dtype=dtype)
         if freeze_params:
@@ -164,7 +163,6 @@ def _random_basis(
             n_basis,
             offsets=off,
             variance=VARIANCE,
-            min_std=GAUSSIAN_MIN_STD,
             device=device,
         ).to(device=device, dtype=dtype)
         if freeze_params:
@@ -177,7 +175,6 @@ def _random_basis(
             n_basis,
             offsets=off,
             variance=VARIANCE,
-            min_concentration=BETA_MIN_CONCENTRATION,
             eps=BETA_EPS,
             device=device,
         ).to(device=device, dtype=dtype)

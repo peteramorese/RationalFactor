@@ -46,7 +46,9 @@ class DiscreteTimeStochasticSystem(torch.nn.Module):
 
 class ControllableStochasticSystem(DiscreteTimeStochasticSystem):
     def __init__(self, state_dim : int, control_dim : int, state_labels : list[str] = None, control_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None):
-        super().__init__(state_dim, state_labels, v_dist)
+        # Call DiscreteTimeStochasticSystem directly: cooperative subclasses also inherit
+        # a passive plant (e.g. VanDerPol) whose __init__ signature differs from ours.
+        DiscreteTimeStochasticSystem.__init__(self, state_dim, state_labels, v_dist)
         self._control_dim = control_dim
         if control_labels is not None:
             assert len(control_labels) == control_dim, "control_labels must be a list of length control_dim"
@@ -219,7 +221,7 @@ def sample_io_pairs(system : DiscreteTimeStochasticSystem, prev_state_sampler, n
 
 def sample_uio_tuples(system : ControllableStochasticSystem, prev_state_sampler, control_sampler, n_pairs : int):
     """
-    Sample input (x, x', u) tuples from a system model, where the starting state x is sampled from prev_state_sampler
+    Sample input (u, x, x') tuples from a system model, where the starting state x is sampled from prev_state_sampler
     and the control input u is sampled from control_sampler
     """
     u_data = control_sampler(n_pairs)
@@ -227,7 +229,7 @@ def sample_uio_tuples(system : ControllableStochasticSystem, prev_state_sampler,
     xp_data = torch.zeros_like(x_data)
     for i in range(n_pairs):
         xp_data[i, :] = system(x_data[i, :], u_data[i, :])
-    return u_data, x_data, xp_data
+    return u_data, x_data, xp_data # (u_k, x_k, x_{k+1}) tuples
 
 def sample_observation_pairs(system : PartiallyObservableSystem, state_sampler, n_pairs : int):
     """

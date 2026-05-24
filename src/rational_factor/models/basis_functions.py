@@ -9,110 +9,205 @@ from nflows.transforms.base import CompositeTransform
 from nflows.transforms.permutations import ReversePermutation
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 
-class PositiveCoefficients(torch.nn.Module):
-    def __init__(self, trainable_init_values : torch.Tensor = None, fixed_values : torch.Tensor = None, normalized : bool = True):
+class Parameters(torch.nn.Module):
+    def __init__(self, trainable_init_values: torch.Tensor = None, fixed_values: torch.Tensor = None):
         super().__init__()
-        assert not (trainable_init_values is not None and fixed_values is not None), "trainable_init_values and fixed_values cannot both be set"
+        assert not (trainable_init_values is not None and fixed_values is not None)
         self._trainable = trainable_init_values is not None
-        self._normalized = normalized
         if self._trainable:
-            self._coeffs = torch.nn.Parameter(trainable_init_values)
+            self._p = torch.nn.Parameter(trainable_init_values)
         else:
-            assert torch.all(fixed_values >= 0), "fixed_values must be nonnegative"
-            if normalized:
-                fixed_values = torch.nn.functional.softmax(fixed_values, dim=0)
-            self.register_buffer("_coeffs", fixed_values)
-    
-    @classmethod
-    def random_init(cls, n : int, normalized : bool = True):
-        return cls(trainable_init_values=torch.randn(n), normalized=normalized)
-    
-    @classmethod
-    def set_init(cls, n : int, value : float, normalized : bool = True):
-        return cls(fixed_values=torch.ones(n) * value, normalized=normalized)
+            self.register_buffer("_p", fixed_values)
 
     @classmethod
-    def from_values(cls, values: torch.Tensor, normalized: bool = False):
-        """Fixed coefficients stored as given (after optional softmax)."""
-        return cls(fixed_values=values, normalized=normalized)
-    
+    def random_init(
+        cls,
+        shape: tuple[int, ...],
+        trainable: bool = True,
+        mean: float = 0.0,
+        std: float = 1.0,
+    ):
+        values = torch.randn(*shape) * std + mean
+        if trainable:
+            return cls(trainable_init_values=values)
+        return cls(fixed_values=values)
+
+    @classmethod
+    def set_init(cls, shape: tuple[int, ...], value: float, trainable: bool = True):
+        values = torch.ones(shape) * value
+        if trainable:
+            return cls(trainable_init_values=values)
+        return cls(fixed_values=values)
+
+    @classmethod
+    def from_values(cls, values: torch.Tensor, trainable: bool = True):
+        if trainable:
+            return cls(trainable_init_values=values)
+        return cls(fixed_values=values.detach().clone())
+
     def size(self):
-        return self._coeffs.size()
-    
-    def forward(self):
-        if self._trainable:
-            if self._normalized:
-                return torch.nn.functional.softmax(self._coeffs, dim=0)
-            else:
-                return torch.nn.functional.softplus(self._coeffs)
-        else:
-            return self._coeffs
-    
-    def freeze_params(self):
-        return PositiveCoefficients(fixed_values=self.forward().detach().clone(), normalized=self._normalized)
+        return self._p.size()
 
     def is_trainable(self):
         return self._trainable
+
+    def dtype_device(self):
+        return self._p.dtype, self._p.device
+
+    def forward(self):
+        return self._p
+
+    def freeze_params(self):
+        return self.__class__(fixed_values=self.forward().detach().clone())
+
+
+class PositiveParameters(Parameters):
+    def __init__(
+        self,
+        trainable_init_values: torch.Tensor = None,
+        fixed_values: torch.Tensor = None,
+        normalized: bool = True,
+        epsilon: float = 0.0,
+    ):
+        super().__init__(trainable_init_values=trainable_init_values, fixed_values=fixed_values)
+        self._normalized = normalized
+        self._epsilon = epsilon
+        if not self._trainable:
+            assert torch.all(fixed_values >= 0), "fixed_values must be nonnegative"
+            if normalized:
+                self._p = self._normalize(self._p)
     
+    @classmethod
+    def random_init(
+        cls,
+        shape: tuple[int, ...],
+        trainable: bool = True,
+        mean: float = 0.0,
+        std: float = 1.0,
+        normalized: bool = True,
+        epsilon: float = 0.0,
+    ):
+        values = torch.randn(*shape) * std + mean
+        if trainable:
+            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
+        return cls(fixed_values=values, normalized=normalized, epsilon=epsilon)
+
+    @classmethod
+    def set_init(cls, shape: tuple[int, ...], value: float, trainable: bool = True, normalized: bool = True, epsilon: float = 0.0):
+        values = torch.ones(shape) * value
+        if trainable:
+            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
+        return cls(fixed_values=values, normalized=normalized, epsilon=epsilon)
+
+    @classmethod
+    def from_values(cls, values: torch.Tensor, trainable: bool = True, normalized: bool = True, epsilon: float = 0.0):
+        if trainable:
+            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
+        return cls(fixed_values=values.detach().clone(), normalized=normalized, epsilon=epsilon)
+
+    def _normalize(self, p: torch.Tensor, dim: int = 0):
+        return self._epsilon + (1.0 - p.shape[dim] * self._epsilon) * torch.nn.functional.softmax(p, dim=dim)
+
+    def forward(self):
+        if self._trainable:
+            if self._normalized:
+                return self._normalize(self._p)
+            return self._epsilon + torch.nn.functional.softplus(self._p)
+        return self._p
+
+    def freeze_params(self):
+        return PositiveParameters(
+            fixed_values=self.forward().detach().clone(),
+            normalized=self._normalized,
+            epsilon=self._epsilon,
+        )
+
+    def with_fixed_values(self, values: torch.Tensor) -> "PositiveParameters":
+        return PositiveParameters(
+            fixed_values=values.detach().clone(),
+            normalized=self._normalized,
+            epsilon=self._epsilon,
+        )
+
     def is_normalized(self):
         return self._normalized
-    
-    def param_dtype_device(self):
-        return self._coeffs.dtype, self._coeffs.device
 
 
-def fixed_coeffs(values: torch.Tensor | None, normalized: bool = False) -> PositiveCoefficients | None:
-    if values is None:
-        return None
-    return PositiveCoefficients.from_values(values, normalized=normalized)
+def _is_functional_proxy_of(obj, basis_cls: type) -> bool:
+    """True if ``obj`` is a basis instance or a FunctionalModuleProxy wrapping one."""
+    if isinstance(obj, basis_cls):
+        return True
+    target = getattr(obj, "_target_module", None)
+    return isinstance(target, basis_cls)
 
 
 class Basis(torch.nn.Module):
     def __init__(self, 
             dim : int, 
-            n_basis : int, 
-            uparams_init : torch.Tensor = None, 
-            fixed_params : torch.Tensor = None, 
-            coeffs : PositiveCoefficients = None):
+            n_basis : int,
+            params : tuple[torch.Tensor, ...] | tuple[Parameters, ...],
+            coeffs : torch.Tensor | Parameters = None):
         '''
         Args:
             dim : int, number of dimensions
             n_basis : int, number of basis functions
-            uparams_init : torch.Tensor of initial unconstrained parameters
-            fixed_params : torch.Tensor of fixed (non trainable) constrained parameters
-            coeffs : PositiveCoefficients of coefficients
+            params : list of tensors where each represents a parameter group for a basis function
+            coeffs : PositiveParameters of coefficients
         '''
         super().__init__()
         self._dim = dim
         self._n_basis = n_basis
 
-        assert not (uparams_init is not None and fixed_params is not None), "uparams_init and fixed_params cannot both be set"
-
-        if uparams_init is not None:
-            assert uparams_init.shape[1] == n_basis, "uparams_init must have shape (dim, n_basis, n_params_per_basis)"
-            self.uparams = torch.nn.Parameter(uparams_init)
-        elif fixed_params is not None:
-            assert fixed_params.shape[1] == n_basis, "fixed_params must have shape (dim, n_basis, n_params_per_basis)"
-            self.register_buffer("fixed_params", fixed_params)
-        else:
-            raise ValueError("uparams_init or fixed_params must be set")
+        self.set_params(params)
 
         if coeffs is not None:
             assert coeffs.size() == (n_basis,), "coeffs must have shape (n_basis,)"
-            self.coeffs = coeffs
-        
+            self.set_coeffs(coeffs)
+        else:
+            self.coeffs = None
+            self._module_coeffs = False
+
     def forward(self, y : torch.Tensor, ignore_coeffs : bool = False):
         raise NotImplementedError("forward is not implemented for this basis function")
 
+    def set_params(self, params : tuple[torch.Tensor, ...] | tuple[Parameters, ...]):
+        if isinstance(params[0], torch.Tensor):
+            self._params = params
+            self._module_params = False
+        elif isinstance(params[0], Parameters):
+            self._params = torch.nn.ModuleList(params)
+            self._module_params = True
+        else:
+            raise ValueError("params must be a tuple of tensors or Parameters")
+
+    def get_params(self):
+        if self._module_params:
+            return [param() for param in self._params]
+        return self._params
+
     def has_coeffs(self):
-        return hasattr(self, "coeffs") and self.coeffs is not None
+        return self.coeffs is not None
 
-    def coeff_values(self) -> torch.Tensor | None:
-        return self.coeffs() if self.has_coeffs() else None
+    def set_coeffs(self, coeffs : torch.Tensor | Parameters):
+        if isinstance(coeffs, torch.Tensor):
+            self.coeffs = coeffs
+            self._module_coeffs = False
+        elif isinstance(coeffs, Parameters):
+            self.add_module("coeffs", coeffs)
+            self._module_coeffs = True
+        else:
+            raise ValueError("coeffs must be a tensor or Parameters")
+        assert coeffs.size() == (self._n_basis,)
+    
+    def get_coeffs(self):
+        if not self.has_coeffs():
+            raise ValueError("Basis has no coefficients.")
+        if self._module_coeffs:
+            return self.coeffs()
+        return self.coeffs
 
-    def set_coeffs(self, values: torch.Tensor, normalized: bool = False):
-        assert values.shape == (self._n_basis,), f"coeffs must have shape ({self._n_basis},)"
-        self.coeffs = PositiveCoefficients.from_values(values.detach().clone(), normalized=normalized)
+    def coeff_values(self):
+        return self.get_coeffs()
 
     def dim(self):
         return self._dim
@@ -120,16 +215,12 @@ class Basis(torch.nn.Module):
     def n_basis_functions(self):
         return self._n_basis
     
-    def trainable(self):
-        return hasattr(self, "uparams")
-
     def param_dtype_device(self):
-        ref = self.uparams if self.trainable() else self.fixed_params
-        return ref.dtype, ref.device
+        params = self.get_params()
+        if len(params) > 0:
+            return params[0].dtype(), params[0].device()
+        return None, None
 
-    def freeze_params(self):
-        raise NotImplementedError("freeze_params is not implemented for this basis function")
-    
     def normalized(self):
         raise NotImplementedError("normalized is not implemented for this basis function")
     
@@ -198,51 +289,99 @@ class Basis(torch.nn.Module):
         '''
         pass
 
-    def _omega2_box_axes(
-        self, lows: torch.Tensor | None, highs: torch.Tensor | None
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if lows is None and highs is None:
-            return None, None
-        assert lows is not None and highs is not None, "lows and highs must both be set for a bounded domain"
-        dtype, device = self.param_dtype_device()
-        lows = lows.to(dtype=dtype, device=device).reshape(self.dim())
-        highs = highs.to(dtype=dtype, device=device).reshape(self.dim())
-        assert torch.all(lows < highs), "each low must be strictly less than the corresponding high"
-        return lows[:, None, None], highs[:, None, None]
-
-    def _omega2_from_log_dims(
-        self, log_dim: torch.Tensor, other: "Basis", ignore_coeffs: bool
-    ) -> torch.Tensor:
-        out = torch.exp(log_dim.sum(dim=0))
-        if not ignore_coeffs:
-            if self.has_coeffs():
-                out = out * self.coeff_values()[:, None]
-            if other.has_coeffs():
-                out = out * other.coeff_values()[None, :]
-        return out
-    
 
 class SeparableBasis(Basis):
     def __init__(
         self,
-        uparams_init: torch.Tensor | None = None,
-        fixed_params: torch.Tensor | None = None,
-        coeffs: PositiveCoefficients | None = None,
+        params: tuple[torch.Tensor, ...] | tuple[Parameters, ...],
+        coeffs: torch.Tensor = None,
     ):
-        params = uparams_init if uparams_init is not None else fixed_params
-        assert params is not None, "uparams_init or fixed_params must be set"
-        assert params.dim() == 3, "basis params must have shape (d, n_basis, n_params_per_basis)"
-        super().__init__(
-            params.shape[0],
-            params.shape[1],
-            uparams_init=uparams_init,
-            fixed_params=fixed_params,
-            coeffs=coeffs,
-        )
+        param_tensor = params[0] if isinstance(params[0], torch.Tensor) else params[0]()
+        dim = param_tensor.size()[0]
+        n_basis = param_tensor.size()[1]
+        super().__init__(dim=dim, n_basis=n_basis, params=params, coeffs=coeffs)
+
+        self_params = self.get_params()
+        for param_set in self_params:
+            assert param_set.size() == (dim, n_basis), "Each parameter tensor must have shape (dim, n_basis)"
 
     def n_params_per_basis(self):
-        ref = self.uparams if self.trainable() else self.fixed_params
-        return ref.shape[2]
+        return len(self.get_params())
+
+
+# Nonnegative basis functions 
+class NonnegativeBasis:
+    pass
+
+
+class GaussianBasis(SeparableBasis, NonnegativeBasis):
+    """Separable product of 1D normal PDFs N(x | mean, std^2)."""
+
+    def __init__(
+        self,
+        mean_params : torch.Tensor | Parameters,
+        std_params : torch.Tensor | PositiveParameters,
+        coeffs: torch.Tensor | PositiveParameters = None,
+        block_size: int | None = None,
+    ):
+        super().__init__(params=(mean_params, std_params), coeffs=coeffs)
+        self.block_size = block_size
+
+    def means_stds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        params = self.get_params()
+        return params[0], params[1]
+
+    @staticmethod
+    def omega2_from_means_stds(
+        mu1: torch.Tensor,
+        std1: torch.Tensor,
+        mu2: torch.Tensor,
+        std2: torch.Tensor,
+        ignore_coeffs: bool = False,
+        coeffs1: torch.Tensor | None = None,
+        coeffs2: torch.Tensor | None = None,
+        lows: torch.Tensor | None = None,
+        highs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Inner product matrix Omega2 from mean/std tensors, optionally batched over leading dim."""
+        if mu1.dim() == 2:
+            mu1_b = mu1[:, :, None]
+            std1_b = std1[:, :, None]
+            mu2_b = mu2[:, None, :]
+            std2_b = std2[:, None, :]
+            sum_dim = 0
+        elif mu1.dim() == 3:
+            mu1_b = mu1[:, :, :, None]
+            std1_b = std1[:, :, :, None]
+            mu2_b = mu2[:, :, None, :]
+            std2_b = std2[:, :, None, :]
+            sum_dim = 1
+        else:
+            raise ValueError(
+                f"means/stds must have shape (d, n_basis) or (batch, d, n_basis), got ndim={mu1.dim()}."
+            )
+
+        lows_b, highs_b = None, None
+        if lows is not None or highs is not None:
+            assert lows is not None and highs is not None, "lows and highs must both be set for a bounded domain"
+            dtype, device = mu1.dtype, mu1.device
+            lows_b = lows.to(dtype=dtype, device=device).reshape(-1)
+            highs_b = highs.to(dtype=dtype, device=device).reshape(-1)
+            if mu1.dim() == 2:
+                lows_b = lows_b[:, None, None]
+                highs_b = highs_b[:, None, None]
+            else:
+                lows_b = lows_b[None, :, None, None]
+                highs_b = highs_b[None, :, None, None]
+
+        log_dim = GaussianBasis._log_gaussian_pair_ip(mu1_b, std1_b, mu2_b, std2_b, lows_b, highs_b)
+        out = torch.exp(log_dim.sum(dim=sum_dim))
+        if not ignore_coeffs:
+            if coeffs1 is not None:
+                out = out * (coeffs1[:, None] if coeffs1.dim() == 1 else coeffs1[:, :, None])
+            if coeffs2 is not None:
+                out = out * (coeffs2[None, :] if coeffs2.dim() == 1 else coeffs2[:, None, :])
+        return out
 
     @staticmethod
     def _log_gaussian_pair_ip(
@@ -254,9 +393,7 @@ class SeparableBasis(Basis):
         highs: torch.Tensor | None,
     ) -> torch.Tensor:
         var_sum = std1.square() + std2.square()
-        log_pref = -0.5 * (
-            torch.log(2 * torch.pi * var_sum) + (mu1 - mu2).square() / var_sum
-        )
+        log_pref = -0.5 * (torch.log(2 * torch.pi * var_sum) + (mu1 - mu2).square() / var_sum)
         if lows is None:
             return log_pref
         m = (mu1 * std2.square() + mu2 * std1.square()) / var_sum
@@ -264,137 +401,22 @@ class SeparableBasis(Basis):
         cdf = torch.special.ndtr((highs - m) / std_m) - torch.special.ndtr((lows - m) / std_m)
         return log_pref + cdf.clamp_min(torch.finfo(mu1.dtype).tiny).log()
 
-    @staticmethod
-    def _log_quadratic_exp_pair_ip(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        lows: torch.Tensor | None,
-        highs: torch.Tensor | None,
-    ) -> torch.Tensor:
-        log_pref = -b.square() / (4.0 * a) + 0.5 * (
-            torch.log(torch.tensor(torch.pi, dtype=a.dtype, device=a.device)) - torch.log(-a)
-        )
-        if lows is None:
-            return log_pref
-        scale = torch.sqrt(-4.0 * a)
-        erf_diff = torch.special.erf((2.0 * a * highs + b) / scale) - torch.special.erf(
-            (2.0 * a * lows + b) / scale
-        )
-        return log_pref + erf_diff.clamp_min(torch.finfo(a.dtype).tiny).log()
-
-    @staticmethod
-    def _log_beta_pair_ip(
-        a1: torch.Tensor,
-        b1: torch.Tensor,
-        a2: torch.Tensor,
-        b2: torch.Tensor,
-        lows: torch.Tensor | None,
-        highs: torch.Tensor | None,
-        log_beta_fn,
-        normalized: bool,
-    ) -> torch.Tensor:
-        a = a1 + a2 - 1.0
-        b = b1 + b2 - 1.0
-        log_ip = log_beta_fn(a, b)
-        if normalized:
-            log_ip = log_ip - log_beta_fn(a1, b1) - log_beta_fn(a2, b2)
-        if lows is None:
-            return log_ip
-        inc = torch.special.betainc(highs, a, b) - torch.special.betainc(lows, a, b)
-        return log_ip + inc.clamp_min(torch.finfo(a.dtype).tiny).log()
-
-# Nonnegative basis functions 
-class NonnegativeBasis:
-    pass
-
-
-class GaussianBasis(SeparableBasis, NonnegativeBasis):
-    """
-    Separable product of 1D normal PDFs N(x | μ, σ²).
-    Optional per-basis scaling is handled by self.coeffs.
-    """
-
-    def __init__(
-        self,
-        uparams_init: torch.Tensor | None = None,
-        fixed_params: torch.Tensor | None = None,
-        coeffs: PositiveCoefficients | None = None,
-        min_std: float = 1e-5,
-        block_size: int = None,
-    ):
-        params = uparams_init if uparams_init is not None else fixed_params
-        assert params is not None, "uparams_init or fixed_params must be set"
-        assert params.shape[2] == 2, "basis params must have shape (d, n_basis, 2)"
-        super().__init__(uparams_init=uparams_init, fixed_params=fixed_params, coeffs=coeffs)
-        self.min_std = min_std
-        self.block_size = block_size
-
-    @classmethod
-    def random_init(
-        cls,
-        d: int,
-        n_basis: int,
-        offsets: torch.Tensor = torch.zeros(2),
-        min_std: float = 1e-5,
-        variance: float = 1.0,
-        device=None,
-        block_size: int = None,
-        coeffs: PositiveCoefficients | None = None,
-    ):
-        if device is None:
-            device = offsets.device
-        else:
-            offsets = offsets.to(device)
-        offsets = offsets.repeat(d, n_basis, 1)
-        return cls(
-            uparams_init=torch.randn(d, n_basis, 2, device=device) * torch.sqrt(torch.tensor(variance, device=device)) + offsets,
-            coeffs=coeffs,
-            min_std=min_std,
-            block_size=block_size,
-        )
-
-    @classmethod
-    def set_init(
-        cls,
-        d: int,
-        n_basis: int,
-        offsets: torch.Tensor = torch.zeros(2),
-        min_std: float = 1e-5,
-        block_size: int = None,
-        coeffs: PositiveCoefficients | None = None,
-    ):
-        offsets = offsets.repeat(d, n_basis, 1)
-        return cls(uparams_init=offsets, coeffs=coeffs, min_std=min_std, block_size=block_size)
-
-    def freeze_params(self):
-        coeffs = self.coeffs.freeze_params() if self.has_coeffs() else None
-        means, stds = self.means_stds()
-        return GaussianBasis(
-            fixed_params=torch.stack([means, stds], dim=-1).detach().clone(),
-            coeffs=coeffs,
-            min_std=self.min_std,
-            block_size=self.block_size,
-        )
-
-    def means_stds(self):
-        if self.trainable():
-            return self.uparams[..., 0], torch.nn.functional.softplus(self.uparams[..., 1] - 1.0) + self.min_std
-        else:
-            return self.fixed_params[..., 0], self.fixed_params[..., 1]
-    
     def forward(self, y: torch.Tensor, ignore_coeffs: bool = False):
         assert y.dim() == 2 and y.shape[1] == self.dim(), "y must have shape (n_data, d)"
-        y = y[:, :, None]  # (n_data, d, n_basis)
         mu, std = self.means_stds()
-
+        y = y[:, :, None]
         log_dim_factors = (
             -0.5 * torch.log(y.new_tensor(2.0 * torch.pi))
             - torch.log(std)
             - (y - mu) ** 2 / (2 * std ** 2)
         )
-        out = torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
+        out = torch.exp(log_dim_factors.sum(dim=1))
         if not ignore_coeffs and self.has_coeffs():
-            out = out * self.coeff_values()[None, :]
+            coeffs = self.get_coeffs()
+            if coeffs.dim() == 1:
+                out = out * coeffs[None, :]
+            else:
+                out = out * coeffs
         return out
 
     def normalized(self):
@@ -408,26 +430,24 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
             device=device,
         )
         if (not ignore_coeffs) and self.has_coeffs():
-            out = out * self.coeff_values()
+            out = out * self.get_coeffs()
         return out
 
-    def Omega2(
-        self,
-        other: "GaussianBasis",
-        ignore_coeffs: bool = False,
-        lows: torch.Tensor | None = None,
-        highs: torch.Tensor | None = None,
-    ):
-        assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
+    def Omega2(self, other: "GaussianBasis", ignore_coeffs: bool = False, lows: torch.Tensor | None = None, highs: torch.Tensor | None = None):
+        assert _is_functional_proxy_of(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
-        lows_b, highs_b = self._omega2_box_axes(lows, highs)
-        log_dim = self._log_gaussian_pair_ip(
-            mu1[:, :, None], std1[:, :, None], mu2[:, None, :], std2[:, None, :], lows_b, highs_b
+        coeffs1 = None if ignore_coeffs or (not self.has_coeffs()) else self.get_coeffs()
+        coeffs2 = None if ignore_coeffs or (not other.has_coeffs()) else other.get_coeffs()
+        return self.omega2_from_means_stds(
+            mu1, std1, mu2, std2,
+            ignore_coeffs=ignore_coeffs,
+            coeffs1=coeffs1,
+            coeffs2=coeffs2,
+            lows=lows,
+            highs=highs,
         )
-        return self._omega2_from_log_dims(log_dim, other, ignore_coeffs)
 
     def Omega3_contract(
         self,
@@ -442,8 +462,8 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         Computes v[k] = sum_{i,j} left_i[i] * left_j[j] * Omega3[i,j,k]
         without materializing Omega3.
         """
-        assert isinstance(other1, GaussianBasis), "other1 must be GaussianBasis"
-        assert isinstance(other2, GaussianBasis), "other2 must be GaussianBasis"
+        assert _is_functional_proxy_of(other1, GaussianBasis), "other1 must be GaussianBasis"
+        assert _is_functional_proxy_of(other2, GaussianBasis), "other2 must be GaussianBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
         assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
         assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
@@ -455,17 +475,17 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         c0 = (
             torch.ones(self.n_basis_functions(), dtype=mu0.dtype, device=mu0.device)
             if ignore_coeffs or (not self.has_coeffs())
-            else self.coeff_values()
+            else self.get_coeffs()
         )
         c1 = (
             torch.ones(other1.n_basis_functions(), dtype=mu0.dtype, device=mu0.device)
             if ignore_coeffs or (not other1.has_coeffs())
-            else other1.coeff_values()
+            else other1.get_coeffs()
         )
         c2 = (
             torch.ones(other2.n_basis_functions(), dtype=mu0.dtype, device=mu0.device)
             if ignore_coeffs or (not other2.has_coeffs())
-            else other2.coeff_values()
+            else other2.get_coeffs()
         )
         coeff_scale = c0[:, None, None] * c1[None, :, None] * c2[None, None, :]
 
@@ -549,7 +569,7 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         return denom
 
     def Omega22(self, other: "GaussianBasis", ignore_coeffs: bool = False):
-        assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
+        assert _is_functional_proxy_of(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
         # (d, n_phi), (d, n_psi)
@@ -597,49 +617,41 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
             c_self = (
                 torch.ones(mu1.shape[1], dtype=mu1.dtype, device=mu1.device)
                 if not self.has_coeffs()
-                else self.coeff_values()
+                else self.get_coeffs()
             )
             c_other = (
                 torch.ones(mu2.shape[1], dtype=mu2.dtype, device=mu2.device)
                 if not other.has_coeffs()
-                else other.coeff_values()
+                else other.get_coeffs()
             )
             out = out * (c_self[:, None, None, None] * c_self[None, :, None, None])
             out = out * (c_other[None, None, :, None] * c_other[None, None, None, :])
         return out
 
     def marginal(self, marginal_dims: tuple[int, ...], ignore_coeffs: bool = False) -> "GaussianBasis":
-        marginal_dims = tuple(marginal_dims)
-        assert all(0 <= i < self.dim() for i in marginal_dims), "marginal_dims must be in [0, d)"
-        coeffs_out = self.coeffs.freeze_params() if ((not ignore_coeffs) and self.has_coeffs()) else None
-        if self.trainable():
-            return GaussianBasis(
-                uparams_init=self.uparams[marginal_dims, :, :].detach().clone(),
-                coeffs=coeffs_out,
-                min_std=self.min_std,
-                block_size=self.block_size,
-            )
-        means, stds = self.means_stds()
-        return GaussianBasis(
-            fixed_params=torch.stack([means[marginal_dims, :], stds[marginal_dims, :]], dim=-1).detach().clone(),
-            coeffs=coeffs_out,
-            min_std=self.min_std,
-            block_size=self.block_size,
-        )
+        dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim() for i in dims), "marginal_dims must be in [0, d)"
+        coeffs_out = self.get_coeffs() if ((not ignore_coeffs) and self.has_coeffs()) else None
+        
+        mu, std = self.means_stds()
+        mu_out = mu[dims, :]
+        std_out = std[dims, :]
+        return GaussianBasis(mean_params=mu_out, std_params=std_out, coeffs=coeffs_out, block_size=self.block_size)
 
     def product_basis(self, other_basis_factors: list["Basis"]) -> "GaussianBasis":
+        pass # TODO
         """
         Cartesian product of factor bases along the flattened product index.
 
         Each factor is a *normalized* separable Gaussian PDF. Their pointwise product is
         proportional to the Gaussian described by the returned ``params``. The ratio
-        ``∏_k N_k / N_*`` (per axis, then multiplied across axes) and any factor ``coeffs``
+        ``product_k N_k / N_*`` (per axis, then multiplied across axes) and any factor ``coeffs``
         are stored on the returned basis as ``coeffs`` (including the all-ones case when the
         prefactor is trivial).
         """
         factors: list[GaussianBasis] = [self]
         for other in other_basis_factors:
-            assert isinstance(other, GaussianBasis), "all factors must be GaussianBasis"
+            assert _is_functional_proxy_of(other, GaussianBasis), "all factors must be GaussianBasis"
             assert other.dim() == self.dim(), "Basis functions must have the same dimension"
             factors.append(other)
 
@@ -692,14 +704,12 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         sigma_flat = sigma_star.reshape(dim, n_total)
         log_const_flat = log_const.reshape(n_total)
 
-        params = torch.stack([mu_flat, sigma_flat], dim=-1)
-
         coeff_terms = []
         for basis in factors:
             if not basis.has_coeffs():
                 coeff_terms.append(torch.ones(basis.n_basis_functions(), dtype=dtype, device=device))
             else:
-                coeff_terms.append(basis.coeff_values())
+                coeff_terms.append(basis.get_coeffs())
 
         coeff_prod = torch.ones(n_per_factor, dtype=dtype, device=device)
         for k, c_k in enumerate(coeff_terms):
@@ -709,32 +719,25 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         coeffs_new = (coeff_prod * torch.exp(log_const_flat.reshape(n_per_factor))).reshape(n_total)
 
         return GaussianBasis(
-            fixed_params=params.detach().clone(),
-            coeffs=fixed_coeffs(coeffs_new.detach().clone()),
-            min_std=self.min_std,
+            params=(
+                Parameters.from_values(mu_flat, trainable=False),
+                self.get_params()[1].with_fixed_values(sigma_flat),
+            ),
+            coeffs=PositiveParameters.from_values(coeffs_new, trainable=False),
             block_size=self.block_size,
         )
-    
 
 
 class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
-    """
-    Separable basis with 1D factors of the form exp(a x^2 + b x).
-    Optional per-basis scaling is handled by self.coeffs.
-    """
+    """Separable basis with 1D factors exp(a x^2 + b x), a < 0."""
 
     def __init__(
         self,
-        uparams_init: torch.Tensor | None = None,
-        fixed_params: torch.Tensor | None = None,
-        coeffs: PositiveCoefficients | None = None,
-        eps: float = 1e-6,
+        params: tuple[Parameters, Parameters],
+        coeffs: PositiveParameters | None = None,
     ):
-        params = uparams_init if uparams_init is not None else fixed_params
-        assert params is not None, "uparams_init or fixed_params must be set"
-        assert params.shape[2] == 2, "basis params must have shape (d, n_basis, 2)"
-        super().__init__(uparams_init=uparams_init, fixed_params=fixed_params, coeffs=coeffs)
-        self.eps = eps
+        assert len(params) == 2 and all(isinstance(p, Parameters) for p in params)
+        super().__init__(params=list(params), coeffs=coeffs)
 
     @classmethod
     def random_init(
@@ -743,19 +746,21 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         n_basis: int,
         offsets: torch.Tensor = torch.zeros(2),
         variance: float = 1.0,
-        eps: float = 1e-6,
         device=None,
-        coeffs: PositiveCoefficients | None = None,
+        coeffs: PositiveParameters | None = None,
     ):
         if device is None:
             device = offsets.device
-        offsets = offsets.repeat(d, n_basis, 1)
-        params_init = (
-            torch.randn(d, n_basis, 2, device=device)
-            * torch.sqrt(torch.tensor(variance, device=device))
-            + offsets
+        else:
+            offsets = offsets.to(device)
+        scale = torch.sqrt(torch.tensor(variance, device=device))
+        return cls(
+            params=(
+                Parameters.random_init((d, n_basis), mean=offsets[0].item(), std=scale.item()),
+                Parameters.random_init((d, n_basis), mean=offsets[1].item(), std=scale.item()),
+            ),
+            coeffs=coeffs,
         )
-        return cls(uparams_init=params_init, coeffs=coeffs, eps=eps)
 
     @classmethod
     def set_init(
@@ -763,55 +768,74 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         d: int,
         n_basis: int,
         offsets: torch.Tensor = torch.zeros(2),
-        eps: float = 1e-6,
-        coeffs: PositiveCoefficients | None = None,
+        coeffs: PositiveParameters | None = None,
     ):
-        offsets = offsets.repeat(d, n_basis, 1)
-        return cls(uparams_init=offsets, coeffs=coeffs, eps=eps)
-
-    def freeze_params(self):
-        coeffs = self.coeffs.freeze_params() if self.has_coeffs() else None
-        a, b = self.ab()
-        return QuadraticExpBasis(
-            fixed_params=torch.stack([a, b], dim=-1).detach().clone(),
+        return cls(
+            params=(
+                Parameters.set_init((d, n_basis), offsets[0].item()),
+                Parameters.set_init((d, n_basis), offsets[1].item()),
+            ),
             coeffs=coeffs,
-            eps=self.eps,
         )
 
-    def ab(self):
-        if self.trainable():
-            raw_a = self.uparams[..., 0]
-            b = self.uparams[..., 1]
-            a = -torch.nn.functional.softplus(raw_a) - self.eps
-            return a, b
-        else:
-            return self.fixed_params[..., 0], self.fixed_params[..., 1]
+    def _a_values(self) -> torch.Tensor:
+        raw = self._params[0]()
+        if self._params[0].is_trainable():
+            return -torch.nn.functional.softplus(raw)
+        return raw
+
+    def freeze_params(self):
+        return QuadraticExpBasis(
+            params=(
+                Parameters.from_values(self._a_values().detach(), trainable=False),
+                self._params[1].freeze_params(),
+            ),
+            coeffs=self._coeffs.freeze_params() if self.has_coeffs() else None,
+        )
+
+    def _ab_axes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._a_values(), self._params[1]()
+
+    @staticmethod
+    def _log_quadratic_exp_pair_ip(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        lows: torch.Tensor | None,
+        highs: torch.Tensor | None,
+    ) -> torch.Tensor:
+        log_pref = -b.square() / (4.0 * a) + 0.5 * (
+            torch.log(torch.tensor(torch.pi, dtype=a.dtype, device=a.device)) - torch.log(-a)
+        )
+        if lows is None:
+            return log_pref
+        scale = torch.sqrt(-4.0 * a)
+        erf_diff = torch.special.erf((2.0 * a * highs + b) / scale) - torch.special.erf(
+            (2.0 * a * lows + b) / scale
+        )
+        return log_pref + erf_diff.clamp_min(torch.finfo(a.dtype).tiny).log()
 
     def normalized(self):
         return False
 
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
-        y = y[:, :, None]  # (n_data, d, n_basis)
-
-        a, b = self.ab()  # (d, n_basis)
-        log_dim_factors = a * y.square() + b * y
-        out = torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
+        a, b = self._ab_axes()
+        y = y[:, :, None]
+        out = torch.exp((a * y.square() + b * y).sum(dim=1))
         if self.has_coeffs():
             out = out * self.coeff_values()[None, :]
         return out
 
     def Omega1(self, ignore_coeffs: bool = False):
-        a, b = self.ab()
-
+        a, b = self._ab_axes()
         log_dim_int = -b.square() / (4.0 * a) + 0.5 * (
             torch.log(torch.tensor(torch.pi, dtype=a.dtype, device=a.device)) - torch.log(-a)
         )
-        out = torch.exp(log_dim_int.sum(dim=0))  # (n_basis,)
+        out = torch.exp(log_dim_int.sum(dim=0))
         if (not ignore_coeffs) and self.has_coeffs():
             out = out * self.coeff_values()
         return out
-    
+
     def Omega2(
         self,
         other: "QuadraticExpBasis",
@@ -821,15 +845,26 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
     ):
         assert isinstance(other, QuadraticExpBasis), "other must be QuadraticExpBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-
-        a1, b1 = self.ab()
-        a2, b2 = other.ab()
-        lows_b, highs_b = self._omega2_box_axes(lows, highs)
+        a1, b1 = self._ab_axes()
+        a2, b2 = other._ab_axes()
+        lows_b, highs_b = None, None
+        if lows is not None or highs is not None:
+            assert lows is not None and highs is not None, "lows and highs must both be set for a bounded domain"
+            dtype, device = self.param_dtype_device()
+            lows_b = lows.to(dtype=dtype, device=device).reshape(self.dim())[:, None, None]
+            highs_b = highs.to(dtype=dtype, device=device).reshape(self.dim())[:, None, None]
+            assert torch.all(lows_b < highs_b), "each low must be strictly less than the corresponding high"
         log_dim = self._log_quadratic_exp_pair_ip(
             a1[:, :, None] + a2[:, None, :], b1[:, :, None] + b2[:, None, :], lows_b, highs_b
         )
-        return self._omega2_from_log_dims(log_dim, other, ignore_coeffs)
-    
+        out = torch.exp(log_dim.sum(dim=0))
+        if not ignore_coeffs:
+            if self.has_coeffs():
+                out = out * self.coeff_values()[:, None]
+            if other.has_coeffs():
+                out = out * other.coeff_values()[None, :]
+        return out
+
     def Omega3_contract(
         self,
         other1: "QuadraticExpBasis",
@@ -848,9 +883,9 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
         assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
 
-        a0, b0 = self.ab()
-        a1, b1 = other1.ab()
-        a2, b2 = other2.ab()
+        a0, b0 = self._ab_axes()
+        a1, b1 = other1._ab_axes()
+        a2, b2 = other2._ab_axes()
 
         n0 = self.n_basis_functions()
         n1 = other1.n_basis_functions()
@@ -901,10 +936,9 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         assert isinstance(other, QuadraticExpBasis), "other must be QuadraticExpBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
-        a1, b1 = self.ab()    # (d, n_self)
-        a2, b2 = other.ab()   # (d, n_other)
+        a1, b1 = self._ab_axes()
+        a2, b2 = other._ab_axes()
 
-        # Broadcast to (d, n_self, n_self, n_other, n_other)
         A = (
             a1[:, :, None, None, None]
             + a1[:, None, :, None, None]
@@ -919,10 +953,8 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         )
         log_pi = torch.log(torch.tensor(torch.pi, dtype=A.dtype, device=A.device))
         log_dim_int = -(B * B) / (4.0 * A) + 0.5 * (log_pi - torch.log(-A))
+        return torch.exp(log_dim_int.sum(dim=0))
 
-        log_Omega = log_dim_int.sum(dim=0)   # (n_self, n_self, n_other, n_other)
-        return torch.exp(log_Omega)
-    
     def marginal(self, marginal_dims: tuple[int, ...], ignore_coeffs: bool = False) -> "QuadraticExpBasis":
         marginal_dims = tuple(marginal_dims)
         assert all(0 <= i < self.dim() for i in marginal_dims), "marginal_dims must be in [0, d)"
@@ -931,52 +963,31 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         keep_dims = marginal_dims
         integrate_dims = tuple(i for i in range(self.dim()) if i not in keep_dims)
 
-        a, b = self.ab()  # (d, n_basis)
+        a, b = self._ab_axes()
         finfo = torch.finfo(a.dtype)
 
-        # --- compute log integral contribution from marginalized dims ---
         if len(integrate_dims) > 0:
-            a_m = a[integrate_dims, :]
+            a_m = torch.clamp(a[integrate_dims, :], max=-torch.finfo(a.dtype).eps)
             b_m = b[integrate_dims, :]
-            # Stay away from a → 0^- where -(b^2)/(4a) and log(-a) are singular.
-            a_m = torch.clamp(a_m, max=-self.eps)
-
             log_pi = torch.log(torch.tensor(torch.pi, dtype=a.dtype, device=a.device))
-
-            log_int_m = (
-                -(b_m * b_m) / (4.0 * a_m)
-                + 0.5 * (log_pi - torch.log(-a_m))
-            )  # (|M|, n_basis)
-
-            log_int_sum = log_int_m.sum(dim=0)  # (n_basis,)
-            log_int_sum = torch.clamp(log_int_sum, max=0.99 * math.log(finfo.max))
+            log_int_m = -(b_m * b_m) / (4.0 * a_m) + 0.5 * (log_pi - torch.log(-a_m))
+            log_int_sum = torch.clamp(log_int_m.sum(dim=0), max=0.99 * math.log(finfo.max))
         else:
-            log_int_sum = torch.zeros(
-                self.n_basis_functions(),
-                dtype=a.dtype,
-                device=a.device,
-            )
+            log_int_sum = torch.zeros(self.n_basis_functions(), dtype=a.dtype, device=a.device)
 
         coeffs_new = torch.exp(log_int_sum)
         if (not ignore_coeffs) and self.has_coeffs():
             coeffs_new = coeffs_new * self.coeff_values()
         coeffs_new = torch.nan_to_num(coeffs_new, nan=0.0, posinf=finfo.max, neginf=0.0)
 
-        # Slice stored parameters on kept axes. Re-inverting a_k -> raw_a can drift in
-        # float32 so (a,b) on kept dims no longer match coeffs_new from the true integral.
-        if self.trainable():
-            return QuadraticExpBasis(
-                uparams_init=self.uparams[keep_dims, :, :].detach().clone(),
-                coeffs=fixed_coeffs(coeffs_new.detach().clone()),
-                eps=self.eps,
-            )
-        a, b = self.ab()
         return QuadraticExpBasis(
-            fixed_params=torch.stack([a[keep_dims, :], b[keep_dims, :]], dim=-1).detach().clone(),
-            coeffs=fixed_coeffs(coeffs_new.detach().clone()),
-            eps=self.eps,
+            params=(
+                Parameters.from_values(a[keep_dims, :], trainable=False),
+                Parameters.from_values(self._params[1]()[keep_dims, :], trainable=False),
+            ),
+            coeffs=PositiveParameters.from_values(coeffs_new, trainable=False),
         )
-    
+
     def product_basis(self, other_basis_factors: list["Basis"]) -> "QuadraticExpBasis":
         factors: list[QuadraticExpBasis] = [self]
         for other in other_basis_factors:
@@ -988,7 +999,7 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         dtype, device = self.param_dtype_device()
         dim = self.dim()
 
-        ab_terms: list[tuple[torch.Tensor, torch.Tensor]] = [basis.ab() for basis in factors]
+        ab_terms: list[tuple[torch.Tensor, torch.Tensor]] = [basis._ab_axes() for basis in factors]
         n_per_factor = [basis.n_basis_functions() for basis in factors]
 
         coeff_shape = [dim, *n_per_factor]
@@ -1008,8 +1019,6 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
         a_flat = a_sum.reshape(dim, n_total)
         b_flat = b_sum.reshape(dim, n_total)
 
-        params = torch.stack([a_flat, b_flat], dim=-1)
-
         coeff_terms = []
         for basis in factors:
             if not basis.has_coeffs():
@@ -1024,32 +1033,25 @@ class QuadraticExpBasis(SeparableBasis, NonnegativeBasis):
             coeff_prod = coeff_prod * c_k.reshape(view_shape)
         coeffs_new = coeff_prod.reshape(n_total)
         return QuadraticExpBasis(
-            fixed_params=params.detach().clone(),
-            coeffs=fixed_coeffs(coeffs_new.detach().clone()),
-            eps=self.eps,
+            params=(
+                Parameters.from_values(a_flat, trainable=False),
+                Parameters.from_values(b_flat, trainable=False),
+            ),
+            coeffs=PositiveParameters.from_values(coeffs_new, trainable=False),
         )
-    
+
 
 class BetaBasis(SeparableBasis, NonnegativeBasis):
-    """
-    Separable product of 1D Beta PDFs on (0, 1).
-    Optional per-basis scaling is handled by self.coeffs.
-    """
+    """Separable product of normalized 1D Beta PDFs on (0, 1)."""
 
     def __init__(
         self,
-        uparams_init: torch.Tensor | None = None,
-        fixed_params: torch.Tensor | None = None,
-        coeffs: PositiveCoefficients | None = None,
-        min_concentration: float = 1.0,
+        params: tuple[PositiveParameters, PositiveParameters],
+        coeffs: PositiveParameters | None = None,
         eps: float = 1e-6,
     ):
-        params = uparams_init if uparams_init is not None else fixed_params
-        assert min_concentration > 0.0, "min_concentration must be positive"
-        assert params is not None, "uparams_init or fixed_params must be set"
-        assert params.shape[2] == 2, "basis params must have shape (d, n_basis, 2)"
-        super().__init__(uparams_init=uparams_init, fixed_params=fixed_params, coeffs=coeffs)
-        self.min_concentration = min_concentration
+        assert len(params) == 2 and all(isinstance(p, PositiveParameters) for p in params)
+        super().__init__(params=list(params), coeffs=coeffs)
         self.eps = eps
 
     @classmethod
@@ -1059,20 +1061,27 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         n_basis: int,
         offsets: torch.Tensor = torch.zeros(2),
         variance: float = 1.0,
-        min_concentration: float = 1.0,
         eps: float = 1e-6,
         device=None,
-        coeffs: PositiveCoefficients | None = None,
+        coeffs: PositiveParameters | None = None,
     ):
         if device is None:
             device = offsets.device
         else:
             offsets = offsets.to(device)
-        offsets = offsets.repeat(d, n_basis, 1)
+        scale = torch.sqrt(torch.tensor(variance, device=device))
         return cls(
-            uparams_init=torch.randn(d, n_basis, 2, device=device) * torch.sqrt(torch.tensor(variance, device=device)) + offsets,
+            params=(
+                PositiveParameters(
+                    trainable_init_values=torch.randn(d, n_basis, device=device) * scale + offsets[0],
+                    normalized=False,
+                ),
+                PositiveParameters(
+                    trainable_init_values=torch.randn(d, n_basis, device=device) * scale + offsets[1],
+                    normalized=False,
+                ),
+            ),
             coeffs=coeffs,
-            min_concentration=min_concentration,
             eps=eps,
         )
 
@@ -1082,62 +1091,72 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         d: int,
         n_basis: int,
         offsets: torch.Tensor = torch.zeros(2),
-        min_concentration: float = 1.0,
         eps: float = 1e-6,
         device=None,
-        coeffs: PositiveCoefficients | None = None,
+        coeffs: PositiveParameters | None = None,
     ):
-        if device is None:
-            device = offsets.device
-        else:
-            offsets = offsets.to(device)
-        offsets = offsets.repeat(d, n_basis, 1)
         return cls(
-            uparams_init=offsets,
+            params=(
+                PositiveParameters(
+                    trainable_init_values=torch.full((d, n_basis), offsets[0].item()),
+                    normalized=False,
+                ),
+                PositiveParameters(
+                    trainable_init_values=torch.full((d, n_basis), offsets[1].item()),
+                    normalized=False,
+                ),
+            ),
             coeffs=coeffs,
-            min_concentration=min_concentration,
             eps=eps,
         )
 
     def freeze_params(self):
-        coeffs = self.coeffs.freeze_params() if self.has_coeffs() else None
-        alpha, beta = self.alphas_betas()
         return BetaBasis(
-            fixed_params=torch.stack([alpha, beta], dim=-1).detach().clone(),
-            coeffs=coeffs,
-            min_concentration=self.min_concentration,
+            params=tuple(p.freeze_params() for p in self._params),
+            coeffs=self._coeffs.freeze_params() if self.has_coeffs() else None,
             eps=self.eps,
         )
 
-    def alphas_betas(self):
-        if self.trainable():
-            alpha = torch.nn.functional.softplus(self.uparams[..., 0] - 1.0) + self.min_concentration
-            beta = torch.nn.functional.softplus(self.uparams[..., 1] - 1.0) + self.min_concentration
-            return alpha, beta
-        else:
-            return self.fixed_params[..., 0], self.fixed_params[..., 1]
+    def _alphas_betas_axes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._params[0](), self._params[1]()
+
+    def alphas_betas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._params[0](), self._params[1]()
 
     @staticmethod
     def _log_beta_fn(a: torch.Tensor, b: torch.Tensor):
         return torch.lgamma(a) + torch.lgamma(b) - torch.lgamma(a + b)
 
+    @staticmethod
+    def _log_beta_pair_ip(
+        a1: torch.Tensor,
+        b1: torch.Tensor,
+        a2: torch.Tensor,
+        b2: torch.Tensor,
+        lows: torch.Tensor | None,
+        highs: torch.Tensor | None,
+        normalized: bool,
+    ) -> torch.Tensor:
+        a = a1 + a2 - 1.0
+        b = b1 + b2 - 1.0
+        log_ip = BetaBasis._log_beta_fn(a, b)
+        if normalized:
+            log_ip = log_ip - BetaBasis._log_beta_fn(a1, b1) - BetaBasis._log_beta_fn(a2, b2)
+        if lows is None:
+            return log_ip
+        inc = torch.special.betainc(highs, a, b) - torch.special.betainc(lows, a, b)
+        return log_ip + inc.clamp_min(torch.finfo(a.dtype).tiny).log()
+
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
-
-        #y_input = y.clone()
-
-        y = y.clamp(self.eps, 1.0 - self.eps)
-        y = y[:, :, None]  # (n_data, d, n_basis)
-
-        alpha, beta = self.alphas_betas()  # (d, n_basis), (d, n_basis)
-
+        y = y.clamp(self.eps, 1.0 - self.eps)[:, :, None]
+        alpha, beta = self._alphas_betas_axes()
         log_dim_factors = (
             (alpha - 1.0) * torch.log(y)
             + (beta - 1.0) * torch.log1p(-y)
             - self._log_beta_fn(alpha, beta)
         )
-
-        out = torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
+        out = torch.exp(log_dim_factors.sum(dim=1))
         if self.has_coeffs():
             out = out * self.coeff_values()[None, :]
         return out
@@ -1147,11 +1166,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
 
     def Omega1(self, ignore_coeffs: bool = False):
         dtype, device = self.param_dtype_device()
-        out = torch.ones(
-            self.n_basis_functions(),
-            dtype=dtype,
-            device=device,
-        )
+        out = torch.ones(self.n_basis_functions(), dtype=dtype, device=device)
         if (not ignore_coeffs) and self.has_coeffs():
             out = out * self.coeff_values()
         return out
@@ -1165,15 +1180,25 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
     ):
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-
-        a1, b1 = self.alphas_betas()
-        a2, b2 = other.alphas_betas()
-        lows_b, highs_b = self._omega2_box_axes(lows, highs)
+        a1, b1 = self._alphas_betas_axes()
+        a2, b2 = other._alphas_betas_axes()
+        lows_b, highs_b = None, None
+        if lows is not None or highs is not None:
+            assert lows is not None and highs is not None, "lows and highs must both be set for a bounded domain"
+            dtype, device = self.param_dtype_device()
+            lows_b = lows.to(dtype=dtype, device=device).reshape(self.dim())[:, None, None]
+            highs_b = highs.to(dtype=dtype, device=device).reshape(self.dim())[:, None, None]
+            assert torch.all(lows_b < highs_b), "each low must be strictly less than the corresponding high"
         log_dim = self._log_beta_pair_ip(
-            a1[:, :, None], b1[:, :, None], a2[:, None, :], b2[:, None, :],
-            lows_b, highs_b, self._log_beta_fn, True,
+            a1[:, :, None], b1[:, :, None], a2[:, None, :], b2[:, None, :], lows_b, highs_b, True
         )
-        return self._omega2_from_log_dims(log_dim, other, ignore_coeffs)
+        out = torch.exp(log_dim.sum(dim=0))
+        if not ignore_coeffs:
+            if self.has_coeffs():
+                out = out * self.coeff_values()[:, None]
+            if other.has_coeffs():
+                out = out * other.coeff_values()[None, :]
+        return out
 
     def Omega3_contract(
         self,
@@ -1194,9 +1219,9 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
         assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
 
-        a0, b0 = self.alphas_betas()
-        a1, b1 = other1.alphas_betas()
-        a2, b2 = other2.alphas_betas()
+        a0, b0 = self._alphas_betas_axes()
+        a1, b1 = other1._alphas_betas_axes()
+        a2, b2 = other2._alphas_betas_axes()
         c0 = (
             torch.ones(self.n_basis_functions(), dtype=a0.dtype, device=a0.device)
             if ignore_coeffs or (not self.has_coeffs())
@@ -1273,8 +1298,8 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
-        a1, b1 = self.alphas_betas()   # (d, n_phi)
-        a2, b2 = other.alphas_betas()  # (d, n_psi)
+        a1, b1 = self._alphas_betas_axes()
+        a2, b2 = other._alphas_betas_axes()
 
         # Broadcast to (d, n_phi, n_phi, n_psi, n_psi)
         a_i = a1[:, :, None, None, None]
@@ -1316,23 +1341,15 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         return out
 
     def marginal(self, marginal_dims: tuple[int, ...], ignore_coeffs: bool = False) -> "BetaBasis":
-        marginal_dims = tuple(marginal_dims)
-        assert all(0 <= i < self.dim() for i in marginal_dims), "marginal_dims must be in [0, d)"
-
-        coeffs_out = self.coeffs.freeze_params() if ((not ignore_coeffs) and self.has_coeffs()) else None
-
-        if self.trainable():
-            return BetaBasis(
-                uparams_init=self.uparams[marginal_dims, :, :].detach().clone(),
-                coeffs=coeffs_out,
-                min_concentration=self.min_concentration,
-                eps=self.eps,
-            )
-        alpha, beta = self.alphas_betas()
+        dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim() for i in dims), "marginal_dims must be in [0, d)"
+        coeffs_out = self._coeffs.freeze_params() if ((not ignore_coeffs) and self.has_coeffs()) else None
         return BetaBasis(
-            fixed_params=torch.stack([alpha[marginal_dims, :], beta[marginal_dims, :]], dim=-1).detach().clone(),
+            params=(
+                self._params[0].with_fixed_values(self._params[0]()[dims, :]),
+                self._params[1].with_fixed_values(self._params[1]()[dims, :]),
+            ),
             coeffs=coeffs_out,
-            min_concentration=self.min_concentration,
             eps=self.eps,
         )
 
@@ -1347,17 +1364,18 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         trivial prefactors apply).
         """
         factors: list["BetaBasis"] = [self]
+        min_c = self._params[0]._epsilon
         for other in other_basis_factors:
             assert isinstance(other, BetaBasis), "all factors must be BetaBasis"
             assert other.dim() == self.dim(), "Basis functions must have the same dimension"
-            assert abs(other.min_concentration - self.min_concentration) < 1e-12, "all factors must share min_concentration"
+            assert abs(other._params[0]._epsilon - min_c) < 1e-12
             factors.append(other)
 
         n_factors = len(factors)
         dtype, device = self.param_dtype_device()
         dim = self.dim()
 
-        alpha_beta_terms: list[tuple[torch.Tensor, torch.Tensor]] = [basis.alphas_betas() for basis in factors]
+        alpha_beta_terms = [basis._alphas_betas_axes() for basis in factors]
         n_per_factor = [basis.n_basis_functions() for basis in factors]
 
         coeff_shape = [dim, *n_per_factor]
@@ -1374,7 +1392,6 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         alpha_new = alpha_sum - shift
         beta_new = beta_sum - shift
 
-        min_c = self.min_concentration
         alpha_new = alpha_new.clamp_min(min_c + 1e-8)
         beta_new = beta_new.clamp_min(min_c + 1e-8)
 
@@ -1392,8 +1409,6 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
 
         alpha_flat = alpha_new.reshape(dim, n_total)
         beta_flat = beta_new.reshape(dim, n_total)
-
-        params = torch.stack([alpha_flat, beta_flat], dim=-1)
 
         coeff_terms = []
         for basis in factors:
@@ -1413,28 +1428,26 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         coeffs_new = (coeff_prod * intrinsic).reshape(n_total)
 
         return BetaBasis(
-            fixed_params=params.detach().clone(),
-            coeffs=fixed_coeffs(coeffs_new.detach().clone()),
-            min_concentration=self.min_concentration,
+            params=(
+                self._params[0].with_fixed_values(alpha_flat),
+                self._params[1].with_fixed_values(beta_flat),
+            ),
+            coeffs=PositiveParameters.from_values(coeffs_new, trainable=False),
             eps=self.eps,
         )
 
 
 class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
+    """Separable unnormalized Beta kernel x^(α-1) (1-x)^(β-1) on (0, 1)."""
+
     def __init__(
         self,
-        uparams_init: torch.Tensor | None = None,
-        fixed_params: torch.Tensor | None = None,
-        coeffs: PositiveCoefficients | None = None,
-        min_concentration: float = 1.0,
+        params: tuple[PositiveParameters, PositiveParameters],
+        coeffs: PositiveParameters | None = None,
         eps: float = 1e-6,
     ):
-        params = uparams_init if uparams_init is not None else fixed_params
-        assert min_concentration > 0.0, "min_concentration must be positive"
-        assert params is not None, "uparams_init or fixed_params must be set"
-        assert params.shape[2] == 2, "basis params must have shape (d, n_basis, 2)"
-        super().__init__(uparams_init=uparams_init, fixed_params=fixed_params, coeffs=coeffs)
-        self.min_concentration = min_concentration
+        assert len(params) == 2 and all(isinstance(p, PositiveParameters) for p in params)
+        super().__init__(params=list(params), coeffs=coeffs)
         self.eps = eps
 
     @classmethod
@@ -1444,22 +1457,12 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
         n_basis: int,
         offsets: torch.Tensor = torch.zeros(2),
         variance: float = 1.0,
-        min_concentration: float = 1.0,
         eps: float = 1e-6,
-        device = None,
-        coeffs: PositiveCoefficients | None = None,
+        device=None,
+        coeffs: PositiveParameters | None = None,
     ):
-        if device is None:
-            device = offsets.device
-        else:
-            offsets = offsets.to(device)
-        offsets = offsets.repeat(d, n_basis, 1)
-        return cls(
-            uparams_init=torch.randn(d, n_basis, 2, device=device) * torch.sqrt(torch.tensor(variance, device=device)) + offsets,
-            coeffs=coeffs,
-            min_concentration=min_concentration,
-            eps=eps,
-        )
+        beta = BetaBasis.random_init(d, n_basis, offsets, variance, eps, device, coeffs)
+        return cls(params=tuple(beta._params), coeffs=coeffs, eps=eps)
 
     @classmethod
     def set_init(
@@ -1467,54 +1470,31 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
         d: int,
         n_basis: int,
         offsets: torch.Tensor = torch.zeros(2),
-        min_concentration: float = 1.0,
         eps: float = 1e-6,
-        device = None,
-        coeffs: PositiveCoefficients | None = None,
+        device=None,
+        coeffs: PositiveParameters | None = None,
     ):
-        if device is None:
-            device = offsets.device
-        else:
-            offsets = offsets.to(device)
-        offsets = offsets.repeat(d, n_basis, 1)
-        return cls(
-            uparams_init=offsets,
-            coeffs=coeffs,
-            min_concentration=min_concentration,
-            eps=eps,
-        )
+        beta = BetaBasis.set_init(d, n_basis, offsets, eps, device, coeffs)
+        return cls(params=tuple(beta._params), coeffs=coeffs, eps=eps)
 
     def freeze_params(self):
-        coeffs = self.coeffs.freeze_params() if self.has_coeffs() else None
-        alpha, beta = self.alphas_betas()
         return UnnormalizedBetaBasis(
-            fixed_params=torch.stack([alpha, beta], dim=-1).detach().clone(),
-            min_concentration=self.min_concentration,
+            params=tuple(p.freeze_params() for p in self._params),
+            coeffs=self._coeffs.freeze_params() if self.has_coeffs() else None,
             eps=self.eps,
-            coeffs=coeffs,
         )
 
-    def alphas_betas(self):
-        if self.trainable():
-            alpha = torch.nn.functional.softplus(self.uparams[..., 0] - 1.0) + self.min_concentration
-            beta = torch.nn.functional.softplus(self.uparams[..., 1] - 1.0) + self.min_concentration
-            return alpha, beta
-        else:
-            return self.fixed_params[..., 0], self.fixed_params[..., 1]
+    def _alphas_betas_axes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._params[0](), self._params[1]()
 
-    @staticmethod
-    def _log_beta_fn(a: torch.Tensor, b: torch.Tensor):
-        return torch.lgamma(a) + torch.lgamma(b) - torch.lgamma(a + b)
+    def alphas_betas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._params[0](), self._params[1]()
 
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
-
-        y = y.clamp(self.eps, 1.0 - self.eps)
-        y = y[:, :, None]  # (n_data, d, n_basis)
-
-        alpha, beta = self.alphas_betas()  # (d, n_basis), (d, n_basis)
-        log_dim_factors = (alpha - 1.0) * torch.log(y) + (beta - 1.0) * torch.log1p(-y)
-        out = torch.exp(log_dim_factors.sum(dim=1))  # (n_data, n_basis)
+        y = y.clamp(self.eps, 1.0 - self.eps)[:, :, None]
+        alpha, beta = self._alphas_betas_axes()
+        out = torch.exp(((alpha - 1.0) * torch.log(y) + (beta - 1.0) * torch.log1p(-y)).sum(dim=1))
         if self.has_coeffs():
             out = out * self.coeff_values()[None, :]
         return out
@@ -1523,9 +1503,8 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
         return False
 
     def Omega1(self, ignore_coeffs: bool = False):
-        alpha, beta = self.alphas_betas()  # (d, n_basis)
-        log_dim_int = self._log_beta_fn(alpha, beta)
-        out = torch.exp(log_dim_int.sum(dim=0))
+        alpha, beta = self._alphas_betas_axes()
+        out = torch.exp(BetaBasis._log_beta_fn(alpha, beta).sum(dim=0))
         if (not ignore_coeffs) and self.has_coeffs():
             out = out * self.coeff_values()
         return out
@@ -1539,16 +1518,26 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
     ):
         assert isinstance(other, UnnormalizedBetaBasis), "other must be UnnormalizedBetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-
-        a1, b1 = self.alphas_betas()
-        a2, b2 = other.alphas_betas()
-        lows_b, highs_b = self._omega2_box_axes(lows, highs)
-        log_dim = self._log_beta_pair_ip(
-            a1[:, :, None], b1[:, :, None], a2[:, None, :], b2[:, None, :],
-            lows_b, highs_b, self._log_beta_fn, False,
+        a1, b1 = self._alphas_betas_axes()
+        a2, b2 = other._alphas_betas_axes()
+        lows_b, highs_b = None, None
+        if lows is not None or highs is not None:
+            assert lows is not None and highs is not None, "lows and highs must both be set for a bounded domain"
+            dtype, device = self.param_dtype_device()
+            lows_b = lows.to(dtype=dtype, device=device).reshape(self.dim())[:, None, None]
+            highs_b = highs.to(dtype=dtype, device=device).reshape(self.dim())[:, None, None]
+            assert torch.all(lows_b < highs_b), "each low must be strictly less than the corresponding high"
+        log_dim = BetaBasis._log_beta_pair_ip(
+            a1[:, :, None], b1[:, :, None], a2[:, None, :], b2[:, None, :], lows_b, highs_b, False
         )
-        return self._omega2_from_log_dims(log_dim, other, ignore_coeffs)
-    
+        out = torch.exp(log_dim.sum(dim=0))
+        if not ignore_coeffs:
+            if self.has_coeffs():
+                out = out * self.coeff_values()[:, None]
+            if other.has_coeffs():
+                out = out * other.coeff_values()[None, :]
+        return out
+
     def Omega3_contract(
         self,
         other1: "UnnormalizedBetaBasis",
@@ -1563,9 +1552,9 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
         assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
         assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
 
-        a0, b0 = self.alphas_betas()
-        a1, b1 = other1.alphas_betas()
-        a2, b2 = other2.alphas_betas()
+        a0, b0 = self._alphas_betas_axes()
+        a1, b1 = other1._alphas_betas_axes()
+        a2, b2 = other2._alphas_betas_axes()
 
         n0 = self.n_basis_functions()
         n1 = other1.n_basis_functions()
@@ -1574,7 +1563,7 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
         if block_size is None:
             a_sum = a0[:, :, None, None] + a1[:, None, :, None] + a2[:, None, None, :] - 2.0
             b_sum = b0[:, :, None, None] + b1[:, None, :, None] + b2[:, None, None, :] - 2.0
-            omega_full = torch.exp(self._log_beta_fn(a_sum, b_sum).sum(dim=0))
+            omega_full = torch.exp(BetaBasis._log_beta_fn(a_sum, b_sum).sum(dim=0))
             return torch.einsum("i,j,ijk->k", left_i, left_j, omega_full)
 
         assert block_size > 0, "block_size must be positive"
@@ -1598,7 +1587,7 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
                         + b2[r, None, None, k_start:k_end]
                         - 2.0
                     )
-                    log_chunk += self._log_beta_fn(a_sum, b_sum)
+                    log_chunk += BetaBasis._log_beta_fn(a_sum, b_sum)
 
                 omega_chunk = torch.exp(log_chunk)
                 denom[k_start:k_end] += torch.einsum("i,j,ijk->k", left_i, left_j_blk, omega_chunk)
@@ -1608,8 +1597,8 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
         assert isinstance(other, UnnormalizedBetaBasis), "other must be UnnormalizedBetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
-        a1, b1 = self.alphas_betas()
-        a2, b2 = other.alphas_betas()
+        a1, b1 = self._alphas_betas_axes()
+        a2, b2 = other._alphas_betas_axes()
 
         a_sum = (
             a1[:, :, None, None, None]
@@ -1625,53 +1614,45 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
             + b2[:, None, None, None, :]
             - 3.0
         )
-        return torch.exp(self._log_beta_fn(a_sum, b_sum).sum(dim=0))
+        return torch.exp(BetaBasis._log_beta_fn(a_sum, b_sum).sum(dim=0))
 
     def marginal(self, marginal_dims: tuple[int, ...], ignore_coeffs: bool = False) -> "UnnormalizedBetaBasis":
-        marginal_dims = tuple(marginal_dims)
-        assert all(0 <= i < self.dim() for i in marginal_dims), "marginal_dims must be in [0, d)"
-
-        # In this codebase, marginal_dims are the coordinates to keep.
-        keep_dims = marginal_dims
+        keep_dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim() for i in keep_dims), "marginal_dims must be in [0, d)"
         integrate_dims = tuple(i for i in range(self.dim()) if i not in keep_dims)
-        alpha, beta = self.alphas_betas()
+        alpha, beta = self._alphas_betas_axes()
         if len(integrate_dims) > 0:
-            log_int_sum = self._log_beta_fn(alpha[integrate_dims, :], beta[integrate_dims, :]).sum(dim=0)
-            coeffs_new = torch.exp(log_int_sum)
+            coeffs_new = torch.exp(
+                BetaBasis._log_beta_fn(alpha[integrate_dims, :], beta[integrate_dims, :]).sum(dim=0)
+            )
         else:
             dtype, device = self.param_dtype_device()
             coeffs_new = torch.ones(self.n_basis_functions(), dtype=dtype, device=device)
         if (not ignore_coeffs) and self.has_coeffs():
             coeffs_new = coeffs_new * self.coeff_values()
-
-        if self.trainable():
-            return UnnormalizedBetaBasis(
-                uparams_init=self.uparams[keep_dims, :, :].detach().clone(),
-                min_concentration=self.min_concentration,
-                eps=self.eps,
-                coeffs=fixed_coeffs(coeffs_new.detach().clone()),
-            )
-        alpha, beta = self.alphas_betas()
         return UnnormalizedBetaBasis(
-            fixed_params=torch.stack([alpha[keep_dims, :], beta[keep_dims, :]], dim=-1).detach().clone(),
-            min_concentration=self.min_concentration,
+            params=(
+                self._params[0].with_fixed_values(self._params[0]()[keep_dims, :]),
+                self._params[1].with_fixed_values(self._params[1]()[keep_dims, :]),
+            ),
+            coeffs=PositiveParameters.from_values(coeffs_new, trainable=False),
             eps=self.eps,
-            coeffs=fixed_coeffs(coeffs_new.detach().clone()),
         )
 
     def product_basis(self, other_basis_factors: list["Basis"]) -> "UnnormalizedBetaBasis":
         factors: list[UnnormalizedBetaBasis] = [self]
+        min_c = self._params[0]._epsilon
         for other in other_basis_factors:
             assert isinstance(other, UnnormalizedBetaBasis), "all factors must be UnnormalizedBetaBasis"
             assert other.dim() == self.dim(), "Basis functions must have the same dimension"
-            assert abs(other.min_concentration - self.min_concentration) < 1e-12, "all factors must share min_concentration"
+            assert abs(other._params[0]._epsilon - min_c) < 1e-12
             factors.append(other)
 
         n_factors = len(factors)
         dtype, device = self.param_dtype_device()
         dim = self.dim()
 
-        alpha_beta_terms: list[tuple[torch.Tensor, torch.Tensor]] = [basis.alphas_betas() for basis in factors]
+        alpha_beta_terms = [basis._alphas_betas_axes() for basis in factors]
         n_per_factor = [basis.n_basis_functions() for basis in factors]
 
         coeff_shape = [dim, *n_per_factor]
@@ -1691,7 +1672,6 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
         alpha_new = alpha_sum - shift
         beta_new = beta_sum - shift
 
-        min_c = self.min_concentration
         alpha_new = alpha_new.clamp_min(min_c + 1e-8)
         beta_new = beta_new.clamp_min(min_c + 1e-8)
 
@@ -1701,8 +1681,6 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
 
         alpha_flat = alpha_new.reshape(dim, n_total)
         beta_flat = beta_new.reshape(dim, n_total)
-
-        params = torch.stack([alpha_flat, beta_flat], dim=-1)
 
         coeff_terms = []
         for basis in factors:
@@ -1719,17 +1697,25 @@ class UnnormalizedBetaBasis(SeparableBasis, NonnegativeBasis):
         coeffs_new = coeff_prod.reshape(n_total)
 
         return UnnormalizedBetaBasis(
-            fixed_params=params.detach().clone(),
-            min_concentration=self.min_concentration,
+            params=(
+                self._params[0].with_fixed_values(alpha_flat),
+                self._params[1].with_fixed_values(beta_flat),
+            ),
+            coeffs=PositiveParameters.from_values(coeffs_new, trainable=False),
             eps=self.eps,
-            coeffs=fixed_coeffs(coeffs_new.detach().clone()),
         )
 
 
 class NFBasis(Basis, NonnegativeBasis):
-    def __init__(self, dim : int, n_basis : int, n_layers : int = 5, hidden_features : int = 128, embedding_dim : int = 16, trainable : bool = True):
-        del trainable  # NF basis params are handled by flow modules.
-        super().__init__(fixed_params=torch.empty(dim, n_basis, 0))
+    def __init__(
+        self,
+        dim: int,
+        n_basis: int,
+        n_layers: int = 5,
+        hidden_features: int = 128,
+        embedding_dim: int = 16,
+    ):
+        super().__init__(dim=dim, n_basis=n_basis, params=[])
 
         self.embedding_dim = embedding_dim
         self.index_embedding = torch.nn.Embedding(num_embeddings=n_basis, embedding_dim=embedding_dim)
@@ -1764,54 +1750,48 @@ class NFBasis(Basis, NonnegativeBasis):
     def normalized(self):
         return True
 
+    def param_dtype_device(self):
+        return self.index_embedding.weight.dtype, self.index_embedding.weight.device
+
     def Omega1(self):
         dtype, device = self.param_dtype_device()
-        return torch.ones(
-            self.n_basis_functions(),
-            dtype=dtype,
-            device=device,
-        )
+        return torch.ones(self.n_basis_functions(), dtype=dtype, device=device)
 
 
-class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
-    def __init__(self, x : torch.Tensor, kernel_bandwidth : float = None, trainable : bool = True, coeffs : PositiveCoefficients | None = None):
+class GaussianKernelBasis(Basis, NonnegativeBasis):
+    def __init__(
+        self,
+        x: torch.Tensor,
+        kernel_bandwidth: torch.Tensor | Parameters | None = None,
+        coeffs: PositiveParameters | None = None,
+        *,
+        trainable: bool = True,
+    ):
         if coeffs is not None:
             assert not trainable, "GaussianKernelBasis: coeffs requires trainable=False"
-        # Preserve sample/dimension alignment as (d, n_basis, 1).
-        # NOTE: reshape would reinterpret memory and scramble centers; use transpose.
-        x_stored = x.detach().transpose(0, 1).unsqueeze(-1).clone()  # (d, n_params, n_params_per_basis=1)
-        
-        super().__init__(fixed_params=x_stored, coeffs=coeffs)
-
+        assert x.dim() == 2, "x must have shape (n_samples, d)"
+        centers = Parameters.from_values(x.detach().clone().transpose(0, 1).contiguous(), trainable=trainable)
         if kernel_bandwidth is None:
             bw = GaussianKernelBasis.ss_bandwidth(x.detach())
-            if trainable:
-                self.kernel_bandwidth = torch.nn.Parameter(bw)
-            else:
-                self.register_buffer("kernel_bandwidth", bw)
-        elif isinstance(kernel_bandwidth, torch.nn.Parameter):
-            # Preserve external/shared parameter object across modules.
-            self.register_parameter("kernel_bandwidth", kernel_bandwidth)
-        elif torch.is_tensor(kernel_bandwidth):
-            # Preserve external/shared tensor object across modules.
-            if trainable:
-                self.kernel_bandwidth = torch.nn.Parameter(kernel_bandwidth)
-            else:
-                self.register_buffer("kernel_bandwidth", kernel_bandwidth)
+            bandwidth = Parameters.from_values(bw, trainable=trainable)
+        elif isinstance(kernel_bandwidth, Parameters):
+            bandwidth = kernel_bandwidth
         else:
-            bw = torch.tensor(kernel_bandwidth, dtype=x.dtype, device=x.device)
-            if trainable:
-                self.kernel_bandwidth = torch.nn.Parameter(bw)
-            else:
-                self.register_buffer("kernel_bandwidth", bw)
+            bandwidth = Parameters.from_values(kernel_bandwidth.detach().clone(), trainable=trainable)
+        super().__init__(dim=x.shape[1], n_basis=x.shape[0], params=(centers,), coeffs=coeffs)
+        self.add_module("_bandwidth", bandwidth)
+
+    @property
+    def kernel_bandwidth(self) -> torch.Tensor:
+        """Shared scalar bandwidth (trainable parameter or buffer)."""
+        return self._bandwidth._p
 
     def freeze_params(self):
-        coeffs = self.coeffs.freeze_params() if self.has_coeffs() else None
         return GaussianKernelBasis(
-            self.kernel_centers().detach().clone(),
-            kernel_bandwidth=self.kernel_bandwidth.detach().clone(),
+            self.kernel_centers().transpose(0, 1).detach().clone(),
+            kernel_bandwidth=self._bandwidth.freeze_params(),
+            coeffs=self._coeffs.freeze_params() if self.has_coeffs() else None,
             trainable=False,
-            coeffs=coeffs,
         )
 
     @staticmethod
@@ -1833,19 +1813,24 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         h = silverman * (n ** (-1.0 / (d + 4.0))) * scale
         return h.clamp_min(eps)
     
-    def kernel_centers(self):
-        # Stored as (d, n_basis, 1) to match SeparableBasis parameter layout.
-        # Convert to canonical center matrix shape (n_basis, d).
-        p = self.uparams if self.trainable() else self.fixed_params
-        return p[..., 0].transpose(0, 1)
+    def kernel_centers(self) -> torch.Tensor:
+        return self._params[0]()
+
+    def bandwidth(self) -> torch.Tensor:
+        return self._bandwidth().reshape(())
+
+    def _kernel_mean_std_axes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        mu = self.kernel_centers()
+        h = self.bandwidth().clamp_min(torch.finfo(mu.dtype).eps)
+        return mu, torch.full_like(mu, h)
 
     def forward(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
 
-        h = self.kernel_bandwidth.clamp_min(torch.finfo(y.dtype).eps)
+        h = self.bandwidth().clamp_min(torch.finfo(y.dtype).eps)
         d = self.dim()
 
-        diff = y[:, None, :] - self.kernel_centers()[None, :, :]  # (n_data, n_kernels, d)
+        diff = y[:, None, :] - self.kernel_centers()[None, :, :]
         sq_norm = diff.square().sum(dim=2)  # (n_data, n_kernels)
 
         two_pi = torch.as_tensor(2.0 * math.pi, device=y.device, dtype=y.dtype)
@@ -1856,24 +1841,14 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         return kernels  # (n_data, n_basis)
 
     def marginal(self, marginal_dims: tuple[int, ...], ignore_coeffs: bool = False) -> "GaussianKernelBasis":
-        marginal_dims = tuple(marginal_dims)
-        assert all(0 <= i < self.dim() for i in marginal_dims), "marginal_dims must be in [0, d)"
-        coeffs_out = self.coeffs.freeze_params() if ((not ignore_coeffs) and self.has_coeffs()) else None
-        p = self.uparams if self.trainable() else self.fixed_params
-        centers_sliced = p[marginal_dims, :, :].detach().clone()
-        h = self.kernel_bandwidth.detach().clone()
-        if self.trainable():
-            return GaussianKernelBasis(
-                centers_sliced[..., 0].transpose(0, 1),
-                kernel_bandwidth=h,
-                trainable=True,
-                coeffs=coeffs_out,
-            )
+        dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim() for i in dims), "marginal_dims must be in [0, d)"
+        coeffs_out = self._coeffs.freeze_params() if ((not ignore_coeffs) and self.has_coeffs()) else None
         return GaussianKernelBasis(
-            centers_sliced[..., 0].transpose(0, 1),
-            kernel_bandwidth=h,
-            trainable=False,
+            self.kernel_centers()[dims, :].transpose(0, 1).detach().clone(),
+            kernel_bandwidth=self._bandwidth.freeze_params(),
             coeffs=coeffs_out,
+            trainable=False,
         )
 
     def product_basis(self, other_basis_factors: list["Basis"]) -> "GaussianKernelBasis":
@@ -1894,8 +1869,8 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
 
         mus_stds = []
         for basis in factors:
-            mu_k = basis.kernel_centers().transpose(0, 1).contiguous()  # (d, n_basis_k)
-            h_k = basis.kernel_bandwidth.clamp_min(torch.finfo(dtype).eps)
+            mu_k = basis.kernel_centers()
+            h_k = basis.bandwidth().clamp_min(torch.finfo(dtype).eps)
             std_k = torch.full_like(mu_k, h_k)
             mus_stds.append((mu_k, std_k))
 
@@ -1962,9 +1937,9 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
 
         return GaussianKernelBasis(
             centers_new,
-            kernel_bandwidth=h_new,
+            kernel_bandwidth=Parameters.from_values(h_new, trainable=False),
+            coeffs=PositiveParameters.from_values(coeffs_new, trainable=False),
             trainable=False,
-            coeffs=fixed_coeffs(coeffs_new.detach().clone()),
         )
 
     def Omega1(self, ignore_coeffs: bool = False):
@@ -1984,17 +1959,25 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         assert isinstance(other, GaussianKernelBasis), "other must be GaussianKernelBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
 
-        mu1 = self.kernel_centers().transpose(0, 1)
-        mu2 = other.kernel_centers().transpose(0, 1)
-        h0 = self.kernel_bandwidth.clamp_min(torch.finfo(mu1.dtype).eps)
-        h1 = other.kernel_bandwidth.clamp_min(torch.finfo(mu1.dtype).eps)
-        lows_b, highs_b = self._omega2_box_axes(lows, highs)
-        log_dim = self._log_gaussian_pair_ip(
-            mu1[:, :, None], torch.full_like(mu1, h0)[:, :, None],
-            mu2[:, None, :], torch.full_like(mu2, h1)[:, None, :],
-            lows_b, highs_b,
+        mu1, std1 = self._kernel_mean_std_axes()
+        mu2, std2 = other._kernel_mean_std_axes()
+        lows_b, highs_b = None, None
+        if lows is not None or highs is not None:
+            assert lows is not None and highs is not None, "lows and highs must both be set for a bounded domain"
+            dtype, device = self.param_dtype_device()
+            lows_b = lows.to(dtype=dtype, device=device).reshape(self.dim())[:, None, None]
+            highs_b = highs.to(dtype=dtype, device=device).reshape(self.dim())[:, None, None]
+            assert torch.all(lows_b < highs_b), "each low must be strictly less than the corresponding high"
+        log_dim = GaussianBasis._log_gaussian_pair_ip(
+            mu1[:, :, None], std1[:, :, None], mu2[:, None, :], std2[:, None, :], lows_b, highs_b
         )
-        return self._omega2_from_log_dims(log_dim, other, ignore_coeffs)
+        out = torch.exp(log_dim.sum(dim=0))
+        if not ignore_coeffs:
+            if self.has_coeffs():
+                out = out * self.coeff_values()[:, None]
+            if other.has_coeffs():
+                out = out * other.coeff_values()[None, :]
+        return out
 
     def Omega3_contract(
         self,
@@ -2011,17 +1994,17 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
         assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
 
-        x0 = self.kernel_centers()     # (n0, d)
-        x1 = other1.kernel_centers()   # (n1, d)
-        x2 = other2.kernel_centers()   # (n2, d)
+        x0 = self.kernel_centers().transpose(0, 1)     # (n0, d)
+        x1 = other1.kernel_centers().transpose(0, 1)   # (n1, d)
+        x2 = other2.kernel_centers().transpose(0, 1)   # (n2, d)
         d = self.dim()
         n0 = x0.shape[0]
         n1 = x1.shape[0]
         n2 = x2.shape[0]
 
-        h0 = self.kernel_bandwidth.clamp_min(torch.finfo(x0.dtype).eps)
-        h1 = other1.kernel_bandwidth.clamp_min(torch.finfo(x1.dtype).eps)
-        h2 = other2.kernel_bandwidth.clamp_min(torch.finfo(x2.dtype).eps)
+        h0 = self.bandwidth().clamp_min(torch.finfo(x0.dtype).eps)
+        h1 = other1.bandwidth().clamp_min(torch.finfo(x1.dtype).eps)
+        h2 = other2.bandwidth().clamp_min(torch.finfo(x2.dtype).eps)
 
         c0 = (
             torch.ones(n0, dtype=x0.dtype, device=x0.device)

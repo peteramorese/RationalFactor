@@ -10,9 +10,8 @@ from rational_factor.systems.base import (
     ControllableStochasticSystem,
     DiscreteTimeStochasticSystem,
     PartiallyObservableSystem,
-    sample_controlled_trajectories,
     sample_io_pairs,
-    sample_iuo_tuples,
+    sample_uio_tuples,
     sample_observation_pairs,
     sample_trajectories,
 )
@@ -64,17 +63,17 @@ class ControlledProblem(FullyObservableProblem):
         with torch.random.fork_rng():
             if self.seed is not None:
                 torch.manual_seed(self.seed)
-            u_data, x_data, x_kp1_data = sample_iuo_tuples(self.system, self.prev_state_sampler, self.control_sampler, n_pairs=self.n_data_tran)
+            u_data, x_data, x_kp1_data = sample_uio_tuples(self.system, self.prev_state_sampler, self.control_sampler, n_pairs=self.n_data_tran)
             return u_data, x_data, x_kp1_data # (u_k, x_k, x_{k+1}) tuples
     
     def test_data(self, controller):
         with torch.random.fork_rng():
             if self.seed is not None:
                 torch.manual_seed(self.seed + 1)
-            return sample_controlled_trajectories(
+            return sample_trajectories(
                 self.system,
                 self.initial_state_sampler,
-                controller,
+                controller=controller,
                 n_timesteps=self.n_timesteps,
                 n_trajectories=self.n_trajectories_test,
             )

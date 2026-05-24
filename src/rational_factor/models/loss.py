@@ -2,7 +2,6 @@ import torch
 from .density_model import DensityModel, ConditionalDensityModel
 from .factor_forms import LinearRFF, QuadraticRFF
 from .basis_functions import UnnormalizedBetaBasis
-
 #### General ####
 
 def conditional_mle_loss(
@@ -19,6 +18,47 @@ def conditional_mle_loss(
 
 def mle_loss(model : DensityModel, x : torch.Tensor):
     return -model.log_density(x).mean()
+
+
+def mse_loss(
+    pred: torch.Tensor | dict[str, torch.Tensor],
+    target: torch.Tensor | dict[str, torch.Tensor],
+    *,
+    keys: tuple[str, ...] | list[str] | None = None,
+) -> torch.Tensor:
+    """
+    Mean squared error between predictions and targets.
+
+    Accepts either a single tensor pair or dicts of tensors with matching keys.
+    For dict inputs, if ``keys`` is given, only those entries are compared (in order);
+    otherwise all keys in ``pred`` must appear in ``target``. Batched ``pred`` tensors
+    broadcast unbatched ``target`` along a leading batch dimension when needed.
+    """
+    if isinstance(pred, torch.Tensor):
+        if not isinstance(target, torch.Tensor):
+            raise TypeError("mse_loss expects both arguments to be tensors or both to be dicts.")
+        if pred.dim() > target.dim():
+            target = target.unsqueeze(0).expand_as(pred)
+        return torch.nn.functional.mse_loss(pred, target)
+
+    if not isinstance(pred, dict) or not isinstance(target, dict):
+        raise TypeError("mse_loss expects both arguments to be tensors or both to be dicts.")
+
+    key_order = tuple(keys) if keys is not None else tuple(pred.keys())
+    missing = set(key_order) - set(target.keys())
+    if missing:
+        raise KeyError(f"target is missing keys: {sorted(missing)}")
+
+    losses = []
+    for name in key_order:
+        if name not in pred:
+            raise KeyError(f"pred is missing key '{name}'.")
+        p = pred[name]
+        t = target[name].to(device=p.device, dtype=p.dtype)
+        if p.dim() > t.dim():
+            t = t.unsqueeze(0).expand_as(p)
+        losses.append(torch.nn.functional.mse_loss(p, t))
+    return torch.stack(losses).mean()
 
 #### Linear models ####
 

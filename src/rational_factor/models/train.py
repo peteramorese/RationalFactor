@@ -1,7 +1,7 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from .density_model import DensityModel, ConditionalDensityModel
-from .basis_functions import GaussianBasis
+from .basis_functions import GaussianBasis, Parameters, PositiveParameters
 from .factor_forms import LinearForm
 import time
 from copy import deepcopy
@@ -60,6 +60,51 @@ def _evaluate_multiset_labeled_losses(
     if n_batches == 0:
         raise RuntimeError("Multiset validation loaders produced no batches.")
     return {label: loss_sum / n_batches for label, loss_sum in sums.items()}
+
+    
+class MixedAlignedRandomDataset(Dataset):
+    def __init__(self, fields, randomized_indices):
+        self.fields = tuple(fields)
+        self.randomized_indices = tuple(randomized_indices)
+
+        n_fields = len(self.fields)
+        self.organized_indices = tuple(
+            idx for idx in range(n_fields)
+            if idx not in self.randomized_indices
+        )
+
+        if len(self.organized_indices) == 0:
+            raise ValueError("At least one organized field is required.")
+
+        self.n = len(self.fields[self.organized_indices[0]])
+
+        for idx in self.organized_indices:
+            if len(self.fields[idx]) != self.n:
+                raise ValueError(
+                    f"Organized field {idx} has length {len(self.fields[idx])}, "
+                    f"but expected length {self.n}."
+                )
+
+        for idx in self.randomized_indices:
+            if len(self.fields[idx]) == 0:
+                raise ValueError(f"Randomized field {idx} is empty.")
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        output = []
+
+        organized_set = set(self.organized_indices)
+
+        for field_idx, field in enumerate(self.fields):
+            if field_idx in organized_set:
+                output.append(field[idx])
+            else:
+                j = torch.randint(0, len(field), size=()).item()
+                output.append(field[j])
+
+        return tuple(output)
 
 class TrainingTimer:
     def __init__(self, n_groups : int, iterations : int, epochs_per_group : int):
@@ -967,9 +1012,12 @@ def fit_gaussian_lf_em(
     vars = torch.as_tensor(sk_gmm.covariances_, device=device, dtype=dtype)
     stds = torch.sqrt(vars.clamp_min(torch.finfo(dtype).eps))
 
-    # GaussianBasis expects parameters with shape (D, K, 2): [..., 0]=mean, [..., 1]=std.
-    fixed_params = torch.stack([means.T, stds.T], dim=-1)
-    basis = GaussianBasis(fixed_params=fixed_params)
-    lf = LinearForm(basis=basis, w_fixed=weights)
+    basis = GaussianBasis(
+        mean_params=Parameters.from_values(means.transpose(0, 1).contiguous(), trainable=False),
+        std_params=PositiveParameters.from_values(stds.transpose(0, 1).contiguous(), trainable=False, normalized=False),
+        coeffs=PositiveParameters.from_values(weights, trainable=False, normalized=True),
+    )
+
+    lf = LinearForm(w=basis)
 
     return lf
