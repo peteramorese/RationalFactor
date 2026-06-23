@@ -122,40 +122,19 @@ def check_mlp_context_transition_pdf_valid(
     return all_valid
 
 
-def plot_transition_u_up_comparison(
-    tran_model,
-    x_k_data,
-    x_kp1_data,
-    u_k_data,
+def plot_em_rff_transition(
+    baseline_rff,
     problem,
     out_path,
     *,
-    baseline_rff=None,
-    u_up_pairs=None,
-    n_pairs=4,
     n_grid=120,
-    u_tol=0.3,
-    random_seed=0,
 ):
-    """Compare EM-fitted RFF, MLP-context RFF, and empirical (x, x') samples near u."""
+    """Plot EM LinearRFF p(x'|x) once (independent of u, u')."""
     lo = float(problem.plot_bounds_low[0].item())
     hi = float(problem.plot_bounds_high[0].item())
-    control_dim = problem.system.control_dim()
 
     analysis_device = torch.device("cpu")
-    tran_model = tran_model.to(analysis_device).eval()
-    if baseline_rff is not None:
-        baseline_rff = baseline_rff.to(analysis_device).eval()
-
-    x_k_cpu = x_k_data.detach().cpu()
-    x_kp1_cpu = x_kp1_data.detach().cpu()
-    u_k_cpu = u_k_data.detach().cpu().view(-1, control_dim)
-
-    if u_up_pairs is None:
-        g = torch.Generator().manual_seed(random_seed)
-        idx_u = torch.randint(0, len(u_k_cpu), (n_pairs,), generator=g)
-        idx_up = torch.randint(0, len(u_k_cpu), (n_pairs,), generator=g)
-        u_up_pairs = [(u_k_cpu[i].clone(), u_k_cpu[j].clone()) for i, j in zip(idx_u, idx_up)]
+    baseline_rff = baseline_rff.to(analysis_device).eval()
 
     nx = n_grid
     nxp = n_grid
@@ -164,63 +143,124 @@ def plot_transition_u_up_comparison(
     x_cond = x_1d.unsqueeze(1).expand(nx, nxp).reshape(-1, 1)
     xp_flat = xp_1d.unsqueeze(0).expand(nx, nxp).reshape(-1, 1)
 
-    n_rows = len(u_up_pairs)
-    n_cols = 3 if baseline_rff is not None else 2
+    with torch.no_grad():
+        log_pdf_rff = baseline_rff.log_density(xp_flat, conditioner=x_cond)
+        pdf_rff = log_pdf_rff.exp().reshape(nx, nxp).cpu().numpy()
+
+    x_np = x_1d.cpu().numpy()
+    xp_np = xp_1d.cpu().numpy()
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    cmap = "viridis"
+    cf = ax.contourf(
+        x_np,
+        xp_np,
+        pdf_rff.T,
+        levels=40,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=float(pdf_rff.max()),
+    )
+    fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("x")
+    ax.set_ylabel("x'")
+    ax.set_title("EM LinearRFF p(x'|x)\n(indep. of u, u')")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved EM transition figure to {out_path}")
+
+
+def plot_mlp_transition_u_with_random_up(
+    tran_model,
+    x_k_data,
+    x_kp1_data,
+    u_k_data,
+    problem,
+    out_path,
+    *,
+    u_values=None,
+    n_u=4,
+    n_up_per_u=3,
+    n_grid=120,
+    u_tol=0.3,
+    random_seed=0,
+):
+    """Per row: fixed u, multiple random u' plots, plus data slice for that u."""
+    lo = float(problem.plot_bounds_low[0].item())
+    hi = float(problem.plot_bounds_high[0].item())
+    control_dim = problem.system.control_dim()
+
+    analysis_device = torch.device("cpu")
+    tran_model = tran_model.to(analysis_device).eval()
+
+    x_k_cpu = x_k_data.detach().cpu()
+    x_kp1_cpu = x_kp1_data.detach().cpu()
+    u_k_cpu = u_k_data.detach().cpu().view(-1, control_dim)
+
+    g = torch.Generator().manual_seed(random_seed)
+    if u_values is None:
+        idx_u = torch.randint(0, len(u_k_cpu), (n_u,), generator=g)
+        u_values = [u_k_cpu[i].clone() for i in idx_u]
+
+    nx = n_grid
+    nxp = n_grid
+    x_1d = torch.linspace(lo, hi, nx, device=analysis_device)
+    xp_1d = torch.linspace(lo, hi, nxp, device=analysis_device)
+    x_cond = x_1d.unsqueeze(1).expand(nx, nxp).reshape(-1, 1)
+    xp_flat = xp_1d.unsqueeze(0).expand(nx, nxp).reshape(-1, 1)
+    x_np = x_1d.cpu().numpy()
+    xp_np = xp_1d.cpu().numpy()
+
+    n_rows = len(u_values)
+    n_cols = n_up_per_u + 1  # +1 for data column
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 4 * n_rows), squeeze=False)
     cmap = "viridis"
-    col_rff, col_model, col_data = (0, 1, 2) if baseline_rff is not None else (None, 0, 1)
 
-    for row, (u_vec, up_vec) in enumerate(u_up_pairs):
-        n_pts = x_cond.shape[0]
-        u_batch = u_vec.unsqueeze(0).expand(n_pts, -1).to(analysis_device)
-        up_batch = up_vec.unsqueeze(0).expand(n_pts, -1).to(analysis_device)
+    for row, u_vec in enumerate(u_values):
+        idx_up = torch.randint(0, len(u_k_cpu), (n_up_per_u,), generator=g)
+        up_values = [u_k_cpu[i].clone() for i in idx_up]
+        u_s = float(u_vec[0])
 
-        with torch.no_grad():
-            log_pdf_model = tran_model.log_density(
-                xp_flat, conditioner=x_cond, u=u_batch, up=up_batch
+        for col, up_vec in enumerate(up_values):
+            n_pts = x_cond.shape[0]
+            u_batch = u_vec.unsqueeze(0).expand(n_pts, -1).to(analysis_device)
+            up_batch = up_vec.unsqueeze(0).expand(n_pts, -1).to(analysis_device)
+
+            with torch.no_grad():
+                log_pdf_model = tran_model.log_density(
+                    xp_flat, conditioner=x_cond, u=u_batch, up=up_batch
+                )
+                pdf_model = log_pdf_model.exp().reshape(nx, nxp).cpu().numpy()
+
+            up_s = float(up_vec[0])
+            ax_model = axes[row, col]
+            cf = ax_model.contourf(
+                x_np,
+                xp_np,
+                pdf_model.T,
+                levels=40,
+                cmap=cmap,
+                vmin=0.0,
+                vmax=float(pdf_model.max()),
             )
-            pdf_model = log_pdf_model.exp().reshape(nx, nxp).cpu().numpy()
-            if baseline_rff is not None:
-                log_pdf_rff = baseline_rff.log_density(xp_flat, conditioner=x_cond)
-                pdf_rff = log_pdf_rff.exp().reshape(nx, nxp).cpu().numpy()
-
-        x_np = x_1d.cpu().numpy()
-        xp_np = xp_1d.cpu().numpy()
-        u_s, up_s = float(u_vec[0]), float(up_vec[0])
-
-        if baseline_rff is not None:
-            vmax = float(max(pdf_rff.max(), pdf_model.max()))
-            vmin = 0.0
-            ax_rff = axes[row, col_rff]
-            cf_rff = ax_rff.contourf(
-                x_np, xp_np, pdf_rff.T, levels=40, cmap=cmap, vmin=vmin, vmax=vmax
-            )
-            fig.colorbar(cf_rff, ax=ax_rff, fraction=0.046, pad=0.04)
-            ax_rff.set_xlabel("x")
-            ax_rff.set_ylabel("x'")
-            ax_rff.set_title("EM LinearRFF p(x'|x)\n(indep. of u, u')")
-            ax_rff.set_xlim(lo, hi)
-            ax_rff.set_ylim(lo, hi)
-
-        ax_model = axes[row, col_model]
-        contour_kw = {"levels": 40, "cmap": cmap}
-        if baseline_rff is not None:
-            contour_kw["vmin"] = vmin
-            contour_kw["vmax"] = vmax
-        cf = ax_model.contourf(x_np, xp_np, pdf_model.T, **contour_kw)
-        fig.colorbar(cf, ax=ax_model, fraction=0.046, pad=0.04)
-        ax_model.set_xlabel("x")
-        ax_model.set_ylabel("x'")
-        ax_model.set_title(f"MLP RFF p(x'|x, u={u_s:.2f}, u'={up_s:.2f})")
-        ax_model.set_xlim(lo, hi)
-        ax_model.set_ylim(lo, hi)
+            fig.colorbar(cf, ax=ax_model, fraction=0.046, pad=0.04)
+            ax_model.set_xlabel("x")
+            ax_model.set_ylabel("x'")
+            ax_model.set_title(f"MLP RFF p(x'|x, u={u_s:.2f}, u'={up_s:.2f})")
+            ax_model.set_xlim(lo, hi)
+            ax_model.set_ylim(lo, hi)
 
         u_diff = (u_k_cpu - u_vec).abs()
         mask = (u_diff.max(dim=-1).values if u_diff.dim() > 1 else u_diff.squeeze(-1)) < u_tol
         x_slice = x_k_cpu[mask, 0].numpy()
         xp_slice = x_kp1_cpu[mask, 0].numpy()
 
-        ax_data = axes[row, col_data]
+        ax_data = axes[row, n_up_per_u]
         if mask.any():
             ax_data.scatter(
                 x_slice,
@@ -238,41 +278,43 @@ def plot_transition_u_up_comparison(
         ax_data.set_ylabel("x'")
         ax_data.set_title(f"data |u - {u_s:.2f}| < {u_tol:.2f}, n={int(mask.sum())}")
 
-    title = "EM RFF vs MLP RFF vs data (1D)" if baseline_rff is not None else "Transition model vs data (1D)"
-    fig.suptitle(title, y=1.01)
+    fig.suptitle("MLP RFF vs data by fixed u and varying u' (1D)", y=1.01)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved transition comparison figure to {out_path}")
+    print(f"Saved MLP transition comparison figure to {out_path}")
 
 
 if __name__ == "__main__":
     problem = OPEN_LOOP_OBSERVABLE_PROBLEMS["scalar_nonlinear_drift"]
 
     use_gpu = torch.cuda.is_available()
-    n_basis = 200
+    n_basis = 500
     control_dim = problem.system.control_dim()
 
     pretrain_params = {
-        "epochs": 30,
+        "g_epochs": 60,
+        "psi_epochs": 60,
         "lr": 1e-3,
     }
     tran_params = {
-        "epochs": 100,
+        "epochs": 120,
         "lr": 5e-5,
         "clip_grad_norm": 1.0,
         "weight_decay": 0.1,
+        "early_stopping_patience": 10,
     }
     init_params = {
-        "epochs": 100,
+        "epochs": 1,
         "lr": 5e-5,
         "clip_grad_norm": 1.0,
         "weight_decay": 0.1,
+        "early_stopping_patience": 20,
     }
 
-    train_batch_size = 256
-    val_batch_size = 256
+    train_batch_size = 512
+    val_batch_size = 512
     n_timesteps_prop = 10
     n_controllers = 3
     reg_covar_joint = 1e-5
@@ -308,7 +350,7 @@ if __name__ == "__main__":
     g_means = Parameters.random_init(basis_shape, trainable=True, mean=0.0, std=1.0).to(device)
     # trainable=True: softplus at forward; pretrain MSE uses decode_params (decoded std space).
     g_stds = PositiveParameters.set_init(
-        basis_shape, value=1.0, trainable=True, normalized=False, epsilon=1e-3
+        basis_shape, value=1.0, trainable=True, normalized=False, epsilon=0.5
     ).to(device)
     g_coeffs = PositiveParameters.random_init((n_basis,), trainable=True, mean=1.0, std=0.1, normalized=False, epsilon=1e-2).to(device)
     g = GaussianBasis(mean_params=g_means, std_params=g_stds, coeffs=g_coeffs).to(device)
@@ -322,7 +364,7 @@ if __name__ == "__main__":
 
     psi_means = Parameters.random_init(basis_shape, trainable=True, mean=0.0, std=1.0).to(device)
     psi_stds = PositiveParameters.set_init(
-        basis_shape, value=1.0, trainable=True, normalized=False, epsilon=1e-3
+        basis_shape, value=1.0, trainable=True, normalized=False, epsilon=0.5
     ).to(device)
     psi = GaussianBasis(mean_params=psi_means, std_params=psi_stds).to(device)
     psi_mlp_form = MLPMetaForm(
@@ -395,7 +437,7 @@ if __name__ == "__main__":
         u_g_train_dataloader,
         {"mse": lambda m, u: g_mlp_pretrain_loss(m, u, target_params=g_target_params)},
         g_pretrain_optimizer,
-        epochs=pretrain_params["epochs"],
+        epochs=pretrain_params["g_epochs"],
         verbose=True,
     )
     print(f"g pretrain loss: {best_loss_g_pre:.6f}, time: {training_time_g_pre:.2f}s\n")
@@ -407,7 +449,7 @@ if __name__ == "__main__":
         u_psi_train_dataloader,
         {"mse": lambda m, u, up: psi_mlp_pretrain_loss(m, u, up, target_params=psi_target_params)},
         psi_pretrain_optimizer,
-        epochs=pretrain_params["epochs"],
+        epochs=pretrain_params["psi_epochs"],
         verbose=True,
     )
     print(f"psi pretrain loss: {best_loss_psi_pre:.6f}, time: {training_time_psi_pre:.2f}s\n")
@@ -426,6 +468,7 @@ if __name__ == "__main__":
         tran_optimizer,
         labeled_validation_loss_fns={"val_mle": mlp_rff_mle_loss},
         validation_data_loader=xp_augmented_val_dataloader,
+        validation_early_stopping_patience=tran_params["early_stopping_patience"],
         epochs=tran_params["epochs"],
         verbose=True,
         use_best="val_mle",
@@ -495,6 +538,7 @@ if __name__ == "__main__":
         init_optimizer,
         labeled_validation_loss_fns={"val_mle": mlp_init_mle_loss},
         validation_data_loader=x0_augmented_val_dataloader,
+        validation_early_stopping_patience=init_params["early_stopping_patience"],
         epochs=init_params["epochs"],
         verbose=True,
         use_best="val_mle",
@@ -563,15 +607,22 @@ if __name__ == "__main__":
     n_plot_steps = min(problem.n_timesteps, n_timesteps_prop)
     out_dir = Path("figures") / "random_control_test_1D"
 
-    plot_transition_u_up_comparison(
+    plot_em_rff_transition(
+        em_rff,
+        problem,
+        out_dir / "transition_em_rff.png",
+        n_grid=120,
+    )
+
+    plot_mlp_transition_u_with_random_up(
         tran_model,
         x_k_data,
         x_kp1_data,
         u_k_data,
         problem,
-        out_dir / "transition_model_vs_data.png",
-        baseline_rff=em_rff,
-        n_pairs=10,
+        out_dir / "transition_mlp_u_vs_up_and_data.png",
+        n_u=10,
+        n_up_per_u=3,
         n_grid=120,
         u_tol=0.3,
         random_seed=42,

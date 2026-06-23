@@ -324,8 +324,8 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             covariance=torch.diag(torch.tensor([4.0])),
         ),
         control_sampler=make_uniform_state_sampler(
-            low=torch.tensor([-2.0]),
-            high=torch.tensor([2.0]),
+            low=torch.tensor([-4.0]),
+            high=torch.tensor([4.0]),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
@@ -333,8 +333,8 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-4.0]),
-        plot_bounds_high=torch.tensor([4.0]),
+        plot_bounds_low=torch.tensor([-3.5]),
+        plot_bounds_high=torch.tensor([3.5]),
         plot_marginals_list=[],
     ),
     "van_der_pol": ControlledProblem(
