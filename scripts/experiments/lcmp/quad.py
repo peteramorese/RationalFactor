@@ -21,7 +21,6 @@ from rational_factor.tools.misc import data_bounds, train_test_split
 from rational_factor.tools.visualization import plot_belief
 from rational_factor.models.kde import GaussianKDE
 
-
 def main() -> None:
     problem = FULLY_OBSERVABLE_PROBLEMS["quadcopter"]
 
@@ -67,7 +66,6 @@ def main() -> None:
     x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-
     ######## TRAIN DECORRUPTER ########
     loc, scale = data_bounds(x_k_data, mode="center_lengths")
     loc = loc.to(device)
@@ -110,7 +108,6 @@ def main() -> None:
     # Initialize base density to LF GMM
     y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
     #gmm_lf = train.fit_gaussian_lf_em(y_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=1e-3, max_iter=100)
-    #basis = GaussianBasis(uparams_init=gmm_lf.basis.uparams_init)
     #mover_base_density = LinearForm()
     mover_joint = StackedTF([mover, mover])
 
@@ -154,18 +151,15 @@ def main() -> None:
 
     mover_trained = VolumePreservingNFTF.copy_from_trainable(mover).to(device)
 
-    weights = gmm_lf.get_w()
-    z_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-    z_means, z_stds = z_marginal.means_stds()
-    z_params = torch.stack([z_means, z_stds], dim=-1)
+    weights = gmm_lf.w.get_coeffs()
+    z_marginal = gmm_lf.marginal(marginal_dims=range(system.dim()))
+    z_means, z_stds = z_marginal.w.means_stds()
 
-    zp_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
-    zp_means, zp_stds = zp_marginal.means_stds()
-    zp_params = torch.stack([zp_means, zp_stds], dim=-1)
-    
+    zp_marginal = gmm_lf.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
+    zp_means, zp_stds = zp_marginal.w.means_stds()
 
-    phi_basis = GaussianBasis(fixed_params=z_params).to(device)
-    psi_basis = GaussianBasis(fixed_params=zp_params).to(device)
+    phi_basis = GaussianBasis.from_means_stds(z_means, z_stds, trainable=False).to(device)
+    psi_basis = GaussianBasis.from_means_stds(zp_means, zp_stds, trainable=False).to(device)
     psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
 
     lrff = LinearRFF(phi_basis, psi_basis, a_fixed=weights.to(device)).to(device)
@@ -200,7 +194,6 @@ def main() -> None:
         data_i = test_traj_data[i].to(device)
         ll = avg_log_likelihood(belief_seq[i], data_i)
         print(f"Log likelihood at time {i}: {ll:.4f}")
-
 
 if __name__ == "__main__":
     main()

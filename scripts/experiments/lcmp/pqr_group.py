@@ -21,7 +21,6 @@ from rational_factor.tools.misc import data_bounds, train_test_split
 from rational_factor.tools.visualization import plot_belief
 from rational_factor.models.kde import GaussianKDE
 
-
 def main() -> None:
     problem = FULLY_OBSERVABLE_PROBLEMS["planar_quadrotor"]
 
@@ -66,7 +65,6 @@ def main() -> None:
 
     x_dataloader = DataLoader(TensorDataset(x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     x0_dataloader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-
 
     ######## TRAIN DECORRUPTER ########
     loc, scale = data_bounds(x_k_data, mode="center_lengths")
@@ -113,17 +111,15 @@ def main() -> None:
     z_joint_data = y_joint_data
     gmm_lf = train.fit_gaussian_lf_em(z_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar, max_iter=200)
 
-    weights = gmm_lf.get_w()
-    z_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-    z_means, z_stds = z_marginal.means_stds()
-    z_params = torch.stack([z_means, z_stds], dim=-1)
+    weights = gmm_lf.w.get_coeffs()
+    z_marginal = gmm_lf.marginal(marginal_dims=range(system.dim()))
+    z_means, z_stds = z_marginal.w.means_stds()
 
-    zp_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
-    zp_means, zp_stds = zp_marginal.means_stds()
-    zp_params = torch.stack([zp_means, zp_stds], dim=-1)
-    
-    phi_basis = GaussianBasis(fixed_params=z_params).to(device)
-    psi_basis = GaussianBasis(fixed_params=zp_params).to(device)
+    zp_marginal = gmm_lf.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
+    zp_means, zp_stds = zp_marginal.w.means_stds()
+
+    phi_basis = GaussianBasis.from_means_stds(z_means, z_stds, trainable=False).to(device)
+    psi_basis = GaussianBasis.from_means_stds(zp_means, zp_stds, trainable=False).to(device)
     lrff = LinearRFF(phi_basis, psi_basis, a_fixed=weights.to(device)).to(device)
 
     mover_density = CompositeConditionalModel([mover], lrff).to(device)
@@ -188,7 +184,6 @@ def main() -> None:
         data_i = test_traj_data[i].to(device)
         ll = avg_log_likelihood(belief_seq[i], data_i)
         print(f"Log likelihood at time {i}: {ll:.4f}")
-
 
 if __name__ == "__main__":
     main()

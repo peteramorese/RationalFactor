@@ -22,7 +22,6 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from copy import deepcopy
 
-
 def _plot_state_vs_latent_grid(
     transform: torch.nn.Module,
     x_data: torch.Tensor,
@@ -104,7 +103,6 @@ def _plot_state_vs_latent_grid(
     fig.tight_layout()
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
-
 
 def _plot_initial_distribution_comparison(
     x0_data: torch.Tensor,
@@ -209,7 +207,6 @@ def _plot_initial_distribution_comparison(
     fig.tight_layout()
     fig.savefig(out_path, dpi=260, bbox_inches="tight")
     plt.close(fig)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -347,32 +344,28 @@ if __name__ == "__main__":
     # Transition model basis functions (fit to p(y, y'))
     y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
     tran_gmm_lf = train.fit_gaussian_lf_em(y_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_joint, max_iter=100)
-    weights = tran_gmm_lf.get_w()
-    phi_marginal = tran_gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-    phi_means, phi_stds = phi_marginal.means_stds()
-    phi_params = torch.stack([phi_means, phi_stds], dim=-1)
+    weights = tran_gmm_lf.w.get_coeffs()
+    phi_marginal = tran_gmm_lf.marginal(marginal_dims=range(system.dim()))
+    phi_means, phi_stds = phi_marginal.w.means_stds()
 
-    psi_marginal = tran_gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
-    psi_means, psi_stds = psi_marginal.means_stds()
-    psi_params = torch.stack([psi_means, psi_stds], dim=-1)
+    psi_marginal = tran_gmm_lf.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
+    psi_means, psi_stds = psi_marginal.w.means_stds()
 
-    phi_basis = GaussianBasis(uparams_init=phi_params).to(device)
-    psi_basis = GaussianBasis(uparams_init=psi_params).to(device)
+    phi_basis = GaussianBasis.from_means_stds(phi_means, phi_stds, trainable=True).to(device)
+    psi_basis = GaussianBasis.from_means_stds(psi_means, psi_stds, trainable=True).to(device)
 
     # Observation model basis functions (fit to p(y, o))
     yo_joint_data = torch.cat([xo_data, o_data], dim=1)
     obs_gmm_lf = train.fit_gaussian_lf_em(yo_joint_data.to(torch.device("cpu")), n_components=n_obs_basis, reg_covar=reg_covar_obs, max_iter=100)
-    weights = obs_gmm_lf.get_w()
-    xi_marginal = obs_gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-    xi_means, xi_stds = xi_marginal.means_stds()
-    xi_params = torch.stack([xi_means, xi_stds], dim=-1)
+    weights = obs_gmm_lf.w.get_coeffs()
+    xi_marginal = obs_gmm_lf.marginal(marginal_dims=range(system.dim()))
+    xi_means, xi_stds = xi_marginal.w.means_stds()
 
-    zeta_marginal = obs_gmm_lf.basis.marginal(marginal_dims=range(system.dim(), system.dim() + system.observation_dim()))
-    zeta_means, zeta_stds = zeta_marginal.means_stds()
-    zeta_params = torch.stack([zeta_means, zeta_stds], dim=-1)
+    zeta_marginal = obs_gmm_lf.marginal(marginal_dims=range(system.dim(), system.dim() + system.observation_dim()))
+    zeta_means, zeta_stds = zeta_marginal.w.means_stds()
 
-    xi_basis = GaussianBasis(uparams_init=xi_params).to(device)
-    zeta_basis = GaussianBasis(uparams_init=zeta_params).to(device)
+    xi_basis = GaussianBasis.from_means_stds(xi_means, xi_stds, trainable=True).to(device)
+    zeta_basis = GaussianBasis.from_means_stds(zeta_means, zeta_stds, trainable=True).to(device)
 
     # Train the transition model and observation model simultaneously
     if use_dtf:
@@ -434,12 +427,10 @@ if __name__ == "__main__":
 
     # Initial model basis functions (fit to p(y))
     init_gmm_lf = train.fit_gaussian_lf_em(y0_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_init, max_iter=100)
-    weights = init_gmm_lf.get_w()
-    psi0_means, psi0_stds = init_gmm_lf.basis.means_stds()
-    psi0_params = torch.stack([psi0_means, psi0_stds], dim=-1)
+    weights = init_gmm_lf.w.get_coeffs()
+    psi0_means, psi0_stds = init_gmm_lf.w.means_stds()
 
-    psi0_basis = GaussianBasis(uparams_init=psi0_params).to(device)
-
+    psi0_basis = GaussianBasis.from_means_stds(psi0_means, psi0_stds, trainable=True).to(device)
 
     base_tran_obs_model = tran_obs_model.conditional_density_model if use_dtf else tran_obs_model
     init_model = LinearFF.from_r2ff(base_tran_obs_model, psi0_basis).to(device)

@@ -118,8 +118,6 @@ CONTEXT_WITH_NFTF_NO_PREFIT = {
     "verbose": True,
 }
 
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark filtering with vs without NFTF on a partially observable problem."
@@ -234,12 +232,11 @@ def main() -> None:
             reg_covar=reg_covar_joint,
             max_iter=100,
         )
-        phi_marginal = tran_gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-        phi_means, phi_stds = phi_marginal.means_stds()
-        phi_params = torch.stack([phi_means, phi_stds], dim=-1)
-        psi_marginal = tran_gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
-        psi_means, psi_stds = psi_marginal.means_stds()
-        psi_params = torch.stack([psi_means, psi_stds], dim=-1)
+        phi_marginal = tran_gmm_lf.marginal(marginal_dims=range(system.dim()))
+        phi_means, phi_stds = phi_marginal.w.means_stds()
+
+        psi_marginal = tran_gmm_lf.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
+        psi_means, psi_stds = psi_marginal.w.means_stds()
 
         yo_joint_data = torch.cat([yo_data_latent, o_data], dim=1)
         obs_gmm_lf = train.fit_gaussian_lf_em(
@@ -248,19 +245,18 @@ def main() -> None:
             reg_covar=reg_covar_obs,
             max_iter=100,
         )
-        xi_marginal = obs_gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-        xi_means, xi_stds = xi_marginal.means_stds()
-        xi_params = torch.stack([xi_means, xi_stds], dim=-1)
-        zeta_marginal = obs_gmm_lf.basis.marginal(
+        xi_marginal = obs_gmm_lf.marginal(marginal_dims=range(system.dim()))
+        xi_means, xi_stds = xi_marginal.w.means_stds()
+
+        zeta_marginal = obs_gmm_lf.marginal(
             marginal_dims=range(system.dim(), system.dim() + system.observation_dim())
         )
-        zeta_means, zeta_stds = zeta_marginal.means_stds()
-        zeta_params = torch.stack([zeta_means, zeta_stds], dim=-1)
+        zeta_means, zeta_stds = zeta_marginal.w.means_stds()
 
-        phi_basis = GaussianBasis(uparams_init=phi_params).to(device)
-        psi_basis = GaussianBasis(uparams_init=psi_params).to(device)
-        xi_basis = GaussianBasis(uparams_init=xi_params).to(device)
-        zeta_basis = GaussianBasis(uparams_init=zeta_params).to(device)
+        phi_basis = GaussianBasis.from_means_stds(phi_means, phi_stds, trainable=True).to(device)
+        psi_basis = GaussianBasis.from_means_stds(psi_means, psi_stds, trainable=True).to(device)
+        xi_basis = GaussianBasis.from_means_stds(xi_means, xi_stds, trainable=True).to(device)
+        zeta_basis = GaussianBasis.from_means_stds(zeta_means, zeta_stds, trainable=True).to(device)
 
         if use_nftf:
             tran_obs_model = CompositeRFandR2FF(
@@ -499,7 +495,6 @@ def main() -> None:
     benchmark.run(trials=TRIALS, verbose=True)
     run_dir = benchmark.process_and_save_results(root_dir=BENCHMARK_ROOT)
     print(f"Saved to {run_dir}")
-
 
 if __name__ == "__main__":
     main()

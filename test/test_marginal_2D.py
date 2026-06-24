@@ -147,6 +147,7 @@ def _random_basis(
             n_basis,
             offsets=off,
             variance=VARIANCE,
+            min_std=GAUSSIAN_MIN_STD,
             device=device,
         ).to(device=device, dtype=dtype)
     elif basis_name == "beta":

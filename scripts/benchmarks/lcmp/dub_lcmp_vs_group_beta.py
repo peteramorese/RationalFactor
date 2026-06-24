@@ -72,7 +72,6 @@ GROUP_BETA_CONTEXT = {
     "verbose": True,
 }
 
-
 def main() -> None:
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -202,17 +201,15 @@ def main() -> None:
 
         mover_trained = VolumePreservingNFTF.copy_from_trainable(mover).to(device)
 
-        weights = gmm_lf.get_w()
-        z_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-        z_means, z_stds = z_marginal.means_stds()
-        z_params = torch.stack([z_means, z_stds], dim=-1)
+        weights = gmm_lf.w.get_coeffs()
+        z_marginal = gmm_lf.marginal(marginal_dims=range(system.dim()))
+        z_means, z_stds = z_marginal.w.means_stds()
 
-        zp_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
-        zp_means, zp_stds = zp_marginal.means_stds()
-        zp_params = torch.stack([zp_means, zp_stds], dim=-1)
+        zp_marginal = gmm_lf.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
+        zp_means, zp_stds = zp_marginal.w.means_stds()
 
-        phi_basis = GaussianBasis(fixed_params=z_params).to(device)
-        psi_basis = GaussianBasis(fixed_params=zp_params).to(device)
+        phi_basis = GaussianBasis.from_means_stds(z_means, z_stds, trainable=False).to(device)
+        psi_basis = GaussianBasis.from_means_stds(zp_means, zp_stds, trainable=False).to(device)
         psi0_basis = GaussianBasis.random_init(
             system.dim(),
             n_basis=n_basis,
@@ -405,7 +402,6 @@ def main() -> None:
     benchmark.run(trials=TRIALS, verbose=True)
     run_dir = benchmark.process_and_save_results(root_dir=BENCHMARK_ROOT)
     print(f"Saved to {run_dir}")
-
 
 if __name__ == "__main__":
     main()

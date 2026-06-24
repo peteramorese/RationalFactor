@@ -15,7 +15,6 @@ from rational_factor.models.composite_model import CompositeDensityModel, Compos
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 import matplotlib.pyplot as plt
 
-
 if __name__ == "__main__":
     problem = FULLY_OBSERVABLE_PROBLEMS["aircraft"]
     
@@ -114,17 +113,15 @@ if __name__ == "__main__":
         y0_data = y0_data.to(torch.device("cpu"))
     y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
     gmm_lf = train.fit_gaussian_lf_em(y_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=reg_covar_joint, max_iter=100)
-    weights = gmm_lf.get_w()
-    phi_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-    phi_means, phi_stds = phi_marginal.means_stds()
-    phi_params = torch.stack([phi_means, phi_stds], dim=-1)
+    weights = gmm_lf.w.get_coeffs()
+    phi_marginal = gmm_lf.marginal(marginal_dims=range(system.dim()))
+    phi_means, phi_stds = phi_marginal.w.means_stds()
 
-    psi_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
-    psi_means, psi_stds = psi_marginal.means_stds()
-    psi_params = torch.stack([psi_means, psi_stds], dim=-1)
+    psi_marginal = gmm_lf.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
+    psi_means, psi_stds = psi_marginal.w.means_stds()
 
-    phi_basis = GaussianBasis(uparams_init=phi_params).to(device)
-    psi_basis = GaussianBasis(uparams_init=psi_params).to(device)
+    phi_basis = GaussianBasis.from_means_stds(phi_means, phi_stds, trainable=True).to(device)
+    psi_basis = GaussianBasis.from_means_stds(psi_means, psi_stds, trainable=True).to(device)
     psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
     print("Done.\n")
 
@@ -154,7 +151,6 @@ if __name__ == "__main__":
         use_best="val_mle")
     print("Done! \n")
     print("Valid: ", tran_model.valid())
-
 
     # Copy the domain transformation to fix it for training the initial state model
     trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None

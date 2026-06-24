@@ -20,7 +20,6 @@ from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.misc import data_bounds
 from rational_factor.tools.visualization import plot_belief
 
-
 def _plot_snd_conditional_true_vs_learned(
     tran_model: CompositeConditionalModel,
     system,
@@ -107,7 +106,6 @@ def _plot_snd_conditional_true_vs_learned(
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
-
 def _plot_snd_1d_belief_trajectory(
     problem,
     beliefs: list[CompositeDensityModel],
@@ -154,7 +152,6 @@ def _plot_snd_1d_belief_trajectory(
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-
 
 def main() -> None:
     problem = FULLY_OBSERVABLE_PROBLEMS["scalar_nonlinear_drift"]
@@ -282,17 +279,15 @@ def main() -> None:
 
     mover_trained = VolumePreservingNFTF.copy_from_trainable(mover).to(device)
 
-    weights = gmm_lf.get_w()
-    z_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim()))
-    z_means, z_stds = z_marginal.means_stds()
-    z_params = torch.stack([z_means, z_stds], dim=-1)
+    weights = gmm_lf.w.get_coeffs()
+    z_marginal = gmm_lf.marginal(marginal_dims=range(system.dim()))
+    z_means, z_stds = z_marginal.w.means_stds()
 
-    zp_marginal = gmm_lf.basis.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
-    zp_means, zp_stds = zp_marginal.means_stds()
-    zp_params = torch.stack([zp_means, zp_stds], dim=-1)
+    zp_marginal = gmm_lf.marginal(marginal_dims=range(system.dim(), 2 * system.dim()))
+    zp_means, zp_stds = zp_marginal.w.means_stds()
 
-    phi_basis = GaussianBasis(fixed_params=z_params).to(device)
-    psi_basis = GaussianBasis(fixed_params=zp_params).to(device)
+    phi_basis = GaussianBasis.from_means_stds(z_means, z_stds, trainable=False).to(device)
+    psi_basis = GaussianBasis.from_means_stds(zp_means, zp_stds, trainable=False).to(device)
     psi0_basis = GaussianBasis.random_init(
         system.dim(),
         n_basis=n_basis,
@@ -404,7 +399,6 @@ def main() -> None:
         title=f"{stem}: true vs learned conditional density",
     )
     print(f"Saved conditional density comparison plot to {cond_out_path}")
-
 
 if __name__ == "__main__":
     main()
