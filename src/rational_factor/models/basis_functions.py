@@ -9,130 +9,7 @@ from nflows.transforms.base import CompositeTransform
 from nflows.transforms.permutations import ReversePermutation
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 
-class Parameters(torch.nn.Module):
-    def __init__(self, trainable_init_values: torch.Tensor = None, fixed_values: torch.Tensor = None):
-        super().__init__()
-        assert not (trainable_init_values is not None and fixed_values is not None)
-        self._trainable = trainable_init_values is not None
-        if self._trainable:
-            self._p = torch.nn.Parameter(trainable_init_values)
-        else:
-            self.register_buffer("_p", fixed_values)
-
-    @classmethod
-    def random_init(
-        cls,
-        shape: tuple[int, ...],
-        trainable: bool = True,
-        mean: float = 0.0,
-        std: float = 1.0,
-    ):
-        values = torch.randn(*shape) * std + mean
-        if trainable:
-            return cls(trainable_init_values=values)
-        return cls(fixed_values=values)
-
-    @classmethod
-    def set_init(cls, shape: tuple[int, ...], value: float, trainable: bool = True):
-        values = torch.ones(shape) * value
-        if trainable:
-            return cls(trainable_init_values=values)
-        return cls(fixed_values=values)
-
-    @classmethod
-    def from_values(cls, values: torch.Tensor, trainable: bool = True):
-        if trainable:
-            return cls(trainable_init_values=values)
-        return cls(fixed_values=values.detach().clone())
-
-    def size(self):
-        return self._p.size()
-
-    def is_trainable(self):
-        return self._trainable
-
-    def dtype_device(self):
-        return self._p.dtype, self._p.device
-
-    def forward(self):
-        return self._p
-
-    def set_requires_grad(self, requires_grad: bool):
-        if self._p.is_leaf:
-            self._p.requires_grad_(requires_grad)
-
-
-class PositiveParameters(Parameters):
-    def __init__(
-        self,
-        trainable_init_values: torch.Tensor = None,
-        fixed_values: torch.Tensor = None,
-        normalized: bool = False,
-        epsilon: float = 0.0,
-    ):
-        super().__init__(trainable_init_values=trainable_init_values, fixed_values=fixed_values)
-        self._normalized = normalized
-        self._epsilon = epsilon
-        if not self._trainable:
-            assert torch.all(fixed_values >= 0), "fixed_values must be nonnegative"
-            if normalized:
-                with torch.no_grad():
-                    self._p.copy_(self._normalize(self._p, dim=-1))
-    
-    @classmethod
-    def random_init(
-        cls,
-        shape: tuple[int, ...],
-        trainable: bool = True,
-        mean: float = 0.0,
-        std: float = 1.0,
-        normalized: bool = False,
-        epsilon: float = 0.0,
-    ):
-        values = torch.randn(*shape) * std + mean
-        if trainable:
-            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
-        return cls(fixed_values=values, normalized=normalized, epsilon=epsilon)
-
-    @classmethod
-    def set_init(cls, shape: tuple[int, ...], value: float, trainable: bool = True, normalized: bool = False, epsilon: float = 0.0):
-        values = torch.ones(shape) * value
-        if trainable:
-            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
-        return cls(fixed_values=values, normalized=normalized, epsilon=epsilon)
-
-    @classmethod
-    def from_values(cls, values: torch.Tensor, trainable: bool = True, normalized: bool = False, epsilon: float = 0.0):
-        if trainable:
-            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
-        return cls(fixed_values=values.detach().clone(), normalized=normalized, epsilon=epsilon)
-
-    def _normalize(self, p: torch.Tensor, dim: int = -1):
-        return self._epsilon + (1.0 - p.shape[dim] * self._epsilon) * torch.nn.functional.softmax(p, dim=dim)
-
-    def forward(self):
-        if self._trainable:
-            if self._normalized:
-                return self._normalize(self._p, dim=-1)
-            return self._epsilon + torch.nn.functional.softplus(self._p)
-        return self._p
-
-    def freeze_params(self):
-        return PositiveParameters(
-            fixed_values=self.forward().detach().clone(),
-            normalized=self._normalized,
-            epsilon=self._epsilon,
-        )
-
-    def with_fixed_values(self, values: torch.Tensor) -> "PositiveParameters":
-        return PositiveParameters(
-            fixed_values=values.detach().clone(),
-            normalized=self._normalized,
-            epsilon=self._epsilon,
-        )
-
-    def is_normalized(self):
-        return self._normalized
+from .parameters import Parameters, PositiveParameters
 
 
 def _is_functional_proxy_of(obj, basis_cls: type) -> bool:
@@ -146,27 +23,30 @@ def _is_functional_proxy_of(obj, basis_cls: type) -> bool:
 class Basis(torch.nn.Module):
     def __init__(self, 
             dim : int, 
+            batch_size : int,
             n_basis : int,
             params : tuple[torch.Tensor, ...] | tuple[Parameters, ...],
             coeffs : torch.Tensor | Parameters = None):
         '''
         Args:
             dim : int, number of dimensions
+            batch_size : int, number of data points in the batch
             n_basis : int, number of basis functions
             params : list of tensors where each represents a parameter group for a basis function
             coeffs : PositiveParameters of coefficients
         '''
         super().__init__()
         self._dim = dim
+        self._batch_size = batch_size
         self._n_basis = n_basis
 
         self.set_params(params)
 
         if coeffs is not None:
-            assert coeffs.size() == (n_basis,), "coeffs must have shape (n_basis,)"
+            assert coeffs.size() == (batch_size, n_basis), "coeffs must have shape (batch_size, n_basis)"
             self.set_coeffs(coeffs)
         else:
-            self.coeffs = None
+            self.coeffs = torch.ones(batch_size, n_basis)
             self._module_coeffs = False
 
     def forward(self, y : torch.Tensor, ignore_coeffs : bool = False):
@@ -191,6 +71,7 @@ class Basis(torch.nn.Module):
         return self.coeffs is not None
 
     def set_coeffs(self, coeffs : torch.Tensor | Parameters):
+        assert coeffs.size() == (self._batch_size, self._n_basis), "coeffs must have shape (batch_size, n_basis)"
         if isinstance(coeffs, torch.Tensor):
             self.coeffs = coeffs
             self._module_coeffs = False
@@ -199,7 +80,10 @@ class Basis(torch.nn.Module):
             self._module_coeffs = True
         else:
             raise ValueError("coeffs must be a tensor or Parameters")
-        assert coeffs.size() == (self._n_basis,)
+    
+    def set_coeffs_to_one(self):
+        dtype, device = self.param_dtype_device()
+        self.set_coeffs(torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device))
     
     def get_coeffs(self):
         if not self.has_coeffs():
@@ -208,11 +92,11 @@ class Basis(torch.nn.Module):
             return self.coeffs()
         return self.coeffs
 
-    def coeff_values(self):
-        return self.get_coeffs()
-
     def dim(self):
         return self._dim
+    
+    def batch_size(self):
+        return self._batch_size
     
     def n_basis_functions(self):
         return self._n_basis
@@ -220,58 +104,59 @@ class Basis(torch.nn.Module):
     def param_dtype_device(self):
         params = self.get_params()
         if len(params) > 0:
-            return params[0].dtype(), params[0].device()
+            return params[0].dtype, params[0].device
         return None, None
 
     def normalized(self):
         raise NotImplementedError("normalized is not implemented for this basis function")
     
-    def Omega1(self, ignore_coeffs : bool = False):
+    def Omega1(self, lows : torch.Tensor = None, highs : torch.Tensor = None):
         '''
         Computes the integral of the basis functions.
         omega[i] = <this_i, 1>
 
-        Returns:
-            Tensor of shape (n_basis,)
+        Args:
+            lows : lower bounds of the integration domain, if None, the domain is the entire real line
+            highs : upper bounds of the integration domain, if None, the domain is the entire real line
         '''
         raise NotImplementedError("Omega1 is not implemented for this basis function")
 
-    def Omega2(self, other: 'Basis', ignore_coeffs : bool = False, lows : torch.Tensor = None, highs : torch.Tensor = None):
+    def Omega2(self, other: 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
         '''
-        Computes the function inner product matrix with another basis function vector. 
+        Computes the inner product matrix of the basis functions with another basis function vector. 
         omega[i, j] = <this_i, other_j>
 
         Args:
             other : Basis function to compute the inner product with
-            ignore_coeffs : whether to ignore the coefficients
-            lows : lower bounds of the domain, if None, the domain is the entire real line
-            highs : upper bounds of the domain, if None, the domain is the entire real line
-        
-        Returns:
-            Tensor of shape (n_basis, other.n_basis)
+            lows : lower bounds of the integration domain, if None, the domain is the entire real line
+            highs : upper bounds of the integration domain, if None, the domain is the entire real line
         '''
         raise NotImplementedError("Omega2 is not implemented for this basis function")
 
-    def Omega3_contract(self, other1: 'Basis', other2: 'Basis'):
+    def Omega3(self, other1: 'Basis', other2: 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
         '''
-        Computes the 3D quadratic function inner product tensor with another basis function vector. 
+        Computes the inner product tensor of the basis functions with another basis function vector. 
         omega[i, j, k] = <this_i, other1_j, other2_k>
-        
-        Returns:
-            Tensor of shape (n_basis, other1.n_basis, other2.n_basis)
-        '''
-        raise NotImplementedError("Omega3 is not implemented for this basis function")
 
-    def Omega22(self, other: 'Basis'):
+        Args:
+            other1 : Basis function to compute the inner product with
+            other2 : Basis function to compute the inner product with
+            lows : lower bounds of the integration domain, if None, the domain is the entire real line
+            highs : upper bounds of the integration domain, if None, the domain is the entire real line
         '''
-        Computes the 4D quadratic function inner product tensor with another basis function vector. 
+
+    def Omega22(self, other: 'Basis', v : torch.Tensor = None, lows : torch.Tensor = None, highs : torch.Tensor = None):
+        '''
+        Computes the inner product tensor of the basis functions with another basis function vector. 
         omega[i, j, k, l] = <this_i * this_j, other_k * other_l>
-        
-        Returns:
-            Tensor of shape (n_basis, n_basis, other.n_basis, other.n_basis)
+
+        Args:
+            other : Basis function to compute the inner product with
+            v : vector to contract with
+            lows : lower bounds of the integration domain, if None, the domain is the entire real line
+            highs : upper bounds of the integration domain, if None, the domain is the entire real line
         '''
-        raise NotImplementedError("Omega4 is not implemented for this basis function")
-    
+
     def product_basis(self, other_basis_factors: list["Basis"]):
         """
         Returns the broadcasted (flattened) product of the basis functions in ``other_basis_factors``.
@@ -281,15 +166,14 @@ class Basis(torch.nn.Module):
         """
         raise NotImplementedError("product_basis is not implemented for this basis function")
     
-    @abstractmethod
-    def marginal(self, marginal_dims : tuple[int, ...], ignore_coeffs : bool = False):
+    def marginal(self, marginal_dims : tuple[int, ...]):
         '''
         Computes the marginalized basis functions over the given dimensions
 
         Returns:
             A new SeparableBasis object with the marginalized dimensions
         '''
-        pass
+        raise NotImplementedError("marginal is not implemented for this basis function")
 
 
 class SeparableBasis(Basis):
@@ -299,19 +183,37 @@ class SeparableBasis(Basis):
         coeffs: torch.Tensor = None,
     ):
         param_tensor = params[0] if isinstance(params[0], torch.Tensor) else params[0]()
-        dim = param_tensor.size()[0]
-        n_basis = param_tensor.size()[1]
-        super().__init__(dim=dim, n_basis=n_basis, params=params, coeffs=coeffs)
+        assert param_tensor.dim() == 3, "Each parameter tensor must have shape (batch_size, dim, n_basis)"
+        batch_size = param_tensor.size()[0]
+        dim = param_tensor.size()[1]
+        n_basis = param_tensor.size()[2]
+        super().__init__(dim=dim, batch_size=batch_size, n_basis=n_basis, params=params, coeffs=coeffs)
 
         self_params = self.get_params()
         for param_set in self_params:
-            assert param_set.size() == (dim, n_basis), "Each parameter tensor must have shape (dim, n_basis)"
+            assert param_set.size() == (batch_size, dim, n_basis), "Each parameter tensor must have shape (batch_size, dim, n_basis)"
 
     def n_params_per_basis(self):
         return len(self.get_params())
 
+    @staticmethod
+    def _broadcast_domain_bounds(
+        lows: torch.Tensor | None,
+        highs: torch.Tensor | None,
+        axes: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Broadcast per-dimension domain bounds to match axis params (..., dim, n_basis)."""
+        dtype, device = axes.dtype, axes.device
+        lows_b, highs_b = None, None
+        if lows is not None:
+            lows_b = lows.to(dtype=dtype, device=device).reshape(-1)
+            lows_b = lows_b[(None,) * (axes.dim() - 2) + (slice(None),) + (None,)]
+        if highs is not None:
+            highs_b = highs.to(dtype=dtype, device=device).reshape(-1)
+            highs_b = highs_b[(None,) * (axes.dim() - 2) + (slice(None),) + (None,)]
+        return lows_b, highs_b
 
-# Nonnegative basis functions 
+
 class NonnegativeBasis:
     pass
 
@@ -324,326 +226,145 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         mean_params : torch.Tensor | Parameters,
         std_params : torch.Tensor | PositiveParameters,
         coeffs: torch.Tensor | PositiveParameters = None,
-        block_size: int | None = None,
     ):
         super().__init__(params=(mean_params, std_params), coeffs=coeffs)
-        self.block_size = block_size
 
     def means_stds(self) -> tuple[torch.Tensor, torch.Tensor]:
         params = self.get_params()
         return params[0], params[1]
 
     @staticmethod
-    def omega2_from_means_stds(
-        mu1: torch.Tensor,
-        std1: torch.Tensor,
-        mu2: torch.Tensor,
-        std2: torch.Tensor,
-        ignore_coeffs: bool = False,
-        coeffs1: torch.Tensor | None = None,
-        coeffs2: torch.Tensor | None = None,
-        lows: torch.Tensor | None = None,
-        highs: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Inner product matrix Omega2 from mean/std tensors, optionally batched over leading dim."""
-        if mu1.dim() != mu2.dim() or std1.dim() != std2.dim():
-            raise ValueError(
-                f"means/stds batch ranks must match: mu1 {mu1.dim()}D, mu2 {mu2.dim()}D, "
-                f"std1 {std1.dim()}D, std2 {std2.dim()}D."
-            )
-        if mu1.dim() == 2:
-            mu1_b = mu1[:, :, None]
-            std1_b = std1[:, :, None]
-            mu2_b = mu2[:, None, :]
-            std2_b = std2[:, None, :]
-            sum_dim = 0
-        elif mu1.dim() == 3:
-            mu1_b = mu1[:, :, :, None]
-            std1_b = std1[:, :, :, None]
-            mu2_b = mu2[:, :, None, :]
-            std2_b = std2[:, :, None, :]
-            sum_dim = 1
-        else:
-            raise ValueError(
-                f"means/stds must have shape (d, n_basis) or (batch, d, n_basis), got ndim={mu1.dim()}."
-            )
-
-        lows_b, highs_b = None, None
-        if lows is not None or highs is not None:
-            assert lows is not None and highs is not None, "lows and highs must both be set for a bounded domain"
-            dtype, device = mu1.dtype, mu1.device
-            lows_b = lows.to(dtype=dtype, device=device).reshape(-1)
-            highs_b = highs.to(dtype=dtype, device=device).reshape(-1)
-            if mu1.dim() == 2:
-                lows_b = lows_b[:, None, None]
-                highs_b = highs_b[:, None, None]
-            else:
-                lows_b = lows_b[None, :, None, None]
-                highs_b = highs_b[None, :, None, None]
-
-        log_dim = GaussianBasis._log_gaussian_pair_ip(mu1_b, std1_b, mu2_b, std2_b, lows_b, highs_b)
-        out = torch.exp(log_dim.sum(dim=sum_dim))
-        if not ignore_coeffs:
-            if coeffs1 is not None:
-                out = out * (coeffs1[:, None] if coeffs1.dim() == 1 else coeffs1[:, :, None])
-            if coeffs2 is not None:
-                out = out * (coeffs2[None, :] if coeffs2.dim() == 1 else coeffs2[:, None, :])
-        return out
-
-    @staticmethod
-    def _log_gaussian_pair_ip(
-        mu1: torch.Tensor,
-        std1: torch.Tensor,
-        mu2: torch.Tensor,
-        std2: torch.Tensor,
+    def _gaussian_dim_integral(
+        mu: torch.Tensor,
+        std: torch.Tensor,
         lows: torch.Tensor | None,
         highs: torch.Tensor | None,
     ) -> torch.Tensor:
-        var_sum = std1.square() + std2.square()
-        log_pref = -0.5 * (torch.log(2 * torch.pi * var_sum) + (mu1 - mu2).square() / var_sum)
-        if lows is None:
-            return log_pref
-        m = (mu1 * std2.square() + mu2 * std1.square()) / var_sum
-        std_m = torch.sqrt(std1.square() * std2.square() / var_sum)
-        cdf = torch.special.ndtr((highs - m) / std_m) - torch.special.ndtr((lows - m) / std_m)
-        return log_pref + cdf.clamp_min(torch.finfo(mu1.dtype).tiny).log()
+        """Integral of N(x | mu, std^2) over [lows, highs] (broadcastable)."""
+        if lows is None and highs is None:
+            return torch.ones_like(mu)
+        std = std.clamp_min(torch.finfo(mu.dtype).eps)
+        cdf_low = 0.0 if lows is None else torch.special.ndtr((lows - mu) / std)
+        cdf_high = 1.0 if highs is None else torch.special.ndtr((highs - mu) / std)
+        return cdf_high - cdf_low
 
-    def forward(self, y: torch.Tensor, ignore_coeffs: bool = False):
-        assert y.dim() == 2 and y.shape[1] == self.dim(), "y must have shape (n_data, d)"
+    @staticmethod
+    def _log_gaussian_product_dim(
+        mus: tuple[torch.Tensor, ...],
+        stds: tuple[torch.Tensor, ...],
+        lows: torch.Tensor | None,
+        highs: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Log integral of product_k N(x | mus[k], stds[k]^2) over [lows, highs] (broadcastable)."""
+        inv_var = sum(std.reciprocal().square() for std in stds)
+        mu_over_var = sum(mu / std.square() for mu, std in zip(mus, stds))
+        mu_sq_over_var = sum(mu.square() / std.square() for mu, std in zip(mus, stds))
+        m = mu_over_var / inv_var
+        std_m = inv_var.rsqrt()
+        log_two_pi = mus[0].new_tensor(2.0 * math.pi)
+        surplus = mu_sq_over_var - mu_over_var.square() / inv_var
+        log_norm = -0.5 * (
+            (len(mus) - 1) * log_two_pi
+            + sum(torch.log(std.square()) for std in stds)
+            + torch.log(inv_var)
+            + surplus
+        )
+        domain = GaussianBasis._gaussian_dim_integral(m, std_m, lows, highs)
+        return log_norm + domain.clamp_min(torch.finfo(mus[0].dtype).tiny).log()
+
+    def Omega1(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         mu, std = self.means_stds()
-        y = y[:, :, None]
-        log_dim_factors = (
-            -0.5 * torch.log(y.new_tensor(2.0 * torch.pi))
-            - torch.log(std)
-            - (y - mu) ** 2 / (2 * std ** 2)
-        )
-        out = torch.exp(log_dim_factors.sum(dim=1))
-        if not ignore_coeffs and self.has_coeffs():
-            coeffs = self.get_coeffs()
-            if coeffs.dim() == 1:
-                out = out * coeffs[None, :]
-            else:
-                out = out * coeffs
-        return out
+        lows_b, highs_b = self._broadcast_domain_bounds(lows, highs, mu)
+        out = torch.exp(self._log_gaussian_product_dim((mu,), (std,), lows_b, highs_b).sum(dim=1))
+        return out * self.get_coeffs()
 
-    def normalized(self):
-        return not self.has_coeffs()
-
-    def Omega1(self, ignore_coeffs: bool = False):
-        dtype, device = self.param_dtype_device()
-        out = torch.ones(
-            self.n_basis_functions(),
-            dtype=dtype,
-            device=device,
-        )
-        if (not ignore_coeffs) and self.has_coeffs():
-            out = out * self.get_coeffs()
-        return out
-
-    def Omega2(self, other: "GaussianBasis", ignore_coeffs: bool = False, lows: torch.Tensor | None = None, highs: torch.Tensor | None = None):
-        assert _is_functional_proxy_of(other, GaussianBasis), "other must be GaussianBasis"
+    def Omega2(self, other: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
+        assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
+        assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
-        coeffs1 = None if ignore_coeffs or (not self.has_coeffs()) else self.get_coeffs()
-        coeffs2 = None if ignore_coeffs or (not other.has_coeffs()) else other.get_coeffs()
-        return self.omega2_from_means_stds(
-            mu1, std1, mu2, std2,
-            ignore_coeffs=ignore_coeffs,
-            coeffs1=coeffs1,
-            coeffs2=coeffs2,
-            lows=lows,
-            highs=highs,
+        lows_b, highs_b = self._broadcast_domain_bounds(lows, highs, mu1)
+        lows_pair = None if lows_b is None else lows_b[..., None]
+        highs_pair = None if highs_b is None else highs_b[..., None]
+        log_dim = self._log_gaussian_product_dim(
+            (mu1[..., :, None], mu2[..., None, :]),
+            (std1[..., :, None], std2[..., None, :]),
+            lows_pair, highs_pair,
         )
+        out = torch.exp(log_dim.sum(dim=1))
+        return out * self.get_coeffs()[:, :, None] * other.get_coeffs()[:, None, :]
 
-    def Omega3_contract(
-        self,
-        other1: "GaussianBasis",
-        other2: "GaussianBasis",
-        left_i: torch.Tensor,
-        left_j: torch.Tensor,
-        block_size: int | None = None,
-        ignore_coeffs: bool = False,
-    ):
-        """
-        Computes v[k] = sum_{i,j} left_i[i] * left_j[j] * Omega3[i,j,k]
-        without materializing Omega3.
-        """
-        assert _is_functional_proxy_of(other1, GaussianBasis), "other1 must be GaussianBasis"
-        assert _is_functional_proxy_of(other2, GaussianBasis), "other2 must be GaussianBasis"
+    def Omega3(self, other1: "GaussianBasis", other2: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
+        assert isinstance(other1, GaussianBasis), "other1 must be GaussianBasis"
+        assert isinstance(other2, GaussianBasis), "other2 must be GaussianBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
-        assert left_i.dim() == 1 and left_i.shape[0] == self.n_basis_functions(), "left_i has wrong shape"
-        assert left_j.dim() == 1 and left_j.shape[0] == other1.n_basis_functions(), "left_j has wrong shape"
-
-        mu0, std0 = self.means_stds()
-        mu1, std1 = other1.means_stds()
-        mu2, std2 = other2.means_stds()
-
-        c0 = (
-            torch.ones(self.n_basis_functions(), dtype=mu0.dtype, device=mu0.device)
-            if ignore_coeffs or (not self.has_coeffs())
-            else self.get_coeffs()
+        batch = self.batch_size()
+        assert batch == other1.batch_size() == other2.batch_size(), "Basis functions must have the same batch size"
+        mu1, std1 = self.means_stds()
+        mu2, std2 = other1.means_stds()
+        mu3, std3 = other2.means_stds()
+        lows_b, highs_b = self._broadcast_domain_bounds(lows, highs, mu1)
+        lows_triple = None if lows_b is None else lows_b[..., None, None]
+        highs_triple = None if highs_b is None else highs_b[..., None, None]
+        log_dim = self._log_gaussian_product_dim(
+            (mu1[..., :, None, None], mu2[..., None, :, None], mu3[..., None, None, :]),
+            (std1[..., :, None, None], std2[..., None, :, None], std3[..., None, None, :]),
+            lows_triple, highs_triple,
         )
-        c1 = (
-            torch.ones(other1.n_basis_functions(), dtype=mu0.dtype, device=mu0.device)
-            if ignore_coeffs or (not other1.has_coeffs())
-            else other1.get_coeffs()
+        out = torch.exp(log_dim.sum(dim=1))
+        return (
+            out
+            * self.get_coeffs()[:, :, None, None]
+            * other1.get_coeffs()[:, None, :, None]
+            * other2.get_coeffs()[:, None, None, :]
         )
-        c2 = (
-            torch.ones(other2.n_basis_functions(), dtype=mu0.dtype, device=mu0.device)
-            if ignore_coeffs or (not other2.has_coeffs())
-            else other2.get_coeffs()
-        )
-        coeff_scale = c0[:, None, None] * c1[None, :, None] * c2[None, None, :]
 
-        var0 = std0.square()
-        var1 = std1.square()
-        var2 = std2.square()
-
-        inv0 = var0.reciprocal()
-        inv1 = var1.reciprocal()
-        inv2 = var2.reciprocal()
-
-        n0 = self.n_basis_functions()
-        n1 = other1.n_basis_functions()
-        n2 = other2.n_basis_functions()
-
-        log2pi = torch.log(mu0.new_tensor(2.0 * torch.pi))
-
-        if block_size is None:
-            block_size = self.block_size
-        if block_size is None:
-            # Full vectorized path (equivalent to building Omega3 then contracting).
-            mu_i = mu0[:, :, None, None]
-            mu_j = mu1[:, None, :, None]
-            mu_k = mu2[:, None, None, :]
-
-            inv_i = inv0[:, :, None, None]
-            inv_j = inv1[:, None, :, None]
-            inv_k = inv2[:, None, None, :]
-
-            var_i = var0[:, :, None, None]
-            var_j = var1[:, None, :, None]
-            var_k = var2[:, None, None, :]
-
-            S = inv_i + inv_j + inv_k
-            T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k
-            U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k
-
-            log_dim = (
-                -0.5 * (3.0 * log2pi + torch.log(var_i) + torch.log(var_j) + torch.log(var_k))
-                + 0.5 * (log2pi - torch.log(S))
-                - 0.5 * (U - T.square() / S)
-            )
-            omega_full = torch.exp(log_dim.sum(dim=0)) * coeff_scale
-            return torch.einsum("i,j,ijk->k", left_i, left_j, omega_full)
-
-        assert block_size > 0, "block_size must be positive"
-        denom = torch.zeros(n2, dtype=mu0.dtype, device=mu0.device)
-
-        for j_start in range(0, n1, block_size):
-            j_end = min(j_start + block_size, n1)
-            left_j_blk = left_j[j_start:j_end]
-            for k_start in range(0, n2, block_size):
-                k_end = min(k_start + block_size, n2)
-                log_chunk = torch.zeros((n0, j_end - j_start, k_end - k_start), dtype=mu0.dtype, device=mu0.device)
-                for r in range(self.dim()):
-                    mu_i = mu0[r, :, None, None]
-                    mu_j = mu1[r, None, j_start:j_end, None]
-                    mu_k = mu2[r, None, None, k_start:k_end]
-
-                    inv_i = inv0[r, :, None, None]
-                    inv_j = inv1[r, None, j_start:j_end, None]
-                    inv_k = inv2[r, None, None, k_start:k_end]
-
-                    var_i = var0[r, :, None, None]
-                    var_j = var1[r, None, j_start:j_end, None]
-                    var_k = var2[r, None, None, k_start:k_end]
-
-                    S = inv_i + inv_j + inv_k
-                    T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k
-                    U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k
-
-                    log_chunk += (
-                        -0.5 * (3.0 * log2pi + torch.log(var_i) + torch.log(var_j) + torch.log(var_k))
-                        + 0.5 * (log2pi - torch.log(S))
-                        - 0.5 * (U - T.square() / S)
-                    )
-
-                omega_chunk = torch.exp(log_chunk) * coeff_scale[:, j_start:j_end, k_start:k_end]
-                denom[k_start:k_end] += torch.einsum("i,j,ijk->k", left_i, left_j_blk, omega_chunk)
-
-        return denom
-
-    def Omega22(self, other: "GaussianBasis", ignore_coeffs: bool = False):
-        assert _is_functional_proxy_of(other, GaussianBasis), "other must be GaussianBasis"
+    def Omega22(self, other: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
+        assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-
-        # (d, n_phi), (d, n_psi)
+        assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
+        lows_b, highs_b = self._broadcast_domain_bounds(lows, highs, mu1)
+        lows_quad = None if lows_b is None else lows_b[..., None, None, None]
+        highs_quad = None if highs_b is None else highs_b[..., None, None, None]
+        log_dim = self._log_gaussian_product_dim(
+            (
+                mu1[..., :, None, None, None],
+                mu1[..., None, :, None, None],
+                mu2[..., None, None, :, None],
+                mu2[..., None, None, None, :],
+            ),
+            (
+                std1[..., :, None, None, None],
+                std1[..., None, :, None, None],
+                std2[..., None, None, :, None],
+                std2[..., None, None, None, :],
+            ),
+            lows_quad,
+            highs_quad,
+        )
+        out = torch.exp(log_dim.sum(dim=1))
+        c1 = self.get_coeffs()
+        c2 = other.get_coeffs()
+        return (
+            out
+            * c1[:, :, None, None, None]
+            * c1[:, None, :, None, None]
+            * c2[:, None, None, :, None]
+            * c2[:, None, None, None, :]
+        )
 
-        var1 = std1 * std1
-        var2 = std2 * std2
-        inv_var1 = 1.0 / var1
-        inv_var2 = 1.0 / var2
-
-        # Broadcast everything to (d, n_phi, n_phi, n_psi, n_psi)
-        mu_i = mu1[:, :, None, None, None]
-        mu_j = mu1[:, None, :, None, None]
-        mu_k = mu2[:, None, None, :, None]
-        mu_l = mu2[:, None, None, None, :]
-
-        inv_i = inv_var1[:, :, None, None, None]
-        inv_j = inv_var1[:, None, :, None, None]
-        inv_k = inv_var2[:, None, None, :, None]
-        inv_l = inv_var2[:, None, None, None, :]
-
-        var_i = var1[:, :, None, None, None]
-        var_j = var1[:, None, :, None, None]
-        var_k = var2[:, None, None, :, None]
-        var_l = var2[:, None, None, None, :]
-
-        S = inv_i + inv_j + inv_k + inv_l
-        T = mu_i * inv_i + mu_j * inv_j + mu_k * inv_k + mu_l * inv_l
-        U = mu_i.square() * inv_i + mu_j.square() * inv_j + mu_k.square() * inv_k + mu_l.square() * inv_l
-
-        two_pi = mu1.new_tensor(2.0 * torch.pi)
-        log2pi = torch.log(two_pi)
-
-        log_pref = -0.5 * (4.0 * log2pi + torch.log(var_i) + torch.log(var_j) + torch.log(var_k) + torch.log(var_l))
-        log_gauss_int = 0.5 * (log2pi - torch.log(S))
-
-        quad = -0.5 * (U - (T * T) / S)
-
-        log_dim = log_pref + log_gauss_int + quad              # (d, nf, nf, ng, ng)
-        log_Omega = log_dim.sum(dim=0)                         # (nf, nf, ng, ng)
-
-        out = torch.exp(log_Omega)
-        if not ignore_coeffs:
-            c_self = (
-                torch.ones(mu1.shape[1], dtype=mu1.dtype, device=mu1.device)
-                if not self.has_coeffs()
-                else self.get_coeffs()
-            )
-            c_other = (
-                torch.ones(mu2.shape[1], dtype=mu2.dtype, device=mu2.device)
-                if not other.has_coeffs()
-                else other.get_coeffs()
-            )
-            out = out * (c_self[:, None, None, None] * c_self[None, :, None, None])
-            out = out * (c_other[None, None, :, None] * c_other[None, None, None, :])
-        return out
-
-    def marginal(self, marginal_dims: tuple[int, ...], ignore_coeffs: bool = False) -> "GaussianBasis":
+    def marginal(self, marginal_dims: tuple[int, ...]) -> "GaussianBasis":
         dims = tuple(marginal_dims)
         assert all(0 <= i < self.dim() for i in dims), "marginal_dims must be in [0, d)"
-        coeffs_out = self.get_coeffs() if ((not ignore_coeffs) and self.has_coeffs()) else None
-        
         mu, std = self.means_stds()
-        mu_out = mu[dims, :]
-        std_out = std[dims, :]
-        return GaussianBasis(mean_params=mu_out, std_params=std_out, coeffs=coeffs_out, block_size=self.block_size)
+        return GaussianBasis(
+            mean_params=mu[:, dims, :],
+            std_params=std[:, dims, :],
+            coeffs=self.get_coeffs(),
+        )
 
     def product_basis(self, other_basis_factors: list["Basis"]) -> "GaussianBasis":
         pass # TODO
