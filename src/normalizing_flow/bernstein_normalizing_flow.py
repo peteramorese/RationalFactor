@@ -58,6 +58,21 @@ def bernstein_gram_matrix(degree: int, *, dtype=torch.float64, device=None):
     return G
 
 
+def _build_simplex_bernstein_operation_matrix(
+    degree: int, *, dtype=torch.float64, device=None
+) -> torch.Tensor:
+    """Return W = S^T (m^2 G) S mapping simplex weights to bilinear operator rows."""
+    m = degree
+    device = device or torch.device("cpu")
+
+    simplex_to_coefficients = torch.zeros(m + 1, m, dtype=dtype, device=device)
+    for k in range(m):
+        simplex_to_coefficients[k + 1, : k + 1] = 1.0
+
+    gram = degree**2 * bernstein_gram_matrix(degree, dtype=dtype, device=device)
+    return simplex_to_coefficients.T @ gram @ simplex_to_coefficients
+
+
 class CoupledMABernsteinConditioner(nn.Module):
     """Masked conditioner mapping x in [0, 1]^d to Bernstein control points.
 
@@ -205,7 +220,7 @@ class MABernsteinConditioner(CoupledMABernsteinConditioner):
         return super().forward(x, context, return_simplex_weights).squeeze(2)
 
 
-class ConstantBilinearMABernsteinConditioner(CoupledMABernsteinConditioner):
+class ConstantBilinearBernsteinConditioner(CoupledMABernsteinConditioner):
     """Coupled conditioner enforcing a constant bilinear form beta^T W alpha across flows."""
 
     def __init__(
@@ -236,10 +251,35 @@ class ConstantBilinearMABernsteinConditioner(CoupledMABernsteinConditioner):
 
         self.register_buffer(
             "bernstein_operation_matrix",
-            degree ** 2 * bernstein_gram_matrix(degree),
+            _build_simplex_bernstein_operation_matrix(degree),
         )
         self.tf_inner_prod_values_u = nn.Parameter(torch.zeros(features))
+        self.nullspace_scale_logits = nn.Parameter(torch.zeros(features))
+        self.positivity_floor = eps
         self.eps = eps
+    
+    def inner_product_values(self, a: torch.Tensor = None, context: torch.Tensor | None = None) -> torch.Tensor:
+        if a is None:
+            param = next(self.parameters())
+            test_x = torch.zeros(
+                1,
+                self.features,
+                dtype=param.dtype,
+                device=param.device,
+            )
+            weights = super().forward(test_x, context, return_simplex_weights=True)
+            alpha = weights[..., 0, :]
+            operation_matrix = self.bernstein_operation_matrix.to(dtype=alpha.dtype)
+            a = torch.einsum("ij,...j->...i", operation_matrix, alpha)
+
+        a_min, _ = a.min(dim=-1, keepdim=True)
+        a_max, _ = a.max(dim=-1, keepdim=True)
+
+        mix = torch.softmax(self.tf_inner_prod_values_u, dim=0).view(
+            *([1] * (a.ndim - 2)), self.features
+        )
+        inner_prod_values = (a_max - a_min).squeeze(-1) * mix + a_min.squeeze(-1)
+        return inner_prod_values
 
     def forward(self, x: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
         weights = super().forward(x, context, return_simplex_weights=True)
@@ -250,13 +290,7 @@ class ConstantBilinearMABernsteinConditioner(CoupledMABernsteinConditioner):
         # a_i = (W alpha_i); feasible Z_i satisfies amin <= Z_i <= amax for beta on the simplex.
         operation_matrix = self.bernstein_operation_matrix.to(dtype=alpha.dtype)
         a = torch.einsum("ij,...j->...i", operation_matrix, alpha)
-        a_min, _ = a.min(dim=-1, keepdim=True)
-        a_max, _ = a.max(dim=-1, keepdim=True)
-
-        mix = torch.softmax(self.tf_inner_prod_values_u, dim=0).view(
-            *([1] * (a.ndim - 2)), self.features
-        )
-        inner_prod_values = (a_max - a_min).squeeze(-1) * mix + a_min.squeeze(-1)
+        inner_prod_values = self.inner_product_values(a, context)
 
         # obtain a beta_z that is strictly positive, sums to 1 and satisfies a^T beta_z = z
         beta_z = self._feasible_beta_center(a, inner_prod_values)
@@ -311,13 +345,7 @@ class ConstantBilinearMABernsteinConditioner(CoupledMABernsteinConditioner):
         return (1.0 - lam) * e_min + lam * e_max
 
     def _positive_tau(self, beta_center: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
-        """
-        Return tau such that
-
-            beta = beta_center + tau * direction
-
-        remains positive.
-        """
+        """Return tau such that beta = beta_center + tau * direction remains positive."""
         floor = torch.as_tensor(self.positivity_floor, dtype=beta_center.dtype, device=beta_center.device)
 
         positive_slack = beta_center - floor
@@ -403,6 +431,67 @@ class MaskedBernsteinAutoregressiveTransform(AutoregressiveTransform):
         return outputs, torchutils.sum_except_batch(logabsdet, num_batch_dims=1)
 
 
+class ConstantBilinearBernsteinAutoregressiveTransform(MaskedBernsteinAutoregressiveTransform):
+    """Autoregressive Bernstein layer with coupled alpha/beta transforms."""
+
+    def __init__(
+        self,
+        features: int,
+        degree: int,
+        hidden_features: int = 64,
+        context_features: int | None = None,
+        num_blocks: int = 2,
+        use_residual_blocks: bool = True,
+        activation=F.relu,
+        dropout_probability: float = 0.0,
+        use_batch_norm: bool = False,
+        min_derivative: float = 1e-6,
+        eps: float = 1e-8,
+    ):
+        self.features = features
+        self.degree = degree
+        self.min_derivative = min_derivative
+
+        conditioner = ConstantBilinearBernsteinConditioner(
+            features=features,
+            degree=degree,
+            hidden_features=hidden_features,
+            context_features=context_features,
+            num_blocks=num_blocks,
+            use_residual_blocks=use_residual_blocks,
+            activation=activation,
+            dropout_probability=dropout_probability,
+            use_batch_norm=use_batch_norm,
+            eps=eps,
+        )
+        AutoregressiveTransform.__init__(self, conditioner)
+
+    def forward(
+        self, inputs: torch.Tensor, context: torch.Tensor | None = None
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        coefficients = self.autoregressive_net(inputs, context)
+        alpha_coefficients = coefficients[..., 0, :]
+        beta_coefficients = coefficients[..., 1, :]
+
+        alpha_outputs = self._de_casteljau(inputs, alpha_coefficients)
+        beta_outputs = self._de_casteljau(inputs, beta_coefficients)
+
+        logabsdet_alpha = torchutils.sum_except_batch(
+            torch.log(self._bernstein_derivative(inputs, alpha_coefficients)),
+            num_batch_dims=1,
+        )
+        logabsdet_beta = torchutils.sum_except_batch(
+            torch.log(self._bernstein_derivative(inputs, beta_coefficients)),
+            num_batch_dims=1,
+        )
+        return (alpha_outputs, beta_outputs), (logabsdet_alpha, logabsdet_beta)
+    
+    def inner_product(self, context: torch.Tensor | None = None) -> torch.Tensor:
+        conditioner = self.autoregressive_net
+        inner_prod_values = conditioner.inner_product_values(context=context)
+        return torch.prod(inner_prod_values, dim=-1)
+
+
 class BernsteinNormalizingFlow(DensityModel):
     """Autoregressive normalizing flow on the unit box with a uniform base distribution."""
 
@@ -432,6 +521,42 @@ class BernsteinNormalizingFlow(DensityModel):
         _, logabsdet = self.transform(x)
         return self._clip_log_density(logabsdet)
 
+
+class CBBNormalizingFlow(DensityModel):
+    """Bernstein autoregressive flow with constant bilinear coupling."""
+
+    def __init__(self, dim: int, degree: int = 5, num_blocks: int = 2, hidden_features: int = 64):
+        super().__init__(dim=dim)
+
+        self.transform = ConstantBilinearBernsteinAutoregressiveTransform(
+            features=dim,
+            degree=degree,
+            hidden_features=hidden_features,
+            num_blocks=num_blocks,
+        )
+        permutation = torch.randperm(dim)
+        self.register_buffer("permutation", permutation)
+
+    def forward(
+        self, x: torch.Tensor, context: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map x through a shared random feature permutation, then both flows.
+
+        Returns:
+            log_density_alpha, log_density_beta: each of shape (batch,).
+        """
+        x = x[:, self.permutation]
+        _, (logabsdet_alpha, logabsdet_beta) = self.transform(x, context)
+        return (
+            self._clip_log_density(logabsdet_alpha),
+            self._clip_log_density(logabsdet_beta),
+        )
+
+    def log_density(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward(x)
+    
+    def inner_product(self):
+        return self.transform.inner_product()
 
 class ConditionalBernsteinNormalizingFlow(ConditionalDensityModel):
     """Conditional Bernstein autoregressive flow on the unit box."""
