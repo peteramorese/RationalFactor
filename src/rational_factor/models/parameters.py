@@ -1,4 +1,5 @@
 import torch
+import itertools
 
 class Parameters(torch.nn.Module):
     def __init__(self, trainable_init_values: torch.Tensor = None, fixed_values: torch.Tensor = None):
@@ -124,3 +125,6 @@ class PositiveParameters(Parameters):
 
     def is_normalized(self):
         return self._normalized
+
+def param_group_iter(params: tuple[Parameters, ...]):
+    return itertools.chain(*[param.parameters() for param in params])

@@ -1,7 +1,6 @@
 import torch
 from .density_model import DensityModel, ConditionalDensityModel
 from .factor_forms import LinearRFF, QuadraticRFF
-from .basis_functions import UnnormalizedBetaBasis
 #### General ####
 
 def conditional_mle_loss(
@@ -89,10 +88,6 @@ def B_psd_loss(model : QuadraticRFF, min_eigval : float = 0.0, penalty_offset : 
 
 
 #### Regularization ####
-
-def beta_basis_concentration_reg_loss(basis : UnnormalizedBetaBasis):
-    alpha, beta = basis.alphas_betas()
-    return torch.square(alpha).mean() + torch.square(beta).mean()
 
 def dtf_data_concentration_loss(dtf, x : torch.Tensor, concentration_point : torch.Tensor, radius : float):
     x_transformed, _ = dtf(x)
