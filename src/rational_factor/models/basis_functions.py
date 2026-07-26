@@ -13,13 +13,13 @@ from .parameters import Parameters, PositiveParameters
 from .gram import BetaGram, GaussianGram
 
 
-class Basis(torch.nn.Module):
+class Basis:
     def __init__(self, 
             dim : int, 
             batch_size : int,
             n_basis : int,
-            params : tuple[torch.Tensor, ...],
-            coeffs : torch.Tensor | Parameters = None):
+            params : tuple[Parameters, ...],
+            coeffs : Parameters = None):
         '''
         Args:
             dim : int, number of dimensions
@@ -29,13 +29,13 @@ class Basis(torch.nn.Module):
             coeffs : coefficients
         '''
         super().__init__()
+
         self._dim = dim
         self._batch_size = batch_size
         self._n_basis = n_basis
 
-        for param, i in enumerate(params):
-            if isinstance(param, Parameters) or isinstance(param, PositiveParameters):
-                raise ValueError("Parameter at index " + str(i) + " must be a tensor, did you forget to call forward() on parameter object?")
+        for i, param in enumerate(params):
+            assert isinstance(param, Parameters), "Parameter at index " + str(i) + " must be a Parameters object"
         self._params = params
 
         if coeffs is not None:
@@ -43,18 +43,36 @@ class Basis(torch.nn.Module):
         else:
             self.set_coeffs_to_one()
 
-    def forward(self, y : torch.Tensor, ignore_coeffs : bool = False):
-        raise NotImplementedError("forward is not implemented for this basis function")
+    @staticmethod
+    def get_deduplicated_module_list(bases : list["Basis"]) -> list[torch.nn.Module]:
+        '''
+        Returns a list of unique parameters and coefficients modules from the given list of bases.
+        '''
+        params_seen = {}
+        coeffs_seen = {}
+        unique_params = []
+        unique_coeffs = []
+        for basis in bases:
+            if basis.coeffs.is_module() and id(basis.coeffs) not in coeffs_seen:
+                unique_coeffs.append(basis.coeffs)
+            for param in basis._params:
+                if param.is_module() and id(param) not in params_seen:
+                    unique_params.append(param)
+                    params_seen[id(param)] = param
+        return unique_params, unique_coeffs
 
-    def set_coeffs(self, coeffs : torch.Tensor):
-        if coeffs.dim() == 1:
-            coeffs = coeffs.unsqueeze(0)
-        assert coeffs.size() == (self._batch_size, self._n_basis), "coeffs must have shape (batch_size, n_basis)"
+    def forward(self, y : torch.Tensor):
+        raise NotImplementedError("__call__ is not implemented for this basis function")
+
+    def set_coeffs(self, coeffs : Parameters):
+        assert isinstance(coeffs, Parameters), "coeffs must be a Parameters object"
+        assert coeffs().dim() == 2, "coeffs must have shape (batch_size, n_basis)"
+        assert coeffs().size() == (self._batch_size, self._n_basis), "coeffs must have shape (batch_size, n_basis)"
         self.coeffs = coeffs
     
     def set_coeffs_to_one(self):
         dtype, device = self.param_dtype_device()
-        self.set_coeffs(torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device))
+        self.set_coeffs(Parameters(torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)))
     
     def dim(self):
         return self._dim
@@ -66,7 +84,7 @@ class Basis(torch.nn.Module):
         return self._n_basis
     
     def param_dtype_device(self):
-        return self._params[0].dtype, self._params[0].device
+        return self._params[0]().dtype, self._params[0]().device
 
     def normalized(self):
         raise NotImplementedError("normalized is not implemented for this basis function")
@@ -140,12 +158,13 @@ class Basis(torch.nn.Module):
 class SeparableBasis(Basis):
     def __init__(
         self,
-        params: tuple[torch.Tensor, ...] | tuple[Parameters, ...],
+        params: tuple[Parameters, ...],
         coeffs: torch.Tensor = None,
     ):
-        if params[0].dim() == 2:
-            params = tuple(param.unsqueeze(0) for param in params)
-        param_tensor = params[0] if isinstance(params[0], torch.Tensor) else params[0]()
+        for param in params:
+            assert param().dim() == 3, "Each parameter tensor must have shape (batch_size, dim, n_basis)"
+        
+        param_tensor = params[0]()
         #assert param_tensor.dim() == 3, "Each parameter tensor must have shape (batch_size, dim, n_basis)"
         batch_size = param_tensor.size()[0]
         dim = param_tensor.size()[1]
@@ -199,14 +218,14 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
 
     def __init__(
         self,
-        mean_params : torch.Tensor,
-        std_params : torch.Tensor,
-        coeffs: torch.Tensor = None,
+        mean_params : Parameters,
+        std_params : PositiveParameters,
+        coeffs: Parameters = None,
     ):
         super().__init__(params=(mean_params, std_params), coeffs=coeffs)
 
     def means_stds(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._params[0], self._params[1]
+        return self._params[0](), self._params[1]()
 
     @staticmethod
     def _separable_gaussian_gram(
@@ -220,11 +239,24 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         log_dim = GaussianGram.log_gram(means, stds, lows=lows_b, highs=highs_b)
         return torch.exp(log_dim.sum(dim=1))
 
+    def __call__(self, y: torch.Tensor):
+        assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
+        mu, std = self.means_stds()
+        y_e = y[:, None, :, None]  # (n_data, 1, d, 1)
+        std = std.clamp_min(torch.finfo(y.dtype).eps)
+        log_two_pi = y.new_tensor(2.0 * math.pi).log()
+        log_dim = -0.5 * (log_two_pi + 2.0 * torch.log(std) + ((y_e - mu) / std).square())
+        out = torch.exp(log_dim.sum(dim=2))  # (n_data, batch, n_basis)
+        out = out * self.coeffs()[None, :, :]
+        if out.shape[1] == 1:
+            out = out[:, 0, :]
+        return out
+
     def Omega1(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         mu, std = self.means_stds()
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu)
         log_dim = GaussianGram.log_gram((mu,), (std,), lows=lows_b, highs=highs_b)
-        return torch.exp(log_dim.sum(dim=1)) * self._coeffs
+        return torch.exp(log_dim.sum(dim=1)) * self.coeffs()
 
     def Omega2(self, other: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
         assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
@@ -232,8 +264,12 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
+        print("mu1 min: ", mu1.min(), "max: ", mu1.max())
+        print("mu2 min: ", mu2.min(), "max: ", mu2.max())
+        print("std1 min: ", std1.min(), "max: ", std1.max())
+        print("std2 min: ", std2.min(), "max: ", std2.max())
         out = self._separable_gaussian_gram((mu1, mu2), (std1, std2), lows, highs)
-        return out * self.get_coeffs()[:, :, None] * other.get_coeffs()[:, None, :]
+        return out * self.coeffs()[:, :, None] * other.coeffs()[:, None, :]
 
     def Omega3(self, other1: "GaussianBasis", other2: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
         assert isinstance(other1, GaussianBasis), "other1 must be GaussianBasis"
@@ -247,9 +283,9 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         out = self._separable_gaussian_gram((mu1, mu2, mu3), (std1, std2, std3), lows, highs)
         return (
             out
-            * self.coeffs[:, :, None, None]
-            * other1.coeffs[:, None, :, None]
-            * other2.coeffs[:, None, None, :]
+            * self.coeffs()[:, :, None, None]
+            * other1.coeffs()[:, None, :, None]
+            * other2.coeffs()[:, None, None, :]
         )
 
     def Omega22(self, other: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
@@ -259,8 +295,8 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
         out = self._separable_gaussian_gram((mu1, mu1, mu2, mu2), (std1, std1, std2, std2), lows, highs)
-        c1 = self.coeffs
-        c2 = other.coeffs
+        c1 = self.coeffs()
+        c2 = other.coeffs()
         return (
             out
             * c1[:, :, None, None, None]
@@ -276,7 +312,7 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         return GaussianBasis(
             mean_params=mu[:, dims, :],
             std_params=std[:, dims, :],
-            coeffs=self.coeffs,
+            coeffs=self.coeffs(),
         )
 
     def product_basis(self, other_basis_factors: list["Basis"]) -> "GaussianBasis":
@@ -370,17 +406,16 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
 
     def __init__(
         self,
-        alpha_params: torch.Tensor,
-        beta_params: torch.Tensor,
-        coeffs: torch.Tensor = None,
+        alpha_params: PositiveParameters,
+        beta_params: PositiveParameters,
+        coeffs: Parameters = None,
         eps: float = 1e-6,
     ):
         super().__init__(params=(alpha_params, beta_params), coeffs=coeffs)
         self.eps = eps
 
     def alphas_betas(self) -> tuple[torch.Tensor, torch.Tensor]:
-        params = self._params
-        return params[0], params[1]
+        return self._params[0](), self._params[1]()
 
     @staticmethod
     def _separable_beta_gram(
@@ -394,7 +429,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         log_dim = BetaGram.log_gram(alphas, betas, lows=lows_b, highs=highs_b)
         return torch.exp(log_dim.sum(dim=1))
 
-    def forward(self, y: torch.Tensor, ignore_coeffs: bool = False):
+    def __call__(self, y: torch.Tensor):
         assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
         alpha, beta = self.alphas_betas()
         y_c = y.clamp(self.eps, 1.0 - self.eps)[:, None, :, None]  # (n_data, 1, d, 1)
@@ -404,8 +439,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
             - BetaGram.log_beta(alpha, beta)
         )
         out = torch.exp(log_dim.sum(dim=2))  # (n_data, batch, n_basis)
-        if not ignore_coeffs:
-            out = out * self._coeffs[None, :, :]
+        out = out * self.coeffs()[None, :, :]
         if out.shape[1] == 1:
             out = out[:, 0, :]
         return out
@@ -414,7 +448,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         alpha, beta = self.alphas_betas()
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, alpha)
         log_dim = BetaGram.log_gram((alpha,), (beta,), lows=lows_b, highs=highs_b)
-        return torch.exp(log_dim.sum(dim=1)) * self._coeffs
+        return torch.exp(log_dim.sum(dim=1)) * self.coeffs()
 
     def Omega2(self, other: "BetaBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
@@ -423,7 +457,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         a1, b1 = self.alphas_betas()
         a2, b2 = other.alphas_betas()
         out = self._separable_beta_gram((a1, a2), (b1, b2), lows, highs)
-        return out * self._coeffs[:, :, None] * other._coeffs[:, None, :]
+        return out * self.coeffs()[:, :, None] * other.coeffs()[:, None, :]
 
     def Omega3(self, other1: "BetaBasis", other2: "BetaBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
         assert isinstance(other1, BetaBasis), "other1 must be BetaBasis"
@@ -437,9 +471,9 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         out = self._separable_beta_gram((a1, a2, a3), (b1, b2, b3), lows, highs)
         return (
             out
-            * self._coeffs[:, :, None, None]
-            * other1._coeffs[:, None, :, None]
-            * other2._coeffs[:, None, None, :]
+            * self.coeffs()[:, :, None, None]
+            * other1.coeffs()[:, None, :, None]
+            * other2.coeffs()[:, None, None, :]
         )
 
     def Omega22(self, other: "BetaBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
@@ -449,8 +483,8 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         a1, b1 = self.alphas_betas()
         a2, b2 = other.alphas_betas()
         out = self._separable_beta_gram((a1, a1, a2, a2), (b1, b1, b2, b2), lows, highs)
-        c1 = self._coeffs
-        c2 = other._coeffs
+        c1 = self.coeffs()
+        c2 = other.coeffs()
         return (
             out
             * c1[:, :, None, None, None]
@@ -466,7 +500,7 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         return BetaBasis(
             alpha_params=alpha[:, dims, :],
             beta_params=beta[:, dims, :],
-            coeffs=self._coeffs,
+            coeffs=self.coeffs(),
             eps=self.eps,
         )
 
@@ -476,15 +510,14 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
 
     def __init__(
         self,
-        mean_params: torch.Tensor,
-        std_params: torch.Tensor,
-        coeffs: torch.Tensor = None,
+        mean_params: Parameters,
+        std_params: PositiveParameters,
+        coeffs: Parameters = None,
     ):
         super().__init__(params=(mean_params, std_params), coeffs=coeffs)
 
     def means_stds(self) -> tuple[torch.Tensor, torch.Tensor]:
-        params = self._params
-        return params[0], params[1]
+        return self._params[0](), self._params[1]()
 
     @staticmethod
     def _separable_gaussian_gram(
@@ -506,7 +539,7 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         log_dim = -0.5 * (log_two_pi + 2.0 * torch.log(std) + ((y_e - mu) / std).square())
         out = torch.exp(log_dim.sum(dim=2))  # (n_data, batch, n_basis)
         if not ignore_coeffs:
-            out = out * self._coeffs[None, :, :]
+            out = out * self.coeffs()[None, :, :]
         if out.shape[1] == 1:
             out = out[:, 0, :]
         return out
@@ -515,7 +548,7 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         mu, std = self.means_stds()
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu)
         log_dim = GaussianGram.log_gram((mu,), (std,), lows=lows_b, highs=highs_b)
-        return torch.exp(log_dim.sum(dim=1)) * self._coeffs
+        return torch.exp(log_dim.sum(dim=1)) * self.coeffs()
 
     def Omega2(self, other: "GaussianKernelBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
         assert isinstance(other, GaussianKernelBasis), "other must be GaussianKernelBasis"
@@ -524,7 +557,7 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
         out = self._separable_gaussian_gram((mu1, mu2), (std1, std2), lows, highs)
-        return out * self._coeffs[:, :, None] * other._coeffs[:, None, :]
+        return out * self.coeffs()[:, :, None] * other.coeffs()[:, None, :]
 
     def Omega3(
         self,
@@ -544,9 +577,9 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         out = self._separable_gaussian_gram((mu1, mu2, mu3), (std1, std2, std3), lows, highs)
         return (
             out
-            * self._coeffs[:, :, None, None]
-            * other1._coeffs[:, None, :, None]
-            * other2._coeffs[:, None, None, :]
+            * self.coeffs()[:, :, None, None]
+            * other1.coeffs()[:, None, :, None]
+            * other2.coeffs()[:, None, None, :]
         )
 
     def Omega22(self, other: "GaussianKernelBasis", lows: torch.Tensor = None, highs: torch.Tensor = None):
@@ -556,8 +589,8 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
         out = self._separable_gaussian_gram((mu1, mu1, mu2, mu2), (std1, std1, std2, std2), lows, highs)
-        c1 = self._coeffs
-        c2 = other._coeffs
+        c1 = self.coeffs()
+        c2 = other.coeffs()
         return (
             out
             * c1[:, :, None, None, None]
@@ -573,7 +606,7 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         return GaussianKernelBasis(
             mean_params=mu[:, dims, :],
             std_params=std[:, dims, :],
-            coeffs=self._coeffs,
+            coeffs=self.coeffs(),
         )
 
 

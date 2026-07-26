@@ -1,7 +1,8 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
 from rational_factor.models.composite_model import CompositeConditionalModel
+from rational_factor.models.parameters import Parameters
 import torch
-from copy import deepcopy
+import copy 
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
 
 def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
@@ -14,22 +15,35 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
     if isinstance(transition_model, LinearRFF):
         assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
 
-        Omega_0 = init_belief.phi_basis.Omega2(init_belief.psi0_basis)
-        Omega = transition_model.phi_basis.Omega2(transition_model.psi_basis)
+        print("type of transition_model.g:", type(transition_model.g))
+        phi = copy.copy(transition_model.g)
+        phi.set_coeffs_to_one()
+
+        psi0 = copy.copy(init_belief.h)
+        psi0.set_coeffs_to_one()
+
+        Omega_0 = phi.Omega2(psi0)
+        Omega = phi.Omega2(transition_model.psi)
+
         b = transition_model.get_b(Omega=Omega)
-        bOmega_0 = b.unsqueeze(1) * Omega_0
-        bOmega = b.unsqueeze(1) * Omega
 
-        c0 = init_belief.get_c0(Omega_0=Omega_0)
+        bOmegaT_0 = torch.einsum("...j,...ij->...ji", b, Omega_0)
+        bOmegaT = torch.einsum("...j,...ij->...ji", b, Omega)
 
-        c_seq = [c0]
-        c_seq.append(bOmega_0 @ c0)
+        c0 = init_belief.h.coeffs()
+
+        h_seq = [init_belief.h]
+        c1 = torch.einsum("...j,...ij->...i", c0, bOmegaT_0)
+        h1 = copy.copy(transition_model.psi)
+        h1.set_coeffs(Parameters(c1))
+        h_seq.append(h1)
         for _ in range(1, n_steps):
-            c_seq.append(bOmega @ c_seq[-1])
+            ck = torch.einsum("...j,...ij->...i", h_seq[-1].coeffs(), bOmegaT)
+            hk = copy.copy(transition_model.psi)
+            hk.set_coeffs(Parameters(ck))
+            h_seq.append(hk)
         
-        #print("C_seq:", C_seq)
-        belief_seq = [LinearFF(init_belief.a, init_belief.phi_basis, transition_model.psi_basis, c0_fixed=c_seq[i + 1]).to(device=device) for i in range(n_steps)]
-        belief_seq.insert(0, init_belief) # Add the initial belief
+        belief_seq = [LinearFF(init_belief.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
         return belief_seq
     
     elif isinstance(transition_model, QuadraticRFF):

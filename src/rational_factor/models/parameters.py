@@ -1,9 +1,29 @@
 import torch
 import itertools
 
-class Parameters(torch.nn.Module):
+class Parameters:
+    def __init__(self, fixed_values: torch.Tensor = None):
+        self._p = fixed_values
+
+    def size(self):
+        return self._p.size()
+
+    def is_trainable(self):
+        return False
+
+    def dtype_device(self):
+        return self._p.dtype, self._p.device
+
+    def __call__(self) -> torch.Tensor:
+        return self._p
+    
+    def is_module(self):
+        return False
+
+
+class TrainableParameters(Parameters, torch.nn.Module):
     def __init__(self, trainable_init_values: torch.Tensor = None, fixed_values: torch.Tensor = None):
-        super().__init__()
+        torch.nn.Module.__init__(self)
         assert not (trainable_init_values is not None and fixed_values is not None)
         self._trainable = trainable_init_values is not None
         if self._trainable:
@@ -37,24 +57,18 @@ class Parameters(torch.nn.Module):
             return cls(trainable_init_values=values)
         return cls(fixed_values=values.detach().clone())
 
-    def size(self):
-        return self._p.size()
-
     def is_trainable(self):
         return self._trainable
-
-    def dtype_device(self):
-        return self._p.dtype, self._p.device
-
-    def forward(self):
-        return self._p
 
     def set_requires_grad(self, requires_grad: bool):
         if self._p.is_leaf:
             self._p.requires_grad_(requires_grad)
+        
+    def is_module(self):
+        return True
 
 
-class PositiveParameters(Parameters):
+class PositiveParameters(TrainableParameters):
     def __init__(
         self,
         trainable_init_values: torch.Tensor = None,
@@ -102,7 +116,7 @@ class PositiveParameters(Parameters):
     def _normalize(self, p: torch.Tensor, dim: int = -1):
         return self._epsilon + (1.0 - p.shape[dim] * self._epsilon) * torch.nn.functional.softmax(p, dim=dim)
 
-    def forward(self):
+    def forward(self) -> torch.Tensor:
         if self._trainable:
             if self._normalized:
                 return self._normalize(self._p, dim=-1)

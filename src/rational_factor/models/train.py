@@ -565,6 +565,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
         data_loader : DataLoader, 
         labeled_loss_fns : dict[str, callable], 
         labeled_optimizers : dict[str, torch.optim.Optimizer], 
+        device : torch.device,
         labeled_validation_loss_fns : dict[str, callable] = None, 
         validation_data_loader : DataLoader = None,
         validation_early_stopping_patience : int = None,
@@ -578,6 +579,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
     torch.autograd.set_detect_anomaly(False)
 
     model.train()
+
 
     loss_labels = list(labeled_loss_fns.keys())
     loss_fns = list(labeled_loss_fns.values())
@@ -644,8 +646,7 @@ def train_iterate(model : DensityModel | ConditionalDensityModel,
                 sum_losses = [0.0 for _ in loss_fns]
                 
                 for batch in data_loader:
-                    dev = next(model.parameters()).device
-                    batch = _batch_to_device(batch, dev)
+                    batch = _batch_to_device(batch, device)
 
                     total_loss, losses = train_step(*batch, optimizer=optimizer, param_groups=param_groups)
                     total_sum_loss += total_loss

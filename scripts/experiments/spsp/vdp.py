@@ -1,5 +1,5 @@
 import torch
-from rational_factor.models.parameters import Parameters, PositiveParameters, param_group_iter
+from rational_factor.models.parameters import TrainableParameters, PositiveParameters, param_group_iter
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from pathlib import Path
@@ -24,15 +24,15 @@ if __name__ == "__main__":
     n_basis = 500
     tran_params = {
         "n_epochs_per_group": [5, 5], # basis, weights
-        "iterations": 40,
+        "iterations": 10,
         "lr_basis": 5e-3,
-        "lr_weights": 1e-2,
+        "lr_weights": 1e-3,
     }
     init_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 50,
+        "iterations": 10,
         "lr_basis": 5e-3,
-        "lr_weights": 1e-2,
+        "lr_weights": 1e-3,
     }
 
     batch_size = 256
@@ -53,35 +53,36 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create parameters
-    phi_means = Parameters.random_init(shape=(system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
-    phi_stds = PositiveParameters.random_init(shape=(system.dim(), n_basis), mean=torch.tensor([1.0]), std=torch.tensor([30.0])).to(device)
-    psi_means = Parameters.random_init(shape=(system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
-    psi_stds = PositiveParameters.random_init(shape=(system.dim(), n_basis), mean=torch.tensor([1.0]), std=torch.tensor([30.0])).to(device)
-    psi0_means = Parameters.random_init(shape=(system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
-    psi0_stds = PositiveParameters.random_init(shape=(system.dim(), n_basis), mean=torch.tensor([1.0]), std=torch.tensor([30.0])).to(device)
+    phi_means = TrainableParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
+    psi_means = TrainableParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
+    psi0_means = TrainableParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
+    phi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([30.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
+    psi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([30.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
+    psi0_stds = PositiveParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([30.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
 
-    g_coeffs = PositiveParameters.random_init(shape=(n_basis,), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
-    psi0_coeffs = PositiveParameters.random_init(shape=(n_basis,), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+    g_coeffs = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
+    h0_coeffs = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
 
 
     # Create basis functions
-    phi_basis = GaussianBasis(phi_means(), phi_stds(), coeffs=g_coeffs()).to(device)
-    psi_basis = GaussianBasis(psi_means(), psi_stds()).to(device)
-    psi0_basis = GaussianBasis(psi0_means(), psi0_stds(), coeffs=psi0_coeffs()).to(device)
+    g_basis = GaussianBasis(phi_means, phi_stds, coeffs=g_coeffs)
+    psi_basis = GaussianBasis(psi_means, psi_stds)
+    h0_basis = GaussianBasis(psi0_means, psi0_stds, coeffs=h0_coeffs)
     # Create and train the transition model
-    tran_model = LinearRFF(phi_basis, psi_basis).to(device)
+    tran_model = LinearRFF(g_basis, psi_basis)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     
-    lrff_basis_params = param_group_iter([phi_means, phi_stds, psi_means, psi_stds])
-    lrff_weight_params = g_coeffs.parameters()
-    optimizers ={"basis": torch.optim.Adam(lrff_basis_params, lr=tran_params["lr_basis"]), "weights": torch.optim.Adam(lrff_weight_params, lr=tran_params["lr_weights"])} 
+    rff_basis_params = param_group_iter([phi_means, phi_stds, psi_means, psi_stds])
+    rff_weight_params = g_coeffs.parameters()
+    optimizers ={"basis": torch.optim.Adam(rff_basis_params, lr=tran_params["lr_basis"]), "weights": torch.optim.Adam(rff_weight_params, lr=tran_params["lr_weights"])} 
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(tran_model,
         xp_dataloader,
         {"mle": mle_loss_fn}, 
         optimizers,
+        device=device,
         epochs_per_group=tran_params["n_epochs_per_group"],
         iterations=tran_params["iterations"],
         verbose=True,
@@ -89,19 +90,20 @@ if __name__ == "__main__":
     print("Done! \n")
 
 
-    init_model = LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis).to(device)
+    init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)
 
     print("Training initial model")
     mle_loss_fn = loss.mle_loss
 
-    lrff_basis_params = param_group_iter([psi0_means, psi0_stds])
-    lrff_weight_params = psi0_coeffs.parameters()
-    optimizers = {"basis": torch.optim.Adam(lrff_basis_params, lr=init_params["lr_basis"]), "weights": torch.optim.Adam(lrff_weight_params, lr=init_params["lr_weights"])}
+    ff_basis_params = param_group_iter([psi0_means, psi0_stds])
+    ff_weight_params = h0_coeffs.parameters()
+    optimizers = {"basis": torch.optim.Adam(ff_basis_params, lr=init_params["lr_basis"]), "weights": torch.optim.Adam(ff_weight_params, lr=init_params["lr_weights"])}
 
     init_model, best_loss_init, training_time_init = train.train_iterate(init_model, 
         x0_dataloader, 
         {"mle": mle_loss_fn}, 
         optimizers,
+        device=device,
         epochs_per_group=init_params["n_epochs_per_group"],
         iterations=init_params["iterations"],
         verbose=True,
@@ -132,8 +134,10 @@ if __name__ == "__main__":
         axes[0, i].set_ylim(box_lows[1], box_highs[1])
     
 
-    plt.savefig("figures/spsp/vdp.png", dpi=1000)
-    print(f"Saved beliefs to figures/spsp/vdp.png")
+    output_dir = Path("figures/spsp/vdp")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_dir / "beliefs.png", dpi=1000)
+    print(f"Saved beliefs to {output_dir / 'beliefs.png'}")
     #plt.show()
 
 

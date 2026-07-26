@@ -1,5 +1,5 @@
 import torch
-from copy import deepcopy
+import copy
 import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
@@ -7,10 +7,17 @@ from .density_model import DensityModel, ConditionalDensityModel
 # Linear models #
 
 class LinearForm(DensityModel):
-    def __init__(self, w : SeparableBasis, numerical_tolerance : float = 1e-20):
+    def __init__(self, w : SeparableBasis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
         super().__init__(w.dim())
 
         self.w = w
+
+        if register_modules:
+            # Register the parameter modules to use parameters() and to() methods
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([w])
+            self._param_modules = torch.nn.ModuleList(param_modules)
+            self._coeff_modules = torch.nn.ModuleList(coeff_modules)
+
         self.numerical_tolerance = numerical_tolerance
 
     def log_norm_constant(self, Omega : torch.Tensor = None):
@@ -36,7 +43,7 @@ class LinearRFF(ConditionalDensityModel):
 
     Used for Markov transition distribution for propagation only models
     """
-    def __init__(self, g : SeparableBasis, psi : SeparableBasis, numerical_tolerance : float = 1e-20):
+    def __init__(self, g : SeparableBasis, psi : SeparableBasis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert g.dim() == psi.dim(), "g and psi must have the same dimension"
         assert isinstance(g, SeparableBasis), "g must be a SeparableBasis"
         assert isinstance(psi, SeparableBasis), "psi must be a SeparableBasis"
@@ -45,35 +52,43 @@ class LinearRFF(ConditionalDensityModel):
         super().__init__(g.dim(), psi.dim())
 
         self.g = g
+        
         self.psi = psi
 
         self.numerical_tolerance = numerical_tolerance
+
+        if register_modules:
+            # Register the parameter modules to use parameters() and to() methods
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, psi])
+            self._param_modules = torch.nn.ModuleList(param_modules)
+            self._coeff_modules = torch.nn.ModuleList(coeff_modules)
     
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         x = conditioner
-        phi_x = self.g(x, ignore_coeffs=True)  # (n_data, n_basis)
-        phi_xp = self.g(xp, ignore_coeffs=True)  # (n_data, n_basis)
-        psi_xp = self.psi(xp, ignore_coeffs=True)  # (n_data, n_basis)
 
-        a = self.g.coeffs
-        b = self.get_b(a=a)
+        log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance)
+        log_g_xp = torch.log(self.g(xp).sum(dim=-1) + self.numerical_tolerance)
 
-        log_g_x = torch.log(phi_x @ a + self.numerical_tolerance)  # (n_data)
-        log_g_xp = torch.log(phi_xp @ a + self.numerical_tolerance)  # (n_data)
-        log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance)  # (n_data)
+        phi = copy.copy(self.g)
+        phi.set_coeffs_to_one()
+        phi_x = phi(x)
+        psi_xp = self.psi(xp)
+        b = self.get_b()
+
+        log_f = torch.log((phi_x * psi_xp * b).sum(dim=-1) + self.numerical_tolerance)
 
         return log_g_xp + log_f - log_g_x
 
     def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
-        if Omega is None:
-            Omega = self.g.Omega2(self.psi, ignore_coeffs=True)
-
         if a is None:
-            a = self.g.get_coeffs()
+            a = self.g.coeffs()
 
-        b = a / (Omega.T @ a + self.numerical_tolerance)
+        if Omega is None:
+            phi = copy.copy(self.g)
+            phi.set_coeffs_to_one()
+            Omega = phi.Omega2(self.psi)
 
-        return b
+        return a / (torch.einsum("...ij,...i->...j", Omega, a) + self.numerical_tolerance)
 
     def weight_params(self):
         #TODO
@@ -409,14 +424,10 @@ class LinearFF(DensityModel):
 
     Used for belief representation for propagation only models
     """
-    def __init__(self, g : SeparableBasis, h : SeparableBasis, numerical_tolerance : float = 1e-20, renormalize_h : bool = True):
-        assert g.dim() == h.dim(), "phi_basis and psi0_basis must have the same dimension"
-        assert isinstance(g, SeparableBasis), "phi_basis must be a SeparableBasis"
-        assert isinstance(h, SeparableBasis), "psi0_basis must be a SeparableBasis"
-        if isinstance(g, SeparableBasis):
-            assert isinstance(g, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
-        if isinstance(h, SeparableBasis):
-            assert isinstance(h, NonnegativeBasis), "psi0_basis must be a NonnegativeBasis"
+    def __init__(self, g : SeparableBasis, h : SeparableBasis, numerical_tolerance : float = 1e-20, renormalize_h : bool = True, register_modules : bool = True):
+        assert g.dim() == h.dim(), "g and h must have the same dimension"
+        assert isinstance(g, Basis), "g must be a SeparableBasis"
+        assert isinstance(h, Basis), "h must be a SeparableBasis"
         super().__init__(g.dim())
 
         self.g = g
@@ -425,55 +436,46 @@ class LinearFF(DensityModel):
         self.numerical_tolerance = numerical_tolerance
         self._renormalize_h = renormalize_h
 
-    @staticmethod
-    def _factor_value(basis, x: torch.Tensor) -> torch.Tensor:
-        values = basis(x)
-        if values.dim() == 2:
-            return values.sum(dim=-1)
-        return values
-    
+        if register_modules:
+            # Register the parameter modules to use parameters() and to() methods
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, h])
+            self._param_modules = torch.nn.ModuleList(param_modules)
+            self._coeff_modules = torch.nn.ModuleList(coeff_modules)
+
     @classmethod
-    def from_rff(cls, rff : LinearRFF, h : SeparableBasis):
-        return cls(rff.g, h, numerical_tolerance=rff.numerical_tolerance)
+    def from_rff(cls, rff : LinearRFF, h : SeparableBasis, register_modules : bool = True):
+        return cls(rff.g, h, numerical_tolerance=rff.numerical_tolerance, register_modules=register_modules)
 
     #TODO
     #@classmethod
     #def from_r2ff(cls, r2ff : LinearR2FF | LinearRFandR2FF, psi0_basis : SeparableBasis):
-    #    phi_basis = r2ff.phi_basis.freeze_params()
-    #    a = r2ff.get_a().detach().clone()
-    #    return cls(a, phi_basis, psi0_basis, numerical_tolerance=r2ff.numerical_tolerance)
 
-    def log_norm_constant(self, Omega : torch.Tensor = None):
-        if Omega is None:
-            Omega = self.g.Omega2(self.h, ignore_coeffs=False)
-            return -torch.log(torch.sum(Omega) + self.numerical_tolerance)
+    def log_norm_constant(self, Omega2 : torch.Tensor = None):
+        if not self._renormalize_h:
+            return 0.0
+        if Omega2 is None:
+            Omega2 = self.g.Omega2(self.h)
+        return -torch.log(torch.sum(Omega2) + self.numerical_tolerance)
         
-    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
-        log_g_x = torch.log(self._factor_value(self.g, x) + self.numerical_tolerance) # (n_data)
-        log_h_x = torch.log(self._factor_value(self.h, x) + self.numerical_tolerance) # (n_data)
+    def log_density(self, x : torch.Tensor):
+        log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance) # (n_data)
+        log_h_x = torch.log(self.h(x).sum(dim=-1) + self.numerical_tolerance) # (n_data)
 
         return self.log_norm_constant() + log_g_x + log_h_x
 
     def marginal(self, marginal_dims : tuple[int, ...]):
-        g_copy = self.g.freeze_params()
-        h_copy = self.h.freeze_params()
-        expanded_basis_marginal = g_copy.product_basis([h_copy]).marginal(marginal_dims)
-        dtype, device = expanded_basis_marginal.param_dtype_device()
-        w_fixed = torch.ones(
-            expanded_basis_marginal.n_basis_functions(),
-            device=device,
-            dtype=dtype,
-        )
-        return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
-
-    def weight_params(self):
-        if hasattr(self, "c0_fixed"):
-            return [self.c0_fixed]
-        else:
-            return [self.__c0u]
-    
-    def basis_params(self):
-        return self.psi0_basis.parameters()
+        pass
+        # TODO
+        #g_copy = self.g.freeze_params()
+        #h_copy = self.h.freeze_params()
+        #expanded_basis_marginal = g_copy.product_basis([h_copy]).marginal(marginal_dims)
+        #dtype, device = expanded_basis_marginal.param_dtype_device()
+        #w_fixed = torch.ones(
+        #    expanded_basis_marginal.n_basis_functions(),
+        #    device=device,
+        #    dtype=dtype,
+        #)
+        #return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
 
 
 class Linear2FF(DensityModel):
