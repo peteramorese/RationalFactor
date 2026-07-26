@@ -86,10 +86,9 @@ class LinearRFF(ConditionalDensityModel):
         if Omega2 is None:
             phi = copy.copy(self.g)
             phi.set_coeffs_to_one()
-            #Omega2 = phi.Omega2(self.psi)
-            Omega2 = self.psi.Omega2(phi)
+            Omega2 = phi.Omega2(self.psi)
 
-        return a / (torch.einsum("...ij,...j->...i", Omega2, a) + self.numerical_tolerance)
+        return a / (torch.einsum("...ij,...i->...j", Omega2, a) + self.numerical_tolerance)
 
 
 #class MLPContextLinearRFF(ConditionalDensityModel):

@@ -22,13 +22,13 @@ if __name__ == "__main__":
     n_basis = 500
     tran_params = {
         "n_epochs_per_group": [5, 5], # basis, weights
-        "iterations": 15,
+        "iterations": 10,
         "lr_basis": 5e-3,
         "lr_weights": 1e-2,
     }
     init_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 30,
+        "iterations": 20,
         "lr_basis": 5e-3,
         "lr_weights": 1e-2,
     }
@@ -66,6 +66,7 @@ if __name__ == "__main__":
     g_basis = GaussianBasis(phi_means, phi_stds, coeffs=g_coeffs)
     psi_basis = GaussianBasis(psi_means, psi_stds)
     h0_basis = GaussianBasis(psi0_means, psi0_stds, coeffs=h0_coeffs)
+
     # Create and train the transition model
     tran_model = LinearRFF(g_basis, psi_basis)
 
