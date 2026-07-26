@@ -152,7 +152,7 @@ class GaussianGram(Basis1DGram):
         mu_sq_over_var = sum(mu.square() / std.square() for mu, std in zip(means, stds))
         m = mu_over_var / inv_var
         std_m = inv_var.rsqrt()
-        log_two_pi = means[0].new_tensor(2.0 * math.pi)
+        log_two_pi = means[0].new_tensor(2.0 * math.pi).log()
         surplus = mu_sq_over_var - mu_over_var.square() / inv_var
         log_norm = -0.5 * (
             (len(means) - 1) * log_two_pi

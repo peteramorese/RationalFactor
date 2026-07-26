@@ -60,6 +60,13 @@ class TrainableParameters(Parameters, torch.nn.Module):
     def is_trainable(self):
         return self._trainable
 
+    def forward(self) -> torch.Tensor:
+        """Unconstrained values. Subclasses override to apply constraints."""
+        return self._p
+
+    def __call__(self) -> torch.Tensor:
+        return torch.nn.Module.__call__(self)
+
     def set_requires_grad(self, requires_grad: bool):
         if self._p.is_leaf:
             self._p.requires_grad_(requires_grad)

@@ -1,5 +1,6 @@
 import torch
 from rational_factor.models.parameters import TrainableParameters, PositiveParameters, param_group_iter
+from rational_factor.tools.analysis import check_pdf_valid, check_conditional_pdf_valid
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from pathlib import Path
@@ -9,9 +10,6 @@ import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
 from rational_factor.tools.visualization import plot_belief
-from rational_factor.tools.analysis import mc_integral_box
-from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSeparableTF
-from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 import matplotlib.pyplot as plt
 
@@ -24,15 +22,15 @@ if __name__ == "__main__":
     n_basis = 500
     tran_params = {
         "n_epochs_per_group": [5, 5], # basis, weights
-        "iterations": 10,
+        "iterations": 15,
         "lr_basis": 5e-3,
-        "lr_weights": 1e-3,
+        "lr_weights": 1e-2,
     }
     init_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 10,
+        "iterations": 30,
         "lr_basis": 5e-3,
-        "lr_weights": 1e-3,
+        "lr_weights": 1e-2,
     }
 
     batch_size = 256
@@ -56,9 +54,9 @@ if __name__ == "__main__":
     phi_means = TrainableParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
     psi_means = TrainableParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
     psi0_means = TrainableParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
-    phi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([30.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
-    psi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([30.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
-    psi0_stds = PositiveParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([30.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
+    phi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
+    psi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
+    psi0_stds = PositiveParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
 
     g_coeffs = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
     h0_coeffs = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
@@ -89,6 +87,12 @@ if __name__ == "__main__":
         use_best="mle")
     print("Done! \n")
 
+    # Freeze parameters of g
+    phi_means.set_requires_grad(False)
+    phi_stds.set_requires_grad(False)
+    psi_means.set_requires_grad(False)
+    psi_stds.set_requires_grad(False)
+    g_coeffs.set_requires_grad(False)
 
     init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)
 
@@ -127,6 +131,7 @@ if __name__ == "__main__":
     fig.suptitle("Beliefs at each time step")
     for i in range(n_timesteps_prop):
         #print("Printing belief: ", i)
+        check_pdf_valid(belief_seq[i], (box_lows, box_highs))
         plot_belief(axes[1, i], belief_seq[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
         axes[0, i].scatter(traj_data[i][:, 0], traj_data[i][:, 1], s=1)
         axes[0, i].set_aspect("equal")

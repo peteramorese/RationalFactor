@@ -79,27 +79,17 @@ class LinearRFF(ConditionalDensityModel):
 
         return log_g_xp + log_f - log_g_x
 
-    def get_b(self, a : torch.Tensor = None, Omega : torch.Tensor = None):
+    def get_b(self, a : torch.Tensor = None, Omega2 : torch.Tensor = None):
         if a is None:
             a = self.g.coeffs()
 
-        if Omega is None:
+        if Omega2 is None:
             phi = copy.copy(self.g)
             phi.set_coeffs_to_one()
-            Omega = phi.Omega2(self.psi)
+            #Omega2 = phi.Omega2(self.psi)
+            Omega2 = self.psi.Omega2(phi)
 
-        return a / (torch.einsum("...ij,...i->...j", Omega, a) + self.numerical_tolerance)
-
-    def weight_params(self):
-        #TODO
-        if hasattr(self, "a_fixed"):
-            return [self.a_fixed]
-        else:
-            return [self.__au]
-    
-    def basis_params(self):
-        #TODO
-        return itertools.chain(self.g.parameters(), self.psi.parameters())
+        return a / (torch.einsum("...ij,...j->...i", Omega2, a) + self.numerical_tolerance)
 
 
 #class MLPContextLinearRFF(ConditionalDensityModel):

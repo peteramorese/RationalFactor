@@ -264,10 +264,10 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
         mu1, std1 = self.means_stds()
         mu2, std2 = other.means_stds()
-        print("mu1 min: ", mu1.min(), "max: ", mu1.max())
-        print("mu2 min: ", mu2.min(), "max: ", mu2.max())
-        print("std1 min: ", std1.min(), "max: ", std1.max())
-        print("std2 min: ", std2.min(), "max: ", std2.max())
+        #print("mu1 min: ", mu1.min(), "max: ", mu1.max())
+        #print("mu2 min: ", mu2.min(), "max: ", mu2.max())
+        #print("std1 min: ", std1.min(), "max: ", std1.max())
+        #print("std2 min: ", std2.min(), "max: ", std2.max())
         out = self._separable_gaussian_gram((mu1, mu2), (std1, std2), lows, highs)
         return out * self.coeffs()[:, :, None] * other.coeffs()[:, None, :]
 

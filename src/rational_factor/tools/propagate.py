@@ -22,23 +22,28 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         psi0 = copy.copy(init_belief.h)
         psi0.set_coeffs_to_one()
 
-        Omega_0 = phi.Omega2(psi0)
-        Omega = phi.Omega2(transition_model.psi)
+        #Omega2_0 = phi.Omega2(psi0)
+        #Omega2 = phi.Omega2(transition_model.psi)
+        Omega2_0 = psi0.Omega2(phi)
+        Omega2 = transition_model.psi.Omega2(phi)
 
-        b = transition_model.get_b(Omega=Omega)
+        b = transition_model.get_b(Omega2=Omega2)
 
-        bOmegaT_0 = torch.einsum("...j,...ij->...ji", b, Omega_0)
-        bOmegaT = torch.einsum("...j,...ij->...ji", b, Omega)
+        bOmega2T_0 = torch.einsum("...ji,...i->...ij", Omega2_0, b)
+        bOmega2T = torch.einsum("...ji,...i->...ij", Omega2, b)
 
-        c0 = init_belief.h.coeffs()
+        c0_norm_constant = torch.exp(init_belief.log_norm_constant())
+        c0 = c0_norm_constant * init_belief.h.coeffs()
 
-        h_seq = [init_belief.h]
-        c1 = torch.einsum("...j,...ij->...i", c0, bOmegaT_0)
+        h0 = copy.copy(init_belief.h)
+        h0.set_coeffs(c0)
+        h_seq = [h0]
+        c1 = torch.einsum("...ij,...j->...i", bOmega2T_0, c0)
         h1 = copy.copy(transition_model.psi)
         h1.set_coeffs(Parameters(c1))
         h_seq.append(h1)
         for _ in range(1, n_steps):
-            ck = torch.einsum("...j,...ij->...i", h_seq[-1].coeffs(), bOmegaT)
+            ck = torch.einsum("...ij,...j->...i", bOmega2T, h_seq[-1].coeffs())
             hk = copy.copy(transition_model.psi)
             hk.set_coeffs(Parameters(ck))
             h_seq.append(hk)
