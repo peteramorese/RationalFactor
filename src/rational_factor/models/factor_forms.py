@@ -52,9 +52,7 @@ class LinearRFF(ConditionalDensityModel):
         super().__init__(g.dim(), psi.dim())
 
         self.g = g
-        
         self.psi = psi
-
         self.numerical_tolerance = numerical_tolerance
 
         if register_modules:
@@ -90,6 +88,22 @@ class LinearRFF(ConditionalDensityModel):
 
         return a / (torch.einsum("...ij,...i->...j", Omega2, a) + self.numerical_tolerance)
 
+class SumProdRFF(ConditionalDensityModel):
+    def __init__(self, g : SeparableBasis, psi : SeparableBasis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
+        assert g.dim() == psi.dim(), "g and psi must have the same dimension"
+        assert isinstance(g, SeparableBasis), "g must be a SeparableBasis"
+        assert isinstance(psi, SeparableBasis), "psi must be a SeparableBasis"
+        super().__init__(g.dim(), psi.dim())
+
+        self.g = g
+        self.psi = psi
+        self.numerical_tolerance = numerical_tolerance
+
+        if register_modules:
+            #TODO
+            pass
+
+    #def 
 
 #class MLPContextLinearRFF(ConditionalDensityModel):
 #    """
