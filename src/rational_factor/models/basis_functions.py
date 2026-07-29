@@ -234,6 +234,28 @@ class SeparableBasis(Basis):
         '''
         raise NotImplementedError("log_Omega22_dim is not implemented for this basis function")
 
+    def eval_dim(self, y : torch.Tensor):
+        '''
+        Per-coordinate factor values (no product over dims, no coeffs).
+
+        ``y`` has shape ``(batch, dim)``. Parameter tensors have leading size
+        ``batch_size``; that axis is the same batch as ``y`` when parameters are
+        functions of ``x``. If ``batch_size == 1``, shared parameters broadcast
+        over ``y``.
+
+        Returns:
+            ``(batch, dim, n_basis)``
+        '''
+        raise NotImplementedError("eval_dim is not implemented for this basis function")
+
+    def _check_eval_batch(self, y : torch.Tensor):
+        assert y.dim() == 2 and y.shape[1] == self.dim(), "y must have shape (batch, dim)"
+        n, b = y.shape[0], self.batch_size()
+        assert b == n or b == 1, (
+            f"y batch {n} must match parameter batch {b} (or parameter batch must be 1 for shared params)"
+        )
+        return n, b
+
     def Omega1(self, lows : torch.Tensor = None, highs : torch.Tensor = None):
         return torch.exp(self.log_Omega1_dim(lows, highs).sum(dim=1)) * self.coeffs()
     
@@ -279,17 +301,18 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         return self._params[0](), self._params[1]()
 
     def __call__(self, y: torch.Tensor):
-        assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
-        mu, std = self.means_stds()
-        y_e = y[:, None, :, None]  # (n_data, 1, d, 1)
+        out = self.eval_dim(y).prod(dim=1)  # (batch, n_basis)
+        return out * self.coeffs()
+
+    def eval_dim(self, y: torch.Tensor):
+        self._check_eval_batch(y)
+        mu, std = self.means_stds()  # (batch_size, dim, n_basis)
+        y_e = y[:, :, None]  # (batch, dim, 1)
         std = std.clamp_min(torch.finfo(y.dtype).eps)
         log_two_pi = y.new_tensor(2.0 * math.pi).log()
+        # batch_size==1 broadcasts shared params over y's batch
         log_dim = -0.5 * (log_two_pi + 2.0 * torch.log(std) + ((y_e - mu) / std).square())
-        out = torch.exp(log_dim.sum(dim=2))  # (n_data, batch, n_basis)
-        out = out * self.coeffs()[None, :, :]
-        if out.shape[1] == 1:
-            out = out[:, 0, :]
-        return out
+        return torch.exp(log_dim)  # (batch, dim, n_basis)
 
     def log_Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         mu, std = self.means_stds()
@@ -444,19 +467,19 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         return self._params[0](), self._params[1]()
 
     def __call__(self, y: torch.Tensor):
-        assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
-        alpha, beta = self.alphas_betas()
-        y_c = y.clamp(self.eps, 1.0 - self.eps)[:, None, :, None]  # (n_data, 1, d, 1)
+        out = self.eval_dim(y).prod(dim=1)  # (batch, n_basis)
+        return out * self.coeffs()
+
+    def eval_dim(self, y: torch.Tensor):
+        self._check_eval_batch(y)
+        alpha, beta = self.alphas_betas()  # (batch_size, dim, n_basis)
+        y_c = y.clamp(self.eps, 1.0 - self.eps)[:, :, None]  # (batch, dim, 1)
         log_dim = (
             (alpha - 1.0) * torch.log(y_c)
             + (beta - 1.0) * torch.log1p(-y_c)
             - BetaGram.log_beta(alpha, beta)
         )
-        out = torch.exp(log_dim.sum(dim=2))  # (n_data, batch, n_basis)
-        out = out * self.coeffs()[None, :, :]
-        if out.shape[1] == 1:
-            out = out[:, 0, :]
-        return out
+        return torch.exp(log_dim)  # (batch, dim, n_basis)
 
     def log_Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         alpha, beta = self.alphas_betas()
@@ -525,18 +548,19 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         return self._params[0](), self._params[1]()
 
     def forward(self, y: torch.Tensor, ignore_coeffs: bool = False):
-        assert y.shape[1] == self.dim(), "y must have shape (n_data, d)"
-        mu, std = self.means_stds()
-        y_e = y[:, None, :, None]  # (n_data, 1, d, 1)
+        out = self.eval_dim(y).prod(dim=1)  # (batch, n_basis)
+        if not ignore_coeffs:
+            out = out * self.coeffs()
+        return out
+
+    def eval_dim(self, y: torch.Tensor):
+        self._check_eval_batch(y)
+        mu, std = self.means_stds()  # (batch_size, dim, n_basis)
+        y_e = y[:, :, None]  # (batch, dim, 1)
         std = std.clamp_min(torch.finfo(y.dtype).eps)
         log_two_pi = y.new_tensor(2.0 * math.pi).log()
         log_dim = -0.5 * (log_two_pi + 2.0 * torch.log(std) + ((y_e - mu) / std).square())
-        out = torch.exp(log_dim.sum(dim=2))  # (n_data, batch, n_basis)
-        if not ignore_coeffs:
-            out = out * self.coeffs()[None, :, :]
-        if out.shape[1] == 1:
-            out = out[:, 0, :]
-        return out
+        return torch.exp(log_dim)  # (batch, dim, n_basis)
 
     def log_Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         mu, std = self.means_stds()
