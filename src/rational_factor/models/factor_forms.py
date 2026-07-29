@@ -3,6 +3,7 @@ import copy
 import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
+from .parameters import PositiveParameters, Parameters
 
 # Linear models #
 
@@ -47,8 +48,6 @@ class LinearRFF(ConditionalDensityModel):
         assert g.dim() == psi.dim(), "g and psi must have the same dimension"
         assert isinstance(g, SeparableBasis), "g must be a SeparableBasis"
         assert isinstance(psi, SeparableBasis), "psi must be a SeparableBasis"
-        assert isinstance(g, NonnegativeBasis), "g must be a NonnegativeBasis"
-        assert isinstance(psi, NonnegativeBasis), "psi must be a NonnegativeBasis"
         super().__init__(g.dim(), psi.dim())
 
         self.g = g
@@ -89,7 +88,8 @@ class LinearRFF(ConditionalDensityModel):
         return a / (torch.einsum("...ij,...i->...j", Omega2, a) + self.numerical_tolerance)
 
 class SumProdRFF(ConditionalDensityModel):
-    def __init__(self, g : SeparableBasis, psi : SeparableBasis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
+    def __init__(self, g : SeparableBasis, psi : SeparableBasis, B : Parameters, P : Parameters,
+                numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert g.dim() == psi.dim(), "g and psi must have the same dimension"
         assert isinstance(g, SeparableBasis), "g must be a SeparableBasis"
         assert isinstance(psi, SeparableBasis), "psi must be a SeparableBasis"
@@ -97,13 +97,58 @@ class SumProdRFF(ConditionalDensityModel):
 
         self.g = g
         self.psi = psi
+        
+        batch_size = g.batch_size()
+        n_basis = g.n_basis_functions()
+
+        assert B().shape == (batch_size, n_basis, n_basis), "B must have shape (batch_size, n_basis, n_basis)"
+        assert P().shape == (batch_size, n_basis, n_basis), "P must have shape (batch_size, n_basis, n_basis)"
+
+        self.B = B
+        self.P = P
         self.numerical_tolerance = numerical_tolerance
 
         if register_modules:
             #TODO
             pass
 
-    #def 
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+        x = conditioner
+
+        log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance)
+        log_g_xp = torch.log(self.g(xp).sum(dim=-1) + self.numerical_tolerance)
+
+        phi = copy.copy(self.g)
+        phi.set_coeffs_to_one()
+        phi_x = phi(x)
+        psi_xp = self.psi(xp)
+
+        B = self.B()
+        Gamma = self.get_Gamma(B=B)
+
+        Gamma_phi_x = torch.einsum("bji,bj->bi", Gamma, phi_x) # Gamma_phi_x = Gamma^T * phi(x)
+        B_psi_xp = torch.einsum("bji,bj->bi", B, psi_xp) # B_psi_xp = B^T * psi(x')
+        log_f = torch.log((Gamma_phi_x * B_psi_xp).sum(dim=-1) + self.numerical_tolerance) # Sum (A_phi_x * B_psi_xp)
+
+        return log_g_xp + log_f - log_g_x
+
+    def get_P_normalized(self):
+        return torch.softmax(self.P(), dim=2)
+
+    def get_Gamma(self, B : torch.Tensor = None, Omega2 : torch.Tensor = None): 
+        if B is None:
+            B = self.B()
+        if Omega2 is None:
+            Omega2 = self.g.Omega2(self.psi)
+
+        a = self.g.coeffs()
+        P_normalized = self.get_P_normalized()
+
+        q1 = torch.einsum("bji,bj->bi", Omega2, a) # q1 = Omega2^T * a
+        q2 = torch.einsum("bji,bj->bi", B, q1) # q2 = B^T * q1
+        Gamma1 = torch.einsum("bij,bj->bij", P_normalized, 1.0 / q2) # Gamma = P_normalized * diag(1.0 / q2)
+        return torch.einsum("bij,bi->bij", Gamma1, a) # Gamma = diag(a) * Gamma1
+    
 
 #class MLPContextLinearRFF(ConditionalDensityModel):
 #    """
@@ -446,8 +491,9 @@ class LinearFF(DensityModel):
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
 
     @classmethod
-    def from_rff(cls, rff : LinearRFF, h : SeparableBasis, register_modules : bool = True):
-        return cls(rff.g, h, numerical_tolerance=rff.numerical_tolerance, register_modules=register_modules)
+    def from_rff(cls, rff : LinearRFF, h : SeparableBasis, renormalize_h : bool = True, register_modules : bool = True):
+        assert isinstance(rff, LinearRFF), "rff must be a LinearRFF"
+        return cls(rff.g, h, numerical_tolerance=rff.numerical_tolerance, renormalize_h=renormalize_h, register_modules=register_modules)
 
     #TODO
     #@classmethod

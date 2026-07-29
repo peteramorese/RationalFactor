@@ -3,7 +3,7 @@ from rational_factor.models.composite_model import CompositeConditionalModel
 from rational_factor.models.parameters import Parameters
 import torch
 import copy 
-from rational_factor.models.factor_forms import LinearFF, LinearRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
+from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
 
 def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
     if device is None:
@@ -12,6 +12,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
     if isinstance(transition_model, CompositeConditionalModel):
         return propagate(init_belief, transition_model.conditional_density_model, n_steps, device)
 
+    ##### LINEAR RATIONAL FACTOR #####
     if isinstance(transition_model, LinearRFF):
         assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
 
@@ -48,6 +49,46 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         belief_seq = [LinearFF(init_belief.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
         return belief_seq
     
+    ##### SUM PRODUCT RATIONAL FACTOR #####
+    elif isinstance(transition_model, SumProdRFF):
+        assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for SumProdRFF transition model"
+
+        phi = copy.copy(transition_model.g)
+        phi.set_coeffs_to_one()
+
+        psi0 = copy.copy(init_belief.h)
+        psi0.set_coeffs_to_one()
+
+        Omega2_0 = phi.Omega2(psi0)
+        Omega2 = phi.Omega2(transition_model.psi)
+        
+        B = transition_model.B()
+        Gamma = transition_model.get_Gamma(B=B, Omega2=Omega2)
+
+        c0_norm_constant = torch.exp(init_belief.log_norm_constant())
+        c0 = c0_norm_constant * init_belief.h.coeffs()
+
+        h0 = copy.copy(init_belief.h)
+        h0.set_coeffs(Parameters(c0))
+        h_seq = [h0]
+        
+        def _Omega2_GammaT_B_matmul(c : torch.tensor, _Omega2 : torch.Tensor):
+            s1 = torch.einsum("bij,bj->bi", _Omega2, c) # s1 = Omega2 * c
+            s2 = torch.einsum("bji,bj->bi", Gamma, s1) # s2 = Gamma^T * s1
+            return torch.einsum("bij,bj->bi", B, s2) # B * s2
+        
+        c1 = _Omega2_GammaT_B_matmul(c0, Omega2_0)
+        h1 = copy.copy(transition_model.psi)
+        h1.set_coeffs(Parameters(c1))
+        h_seq.append(h1)
+        for _ in range(1, n_steps):
+            ck = _Omega2_GammaT_B_matmul(h_seq[-1].coeffs(), Omega2)
+            hk = copy.copy(transition_model.psi)
+            hk.set_coeffs(Parameters(ck))
+            h_seq.append(hk)
+        belief_seq = [LinearFF(transition_model.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
+
+    ##### QUADRATIC RATIONAL FACTOR #####
     elif isinstance(transition_model, QuadraticRFF):
         assert isinstance(init_belief, QuadraticFF), "Belief must be QuadraticFF for QuadraticRFF transition model"
 
