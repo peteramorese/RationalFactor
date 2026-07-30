@@ -15,6 +15,8 @@ def _square_ranges(x_range: tuple[float, float], y_range: tuple[float, float]) -
 
 def plot_belief(ax: plt.Axes, belief : DensityModel, x_range: tuple[float, float], y_range: tuple[float, float], n_points: int = 100, contour_levels: int = 10, contourf_kwargs: dict = None):
     assert belief.dim == 2, "Belief must be 2D"
+    dtype, device = belief.dtype_device()
+
     x_range, y_range = _square_ranges(x_range, y_range)
     ax.set_aspect("equal")
     ax.set_xlim(*x_range)
@@ -27,11 +29,7 @@ def plot_belief(ax: plt.Axes, belief : DensityModel, x_range: tuple[float, float
     xy = np.stack([X.ravel(), Y.ravel()], axis=1)
     with torch.no_grad():
         belief.eval()
-        param = next(iter(belief.parameters()), None)
-        buffer = next(iter(belief.buffers()), None)
-        belief_device = param.device if param is not None else (buffer.device if buffer is not None else torch.device("cpu"))
-        belief_dtype = param.dtype if param is not None else (buffer.dtype if buffer is not None else torch.get_default_dtype())
-        density = belief(torch.tensor(xy, dtype=belief_dtype, device=belief_device))
+        density = belief(torch.tensor(xy, dtype=dtype, device=device))
         density = density.cpu().numpy()
     Z = density.reshape(X.shape)
 

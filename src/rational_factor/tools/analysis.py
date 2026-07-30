@@ -268,6 +268,8 @@ def avg_log_likelihood_under_particle_belief_reference(
 
 def check_pdf_valid(pdf : DensityModel | ConditionalDensityModel, domain_bounds, n_samples=1000, atol=0.2, device=None):
     assert isinstance(pdf, DensityModel)
+    if device is None:
+        device = pdf.dtype_device()[1]
     integral = mc_integral_box(pdf.forward, domain_bounds, n_samples, device=device)
     err = abs(float(integral) - 1.0)
     if err < atol:
@@ -281,7 +283,7 @@ def check_conditional_pdf_valid(pdf : ConditionalDensityModel, domain_bounds, co
     assert isinstance(pdf, ConditionalDensityModel)
     print("Testing conditional density model...")
     if device is None:
-        device = next(pdf.parameters()).device
+        device = pdf.dtype_device()[1]
     domain_lows = torch.as_tensor(domain_bounds[0], device=device)
     domain_highs = torch.as_tensor(domain_bounds[1], device=device)
     domain_bounds_dev = (domain_lows, domain_highs)

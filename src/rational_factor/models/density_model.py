@@ -30,6 +30,9 @@ class DensityModel(torch.nn.Module):
     def sample(self, n_samples : int, **contexts : torch.Tensor):
         raise NotImplementedError("sample not implemented")
 
+    def dtype_device(self):
+        raise NotImplementedError("dtype_device not implemented")
+
 class ConditionalDensityModel(torch.nn.Module):
     def __init__(self, dim : int, conditioner_dim : int):
         super().__init__()
@@ -61,6 +64,9 @@ class ConditionalDensityModel(torch.nn.Module):
         Returns (n_samples, dim) tensor of samples.
         """
         raise NotImplementedError("sample not implemented")
+    
+    def dtype_device(self):
+        raise NotImplementedError("dtype_device not implemented")
     
 
 ###### Special Distributions ######

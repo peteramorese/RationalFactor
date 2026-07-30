@@ -7,7 +7,7 @@ from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF,
 
 def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
     if device is None:
-        device = next(init_belief.parameters()).device
+        device = init_belief.dtype_device()[1]
 
     if isinstance(transition_model, CompositeConditionalModel):
         return propagate(init_belief, transition_model.conditional_density_model, n_steps, device)
@@ -86,7 +86,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
             hk = copy.copy(transition_model.psi)
             hk.set_coeffs(Parameters(ck))
             h_seq.append(hk)
-        belief_seq = [LinearFF(transition_model.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
+        belief_seq = [LinearFF(transition_model.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False) for h in h_seq]
 
     ##### QUADRATIC RATIONAL FACTOR #####
     elif isinstance(transition_model, QuadraticRFF):
@@ -198,7 +198,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
 
 def update(belief : DensityModel, observation_model : ConditionalDensityModel, observation : torch.Tensor, device : torch.device = None):
     if device is None:
-        device = next(belief.parameters()).device
+        device = belief.dtype_device()[1]
 
     if isinstance(observation_model, CompositeConditionalModel):
         return update(belief, observation_model.conditional_density_model, observation, device)

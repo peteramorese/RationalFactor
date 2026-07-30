@@ -42,6 +42,12 @@ class Basis:
         else:
             self.set_coeffs_to_one()
 
+    def _coeffs_register(self):
+        return [self.coeffs]
+    
+    def _params_register(self):
+        return [self._params]
+
     @staticmethod
     def get_deduplicated_module_list(bases : list["Basis"]) -> list[torch.nn.Module]:
         '''
@@ -52,12 +58,14 @@ class Basis:
         unique_params = []
         unique_coeffs = []
         for basis in bases:
-            if basis.coeffs.is_module() and id(basis.coeffs) not in coeffs_seen:
-                unique_coeffs.append(basis.coeffs)
-            for param in basis._params:
-                if param.is_module() and id(param) not in params_seen:
-                    unique_params.append(param)
-                    params_seen[id(param)] = param
+            for coeffs in basis._coeffs_register():
+                if coeffs.is_module() and id(coeffs) not in coeffs_seen:
+                    unique_coeffs.append(coeffs)
+            for params in basis._params_register():
+                for param in params:
+                    if param.is_module() and id(param) not in params_seen:
+                        unique_params.append(param)
+                        params_seen[id(param)] = param
         return unique_params, unique_coeffs
 
     def forward(self, y : torch.Tensor):
@@ -70,7 +78,7 @@ class Basis:
         self.coeffs = coeffs
     
     def set_coeffs_to_one(self):
-        dtype, device = self.param_dtype_device()
+        dtype, device = self.dtype_device()
         self.set_coeffs(Parameters(torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)))
     
     def dim(self):
@@ -82,7 +90,7 @@ class Basis:
     def n_basis_functions(self):
         return self._n_basis
     
-    def param_dtype_device(self):
+    def dtype_device(self):
         return self._params[0]().dtype, self._params[0]().device
 
     def normalized(self):
@@ -382,7 +390,7 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
             factors.append(other)
 
         n_factors = len(factors)
-        dtype, device = self.param_dtype_device()
+        dtype, device = self.dtype_device()
         dim = self.dim()
 
         mus_stds = [basis.means_stds() for basis in factors]
@@ -657,9 +665,9 @@ class NFBasis(Basis, NonnegativeBasis):
     def normalized(self):
         return True
 
-    def param_dtype_device(self):
+    def dtype_device(self):
         return self.index_embedding.weight.dtype, self.index_embedding.weight.device
 
     def Omega1(self):
-        dtype, device = self.param_dtype_device()
+        dtype, device = self.dtype_device()
         return torch.ones(self.n_basis_functions(), dtype=dtype, device=device)

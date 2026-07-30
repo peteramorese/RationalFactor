@@ -60,6 +60,9 @@ class LinearRFF(ConditionalDensityModel):
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
     
+    def dtype_device(self):
+        return self.g.dtype_device()
+
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         x = conditioner
 
@@ -109,8 +112,12 @@ class SumProdRFF(ConditionalDensityModel):
         self.numerical_tolerance = numerical_tolerance
 
         if register_modules:
-            #TODO
-            pass
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, psi])
+            self._param_modules = torch.nn.ModuleList(param_modules)
+            self._coeff_modules = torch.nn.ModuleList(coeff_modules)
+
+    def dtype_device(self):
+        return self.g.dtype_device()
 
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         x = conditioner
@@ -489,6 +496,9 @@ class LinearFF(DensityModel):
             param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, h])
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
+
+    def dtype_device(self):
+        return self.g.dtype_device()
 
     @classmethod
     def from_rff(cls, rff : LinearRFF, h : SeparableBasis, renormalize_h : bool = True, register_modules : bool = True):

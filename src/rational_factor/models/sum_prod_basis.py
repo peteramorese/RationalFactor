@@ -23,6 +23,12 @@ class SumProdBasis(SeparableBasis):
 
         self.set_matrix_coeffs(matrix_coeffs)
 
+    def _coeffs_register(self):
+        return [self.coeffs, self.matrix_coeffs]
+    
+    def _params_register(self):
+        return [self.leaf_basis._params]
+
     def set_matrix_coeffs(self, matrix_coeffs : Parameters):
         assert isinstance(matrix_coeffs, Parameters), "matrix coeffs must be a Parameters object"
         assert matrix_coeffs().dim() == 4, "matrix coeffs must have shape (batch_size, dim, n_output_basis, n_leaf_basis)"

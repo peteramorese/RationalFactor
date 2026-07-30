@@ -1,6 +1,6 @@
 import torch
 from rational_factor.models.parameters import TrainableParameters, PositiveParameters, param_group_iter
-from rational_factor.tools.analysis import check_pdf_valid, check_conditional_pdf_valid
+from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid, check_conditional_pdf_valid
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from pathlib import Path
@@ -19,16 +19,16 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 500
+    n_basis = 400
     tran_params = {
         "n_epochs_per_group": [5, 5], # basis, weights
-        "iterations": 10,
+        "iterations": 100,
         "lr_basis": 5e-3,
         "lr_weights": 1e-2,
     }
     init_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 20,
+        "iterations": 100,
         "lr_basis": 5e-3,
         "lr_weights": 1e-2,
     }
@@ -119,7 +119,8 @@ if __name__ == "__main__":
     print(f"Initial model loss: {best_loss_init:.4f}, training time: {training_time_init:.2f} seconds")
 
     # Analysis
-    analysis_device = torch.device("cpu")
+    #analysis_device = torch.device("cpu")
+    analysis_device = torch.device("cuda")
     init_model = init_model.to(analysis_device).eval()
     tran_model = tran_model.to(analysis_device).eval()
 
@@ -128,11 +129,18 @@ if __name__ == "__main__":
 
     belief_seq = [belief.to(analysis_device).eval() for belief in propagate.propagate(init_model, tran_model, n_steps=n_timesteps_prop)]
 
+    ll_per_step = []
+    for i in range(n_timesteps_prop):
+        data_i = traj_data[i].to(analysis_device)
+        ll = avg_log_likelihood(belief_seq[i], data_i)
+        ll_per_step.append(float(ll.detach().cpu()))
+        print(f"Avg log-likelihood at time {i}: {ll_per_step[-1]:.6f}")
+
     fig, axes = plt.subplots(2, n_timesteps_prop, figsize=(20, 10))
     fig.suptitle("Beliefs at each time step")
     for i in range(n_timesteps_prop):
         #print("Printing belief: ", i)
-        check_pdf_valid(belief_seq[i], (box_lows, box_highs))
+        check_pdf_valid(belief_seq[i], (box_lows, box_highs), device=analysis_device)
         plot_belief(axes[1, i], belief_seq[i], x_range=(box_lows[0], box_highs[0]), y_range=(box_lows[1], box_highs[1]))
         axes[0, i].scatter(traj_data[i][:, 0], traj_data[i][:, 1], s=1)
         axes[0, i].set_aspect("equal")
