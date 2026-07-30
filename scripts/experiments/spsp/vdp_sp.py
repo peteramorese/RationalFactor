@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from pathlib import Path
 from rational_factor.models.basis_functions import GaussianBasis
+from rational_factor.models.sum_prod_basis import SumProdBasis
 from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
@@ -19,7 +20,8 @@ if __name__ == "__main__":
     
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 500
+    n_leaf_basis = 500
+    n_output_basis = 500
     tran_params = {
         "n_epochs_per_group": [5, 5], # basis, weights
         "iterations": 10,
@@ -51,20 +53,29 @@ if __name__ == "__main__":
     xp_dataloader = DataLoader(TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create parameters
-    phi_means = TrainableParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
-    psi_means = TrainableParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
-    psi0_means = TrainableParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
-    phi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
-    psi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
-    psi0_stds = PositiveParameters.random_init(shape=(1, system.dim(), n_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
+    phi_means = TrainableParameters.random_init(shape=(1, system.dim(), n_leaf_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
+    psi_means = TrainableParameters.random_init(shape=(1, system.dim(), n_leaf_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
+    psi0_means = TrainableParameters.random_init(shape=(1,system.dim(), n_leaf_basis), mean=torch.tensor([0.0]), std=torch.tensor([5.0])).to(device)
+    phi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_leaf_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
+    psi_stds = PositiveParameters.random_init(shape=(1,system.dim(), n_leaf_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
+    psi0_stds = PositiveParameters.random_init(shape=(1, system.dim(), n_leaf_basis), mean=torch.tensor([5.0]), std=torch.tensor([10.0]), epsilon=1e-1).to(device)
 
-    g_coeffs = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
-    h0_coeffs = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+    # Matrix coefficients for sum product basis functions
+    phi_matrix_coeffs = PositiveParameters.random_init(shape=(1, system.dim(), n_output_basis, n_leaf_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
+    psi_matrix_coeffs = PositiveParameters.random_init(shape=(1, system.dim(), n_output_basis, n_leaf_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
+    psi0_matrix_coeffs = PositiveParameters.random_init(shape=(1, system.dim(), n_output_basis, n_leaf_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
+
+    g_coeffs = PositiveParameters.random_init(shape=(1, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+    h0_coeffs = PositiveParameters.random_init(shape=(1, n_leaf_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
 
     # Create basis functions
-    g_basis = GaussianBasis(phi_means, phi_stds, coeffs=g_coeffs)
-    psi_basis = GaussianBasis(psi_means, psi_stds)
-    h0_basis = GaussianBasis(psi0_means, psi0_stds, coeffs=h0_coeffs)
+    phi_leaf_basis = GaussianBasis(phi_means, phi_stds)
+    psi_leaf_basis = GaussianBasis(psi_means, psi_stds)
+    psi0_leaf_basis = GaussianBasis(psi0_means, psi0_stds)
+
+    g_basis = SumProdBasis(n_output_basis, phi_leaf_basis, phi_matrix_coeffs, coeffs=g_coeffs)
+    psi_basis = SumProdBasis(n_output_basis, psi_leaf_basis, psi_matrix_coeffs)
+    h0_basis = SumProdBasis(n_output_basis, psi0_leaf_basis, psi0_matrix_coeffs, coeffs=h0_coeffs)
 
     # Create and train the transition model
     tran_model = LinearRFF(g_basis, psi_basis)
@@ -90,8 +101,10 @@ if __name__ == "__main__":
     # Freeze parameters of g
     phi_means.set_requires_grad(False)
     phi_stds.set_requires_grad(False)
+    phi_matrix_coeffs.set_requires_grad(False)
     psi_means.set_requires_grad(False)
     psi_stds.set_requires_grad(False)
+    psi_matrix_coeffs.set_requires_grad(False)
     g_coeffs.set_requires_grad(False)
 
     init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)

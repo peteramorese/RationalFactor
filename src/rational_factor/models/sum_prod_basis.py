@@ -5,7 +5,7 @@ from .parameters import Parameters
 
 
 class SumProdBasis(SeparableBasis):
-    def __init__(self, n_output_basis : int, leaf_basis : SeparableBasis, matrix_coeffs : Parameters):
+    def __init__(self, n_output_basis : int, leaf_basis : SeparableBasis, matrix_coeffs : Parameters, coeffs : Parameters = None):
         dim = leaf_basis.dim()
         batch_size = leaf_basis.batch_size()
 
@@ -18,7 +18,7 @@ class SumProdBasis(SeparableBasis):
             batch_size=batch_size,
             n_basis=n_output_basis,
             params=leaf_basis._params,
-            coeffs=None,
+            coeffs=coeffs,
         )
 
         self.set_matrix_coeffs(matrix_coeffs)
