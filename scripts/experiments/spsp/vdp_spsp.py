@@ -6,7 +6,7 @@ import numpy as np
 from pathlib import Path
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.sum_prod_basis import SumProdBasis
-from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
+from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF, SumProdRFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
@@ -24,13 +24,13 @@ if __name__ == "__main__":
     n_output_basis = 400
     tran_params = {
         "n_epochs_per_group": [5, 5], # basis, weights
-        "iterations": 100,
+        "iterations": 30,
         "lr_basis": 5e-3,
         "lr_weights": 5e-2,
     }
     init_params = {
         "n_epochs_per_group": [20, 5], # basis, weights
-        "iterations": 200,
+        "iterations": 20,
         "lr_basis": 5e-3,
         "lr_weights": 1e-2,
     }
@@ -70,8 +70,11 @@ if __name__ == "__main__":
     #psi_matrix_coeffs = PositiveParameters.random_init(shape=(1, system.dim(), n_output_basis, n_leaf_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
     #psi0_matrix_coeffs = PositiveParameters.random_init(shape=(1, system.dim(), n_output_basis, n_leaf_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
 
-    g_coeffs = PositiveParameters.random_init(shape=(1, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+    g_coeffs = PositiveParameters.random_init(shape=(1, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=1e-3).to(device)
     h0_coeffs = PositiveParameters.random_init(shape=(1, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+
+    B = PositiveParameters.random_init(shape=(1, n_output_basis, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+    P = PositiveParameters.random_init(shape=(1, n_output_basis, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
 
     # Create basis functions
     phi_leaf_basis = GaussianBasis(phi_means, phi_stds)
@@ -83,13 +86,13 @@ if __name__ == "__main__":
     h0_basis = SumProdBasis(n_output_basis, psi0_leaf_basis, psi0_matrix_coeffs, coeffs=h0_coeffs)
 
     # Create and train the transition model
-    tran_model = LinearRFF(g_basis, psi_basis)
+    tran_model = SumProdRFF(g_basis, psi_basis, B, P)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     
     rff_basis_params = param_group_iter([phi_means, phi_stds, psi_means, psi_stds])
-    rff_weight_params = param_group_iter([g_coeffs, phi_matrix_coeffs, psi_matrix_coeffs])
+    rff_weight_params = param_group_iter([g_coeffs, phi_matrix_coeffs, psi_matrix_coeffs, B, P])
     optimizers ={"basis": torch.optim.Adam(rff_basis_params, lr=tran_params["lr_basis"]), "weights": torch.optim.Adam(rff_weight_params, lr=tran_params["lr_weights"])} 
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(tran_model,
@@ -104,10 +107,11 @@ if __name__ == "__main__":
     print("Done! \n")
 
 
-    box_lows = tuple(problem.plot_bounds_low.tolist())
-    box_highs = tuple(problem.plot_bounds_high.tolist())
-    check_conditional_pdf_valid(tran_model, (box_lows, box_highs), (box_lows, box_highs), n_samples=1000, n_conditioner_samples=10, device=device)
+    #box_lows = tuple(problem.plot_bounds_low.tolist())
+    #box_highs = tuple(problem.plot_bounds_high.tolist())
+    #check_conditional_pdf_valid(tran_model, (box_lows, box_highs), (box_lows, box_highs), n_samples=1000, n_conditioner_samples=10, device=device)
 
+    #input("...")
 
     # Freeze parameters of g
     phi_means.set_requires_grad(False)
@@ -117,6 +121,8 @@ if __name__ == "__main__":
     psi_stds.set_requires_grad(False)
     psi_matrix_coeffs.set_requires_grad(False)
     g_coeffs.set_requires_grad(False)
+    B.set_requires_grad(False)
+    P.set_requires_grad(False)
 
     init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)
 

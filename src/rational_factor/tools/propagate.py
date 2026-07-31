@@ -88,6 +88,8 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
             h_seq.append(hk)
         belief_seq = [LinearFF(transition_model.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False) for h in h_seq]
 
+        return belief_seq
+
     ##### QUADRATIC RATIONAL FACTOR #####
     elif isinstance(transition_model, QuadraticRFF):
         assert isinstance(init_belief, QuadraticFF), "Belief must be QuadraticFF for QuadraticRFF transition model"

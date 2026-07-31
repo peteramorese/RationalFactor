@@ -137,6 +137,9 @@ class SumProdRFF(ConditionalDensityModel):
         B_psi_xp = torch.einsum("bji,bj->bi", B, psi_xp) # B_psi_xp = B^T * psi(x')
         log_f = torch.log((Gamma_phi_x * B_psi_xp).sum(dim=-1) + self.numerical_tolerance) # Sum (A_phi_x * B_psi_xp)
 
+        #print("log_f min: ", log_f.min(), "max: ", log_f.max())
+        #print("log_g_xp min: ", log_g_xp.min(), "max: ", log_g_xp.max())
+        #print("log_g_x min: ", log_g_x.min(), "max: ", log_g_x.max())
         return log_g_xp + log_f - log_g_x
 
     def get_P_normalized(self):
@@ -146,14 +149,16 @@ class SumProdRFF(ConditionalDensityModel):
         if B is None:
             B = self.B()
         if Omega2 is None:
-            Omega2 = self.g.Omega2(self.psi)
+            phi = copy.copy(self.g)
+            phi.set_coeffs_to_one()
+            Omega2 = phi.Omega2(self.psi)
 
         a = self.g.coeffs()
         P_normalized = self.get_P_normalized()
 
         q1 = torch.einsum("bji,bj->bi", Omega2, a) # q1 = Omega2^T * a
         q2 = torch.einsum("bji,bj->bi", B, q1) # q2 = B^T * q1
-        Gamma1 = torch.einsum("bij,bj->bij", P_normalized, 1.0 / q2) # Gamma = P_normalized * diag(1.0 / q2)
+        Gamma1 = torch.einsum("bij,bj->bij", P_normalized, 1.0 / (q2 + self.numerical_tolerance)) # Gamma = P_normalized * diag(1.0 / q2)
         return torch.einsum("bij,bi->bij", Gamma1, a) # Gamma = diag(a) * Gamma1
     
 
@@ -501,8 +506,8 @@ class LinearFF(DensityModel):
         return self.g.dtype_device()
 
     @classmethod
-    def from_rff(cls, rff : LinearRFF, h : SeparableBasis, renormalize_h : bool = True, register_modules : bool = True):
-        assert isinstance(rff, LinearRFF), "rff must be a LinearRFF"
+    def from_rff(cls, rff : LinearRFF | SumProdRFF, h : SeparableBasis, renormalize_h : bool = True, register_modules : bool = True):
+        assert isinstance(rff, LinearRFF) or isinstance(rff, SumProdRFF), "rff must be a LinearRFF or SumProdRFF"
         return cls(rff.g, h, numerical_tolerance=rff.numerical_tolerance, renormalize_h=renormalize_h, register_modules=register_modules)
 
     #TODO
