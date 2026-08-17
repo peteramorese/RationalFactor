@@ -106,6 +106,7 @@ class SumProdRFF(ConditionalDensityModel):
 
         assert B().shape == (batch_size, n_basis, n_basis), "B must have shape (batch_size, n_basis, n_basis)"
         assert P().shape == (batch_size, n_basis, n_basis), "P must have shape (batch_size, n_basis, n_basis)"
+        assert P.get_normalization_dim() == 2, "P must be normalized over the last dimension"
 
         self.B = B
         self.P = P
@@ -142,9 +143,6 @@ class SumProdRFF(ConditionalDensityModel):
         #print("log_g_x min: ", log_g_x.min(), "max: ", log_g_x.max())
         return log_g_xp + log_f - log_g_x
 
-    def get_P_normalized(self):
-        return torch.softmax(self.P(), dim=2)
-
     def get_Gamma(self, B : torch.Tensor = None, Omega2 : torch.Tensor = None): 
         if B is None:
             B = self.B()
@@ -154,11 +152,10 @@ class SumProdRFF(ConditionalDensityModel):
             Omega2 = phi.Omega2(self.psi)
 
         a = self.g.coeffs()
-        P_normalized = self.get_P_normalized()
 
         q1 = torch.einsum("bji,bj->bi", Omega2, a) # q1 = Omega2^T * a
         q2 = torch.einsum("bji,bj->bi", B, q1) # q2 = B^T * q1
-        Gamma1 = torch.einsum("bij,bj->bij", P_normalized, 1.0 / (q2 + self.numerical_tolerance)) # Gamma = P_normalized * diag(1.0 / q2)
+        Gamma1 = torch.einsum("bij,bj->bij", self.P(), 1.0 / (q2 + self.numerical_tolerance)) # Gamma = P * diag(1.0 / q2)
         return torch.einsum("bij,bi->bij", Gamma1, a) # Gamma = diag(a) * Gamma1
     
 

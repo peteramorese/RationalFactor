@@ -80,17 +80,17 @@ class PositiveParameters(TrainableParameters):
         self,
         trainable_init_values: torch.Tensor = None,
         fixed_values: torch.Tensor = None,
-        normalized: bool = False,
+        normalization_dim: int = None,
         epsilon: float = 0.0,
     ):
         super().__init__(trainable_init_values=trainable_init_values, fixed_values=fixed_values)
-        self._normalized = normalized
+        self._normalization_dim = normalization_dim
         self._epsilon = epsilon
         if not self._trainable:
             assert torch.all(fixed_values >= 0), "fixed_values must be nonnegative"
-            if normalized:
+            if normalization_dim is not None:
                 with torch.no_grad():
-                    self._p.copy_(self._normalize(self._p, dim=-1))
+                    self._p.copy_(self._normalize(self._p))
     
     @classmethod
     def random_init(
@@ -99,53 +99,53 @@ class PositiveParameters(TrainableParameters):
         trainable: bool = True,
         mean: float = 0.0,
         std: float = 1.0,
-        normalized: bool = False,
+        normalization_dim: int = None,
         epsilon: float = 0.0,
     ):
         values = torch.randn(*shape) * std + mean
         if trainable:
-            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
-        return cls(fixed_values=values, normalized=normalized, epsilon=epsilon)
+            return cls(trainable_init_values=values, normalization_dim=normalization_dim, epsilon=epsilon)
+        return cls(fixed_values=values, normalization_dim=normalization_dim, epsilon=epsilon)
 
     @classmethod
-    def set_init(cls, shape: tuple[int, ...], value: float, trainable: bool = True, normalized: bool = False, epsilon: float = 0.0):
+    def set_init(cls, shape: tuple[int, ...], value: float, trainable: bool = True, normalization_dim: int = None, epsilon: float = 0.0):
         values = torch.ones(shape) * value
         if trainable:
-            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
-        return cls(fixed_values=values, normalized=normalized, epsilon=epsilon)
+            return cls(trainable_init_values=values, normalization_dim=normalization_dim, epsilon=epsilon)
+        return cls(fixed_values=values, normalization_dim=normalization_dim, epsilon=epsilon)
 
     @classmethod
-    def from_values(cls, values: torch.Tensor, trainable: bool = True, normalized: bool = False, epsilon: float = 0.0):
+    def from_values(cls, values: torch.Tensor, trainable: bool = True, normalization_dim: int = None, epsilon: float = 0.0):
         if trainable:
-            return cls(trainable_init_values=values, normalized=normalized, epsilon=epsilon)
-        return cls(fixed_values=values.detach().clone(), normalized=normalized, epsilon=epsilon)
+            return cls(trainable_init_values=values, normalization_dim=normalization_dim, epsilon=epsilon)
+        return cls(fixed_values=values.detach().clone(), normalization_dim=normalization_dim, epsilon=epsilon)
 
-    def _normalize(self, p: torch.Tensor, dim: int = -1):
-        return self._epsilon + (1.0 - p.shape[dim] * self._epsilon) * torch.nn.functional.softmax(p, dim=dim)
+    def _normalize(self, p: torch.Tensor):
+        return self._epsilon + (1.0 - p.shape[self._normalization_dim] * self._epsilon) * torch.nn.functional.softmax(p, dim=self._normalization_dim)
 
     def forward(self) -> torch.Tensor:
         if self._trainable:
-            if self._normalized:
-                return self._normalize(self._p, dim=-1)
+            if self._normalization_dim is not None:
+                return self._normalize(self._p)
             return self._epsilon + torch.nn.functional.softplus(self._p)
         return self._p
 
     def freeze_params(self):
         return PositiveParameters(
             fixed_values=self.forward().detach().clone(),
-            normalized=self._normalized,
+            normalization_dim=self._normalization_dim,
             epsilon=self._epsilon,
         )
 
     def with_fixed_values(self, values: torch.Tensor) -> "PositiveParameters":
         return PositiveParameters(
             fixed_values=values.detach().clone(),
-            normalized=self._normalized,
+            normalization_dim=self._normalization_dim,
             epsilon=self._epsilon,
         )
 
-    def is_normalized(self):
-        return self._normalized
+    def get_normalization_dim(self):
+        return self._normalization_dim
 
 def param_group_iter(params: tuple[Parameters, ...]):
     return itertools.chain(*[param.parameters() for param in params])
