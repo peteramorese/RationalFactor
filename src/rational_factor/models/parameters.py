@@ -14,7 +14,7 @@ class Parameters:
     def dtype_device(self):
         return self._p.dtype, self._p.device
 
-    def __call__(self) -> torch.Tensor:
+    def __call__(self):
         return self._p
     
     def is_module(self):
@@ -149,3 +149,4 @@ class PositiveParameters(TrainableParameters):
 
 def param_group_iter(params: tuple[Parameters, ...]):
     return itertools.chain(*[param.parameters() for param in params])
+

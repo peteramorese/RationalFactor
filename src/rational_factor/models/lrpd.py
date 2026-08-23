@@ -1,59 +1,49 @@
 import torch
+from src.rational_factor.models.parameters import Parameters
 
 
-class LowRankPlusDiagonal:
-    """Batched low-rank-plus-diagonal matrix ``M = diag(D) + Uᵀ V``.
+class Rank1PlusDiagonal:
+    """Batched rank-1-plus-diagonal matrix ``M = diag(d) + u vᵀ``.
 
-    Factors are stored with the thin axis first:
+    - ``d``: ``(..., n)`` diagonal entries
+    - ``u``, ``v``: ``(..., n)`` vectors
 
-    - ``D``: ``(..., n)`` diagonal entries
-    - ``U``, ``V``: ``(..., k, n)`` with ``k << n``
-
-    Matrix–vector products use ``Mx = D ⊙ x + Uᵀ (V x)`` and cost ``O(n k)``
-    per batch element (linear in ``n`` for fixed rank ``k``), never forming the
-    dense ``n × n`` matrix.
+    Matrix–vector products use ``Mx = d ⊙ x + u (vᵀ x)`` and cost ``O(n)``
+    per batch element, never forming the dense ``n × n`` matrix.
     """
 
-    def __init__(self, D: torch.Tensor, U: torch.Tensor, V: torch.Tensor):
-        D = torch.as_tensor(D)
-        U = torch.as_tensor(U)
-        V = torch.as_tensor(V)
+    def __init__(self, d: torch.Tensor, u: torch.Tensor, v: torch.Tensor):
+        d = torch.as_tensor(d)
+        u = torch.as_tensor(u)
+        v = torch.as_tensor(v)
 
-        if D.dim() < 1:
-            raise ValueError("D must have shape (..., n)")
-        if U.dim() < 2 or V.dim() < 2:
-            raise ValueError("U and V must have shape (..., k, n)")
-        if U.shape != V.shape:
-            raise ValueError(f"U and V must have the same shape, got {tuple(U.shape)} and {tuple(V.shape)}")
-        if U.shape[:-2] != D.shape[:-1]:
+        if d.dim() < 1:
+            raise ValueError("d must have shape (..., n)")
+        if u.dim() < 1 or v.dim() < 1:
+            raise ValueError("u and v must have shape (..., n)")
+        if u.shape != v.shape:
+            raise ValueError(f"u and v must have the same shape, got {tuple(u.shape)} and {tuple(v.shape)}")
+        if u.shape != d.shape:
             raise ValueError(
-                f"batch shapes of D and U/V must match, got D[..., n]={tuple(D.shape)} "
-                f"and U/V[..., k, n]={tuple(U.shape)}"
+                f"d, u, and v must have the same shape (..., n), got "
+                f"d={tuple(d.shape)}, u={tuple(u.shape)}, v={tuple(v.shape)}"
             )
-        if U.shape[-1] != D.shape[-1]:
-            raise ValueError(
-                f"trailing size of D and U/V must match (n), got n={D.shape[-1]} and U/V n={U.shape[-1]}"
-            )
-        if D.dtype != U.dtype or D.dtype != V.dtype:
-            raise ValueError("D, U, and V must share the same dtype")
-        if D.device != U.device or D.device != V.device:
-            raise ValueError("D, U, and V must share the same device")
+        if d.dtype != u.dtype or d.dtype != v.dtype:
+            raise ValueError("d, u, and v must share the same dtype")
+        if d.device != u.device or d.device != v.device:
+            raise ValueError("d, u, and v must share the same device")
 
-        self.D = D
-        self.U = U
-        self.V = V
+        self.d = d
+        self.u = u
+        self.v = v
 
     @property
     def n(self) -> int:
-        return self.D.shape[-1]
-
-    @property
-    def k(self) -> int:
-        return self.U.shape[-2]
+        return self.d.shape[-1]
 
     @property
     def batch_shape(self) -> torch.Size:
-        return self.D.shape[:-1]
+        return self.d.shape[:-1]
 
     @property
     def shape(self) -> torch.Size:
@@ -61,41 +51,105 @@ class LowRankPlusDiagonal:
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.D.dtype
+        return self.d.dtype
 
     @property
     def device(self) -> torch.device:
-        return self.D.device
+        return self.d.device
 
     @property
-    def T(self) -> "LowRankPlusDiagonal":
-        return LowRankPlusDiagonal(self.D, self.V, self.U)
+    def T(self) -> "Rank1PlusDiagonal":
+        """Transpose: ``(diag(d) + u vᵀ)ᵀ = diag(d) + v uᵀ``."""
+        return Rank1PlusDiagonal(self.d, self.v, self.u)
 
-    def to(self, *args, **kwargs) -> "LowRankPlusDiagonal":
-        return LowRankPlusDiagonal(
-            self.D.to(*args, **kwargs),
-            self.U.to(*args, **kwargs),
-            self.V.to(*args, **kwargs),
+    def to(self, *args, **kwargs) -> "Rank1PlusDiagonal":
+        return Rank1PlusDiagonal(
+            self.d.to(*args, **kwargs),
+            self.u.to(*args, **kwargs),
+            self.v.to(*args, **kwargs),
         )
 
     def to_dense(self) -> torch.Tensor:
-        return torch.diag_embed(self.D) + self.U.transpose(-2, -1) @ self.V
+        """Materialize the full ``(..., n, n)`` matrix (``O(n^2)``)."""
+        return torch.diag_embed(self.d) + self.u.unsqueeze(-1) * self.v.unsqueeze(-2)
 
-    def inverse(self) -> "LowRankPlusDiagonal":
-        """Invser using woodbury formula."""
-        D_inv = self.D.reciprocal()
-        U_scaled = self.U * D_inv.unsqueeze(-2)
-        V_scaled = self.V * D_inv.unsqueeze(-2)
-        # S = I + V D^{-1} Uᵀ = I + V @ U_scaledᵀ
-        eye = torch.eye(self.k, dtype=self.dtype, device=self.device)
-        S = eye + self.V @ U_scaled.transpose(-2, -1)
-        # M^{-1} = diag(D_inv) + U_invᵀ V_inv with
-        # U_inv = -S^{-ᵀ} U_scaled, V_inv = V_scaled
-        U_inv = -torch.linalg.solve(S.transpose(-2, -1), U_scaled)
-        return LowRankPlusDiagonal(D_inv, U_inv, V_scaled)
+    def inverse(self) -> "Rank1PlusDiagonal":
+        """Inverse via Sherman–Morrison in ``O(n)`` time. """
+        d_inv = self.d.reciprocal()
+        u_scaled = d_inv * self.u
+        v_scaled = d_inv * self.v
+        alpha = 1.0 + (self.v * u_scaled).sum(dim=-1)
+        u_inv = -u_scaled / alpha.unsqueeze(-1)
+        return Rank1PlusDiagonal(d_inv, u_inv, v_scaled)
+
+    def sequential_matvec(
+        self,
+        x0: torch.Tensor,
+        *,
+        seq_dim: int = 0,
+        return_trajectory: bool = False,
+    ) -> torch.Tensor:
+        """Apply ``M_t`` sequentially: ``x_{t+1} = M_t x_t``.
+
+        One batch axis (``seq_dim``) indexes the time-ordered factors; all other
+        batch axes are independent sequences updated in parallel.
+
+        Args:
+            x0: ``(..., n)`` where ``...`` is ``batch_shape`` with ``seq_dim``
+                removed (e.g. factors ``(B, T, n)``, ``seq_dim=1`` → ``x0`` is
+                ``(B, n)``).
+            seq_dim: batch axis along which factors are ordered in time.
+            return_trajectory: if True, return all states with shape
+                ``batch_shape + (n,)`` (same as factors but ``seq_dim`` length
+                is ``T + 1``). Otherwise return the final state only.
+
+        Returns:
+            Final state ``(..., n)``, or full trajectory if
+            ``return_trajectory=True``.
+        """
+        batch_ndim = self.d.dim() - 1
+        if batch_ndim == 0:
+            raise ValueError(
+                "sequential_matvec requires at least one batch dim (sequence length); "
+                f"got factor shape {tuple(self.d.shape)}"
+            )
+        if not (-batch_ndim <= seq_dim < batch_ndim):
+            raise ValueError(
+                f"seq_dim must index a batch axis of d/u/v, got seq_dim={seq_dim} "
+                f"for batch_shape={tuple(self.batch_shape)}"
+            )
+        if seq_dim < 0:
+            seq_dim += batch_ndim
+
+        d = self.d.movedim(seq_dim, 0)
+        u = self.u.movedim(seq_dim, 0)
+        v = self.v.movedim(seq_dim, 0)
+        T_seq = d.shape[0]
+        state_shape = d.shape[1:]
+
+        x = torch.as_tensor(x0, dtype=self.dtype, device=self.device)
+        if x.shape != state_shape:
+            raise ValueError(
+                f"x0 must have shape {tuple(state_shape)} (batch without seq_dim + (n,)), "
+                f"got {tuple(x.shape)}"
+            )
+
+        if return_trajectory:
+            traj = x.new_empty((T_seq + 1,) + state_shape)
+            traj[0] = x
+            for t in range(T_seq):
+                vx = (v[t] * x).sum(dim=-1)
+                x = d[t] * x + u[t] * vx.unsqueeze(-1)
+                traj[t + 1] = x
+            return traj.movedim(0, seq_dim)
+
+        for t in range(T_seq):
+            vx = (v[t] * x).sum(dim=-1)
+            x = d[t] * x + u[t] * vx.unsqueeze(-1)
+        return x
 
     def matvec(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute ``M @ x`` in ``O(n k)`` time (per batch / RHS).
+        """Compute ``M @ x`` in ``O(n)`` time (per batch / RHS).
 
         Args:
             x: ``(..., n)`` or ``(..., n, m)``. Leading dims broadcast with
@@ -103,14 +157,13 @@ class LowRankPlusDiagonal:
         """
         x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
         n = self.n
-        batch_ndim = self.D.dim() - 1
-        # Multi-RHS: (..., n, m) — one more axis than a batched vector.
+        batch_ndim = self.d.dim() - 1
         if x.dim() >= batch_ndim + 2 and x.shape[-2] == n:
-            Vx = torch.einsum("...ki,...im->...km", self.V, x)
-            return self.D.unsqueeze(-1) * x + torch.einsum("...ki,...km->...im", self.U, Vx)
+            vx = torch.einsum("...i,...im->...m", self.v, x)
+            return self.d.unsqueeze(-1) * x + self.u.unsqueeze(-1) * vx.unsqueeze(-2)
         if x.shape[-1] == n:
-            Vx = torch.einsum("...ki,...i->...k", self.V, x)
-            return self.D * x + torch.einsum("...ki,...k->...i", self.U, Vx)
+            vx = torch.einsum("...i,...i->...", self.v, x)
+            return self.d * x + self.u * vx.unsqueeze(-1)
         raise ValueError(
             f"x must have shape (..., n) or (..., n, m) with n={n}, got {tuple(x.shape)}"
         )
@@ -121,10 +174,9 @@ class LowRankPlusDiagonal:
     def __rmatmul__(self, other: torch.Tensor) -> torch.Tensor:
         """Row-vector / left multiply: ``x @ M == (Mᵀ @ xᵀ)ᵀ``."""
         other = torch.as_tensor(other, dtype=self.dtype, device=self.device)
-        if other.shape[-1] == self.n and other.dim() == self.D.dim():
+        if other.shape[-1] == self.n and other.dim() == self.d.dim():
             return self.T.matvec(other)
         if other.shape[-1] == self.n:
-            # other: (..., m, n) → treat rows as vectors
             return self.T.matvec(other.transpose(-2, -1)).transpose(-2, -1)
         raise ValueError(
             f"left operand must have shape (..., n) or (..., m, n) with n={self.n}, got {tuple(other.shape)}"
@@ -133,5 +185,17 @@ class LowRankPlusDiagonal:
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(batch_shape={tuple(self.batch_shape)}, "
-            f"n={self.n}, k={self.k}, dtype={self.dtype}, device={self.device})"
+            f"n={self.n}, dtype={self.dtype}, device={self.device})"
         )
+
+
+class Rank1PlusDiagonalFactorization:
+    def __init__(self, d: Parameters, u: Parameters, v: Parameters):
+        assert d.size() == u.size() == v.size(), "d, u, and v must have the same shape"
+        assert d.size().__len__() == 2, "d, u, and v must have shape (n_factors, n)"
+        self.d = d
+        self.u = u
+        self.v = v
+
+    def __call__(self) -> Rank1PlusDiagonal:
+        return Rank1PlusDiagonal(self.d(), self.u(), self.v())
