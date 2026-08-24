@@ -68,21 +68,56 @@ class MutualPairMemberBasis(Basis):
 
 
 class Orthogonal1DPWCBasis(MutualPairBasis):
-    def __init__(self, value_params_1 : Parameters, value_params_2 : Parameters, cell_width_params : Parameters, r1pd_factorization : Rank1PlusDiagonalFactorization, zero_mean: bool = True):
+    def __init__(self, 
+            value_params_1 : Parameters, 
+            value_params_2 : Parameters, 
+            cell_width_params : Parameters, 
+            r1pd_factorization : Rank1PlusDiagonalFactorization, 
+            zero_mean: bool = True,
+            last_alpha_cell_vector : Parameters = None, 
+            last_beta_cell_vector : Parameters = None):
         value_params_tensor_1 = value_params_1()
         
         batch_size = value_params_tensor_1.shape[0]
         n_basis = value_params_tensor_1.shape[1]
 
+        if last_alpha_cell_vector is not None or last_beta_cell_vector is not None:
+            assert zero_mean, "zero_mean must be True if last_alpha_cell_vector or last_beta_cell_vector is not None"
+
         assert value_params_2().shape == (batch_size, n_basis), "value_params_2 must have shape (batch_size, n_basis)"
         assert cell_width_params().shape == (batch_size, n_basis), "cell_width_params must have shape (batch_size, n_basis)"
 
+        r1pd_n = r1pd_factorization.d.size()[-1]
+        extra_params: tuple[Parameters, ...] = ()
+        if zero_mean:
+            assert r1pd_n == n_basis - 1, (
+                f"with zero_mean, r1pd factors must have trailing size n_basis-1={n_basis - 1}, got {r1pd_n}"
+            )
+            assert last_alpha_cell_vector is not None and last_beta_cell_vector is not None, (
+                "zero_mean=True requires last_alpha_cell_vector and last_beta_cell_vector"
+            )
+            assert last_alpha_cell_vector().shape == (batch_size, n_basis)
+            assert last_beta_cell_vector().shape == (batch_size, n_basis)
+            extra_params = (last_alpha_cell_vector, last_beta_cell_vector)
+        else:
+            assert r1pd_n == n_basis, (
+                f"with zero_mean=False, r1pd factors must have trailing size n_basis={n_basis}, got {r1pd_n}"
+            )
+            assert last_alpha_cell_vector is None and last_beta_cell_vector is None
+
         super().__init__(1, 1, n_basis, 
-            (value_params_1, value_params_2, cell_width_params, r1pd_factorization.d, r1pd_factorization.u, r1pd_factorization.v), 
+            (value_params_1, 
+                value_params_2, 
+                cell_width_params, 
+                r1pd_factorization.d, 
+                r1pd_factorization.u, 
+                r1pd_factorization.v) + extra_params, 
             (None, None))
 
         self._zero_mean = zero_mean
         self._r1pd_factorization = r1pd_factorization
+        self._last_alpha_cell_vector = last_alpha_cell_vector
+        self._last_beta_cell_vector = last_beta_cell_vector
     
     def get_basis(self, index : int) -> MutualPairMemberBasis:
         return MutualPairMemberBasis(self, index)
@@ -135,6 +170,82 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
         B = Rank1PlusDiagonal(d_B, u_B, v_B)
         return A, B
 
+    def _expand_seq(self, M: Rank1PlusDiagonal, n_data: int) -> Rank1PlusDiagonal:
+        """Broadcast a ``(T, k)`` factor product across ``n_data`` independent vectors."""
+        return Rank1PlusDiagonal(
+            M.d.unsqueeze(0).expand(n_data, -1, -1).contiguous(),
+            M.u.unsqueeze(0).expand(n_data, -1, -1).contiguous(),
+            M.v.unsqueeze(0).expand(n_data, -1, -1).contiguous(),
+        )
+
+    def _r1pd_invT_conj(self, M: Rank1PlusDiagonal, diag: torch.Tensor) -> Rank1PlusDiagonal:
+        """``diag(a) M^{-T} diag(a)^{-1}`` as an R1PD product (same factor count)."""
+        return M.inverse().T.mul_diag_left(diag).mul_diag_right(diag.reciprocal())
+
+    def _block_last_col_matvec(
+        self,
+        M: Rank1PlusDiagonal,
+        last_col: torch.Tensor,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply ``[[M, 0], l]`` i.e. last column ``l``, zeros under ``M``.
+
+        ``M`` is ``(T, m-1)``; ``last_col`` is ``(m,)``; ``x`` is ``(N, m)``.
+        """
+        N = x.shape[0]
+        head = self._expand_seq(M, N).sequential_matvec(x[:, :-1], seq_dim=1)
+        last = x[:, -1]
+        l = last_col.reshape(-1)
+        out_head = head + last.unsqueeze(-1) * l[:-1]
+        out_last = last * l[-1]
+        return torch.cat([out_head, out_last.unsqueeze(-1)], dim=-1)
+
+    def _get_LR(self) -> tuple:
+        """Operators ``L``, ``R`` with ``ψ_α = L A α`` and ``ψ_β = R B β``.
+
+        ``zero_mean=False``: ``L`` is the ``m×m`` R1PD product; ``R = D L^{-T} D^{-1}``.
+
+        ``zero_mean=True``: the stored R1PD is ``(m-1)×(m-1)``. With last columns
+        ``l``, ``r`` (shape ``(m,)``),
+
+        ``L = [[M, l_{:m-1}], [0, l_{m-1}]]``,
+        ``R = [[D_{m-1} M^{-T} D_{m-1}^{-1}, r_{:m-1}], [0, r_{m-1}]]``.
+
+        Each returned object has ``.matvec(x)`` for ``x`` of shape ``(N, m)``.
+        """
+        M = self._r1pd_factorization()
+
+        if not self._zero_mean:
+            d0 = self._get_d0().reshape(-1)
+            R = self._r1pd_invT_conj(M, d0)
+
+            class _SeqOp:
+                def __init__(self, op, expand):
+                    self.op = op
+                    self.expand = expand
+
+                def matvec(self, x: torch.Tensor) -> torch.Tensor:
+                    return self.expand(self.op, x.shape[0]).sequential_matvec(x, seq_dim=1)
+
+            return _SeqOp(M, self._expand_seq), _SeqOp(R, self._expand_seq)
+
+        l = self._last_alpha_cell_vector()[0]
+        r = self._last_beta_cell_vector()[0]
+        d_small = self._get_d0().reshape(-1)[:-1]
+        N = self._r1pd_invT_conj(M, d_small)
+        expand = self._expand_seq
+        block = self._block_last_col_matvec
+
+        class _BlockOp:
+            def __init__(self, core, last_col):
+                self.core = core
+                self.last_col = last_col
+
+            def matvec(self, x: torch.Tensor) -> torch.Tensor:
+                return block(self.core, self.last_col, x)
+
+        return _BlockOp(M, l), _BlockOp(N, r)
+
     def _get_alpha_beta(self):
         """Raw disjoint PWC heights (not Aα / Bβ)."""
         return self._params[0](), self._params[1]()
@@ -158,8 +269,7 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
         """Evaluate transformed α / β PWC bases at locations ``y ∈ [0, 1]``.
 
         At ``y`` in cell ``k`` the raw vector is ``h_k e_k``. Then
-        ``ψ_α(y) = L A φ_α(y)`` and ``ψ_β(y) = D L⁻ᵀ D⁻¹ B φ_β(y)``
-        with ``D = diag(d0)``.
+        ``ψ_α(y) = L A φ_α(y)`` and ``ψ_β(y) = R B φ_β(y)``.
 
         Args:
             y: ``(N,)`` or ``(N, 1)`` in ``[0, 1]``.
@@ -170,8 +280,7 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
 
         alpha, beta = self._get_alpha_beta()
         A, B = self._get_AB()
-        d0 = self._get_d0().reshape(-1)
-        L = self._r1pd_factorization()  # (T, n)
+        L, R = self._get_LR()
 
         y = torch.as_tensor(y, dtype=alpha.dtype, device=alpha.device).reshape(-1)
         cell = self._cell_index(y, batch_index=0)
@@ -184,25 +293,13 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
             raw[torch.arange(N, device=y.device), cell] = h[cell]
             return raw
 
-        def _expand_seq(M: Rank1PlusDiagonal) -> Rank1PlusDiagonal:
-            return Rank1PlusDiagonal(
-                M.d.unsqueeze(0).expand(N, -1, -1).contiguous(),
-                M.u.unsqueeze(0).expand(N, -1, -1).contiguous(),
-                M.v.unsqueeze(0).expand(N, -1, -1).contiguous(),
-            )
-
-        def _eval_alpha() -> torch.Tensor:
-            return _expand_seq(L).sequential_matvec(A.matvec(_raw_at(alpha)), seq_dim=1)
-
-        def _eval_beta() -> torch.Tensor:
-            L_inv_T = L.inverse().T
-            Bphi = B.matvec(_raw_at(beta))
-            return d0 * _expand_seq(L_inv_T).sequential_matvec(Bphi / d0, seq_dim=1)
-
         if index == 0:
-            return _eval_alpha()
+            return L.matvec(A.matvec(_raw_at(alpha)))
         if index == 1:
-            return _eval_beta()
+            return R.matvec(B.matvec(_raw_at(beta)))
         if index is None:
-            return torch.stack([_eval_alpha(), _eval_beta()], dim=1)
+            return torch.stack(
+                [L.matvec(A.matvec(_raw_at(alpha))), R.matvec(B.matvec(_raw_at(beta)))],
+                dim=1,
+            )
         raise ValueError("index must be 0, 1, or None")
