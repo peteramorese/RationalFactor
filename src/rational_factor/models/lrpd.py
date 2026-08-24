@@ -1,5 +1,5 @@
 import torch
-from src.rational_factor.models.parameters import Parameters
+from rational_factor.models.parameters import Parameters
 
 
 class Rank1PlusDiagonal:
@@ -73,8 +73,49 @@ class Rank1PlusDiagonal:
         """Materialize the full ``(..., n, n)`` matrix (``O(n^2)``)."""
         return torch.diag_embed(self.d) + self.u.unsqueeze(-1) * self.v.unsqueeze(-2)
 
+    def _prepare_diag(self, a: torch.Tensor) -> torch.Tensor:
+        a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
+        if a.shape[-1] != self.n:
+            raise ValueError(
+                f"diagonal must have trailing size n={self.n}, got shape {tuple(a.shape)}"
+            )
+        try:
+            torch.broadcast_shapes(a.shape, self.d.shape)
+        except RuntimeError as e:
+            raise ValueError(
+                f"diagonal shape {tuple(a.shape)} is not broadcastable with "
+                f"factor shape {tuple(self.d.shape)}"
+            ) from e
+        return a
+
+    def mul_diag_left(self, a: torch.Tensor) -> "Rank1PlusDiagonal":
+        """Left-multiply by ``diag(a)``: ``diag(a) M = diag(a ⊙ d) + (a ⊙ u) vᵀ``.
+
+        ``a`` has shape ``(..., n)``, broadcastable with ``d``.
+        """
+        a = self._prepare_diag(a)
+        d, u, v = torch.broadcast_tensors(a * self.d, a * self.u, self.v)
+        return Rank1PlusDiagonal(d.clone(), u.clone(), v.clone())
+
+    def mul_diag_right(self, a: torch.Tensor) -> "Rank1PlusDiagonal":
+        """Right-multiply by ``diag(a)``: ``M diag(a) = diag(d ⊙ a) + u (a ⊙ v)ᵀ``.
+
+        ``a`` has shape ``(..., n)``, broadcastable with ``d``.
+        """
+        a = self._prepare_diag(a)
+        d, u, v = torch.broadcast_tensors(self.d * a, self.u, self.v * a)
+        return Rank1PlusDiagonal(d.clone(), u.clone(), v.clone())
+
+    def mul_diag(self, a: torch.Tensor, *, side: str = "left") -> "Rank1PlusDiagonal":
+        """Multiply by ``diag(a)`` on ``side`` ``\"left\"`` or ``\"right\"``."""
+        if side == "left":
+            return self.mul_diag_left(a)
+        if side == "right":
+            return self.mul_diag_right(a)
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
     def inverse(self) -> "Rank1PlusDiagonal":
-        """Inverse via Sherman–Morrison in ``O(n)`` time. """
+        """Inverse via Sherman–Morrison in ``O(n)`` time (batched over leading dims)."""
         d_inv = self.d.reciprocal()
         u_scaled = d_inv * self.u
         v_scaled = d_inv * self.v
@@ -82,11 +123,20 @@ class Rank1PlusDiagonal:
         u_inv = -u_scaled / alpha.unsqueeze(-1)
         return Rank1PlusDiagonal(d_inv, u_inv, v_scaled)
 
+    def flip(self, seq_dim: int = 0) -> "Rank1PlusDiagonal":
+        """Reverse factor order along ``seq_dim`` (e.g. for ``(M₀⋯M_{T-1})⁻¹``)."""
+        return Rank1PlusDiagonal(
+            self.d.flip(seq_dim),
+            self.u.flip(seq_dim),
+            self.v.flip(seq_dim),
+        )
+
     def sequential_matvec(
         self,
         x0: torch.Tensor,
         *,
         seq_dim: int = 0,
+        reverse: bool = False,
         return_trajectory: bool = False,
     ) -> torch.Tensor:
         """Apply ``M_t`` sequentially: ``x_{t+1} = M_t x_t``.
@@ -94,11 +144,16 @@ class Rank1PlusDiagonal:
         One batch axis (``seq_dim``) indexes the time-ordered factors; all other
         batch axes are independent sequences updated in parallel.
 
+        With ``reverse=False`` (default), applies ``M_0``, then ``M_1``, … so the
+        product is ``M_{T-1} ⋯ M_0``. With ``reverse=True``, applies ``M_{T-1}``,
+        then ``M_{T-2}``, … (same as ``self.flip(seq_dim).sequential_matvec(...)``).
+
         Args:
             x0: ``(..., n)`` where ``...`` is ``batch_shape`` with ``seq_dim``
                 removed (e.g. factors ``(B, T, n)``, ``seq_dim=1`` → ``x0`` is
                 ``(B, n)``).
             seq_dim: batch axis along which factors are ordered in time.
+            reverse: if True, traverse the sequence axis backward.
             return_trajectory: if True, return all states with shape
                 ``batch_shape + (n,)`` (same as factors but ``seq_dim`` length
                 is ``T + 1``). Otherwise return the final state only.
@@ -107,6 +162,11 @@ class Rank1PlusDiagonal:
             Final state ``(..., n)``, or full trajectory if
             ``return_trajectory=True``.
         """
+        if reverse:
+            return self.flip(seq_dim).sequential_matvec(
+                x0, seq_dim=seq_dim, reverse=False, return_trajectory=return_trajectory
+            )
+
         batch_ndim = self.d.dim() - 1
         if batch_ndim == 0:
             raise ValueError(
@@ -190,6 +250,12 @@ class Rank1PlusDiagonal:
 
 
 class Rank1PlusDiagonalFactorization:
+    """Stores R1PD factor tensors ``d, u, v`` with shape ``(T, n)``.
+
+    Call ``()`` to get a ``Rank1PlusDiagonal``; apply products with
+    ``sequential_matvec`` / ``inverse`` / ``T`` / ``flip`` on that object.
+    """
+
     def __init__(self, d: Parameters, u: Parameters, v: Parameters):
         assert d.size() == u.size() == v.size(), "d, u, and v must have the same shape"
         assert d.size().__len__() == 2, "d, u, and v must have shape (n_factors, n)"

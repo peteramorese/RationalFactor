@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import torch
 from rational_factor.models.basis_functions import Basis
-from rational_factor.models.parameters import Parameters, PositiveParameters
+from rational_factor.models.parameters import Parameters
 from rational_factor.models.lrpd import Rank1PlusDiagonal, Rank1PlusDiagonalFactorization
+
 
 class MutualPairBasis:
     def __init__(self, 
@@ -65,7 +68,7 @@ class MutualPairMemberBasis(Basis):
 
 
 class Orthogonal1DPWCBasis(MutualPairBasis):
-    def __init__(self, value_params_1 : Parameters, value_params_2 : Parameters, cell_width_params : PositiveParameters, r1pd_factorization : Rank1PlusDiagonalFactorization, zero_mean: bool = True):
+    def __init__(self, value_params_1 : Parameters, value_params_2 : Parameters, cell_width_params : Parameters, r1pd_factorization : Rank1PlusDiagonalFactorization, zero_mean: bool = True):
         value_params_tensor_1 = value_params_1()
         
         batch_size = value_params_tensor_1.shape[0]
@@ -87,30 +90,119 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
     def Omega1(self, index : int, lows : torch.Tensor = None, highs : torch.Tensor = None):
         pass
     
-    def _get_alpha(self):
-        if self._zero_mean:
-            pre_proj_alpha = self._params[0]()
-            cell_widths = self._params[2]()
+    def _get_d0(self):
+        # \int α_i(x) β_i(x) dx = α_i * β_i * cell_width_i
+        return self._params[0]() * self._params[1]() * self._get_normalized_cell_widths()
 
-            device = pre_proj_alpha.device
-            dtype = pre_proj_alpha.dtype
+    def _get_normalized_cell_widths(self) -> torch.Tensor:
+        """Cell widths on ``[0, 1]``, shape ``(batch, n_basis)``, summing to 1."""
+        return torch.softmax(self._params[2](), dim=-1)
 
-            # Integral over each pre-projected piece
-            sigma_alpha = cell_widths * pre_proj_alpha
+    def _get_AB(self) -> tuple[Rank1PlusDiagonal, Rank1PlusDiagonal]:
+        """Return function-vector maps ``A``, ``B`` (R1PD).
 
-            u = -sigma_alpha / sigma_alpha[:, -1].unsqueeze(-1)
-            d = torch.ones_like(pre_proj_alpha)
-            v = torch.zeros_like(pre_proj_alpha)
-            v[..., -1] = 1.0
+        ``A = I - (σ_α / σ_{α,m}) e_mᵀ`` so ``A σ_α = 0``.
 
-            A_r1pd = Rank1PlusDiagonal()
-            return A_r1pd.matvec(pre_proj_alpha)
-        return self._params[0]()
+        ``B = I_{m-1} - (1/s) (I_{m-1} σ_β) (D₀⁻¹ σ_α)ᵀ`` with
+        ``s = σ_αᵀ D₀⁻¹ σ_β``, so ``B σ_β = 0`` and
+        ``A D₀ Bᵀ = D₀ I_{m-1}``.
+        """
+        pre_proj_alpha = self._params[0]()
+        pre_proj_beta = self._params[1]()
+        ones = torch.ones_like(pre_proj_alpha)
+        zeros = torch.zeros_like(pre_proj_alpha)
+        if not self._zero_mean:
+            I = Rank1PlusDiagonal(ones, zeros, zeros)
+            return I, I
 
-    def _get_beta(self):
-        if self._zero_mean:
-        return self._params[1]()
+        cell_widths = self._get_normalized_cell_widths()
+        sigma_alpha = cell_widths * pre_proj_alpha
+        sigma_beta = cell_widths * pre_proj_beta
+        d0 = self._get_d0()
 
-    def eval(self, y)
+        u_A = -sigma_alpha / sigma_alpha[..., -1].unsqueeze(-1)
+        v_A = torch.zeros_like(pre_proj_alpha)
+        v_A[..., -1] = 1.0
+        A = Rank1PlusDiagonal(ones, u_A, v_A)
 
-    
+        # v_B = D₀⁻¹ σ_α so D₀ v_B = σ_α and A (D₀ v_B) = A σ_α = 0
+        v_B = sigma_alpha / d0
+        s = (v_B * sigma_beta).sum(dim=-1)
+        u_B = -sigma_beta / s.unsqueeze(-1)
+        u_B[..., -1] = 0.0
+        d_B = ones.clone()
+        d_B[..., -1] = 0.0
+        B = Rank1PlusDiagonal(d_B, u_B, v_B)
+        return A, B
+
+    def _get_alpha_beta(self):
+        """Raw disjoint PWC heights (not Aα / Bβ)."""
+        return self._params[0](), self._params[1]()
+
+    def cell_edges(self, batch_index: int = 0) -> torch.Tensor:
+        """Ordered partition edges on ``[0, 1]``, shape ``(n_basis + 1,)``."""
+        widths = self._get_normalized_cell_widths()[batch_index]
+        zero = torch.zeros(1, dtype=widths.dtype, device=widths.device)
+        return torch.cat([zero, torch.cumsum(widths, dim=0)], dim=0)
+
+    def _cell_index(self, y: torch.Tensor, batch_index: int = 0) -> torch.Tensor:
+        """Map ``y ∈ [0, 1]`` to cell indices in ``{0, ..., n_basis - 1}``."""
+        y = torch.as_tensor(
+            y, dtype=self._params[0]().dtype, device=self._params[0]().device
+        ).reshape(-1)
+        edges = self.cell_edges(batch_index)
+        idx = torch.searchsorted(edges, y, right=True) - 1
+        return idx.clamp(0, self._n_basis - 1)
+
+    def eval(self, y: torch.Tensor, index: int | None = None) -> torch.Tensor:
+        """Evaluate transformed α / β PWC bases at locations ``y ∈ [0, 1]``.
+
+        At ``y`` in cell ``k`` the raw vector is ``h_k e_k``. Then
+        ``ψ_α(y) = L A φ_α(y)`` and ``ψ_β(y) = D L⁻ᵀ D⁻¹ B φ_β(y)``
+        with ``D = diag(d0)``.
+
+        Args:
+            y: ``(N,)`` or ``(N, 1)`` in ``[0, 1]``.
+            index: ``0`` → α, ``1`` → β, ``None`` → both as ``(N, 2, n_basis)``.
+        """
+        if self._params[0]().shape[0] != 1:
+            raise ValueError("eval currently requires parameter batch_size == 1")
+
+        alpha, beta = self._get_alpha_beta()
+        A, B = self._get_AB()
+        d0 = self._get_d0().reshape(-1)
+        L = self._r1pd_factorization()  # (T, n)
+
+        y = torch.as_tensor(y, dtype=alpha.dtype, device=alpha.device).reshape(-1)
+        cell = self._cell_index(y, batch_index=0)
+        N = y.shape[0]
+        n = self._n_basis
+
+        def _raw_at(heights: torch.Tensor) -> torch.Tensor:
+            h = heights.reshape(n)
+            raw = torch.zeros(N, n, dtype=h.dtype, device=h.device)
+            raw[torch.arange(N, device=y.device), cell] = h[cell]
+            return raw
+
+        def _expand_seq(M: Rank1PlusDiagonal) -> Rank1PlusDiagonal:
+            return Rank1PlusDiagonal(
+                M.d.unsqueeze(0).expand(N, -1, -1).contiguous(),
+                M.u.unsqueeze(0).expand(N, -1, -1).contiguous(),
+                M.v.unsqueeze(0).expand(N, -1, -1).contiguous(),
+            )
+
+        def _eval_alpha() -> torch.Tensor:
+            return _expand_seq(L).sequential_matvec(A.matvec(_raw_at(alpha)), seq_dim=1)
+
+        def _eval_beta() -> torch.Tensor:
+            L_inv_T = L.inverse().T
+            Bphi = B.matvec(_raw_at(beta))
+            return d0 * _expand_seq(L_inv_T).sequential_matvec(Bphi / d0, seq_dim=1)
+
+        if index == 0:
+            return _eval_alpha()
+        if index == 1:
+            return _eval_beta()
+        if index is None:
+            return torch.stack([_eval_alpha(), _eval_beta()], dim=1)
+        raise ValueError("index must be 0, 1, or None")
