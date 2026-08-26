@@ -199,13 +199,13 @@ def main() -> None:
     print(f"exact relative off-diag={rel.item():.3e}")
     assert rel.item() < EXACT_GRAM_REL_TOL, f"Gram not diagonal: rel={rel.item()}"
 
-    G_omega = basis.Omega2()[0]
+    G_omega = basis.Omega2().to_dense()[0]
     assert torch.allclose(G, G_omega, atol=1e-4, rtol=1e-4), "Omega2 != exact Gram"
 
     alpha, beta = basis.get_basis(0), basis.get_basis(1)
     assert torch.allclose(alpha.Omega1(), Omega1_a)
-    assert torch.allclose(alpha.Omega2(beta)[0], G_omega, atol=1e-4, rtol=1e-4)
-    assert torch.allclose(beta.Omega2(alpha)[0], G_omega.T, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(alpha.Omega2(beta).to_dense()[0], G_omega, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(beta.Omega2(alpha).to_dense()[0], G_omega.T, atol=1e-4, rtol=1e-4)
 
     mids = _cell_midpoints(basis)
     for index in (0, 1):

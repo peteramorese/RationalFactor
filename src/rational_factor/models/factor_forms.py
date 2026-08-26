@@ -3,6 +3,7 @@ import copy
 import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
+from .gram import Omega2Gram
 from .parameters import PositiveParameters, Parameters
 
 # Linear models #
@@ -88,7 +89,7 @@ class LinearRFF(ConditionalDensityModel):
             phi.set_coeffs_to_one()
             Omega2 = phi.Omega2(self.psi)
 
-        return a / (torch.einsum("...ij,...i->...j", Omega2, a) + self.numerical_tolerance)
+        return a / (Omega2Gram(Omega2).rev_matvec(a) + self.numerical_tolerance)
 
 class SumProdRFF(ConditionalDensityModel):
     def __init__(self, g : SeparableBasis, psi : SeparableBasis, B : Parameters, P : Parameters,
@@ -153,7 +154,7 @@ class SumProdRFF(ConditionalDensityModel):
 
         a = self.g.coeffs()
 
-        q1 = torch.einsum("bji,bj->bi", Omega2, a) # q1 = Omega2^T * a
+        q1 = Omega2Gram(Omega2).rev_matvec(a)  # q1 = Omega2^T * a
         q2 = torch.einsum("bji,bj->bi", B, q1) # q2 = B^T * q1
         Gamma1 = torch.einsum("bij,bj->bij", self.P(), 1.0 / (q2 + self.numerical_tolerance)) # Gamma = P * diag(1.0 / q2)
         return torch.einsum("bij,bi->bij", Gamma1, a) # Gamma = diag(a) * Gamma1
@@ -516,7 +517,7 @@ class LinearFF(DensityModel):
             return 0.0
         if Omega2 is None:
             Omega2 = self.g.Omega2(self.h)
-        return -torch.log(torch.sum(Omega2) + self.numerical_tolerance)
+        return -torch.log(Omega2Gram(Omega2).sum() + self.numerical_tolerance)
         
     def log_density(self, x : torch.Tensor):
         log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance) # (n_data)

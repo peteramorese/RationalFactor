@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-import torch
 import math
+
+import torch
+
+from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import Basis
+from rational_factor.models.density_model import DensityModel
+from rational_factor.models.gram import Omega2Gram
+from rational_factor.models.lrpd import Rank1PlusDiagonal
 from rational_factor.models.parameters import Parameters
 from rational_factor.models.qs_matrix import (
     Order1QSGenerators,
@@ -32,7 +38,7 @@ class MutualPairBasis:
     def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
         raise NotImplementedError("Omega1 is not implemented for this mutual basis")
 
-    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
         raise NotImplementedError("Omega2 is not implemented for this mutual basis")
 
     def eval(self, y: torch.Tensor, index: int = None):
@@ -47,10 +53,15 @@ class MutualPairBasis:
     def n_basis_functions(self) -> int:
         return self._n_basis
 
+    def dtype_device(self):
+        return self._params[0]().dtype, self._params[0]().device
+
 
 class MutualPairMemberBasis(Basis):
     def __init__(self, owner: MutualPairBasis, index: int):
         assert index in (0, 1), "index must be 0 or 1"
+        self.owner = owner
+        self.index = index
         super().__init__(
             owner._dim,
             owner._batch_size,
@@ -58,8 +69,9 @@ class MutualPairMemberBasis(Basis):
             owner._params,
             owner._coeffs[index],
         )
-        self.owner = owner
-        self.index = index
+
+    def dtype_device(self):
+        return self.owner.dtype_device()
 
     def _is_mate(self, other: MutualPairMemberBasis | list[MutualPairMemberBasis]) -> bool:
         if isinstance(other, MutualPairMemberBasis):
@@ -71,16 +83,18 @@ class MutualPairMemberBasis(Basis):
     def Omega1(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         return self.owner.Omega1(self.index, lows, highs) * self.coeffs()
 
-    def Omega2(self, other: MutualPairMemberBasis, lows: torch.Tensor = None, highs: torch.Tensor = None):
+    def Omega2(self, other: MutualPairMemberBasis, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
         if not self._is_mate(other):
             raise ValueError("Omega2 is not defined for non-mate bases")
-        G = self.owner.Omega2(lows, highs)
+        G = Omega2Gram(self.owner.Omega2(lows, highs))
         if self.index == 1:
-            G = torch.transpose(G, -2, -1)
-        return G * self.coeffs()[:, :, None] * other.coeffs()[:, None, :]
+            G = G.T
+        return G.mul_diag_left(self.coeffs()).mul_diag_right(other.coeffs())
 
     def __call__(self, y: torch.Tensor):
-        return self.owner.eval(y, self.index) * self.coeffs()
+        values = self.owner.eval(y, self.index)
+        coeffs = self.coeffs().to(dtype=values.dtype, device=values.device)
+        return values * coeffs
 
 
 class FeasibleZeroMeanPWC:
@@ -231,13 +245,13 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
         w = self._cell_overlaps(lows, highs)
         return torch.einsum("k,bkm->bm", w, self._cell_values(index))
 
-    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
         """Cross Gram ``<alpha_i, beta_j>``, shape ``(batch, m, m)``."""
         if lows is None and highs is None:
-            return torch.diag_embed(self._get_gram_diag())
+            return Omega2Gram(torch.diag_embed(self._get_gram_diag()))
         w = self._cell_overlaps(lows, highs)
         a, b = self._cell_values(0), self._cell_values(1)
-        return torch.einsum("k,bki,bkj->bij", w, a, b)
+        return Omega2Gram(torch.einsum("k,bki,bkj->bij", w, a, b))
 
     def _PF_bounds(
         self,
@@ -271,3 +285,259 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
 
     def supremum(self, index: int) -> torch.Tensor:
         return self.bounds(index)[1]
+
+
+class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
+    """Mutual pair whose matched products are conditional VP-flow densities.
+
+    A single volume-preserving flow ``T(· | e_i)`` is shared across the ``m``
+    basis functions and conditioned on a learned index embedding ``e_i``.
+    With base density ``p_0`` and ``N = p_0.supremum_bound()``,
+
+        n_i(x) = p_0(T(x | e_i)),
+
+    since ``log |det DT| = 0``. The split
+
+        α_i(x) = n_i(x)/N + (1 - n_i(x)/N) s_i(x)
+        β_i(x) = n_i(x) / α_i(x)
+
+    then satisfies ``α_i β_i = n_i``. The splitter, index embedding, and flow
+    are all supplied from outside. The splitter maps ``x`` to ``m`` pre-sigmoid
+    logits; after a sigmoid, ``s ∈ (0, 1)^m``. Because ``s ∈ (0, 1)`` and
+    ``n ≤ N``,
+
+        n/N ≤ α ≤ 1,    β ≤ N.
+    """
+
+    def __init__(
+        self,
+        flow: VolumePreservingFlow,
+        base: DensityModel,
+        splitter: torch.nn.Module,
+        embedding: torch.nn.Embedding,
+        eps: float = 1e-6,
+        coeffs: tuple[Parameters | None, Parameters | None] | None = None,
+    ):
+        torch.nn.Module.__init__(self)
+        n_basis = embedding.num_embeddings
+        if n_basis < 1:
+            raise ValueError("n_basis must be at least 1")
+        if flow.dim != base.dim:
+            raise ValueError("flow and base must have the same dimension")
+        if embedding.embedding_dim != flow.conditioner_dim:
+            raise ValueError(
+                f"embedding dim {embedding.embedding_dim} must match "
+                f"flow conditioner_dim {flow.conditioner_dim}"
+            )
+
+        MutualPairBasis.__init__(self, flow.dim, 1, n_basis, (), coeffs)
+
+        self.flow = flow
+        self.base = base
+        self.splitter = splitter
+        self.index_embedding = embedding
+        self.eps = eps
+
+    def dtype_device(self):
+        p = next(self.parameters())
+        return p.dtype, p.device
+
+    def get_basis(self, index: int) -> MutualPairMemberBasis:
+        return MutualPairMemberBasis(self, index)
+
+    def _index_conditioners(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        idx = torch.arange(self._n_basis, device=device)
+        return self.index_embedding(idx).to(dtype=dtype)
+
+    def _as_data(self, y: torch.Tensor) -> torch.Tensor:
+        y = torch.as_tensor(y)
+        if y.ndim == 1:
+            y = y.unsqueeze(-1) if self._dim == 1 else y.unsqueeze(0)
+        if y.ndim != 2 or y.shape[1] != self._dim:
+            raise ValueError(f"y must have shape (n_data, {self._dim}), got {tuple(y.shape)}")
+        return y
+
+    def flow_density(self, y: torch.Tensor) -> torch.Tensor:
+        """VP-flow densities ``n_i(y)``, shape ``(n_data, n_basis)``."""
+        y = self._as_data(y)
+        n_data, m = y.shape[0], self._n_basis
+        cond = self._index_conditioners(y.dtype, y.device)
+        y_rep = y.unsqueeze(1).expand(-1, m, -1).reshape(n_data * m, self._dim)
+        c_rep = cond.unsqueeze(0).expand(n_data, -1, -1).reshape(n_data * m, -1)
+        z, ladj = self.flow.forward(y_rep, conditioner=c_rep)
+        log_n = self.base.log_density(z) + ladj
+        return torch.exp(log_n).view(n_data, m)
+
+    def _split(self, y: torch.Tensor, n: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        bound = self.base.supremum_bound().to(dtype=n.dtype, device=n.device)
+        r = n / bound.clamp_min(self.eps)
+        s = torch.sigmoid(self.splitter(y))
+        alpha = r + (1.0 - r) * s
+        beta = n / alpha.clamp_min(self.eps)
+        return alpha, beta
+
+    def eval(self, y: torch.Tensor | None = None, index: int | None = None):
+        if y is None:
+            return torch.nn.Module.eval(self)
+        y = self._as_data(y)
+        n = self.flow_density(y)
+        alpha, beta = self._split(y, n)
+        if index == 0:
+            return alpha
+        if index == 1:
+            return beta
+        if index is None:
+            return torch.stack([alpha, beta], dim=1)
+        raise ValueError("index must be 0, 1, or None")
+
+    def supremum(self, index: int) -> torch.Tensor:
+        """Per-function supremum bounds, shape ``(batch, n_basis)``.
+
+        ``α ≤ 1`` and ``β ≤ N``. ``N = base.supremum_bound()`` is recomputed
+        from the current base parameters, so it tracks training.
+        """
+        dtype, device = self.dtype_device()
+        ones = torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
+        if index == 0:
+            return ones
+        if index == 1:
+            return ones * self.base.supremum_bound()
+        raise ValueError("index must be 0 or 1")
+
+
+class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
+    """Product of a 1D PWC pair on a sacrificial coordinate and a VP pair on the rest.
+
+    For sacrificial index ``l`` in ``{0, …, d-1}``,
+
+        α_i(x) = α^{pwc}_i(x_l) α^{vp}_i(x_{≠l})
+        β_i(x) = β^{pwc}_i(x_l) β^{vp}_i(x_{≠l})
+
+    The PWC Gram is diagonal, so it zeros VP off-diagonal couplings. On the
+    full unit cube the VP paired products integrate to 1, and
+
+        Ω2_ij = Ω2^{pwc}_ij * δ_ij = Λ_i δ_ij.
+    """
+
+    def __init__(
+        self,
+        pwc: Orthogonal1DPWCBasis,
+        vp: VolumePreservingPairBasis,
+        sacrificial_index: int,
+        coeffs: tuple[Parameters | None, Parameters | None] | None = None,
+    ):
+        torch.nn.Module.__init__(self)
+        if pwc.dim() != 1:
+            raise ValueError("pwc must be 1-dimensional")
+        dim = vp.dim() + 1
+        if not (0 <= sacrificial_index < dim):
+            raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
+        if pwc.n_basis_functions() != vp.n_basis_functions():
+            raise ValueError(
+                f"pwc n_basis {pwc.n_basis_functions()} must match "
+                f"vp n_basis {vp.n_basis_functions()}"
+            )
+
+        MutualPairBasis.__init__(
+            self,
+            dim,
+            pwc.batch_size(),
+            pwc.n_basis_functions(),
+            pwc._params,
+            coeffs,
+        )
+        self.pwc = pwc
+        self.vp = vp
+        self.sacrificial_index = sacrificial_index
+        self._pwc_param_modules = torch.nn.ModuleList(
+            [p for p in pwc._params if p.is_module()]
+        )
+
+    def dtype_device(self):
+        return self.pwc.dtype_device()
+
+    def get_basis(self, index: int) -> MutualPairMemberBasis:
+        return MutualPairMemberBasis(self, index)
+
+    def _split_coords(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        y = torch.as_tensor(y)
+        if y.ndim == 1:
+            y = y.unsqueeze(0)
+        if y.ndim != 2 or y.shape[1] != self._dim:
+            raise ValueError(f"y must have shape (n_data, {self._dim}), got {tuple(y.shape)}")
+        l = self.sacrificial_index
+        rest = [i for i in range(self._dim) if i != l]
+        return y[:, l], y[:, rest]
+
+    def eval(self, y: torch.Tensor | None = None, index: int | None = None):
+        if y is None:
+            return torch.nn.Module.eval(self)
+        x_l, x_rest = self._split_coords(y)
+        return self.pwc.eval(x_l, index) * self.vp.eval(x_rest, index)
+
+    def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
+        if lows is not None or highs is not None:
+            raise ValueError("MaskedGramMutualBasis.Omega1 is only defined on the full domain")
+        dtype, device = self.pwc.dtype_device()
+        return torch.zeros(self._batch_size, self._n_basis, dtype=dtype, device=device)
+
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
+        if lows is not None or highs is not None:
+            raise ValueError("MaskedGramMutualBasis.Omega2 is only defined on the full domain")
+        return Omega2Gram(self.pwc.Omega2())
+
+    def supremum(self, index: int) -> torch.Tensor:
+        return self.pwc.supremum(index) * self.vp.supremum(index)
+
+
+class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
+    """Shifted masked pair ``α = α_u + a``, ``β = β_u + b``.
+
+    ``α_u``, ``β_u`` are the unsigned ``MaskedGramMutualBasis`` products. Because
+    the VP factors are positive, the most negative unsigned values are bounded
+    by the PWC infima times the VP suprema, so the constant shifts
+
+        a = -inf(α^{pwc}) ⊙ sup(α^{vp})
+        b = -inf(β^{pwc}) ⊙ sup(β^{vp})
+
+    make ``α, β ≥ 0``. On the unit cube the unsigned pair is zero-mean, hence
+
+        Ω1(α) = a,    Ω1(β) = b,
+        Ω2 = diag(Λ) + a bᵀ.
+    """
+
+    def constant_shifts(self) -> tuple[torch.Tensor, torch.Tensor]:
+        a = -self.pwc.infimum(0) * self.vp.supremum(0)
+        b = -self.pwc.infimum(1) * self.vp.supremum(1)
+        return a, b
+
+    def eval(self, y: torch.Tensor | None = None, index: int | None = None):
+        if y is None:
+            return torch.nn.Module.eval(self)
+        unsigned = MaskedGramMutualBasis.eval(self, y, index)
+        a, b = self.constant_shifts()
+        if index == 0:
+            return unsigned + a
+        if index == 1:
+            return unsigned + b
+        if index is None:
+            return unsigned + torch.stack([a, b], dim=-2)
+        raise ValueError("index must be 0, 1, or None")
+
+    def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
+        if lows is not None or highs is not None:
+            raise ValueError("PositiveMaskedGramMutualBasis.Omega1 is only defined on the full domain")
+        if index not in (0, 1):
+            raise ValueError("index must be 0 or 1")
+        a, b = self.constant_shifts()
+        return a if index == 0 else b
+
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
+        unsigned = super().Omega2(lows, highs)
+        a, b = self.constant_shifts()
+        return Omega2Gram(Rank1PlusDiagonal(unsigned.diag(), a, b))
+
+    def supremum(self, index: int) -> torch.Tensor:
+        a, b = self.constant_shifts()
+        shift = a if index == 0 else b
+        return super().supremum(index) + shift

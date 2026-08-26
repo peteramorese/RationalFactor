@@ -10,7 +10,7 @@ from nflows.transforms.permutations import ReversePermutation
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 
 from .parameters import Parameters, PositiveParameters
-from .gram import BetaGram, GaussianGram
+from .gram import BetaGram, GaussianGram, Omega2Gram
 
 
 class Basis:
@@ -268,7 +268,7 @@ class SeparableBasis(Basis):
         return torch.exp(self.log_Omega1_dim(lows, highs).sum(dim=1)) * self.coeffs()
     
     def Omega2(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
-        return (
+        return Omega2Gram(
             torch.exp(self.log_Omega2_dim(other, lows, highs).sum(dim=1))
             * self.coeffs()[:, :, None]
             * other.coeffs()[:, None, :]
