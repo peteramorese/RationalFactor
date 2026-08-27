@@ -123,6 +123,13 @@ class Omega2Gram:
         a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
         return Omega2Gram(self._dense * a.unsqueeze(-2))
 
+    def scale(self, s: torch.Tensor | float) -> Omega2Gram:
+        """Multiply every entry by scalar ``s`` (broadcasts over batch)."""
+        s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
+        if self.is_structured:
+            return Omega2Gram(Rank1PlusDiagonal(self._structured.d * s, self._structured.u * s, self._structured.v))
+        return Omega2Gram(self._dense * s)
+
     def __matmul__(self, other: torch.Tensor) -> torch.Tensor:
         return self.matvec(other)
 

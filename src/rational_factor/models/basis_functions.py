@@ -66,6 +66,10 @@ class Basis:
                     if param.is_module() and id(param) not in params_seen:
                         unique_params.append(param)
                         params_seen[id(param)] = param
+            owner = getattr(basis, "owner", None)
+            if isinstance(owner, torch.nn.Module) and id(owner) not in params_seen:
+                unique_params.append(owner)
+                params_seen[id(owner)] = owner
         return unique_params, unique_coeffs
 
     def forward(self, y : torch.Tensor):

@@ -45,10 +45,10 @@ class LinearRFF(ConditionalDensityModel):
 
     Used for Markov transition distribution for propagation only models
     """
-    def __init__(self, g : SeparableBasis, psi : SeparableBasis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
+    def __init__(self, g : Basis, psi : Basis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert g.dim() == psi.dim(), "g and psi must have the same dimension"
-        assert isinstance(g, SeparableBasis), "g must be a SeparableBasis"
-        assert isinstance(psi, SeparableBasis), "psi must be a SeparableBasis"
+        assert isinstance(g, Basis), "g must be a Basis"
+        assert isinstance(psi, Basis), "psi must be a Basis"
         super().__init__(g.dim(), psi.dim())
 
         self.g = g
@@ -482,10 +482,10 @@ class LinearFF(DensityModel):
 
     Used for belief representation for propagation only models
     """
-    def __init__(self, g : SeparableBasis, h : SeparableBasis, numerical_tolerance : float = 1e-20, renormalize_h : bool = True, register_modules : bool = True):
+    def __init__(self, g : Basis, h : Basis, numerical_tolerance : float = 1e-20, renormalize_h : bool = True, register_modules : bool = True):
         assert g.dim() == h.dim(), "g and h must have the same dimension"
-        assert isinstance(g, Basis), "g must be a SeparableBasis"
-        assert isinstance(h, Basis), "h must be a SeparableBasis"
+        assert isinstance(g, Basis), "g must be a Basis"
+        assert isinstance(h, Basis), "h must be a Basis"
         super().__init__(g.dim())
 
         self.g = g
@@ -504,7 +504,7 @@ class LinearFF(DensityModel):
         return self.g.dtype_device()
 
     @classmethod
-    def from_rff(cls, rff : LinearRFF | SumProdRFF, h : SeparableBasis, renormalize_h : bool = True, register_modules : bool = True):
+    def from_rff(cls, rff : LinearRFF | SumProdRFF, h : Basis, renormalize_h : bool = True, register_modules : bool = True):
         assert isinstance(rff, LinearRFF) or isinstance(rff, SumProdRFF), "rff must be a LinearRFF or SumProdRFF"
         return cls(rff.g, h, numerical_tolerance=rff.numerical_tolerance, renormalize_h=renormalize_h, register_modules=register_modules)
 
