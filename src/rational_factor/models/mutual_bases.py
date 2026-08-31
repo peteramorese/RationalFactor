@@ -5,8 +5,7 @@ import math
 import torch
 
 from normalizing_flow.vp_flow import VolumePreservingFlow
-from rational_factor.models.basis_functions import Basis
-from rational_factor.models.density_model import DensityModel
+from rational_factor.models.basis_functions import Basis, BetaBasis
 from rational_factor.models.gram import Omega2Gram
 from rational_factor.models.lrpd import Rank1PlusDiagonal
 from rational_factor.models.parameters import Parameters
@@ -270,7 +269,12 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
         return torch.minimum(a, b), torch.maximum(a, b)
 
     def bounds(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Exact inf/sup of every basis function, each shape ``(batch, m)``."""
+        """Exact inf/sup of every basis function, each shape ``(batch, m)``.
+
+        ``α = P F`` and ``β = Λ P^{-T} F``. Row extrema of ``P`` / ``P^{-T}``
+        come from the order-1 QS generators; F's two column types then give
+        the extrema of the PWC pair without enumerating cells.
+        """
         P = self._get_P()
         ones = torch.ones_like(P.d)
         if index == 0:
@@ -292,18 +296,20 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
 
     A single volume-preserving flow ``T(· | e_i)`` is shared across the ``m``
     basis functions and conditioned on a learned index embedding ``e_i``.
-    With base density ``p_0`` and ``N = p_0.supremum_bound()``,
+    With per-index base density ``p_{0,i}`` and ``N_i = sup p_{0,i}``,
 
-        n_i(x) = p_0(T(x | e_i)),
+        n_i(x) = p_{0,i}(T(x | e_i)),
 
-    since ``log |det DT| = 0``. The split
+    since ``log |det DT| = 0``. If ``flow`` is ``None`` (or the map is 1D
+    identity), ``n_i(x) = p_{0,i}(x)``. A single shared base is broadcast
+    across indices. The split
 
         α_i(x) = n_i(x)/N + (1 - n_i(x)/N) s_i(x)
         β_i(x) = n_i(x) / α_i(x)
 
-    then satisfies ``α_i β_i = n_i``. The splitter, index embedding, and flow
-    are all supplied from outside. The splitter maps ``x`` to ``m`` pre-sigmoid
-    logits; after a sigmoid, ``s ∈ (0, 1)^m``. Because ``s ∈ (0, 1)`` and
+    then satisfies ``α_i β_i = n_i``. The splitter is a shared scalar net
+    ``σ(x, e_i)``: concatenate each ``x`` with every index embedding and
+    evaluate once to get ``s ∈ (0, 1)^m``. Because ``s ∈ (0, 1)`` and
     ``n ≤ N``,
 
         n/N ≤ α ≤ 1,    β ≤ N.
@@ -311,10 +317,10 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
 
     def __init__(
         self,
-        flow: VolumePreservingFlow,
-        base: DensityModel,
+        base: BetaBasis,
         splitter: torch.nn.Module,
         embedding: torch.nn.Embedding,
+        flow: VolumePreservingFlow | None = None,
         eps: float = 1e-6,
         coeffs: tuple[Parameters | None, Parameters | None] | None = None,
     ):
@@ -322,18 +328,27 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
         n_basis = embedding.num_embeddings
         if n_basis < 1:
             raise ValueError("n_basis must be at least 1")
-        if flow.dim != base.dim:
-            raise ValueError("flow and base must have the same dimension")
-        if embedding.embedding_dim != flow.conditioner_dim:
+        base_n = base.n_basis_functions()
+        if base_n not in (1, n_basis):
             raise ValueError(
-                f"embedding dim {embedding.embedding_dim} must match "
-                f"flow conditioner_dim {flow.conditioner_dim}"
+                f"base n_basis {base_n} must be 1 or match embedding n_basis {n_basis}"
             )
+        if flow is not None:
+            if flow.dim != base.dim():
+                raise ValueError("flow and base must have the same dimension")
+            if embedding.embedding_dim != flow.conditioner_dim:
+                raise ValueError(
+                    f"embedding dim {embedding.embedding_dim} must match "
+                    f"flow conditioner_dim {flow.conditioner_dim}"
+                )
 
-        MutualPairBasis.__init__(self, flow.dim, 1, n_basis, (), coeffs)
+        MutualPairBasis.__init__(self, base.dim(), 1, n_basis, (), coeffs)
 
         self.flow = flow
         self.base = base
+        self._base_param_modules = torch.nn.ModuleList(
+            [p for p in base._params if p.is_module()]
+        )
         self.splitter = splitter
         self.index_embedding = embedding
         self.eps = eps
@@ -354,21 +369,39 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
             raise ValueError(f"y must have shape (n_data, {self._dim}), got {tuple(y.shape)}")
         return y
 
+    def _eval_base(self, y: torch.Tensor) -> torch.Tensor:
+        """``p_{0,i}(y)``, shape ``(n_data, n_basis)``."""
+        n = self.base(y)
+        if n.shape[-1] == 1:
+            return n.expand(-1, self._n_basis)
+        return n
+
     def flow_density(self, y: torch.Tensor) -> torch.Tensor:
-        """VP-flow densities ``n_i(y)``, shape ``(n_data, n_basis)``."""
+        """Base-flow densities ``n_i(y)``, shape ``(n_data, n_basis)``."""
         y = self._as_data(y)
         n_data, m = y.shape[0], self._n_basis
+        if self.flow is None or self.flow.dim == 1:
+            return self._eval_base(y)
         cond = self._index_conditioners(y.dtype, y.device)
         y_rep = y.unsqueeze(1).expand(-1, m, -1).reshape(n_data * m, self._dim)
         c_rep = cond.unsqueeze(0).expand(n_data, -1, -1).reshape(n_data * m, -1)
         z, ladj = self.flow.forward(y_rep, conditioner=c_rep)
-        log_n = self.base.log_density(z) + ladj
-        return torch.exp(log_n).view(n_data, m)
+        n = self.base(z)
+        if n.shape[-1] == 1:
+            n = n.reshape(n_data, m)
+        else:
+            n = n.view(n_data, m, m).diagonal(dim1=-2, dim2=-1)
+        return n * torch.exp(ladj).view(n_data, m)
 
     def _split(self, y: torch.Tensor, n: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         bound = self.base.supremum_bound().to(dtype=n.dtype, device=n.device)
         r = n / bound.clamp_min(self.eps)
-        s = torch.sigmoid(self.splitter(y))
+        n_data, m = y.shape[0], self._n_basis
+        e = self._index_conditioners(y.dtype, y.device)
+        y_rep = y.unsqueeze(1).expand(-1, m, -1)
+        e_rep = e.unsqueeze(0).expand(n_data, -1, -1)
+        inp = torch.cat([y_rep, e_rep], dim=-1).reshape(n_data * m, -1)
+        s = torch.sigmoid(self.splitter(inp)).reshape(n_data, m)
         alpha = r + (1.0 - r) * s
         beta = n / alpha.clamp_min(self.eps)
         return alpha, beta
@@ -390,7 +423,7 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
     def supremum(self, index: int) -> torch.Tensor:
         """Per-function supremum bounds, shape ``(batch, n_basis)``.
 
-        ``α ≤ 1`` and ``β ≤ N``. ``N = base.supremum_bound()`` is recomputed
+        ``α ≤ 1`` and ``β ≤ N_i``. ``N_i = sup p_{0,i}`` is recomputed
         from the current base parameters, so it tracks training.
         """
         dtype, device = self.dtype_device()
@@ -419,8 +452,8 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
     def __init__(
         self,
         pwc: Orthogonal1DPWCBasis,
-        vp: VolumePreservingPairBasis,
         sacrificial_index: int,
+        vp: VolumePreservingPairBasis,
         coeffs: tuple[Parameters | None, Parameters | None] | None = None,
         domain_lows: torch.Tensor | None = None,
         domain_highs: torch.Tensor | None = None,
@@ -528,9 +561,28 @@ class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
     where ``V`` is the volume of the affine domain box (1 on the unit cube).
     """
 
+    def _shift_cache_key(self) -> tuple:
+        key = []
+        for param in self.pwc._params:
+            leaves = list(param.parameters()) + list(param.buffers()) if param.is_module() else [param()]
+            for t in leaves:
+                key.append((t.data_ptr(), t._version, bool(t.requires_grad)))
+        return tuple(key)
+
     def constant_shifts(self) -> tuple[torch.Tensor, torch.Tensor]:
+        key = self._shift_cache_key()
+        cached = getattr(self, "_shift_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
         a = -self.pwc.infimum(0) * self.vp.supremum(0)
         b = -self.pwc.infimum(1) * self.vp.supremum(1)
+        self._shift_cache = (key, a, b)
+        def _invalidate(_grad):
+            self._shift_cache = None
+        if a.requires_grad:
+            a.register_hook(_invalidate)
+        if b.requires_grad:
+            b.register_hook(_invalidate)
         return a, b
 
     def eval(self, y: torch.Tensor | None = None, index: int | None = None):

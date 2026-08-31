@@ -17,6 +17,10 @@ class SeparableBeta(DensityModel):
     ``min_concentration`` while remaining trainable. The default floor of 1
     keeps the density bounded, so ``supremum_bound()`` is finite and
     differentiable in the parameters.
+
+    ``n_basis > 1`` gives an independent Beta product per basis index.
+    Then ``log_density`` has shape ``(n_data, n_basis)`` and
+    ``supremum_bound`` has shape ``(n_basis,)``.
     """
 
     def __init__(
@@ -24,16 +28,20 @@ class SeparableBeta(DensityModel):
         dim: int,
         alpha: torch.Tensor | float | None = None,
         beta: torch.Tensor | float | None = None,
+        n_basis: int = 1,
         min_concentration: float = 1.0,
         eps: float = 1e-6,
     ):
         super().__init__(dim=dim)
+        if n_basis < 1:
+            raise ValueError("n_basis must be at least 1")
         if min_concentration < 0:
             raise ValueError("min_concentration must be nonnegative")
+        self.n_basis = n_basis
         self.min_concentration = min_concentration
         self.eps = eps
-        alpha = self._positive_vector(alpha, dim, "alpha")
-        beta = self._positive_vector(beta, dim, "beta")
+        alpha = self._positive_tensor(alpha, dim, n_basis, "alpha")
+        beta = self._positive_tensor(beta, dim, n_basis, "beta")
         self.raw_alpha = torch.nn.Parameter(self._to_raw(alpha, "alpha"))
         self.raw_beta = torch.nn.Parameter(self._to_raw(beta, "beta"))
 
@@ -46,16 +54,37 @@ class SeparableBeta(DensityModel):
         return value.log()
 
     @staticmethod
-    def _positive_vector(value: torch.Tensor | float | None, dim: int, name: str) -> torch.Tensor:
+    def _positive_tensor(
+        value: torch.Tensor | float | None,
+        dim: int,
+        n_basis: int,
+        name: str,
+    ) -> torch.Tensor:
         if value is None:
-            return torch.ones(dim)
-        t = torch.as_tensor(value, dtype=torch.float32).reshape(-1)
-        if t.numel() == 1:
-            t = t.expand(dim).clone()
-        if t.numel() != dim:
-            raise ValueError(f"{name} must have 1 or {dim} entries, got {t.numel()}")
+            t = torch.ones(dim)
+        else:
+            t = torch.as_tensor(value, dtype=torch.float32)
+            if t.ndim == 0 or t.numel() == 1:
+                t = t.reshape(()).expand(dim).clone()
+            elif tuple(t.shape) == (dim,):
+                t = t.clone()
+            elif tuple(t.shape) == (n_basis, dim):
+                if not torch.all(t > 0):
+                    raise ValueError(f"{name} must be positive")
+                return t
+            elif tuple(t.shape) == (n_basis,) and dim == 1:
+                if not torch.all(t > 0):
+                    raise ValueError(f"{name} must be positive")
+                return t.unsqueeze(-1)
+            else:
+                raise ValueError(
+                    f"{name} must have shape (), ({dim},), ({n_basis},), or "
+                    f"({n_basis}, {dim}), got {tuple(t.shape)}"
+                )
         if not torch.all(t > 0):
             raise ValueError(f"{name} must be positive")
+        if n_basis > 1:
+            t = t.unsqueeze(0).expand(n_basis, dim).clone()
         return t
 
     def concentrations(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -70,10 +99,26 @@ class SeparableBeta(DensityModel):
         return self.raw_alpha.dtype, self.raw_alpha.device
 
     def log_density(self, x: torch.Tensor, **contexts: torch.Tensor) -> torch.Tensor:
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
         alpha, beta = self.concentrations()
         x_c = x.clamp(self.eps, 1.0 - self.eps)
-        log_p = torch.distributions.Beta(alpha, beta).log_prob(x_c).sum(dim=-1)
+        dist = torch.distributions.Beta(alpha, beta)
+        if x_c.ndim == 2:
+            if x_c.shape[1] != self.dim:
+                raise ValueError(f"x must have shape (n_data, {self.dim}), got {tuple(x.shape)}")
+            if alpha.ndim == 1:
+                log_p = dist.log_prob(x_c).sum(dim=-1)
+            else:
+                log_p = dist.log_prob(x_c.unsqueeze(1)).sum(dim=-1)
+        elif x_c.ndim == 3:
+            if x_c.shape[-1] != self.dim:
+                raise ValueError(f"x must have trailing dim {self.dim}, got {tuple(x.shape)}")
+            if alpha.ndim == 2 and x_c.shape[1] != alpha.shape[0]:
+                raise ValueError(
+                    f"x index axis {x_c.shape[1]} must match n_basis {alpha.shape[0]}"
+                )
+            log_p = dist.log_prob(x_c).sum(dim=-1)
+        else:
+            raise ValueError(f"x must have 2 or 3 dims, got {tuple(x.shape)}")
         return self._clip_log_density(log_p)
 
     def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
@@ -88,9 +133,8 @@ class SeparableBeta(DensityModel):
 
             ((α-1)^{α-1} (β-1)^{β-1} / (α+β-2)^{α+β-2}) / B(α, β)
 
-        with the convention 0 log 0 = 0, which also covers the uniform, strictly
-        decreasing, and strictly increasing endpoint cases. If α < 1 or β < 1 the
-        density is unbounded and the result is +∞.
+        with the convention 0 log 0 = 0. If α < 1 or β < 1 the density is
+        unbounded and the result is +∞.
         """
         a1 = (alpha - 1.0).clamp(min=0.0)
         b1 = (beta - 1.0).clamp(min=0.0)
@@ -104,16 +148,23 @@ class SeparableBeta(DensityModel):
 
     def supremum_bound(self) -> torch.Tensor:
         alpha, beta = self.concentrations()
-        return self._log_mode_1d(alpha, beta).sum().exp()
+        return self._log_mode_1d(alpha, beta).sum(dim=-1).exp()
 
     def marginal(self, marginal_dims: tuple[int, ...]) -> "SeparableBeta":
         dims = tuple(marginal_dims)
         assert all(0 <= i < self.dim for i in dims), "marginal_dims must be in [0, dim)"
         alpha, beta = self.concentrations()
+        if alpha.ndim == 1:
+            a, b = alpha[list(dims)].detach().clone(), beta[list(dims)].detach().clone()
+            n_basis = 1
+        else:
+            a, b = alpha[:, list(dims)].detach().clone(), beta[:, list(dims)].detach().clone()
+            n_basis = alpha.shape[0]
         return SeparableBeta(
             dim=len(dims),
-            alpha=alpha[list(dims)].detach().clone(),
-            beta=beta[list(dims)].detach().clone(),
+            alpha=a,
+            beta=b,
+            n_basis=n_basis,
             min_concentration=self.min_concentration,
             eps=self.eps,
         )

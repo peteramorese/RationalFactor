@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as torch_F
 
 from rational_factor.models.parameters import Parameters
+
+
+def _inclusive_affine_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Inclusive scan of maps ``x ↦ a x + b``. Returns ``(op_i ∘ ⋯ ∘ op_0)(0)``."""
+    n = a.shape[-1]
+    k = 1
+    while k < n:
+        a_l, b_l = a[..., :-k], b[..., :-k]
+        a_r, b_r = a[..., k:], b[..., k:]
+        b = torch.cat((b[..., :k], a_r * b_l + b_r), dim=-1)
+        a = torch.cat((a[..., :k], a_r * a_l), dim=-1)
+        k *= 2
+    return b
+
+
+def _affine_scan_from_zero(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``s[..., 0] = 0``, ``s[..., i+1] = a[..., i] s[..., i] + b[..., i]``.
+
+    ``a, b`` have shape ``(..., n)`` (``n`` transitions). Result is ``(..., n+1)``.
+    """
+    a, b = torch.broadcast_tensors(a, b)
+    zero = b.new_zeros(b.shape[:-1] + (1,))
+    if a.shape[-1] == 0:
+        return zero
+    return torch.cat((zero, _inclusive_affine_scan(a, b)), dim=-1)
 
 
 def _semiseparable(
@@ -29,21 +53,42 @@ def _semiseparable(
         x, p, a, q = x.flip(-1), p.flip(-1), a.flip(-1), q.flip(-1)
 
     m = x.shape[-1]
-    state = torch.zeros_like(x[..., 0])
-    sign = -1.0 if solve else 1.0
-    cols = []
-    for i in range(m):
-        yi = x[..., i] + sign * p[..., i] * state
-        cols.append(yi)
-        if i < m - 1:
-            src = yi if solve else x[..., i]
-            state = a[..., i] * state + q[..., i] * src
-    out = torch.stack(cols, dim=-1)
-    return out.flip(-1) if reverse else out
+    if m == 1:
+        y = x
+    else:
+        if solve:
+            trans_a = a[..., :-1] - q[..., :-1] * p[..., :-1]
+            trans_b = q[..., :-1] * x[..., :-1]
+        else:
+            trans_a = a[..., :-1]
+            trans_b = q[..., :-1] * x[..., :-1]
+        s = _affine_scan_from_zero(trans_a, trans_b)
+        sign = -1.0 if solve else 1.0
+        y = x + sign * p * s
+    return y.flip(-1) if reverse else y
 
 
-def _stack_cols(cols: list[torch.Tensor]) -> torch.Tensor:
-    return torch.stack(cols, dim=-1)
+def _strict_lower_scale(a: torch.Tensor) -> torch.Tensor:
+    """``S[..., i, j] = prod_{k=j+1}^{i-1} a[..., k]`` for ``i > j`` (empty product is 1)."""
+    m = a.shape[-1]
+    ones = torch.ones_like(a)
+    idx_i = torch.arange(m, device=a.device).view(*([1] * (a.ndim - 1)), m, 1)
+    idx_j = torch.arange(m, device=a.device).view(*([1] * (a.ndim - 1)), 1, m)
+    factors = torch.where(idx_i > idx_j, a.unsqueeze(-1), ones.unsqueeze(-1))
+    cprod = torch.cumprod(factors, dim=-2)
+    scale = a.new_zeros(a.shape + (m,))
+    scale[..., 1:, :] = cprod[..., :-1, :]
+    return scale
+
+
+def _qs_strict_lower(p: torch.Tensor, a: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Strict lower triangle ``M[i, j] = p[i] (prod_{k=j+1}^{i-1} a[k]) q[j]``."""
+    return torch.tril(p.unsqueeze(-1) * _strict_lower_scale(a) * q.unsqueeze(-2), diagonal=-1)
+
+
+def _qs_strict_upper(g: torch.Tensor, b: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    """Strict upper triangle ``M[i, j] = g[i] (prod_{k=i+1}^{j-1} b[k]) h[j]``."""
+    return _qs_strict_lower(g.flip(-1), b.flip(-1), h.flip(-1)).flip(-1).flip(-2)
 
 
 @dataclass
@@ -71,52 +116,17 @@ class Order1QSGenerators:
         return self.d.shape[-1]
 
     def row_minmax(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Exact per-row min/max over columns in ``O(m)`` time."""
-        m = self.n
-        row_min_cols = [self.d[..., i] for i in range(m)]
-        row_max_cols = [self.d[..., i] for i in range(m)]
-
-        def _sweep(p, a, q, forward: bool) -> None:
-            state_min = state_max = None
-            idx = range(m) if forward else range(m - 1, -1, -1)
-            for i in idx:
-                has_off = (i > 0) if forward else (i < m - 1)
-                grow = (i < m - 1) if forward else (i > 0)
-                start = (i == 0) if forward else (i == m - 1)
-
-                if has_off:
-                    z1, z2 = p[..., i] * state_min, p[..., i] * state_max
-                    row_min_cols[i] = torch.minimum(row_min_cols[i], torch.minimum(z1, z2))
-                    row_max_cols[i] = torch.maximum(row_max_cols[i], torch.maximum(z1, z2))
-
-                if grow:
-                    if start:
-                        state_min = state_max = q[..., i]
-                    else:
-                        z1, z2 = a[..., i] * state_min, a[..., i] * state_max
-                        state_min = torch.minimum(q[..., i], torch.minimum(z1, z2))
-                        state_max = torch.maximum(q[..., i], torch.maximum(z1, z2))
-
-        _sweep(self.p, self.a, self.q, forward=True)
-        _sweep(self.g, self.b, self.h, forward=False)
-        return torch.stack(row_min_cols, dim=-1), torch.stack(row_max_cols, dim=-1)
+        """Exact per-row min/max over columns."""
+        M = self.to_dense()
+        return M.amin(dim=-1), M.amax(dim=-1)
 
     def to_dense(self) -> torch.Tensor:
-        """Materialize the full matrix (``O(m^2)``, debug only)."""
-        m = self.n
-        M = torch.diag_embed(self.d)
-
-        prod = self.q.clone()
-        for i in range(1, m):
-            M[..., i, :i] = self.p[..., i].unsqueeze(-1) * prod[..., :i]
-            prod[..., :i] = prod[..., :i] * self.a[..., i].unsqueeze(-1)
-
-        prod = self.h.clone()
-        for i in range(m - 2, -1, -1):
-            M[..., i, i + 1 :] = self.g[..., i].unsqueeze(-1) * prod[..., i + 1 :]
-            prod[..., i + 1 :] = prod[..., i + 1 :] * self.b[..., i].unsqueeze(-1)
-
-        return M
+        """Materialize the full matrix (``O(m^2)``, debug / row extrema)."""
+        return (
+            torch.diag_embed(self.d)
+            + _qs_strict_lower(self.p, self.a, self.q)
+            + _qs_strict_upper(self.g, self.b, self.h)
+        )
 
 
 class Order1Quasiseparable:
@@ -171,19 +181,17 @@ class Order1Quasiseparable:
 
     def direct_generators(self) -> Order1QSGenerators:
         """Direct QS generators of ``P`` itself (``O(m)``)."""
-        S = torch.zeros_like(self.d[..., 0])
-        qP, dP, gP = [], [], []
-        for i in range(self.n):
-            lp, la, lq = self.lp[..., i], self.la[..., i], self.lq[..., i]
-            d, ug, ub, uh = self.d[..., i], self.ug[..., i], self.ub[..., i], self.uh[..., i]
-            dP.append(d + lp * uh * S)
-            qP.append(lq * d + la * uh * S)
-            gP.append(d * ug + lp * ub * S)
-            S = lq * d * ug + la * ub * S
+        trans_a = self.la[..., :-1] * self.ub[..., :-1]
+        trans_b = self.lq[..., :-1] * self.d[..., :-1] * self.ug[..., :-1]
+        S = _affine_scan_from_zero(trans_a, trans_b)
         return Order1QSGenerators(
-            p=self.lp, a=self.la, q=_stack_cols(qP),
-            d=_stack_cols(dP),
-            g=_stack_cols(gP), b=self.ub, h=self.uh,
+            p=self.lp,
+            a=self.la,
+            q=self.lq * self.d + self.la * self.uh * S,
+            d=self.d + self.lp * self.uh * S,
+            g=self.d * self.ug + self.lp * self.ub * S,
+            b=self.ub,
+            h=self.uh,
         )
 
     def inverse_transpose_generators(self) -> Order1QSGenerators:
@@ -194,24 +202,17 @@ class Order1Quasiseparable:
         B_p, B_a, B_q = self.uh, self.ub - self.uh * self.ug, -self.ug
         Dinv = self.d.reciprocal()
 
-        T = torch.zeros_like(self.d[..., 0])
-        pQ, dQ, hQ = [], [], []
-        for i in range(self.n - 1, -1, -1):
-            Ag, Ab, Ah = A_g[..., i], A_b[..., i], A_h[..., i]
-            Bp, Ba, Bq = B_p[..., i], B_a[..., i], B_q[..., i]
-            dinv = Dinv[..., i]
-            dQ.append(dinv + Ag * Bq * T)
-            pQ.append(dinv * Bp + Ag * Ba * T)
-            hQ.append(Ah * dinv + Ab * Bq * T)
-            T = Ah * dinv * Bp + Ab * Ba * T
-
-        pQ.reverse()
-        dQ.reverse()
-        hQ.reverse()
+        trans_a = (A_b * B_a).flip(-1)[..., :-1]
+        trans_b = (A_h * Dinv * B_p).flip(-1)[..., :-1]
+        T = _affine_scan_from_zero(trans_a, trans_b).flip(-1)
         return Order1QSGenerators(
-            p=_stack_cols(pQ), a=B_a, q=B_q,
-            d=_stack_cols(dQ),
-            g=A_g, b=A_b, h=_stack_cols(hQ),
+            p=Dinv * B_p + A_g * B_a * T,
+            a=B_a,
+            q=B_q,
+            d=Dinv + A_g * B_q * T,
+            g=A_g,
+            b=A_b,
+            h=A_h * Dinv + A_b * B_q * T,
         )
 
     def to_dense(self) -> torch.Tensor:

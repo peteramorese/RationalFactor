@@ -121,6 +121,14 @@ def main() -> None:
     assert samples_b.shape == (1024, 2)
     assert torch.all(samples_b >= 0) and torch.all(samples_b <= 1)
 
+    fam = SeparableBeta(dim=1, n_basis=3, alpha=torch.tensor([2.0, 3.0, 4.0]), beta=2.0)
+    y_f = torch.rand(32, 1, generator=g)
+    logp_f = fam.log_density(y_f)
+    assert logp_f.shape == (32, 3)
+    assert fam.supremum_bound().shape == (3,)
+    assert (logp_f[:, 0] - logp_f[:, 1]).abs().max() > 1e-4
+    print(f"family Beta log-density shape:    {tuple(logp_f.shape)}")
+
     product.supremum_bound().backward()
     assert product.raw_alpha.grad is not None and product.raw_alpha.grad.abs().sum() > 0
     bern.supremum_bound().backward()

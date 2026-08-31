@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import torch
 
-from normalizing_flow.base_distributions import SeparableBeta
 from normalizing_flow.vp_flow import VolumePreservingFlow
+from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.domain_transformation import MLP
 from rational_factor.models.gram import Omega2Gram
 from rational_factor.models.mutual_bases import (
@@ -19,7 +19,7 @@ from rational_factor.models.mutual_bases import (
     PositiveMaskedGramMutualBasis,
     VolumePreservingPairBasis,
 )
-from rational_factor.models.parameters import Parameters
+from rational_factor.models.parameters import Parameters, PositiveParameters
 from rational_factor.models.qs_matrix import Order1QuasiseparableFactorization
 
 
@@ -63,24 +63,28 @@ def _make_vp(n_basis: int, rest_dim: int) -> VolumePreservingPairBasis:
         num_hidden_layers=2,
         zero_init=False,
     )
-    base = SeparableBeta(dim=rest_dim, alpha=2.0, beta=2.0)
+    shape = (1, rest_dim, 1)
+    base = BetaBasis(
+        PositiveParameters.set_init(shape, 0.0, epsilon=1.0),
+        PositiveParameters.set_init(shape, 0.0, epsilon=1.0),
+    )
     embedding = torch.nn.Embedding(n_basis, CONDITIONER_DIM)
     splitter = MLP(
-        in_features=rest_dim,
-        out_features=n_basis,
+        in_features=rest_dim + CONDITIONER_DIM,
+        out_features=1,
         hidden_features=16,
         num_hidden_layers=2,
         zero_init_last=True,
     )
-    return VolumePreservingPairBasis(flow, base, splitter, embedding)
+    return VolumePreservingPairBasis(base, splitter, embedding, flow)
 
 
 def main() -> None:
     torch.manual_seed(SEED)
     pwc = _make_pwc(N_BASIS, SEED)
     vp = _make_vp(N_BASIS, DIM - 1)
-    unsigned = MaskedGramMutualBasis(pwc, vp, sacrificial_index=SACRIFICIAL)
-    pos = PositiveMaskedGramMutualBasis(pwc, vp, sacrificial_index=SACRIFICIAL)
+    unsigned = MaskedGramMutualBasis(pwc, SACRIFICIAL, vp)
+    pos = PositiveMaskedGramMutualBasis(pwc, SACRIFICIAL, vp)
     pos.eval()
     unsigned.eval()
 

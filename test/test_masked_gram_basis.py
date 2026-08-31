@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import torch
 
-from normalizing_flow.base_distributions import SeparableBeta
 from normalizing_flow.vp_flow import VolumePreservingFlow
+from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.domain_transformation import MLP
 from rational_factor.models.mutual_bases import (
     MaskedGramMutualBasis,
     Orthogonal1DPWCBasis,
     VolumePreservingPairBasis,
 )
-from rational_factor.models.parameters import Parameters
+from rational_factor.models.parameters import Parameters, PositiveParameters
 from rational_factor.models.qs_matrix import Order1QuasiseparableFactorization
 
 
@@ -63,17 +63,21 @@ def main() -> None:
         num_hidden_layers=2,
         zero_init=False,
     )
-    base = SeparableBeta(dim=rest_dim, alpha=2.0, beta=2.0)
+    shape = (1, rest_dim, 1)
+    base = BetaBasis(
+        PositiveParameters.set_init(shape, 0.0, epsilon=1.0),
+        PositiveParameters.set_init(shape, 0.0, epsilon=1.0),
+    )
     embedding = torch.nn.Embedding(N_BASIS, CONDITIONER_DIM)
     splitter = MLP(
-        in_features=rest_dim,
-        out_features=N_BASIS,
+        in_features=rest_dim + CONDITIONER_DIM,
+        out_features=1,
         hidden_features=16,
         num_hidden_layers=2,
         zero_init_last=True,
     )
-    vp = VolumePreservingPairBasis(flow, base, splitter, embedding)
-    masked = MaskedGramMutualBasis(pwc, vp, sacrificial_index=SACRIFICIAL)
+    vp = VolumePreservingPairBasis(base, splitter, embedding, flow)
+    masked = MaskedGramMutualBasis(pwc, SACRIFICIAL, vp)
     masked.eval()
 
     y = 0.05 + 0.9 * torch.rand(N_POINTS, DIM)

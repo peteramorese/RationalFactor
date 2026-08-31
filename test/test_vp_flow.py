@@ -113,6 +113,14 @@ def main() -> None:
     print(f"max |log|det J||:         {max_logdet:.3e}")
     assert max_logdet < LOGDET_TOL, f"discrete map is not volume-preserving: {max_logdet}"
 
+    flow_1d = VolumePreservingFlow(dim=1, conditioner_dim=CONDITIONER_DIM, n_steps=8, zero_init=False)
+    x1 = _random_interior(N_POINTS, 1, g)
+    c1 = torch.randn(N_POINTS, CONDITIONER_DIM, generator=g)
+    z1, ladj1 = flow_1d.forward(x1, conditioner=c1)
+    assert torch.equal(z1, x1) and torch.equal(ladj1, torch.zeros(N_POINTS))
+
+    print("1D flow is identity:      ok")
+
     ident = VolumePreservingFlow(
         dim=DIM,
         conditioner_dim=CONDITIONER_DIM,

@@ -36,6 +36,9 @@ class CompositeDensityModel(DensityModel):
             domain_tfs=[tf.marginal(marginal_dims) for tf in self.domain_tfs],
             density_model=self.density_model.marginal(marginal_dims),
         )
+    
+    def dtype_device(self):
+        return self.density_model.dtype_device()
 
 class CompositeConditionalModel(ConditionalDensityModel):
     def __init__(self, domain_tfs: DomainTF | Sequence[DomainTF], conditional_density_model: ConditionalDensityModel, tf_conditioner_only: bool = False):

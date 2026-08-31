@@ -61,15 +61,18 @@ class Basis:
             for coeffs in basis._coeffs_register():
                 if coeffs.is_module() and id(coeffs) not in coeffs_seen:
                     unique_coeffs.append(coeffs)
+                    coeffs_seen[id(coeffs)] = coeffs
+            owner = getattr(basis, "owner", None)
+            if isinstance(owner, torch.nn.Module):
+                if id(owner) not in params_seen:
+                    unique_params.append(owner)
+                    params_seen[id(owner)] = owner
+                continue
             for params in basis._params_register():
                 for param in params:
                     if param.is_module() and id(param) not in params_seen:
                         unique_params.append(param)
                         params_seen[id(param)] = param
-            owner = getattr(basis, "owner", None)
-            if isinstance(owner, torch.nn.Module) and id(owner) not in params_seen:
-                unique_params.append(owner)
-                params_seen[id(owner)] = owner
         return unique_params, unique_coeffs
 
     def forward(self, y : torch.Tensor):
@@ -492,6 +495,20 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
             - BetaGram.log_beta(alpha, beta)
         )
         return torch.exp(log_dim)  # (batch, dim, n_basis)
+
+    def supremum_bound(self) -> torch.Tensor:
+        """Product of per-coordinate Beta PDF suprema, shape ``(batch, n_basis)``."""
+        alpha, beta = self.alphas_betas()
+        a1 = (alpha - 1.0).clamp(min=0.0)
+        b1 = (beta - 1.0).clamp(min=0.0)
+        s = a1 + b1
+        log_sup = (
+            torch.xlogy(a1, a1) + torch.xlogy(b1, b1) - torch.xlogy(s, s)
+            - BetaGram.log_beta(alpha, beta)
+        )
+        finite = (alpha >= 1.0) & (beta >= 1.0)
+        log_sup = torch.where(finite, log_sup, torch.full_like(log_sup, math.inf))
+        return log_sup.sum(dim=1).exp() * self.coeffs()
 
     def log_Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         alpha, beta = self.alphas_betas()

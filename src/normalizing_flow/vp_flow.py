@@ -209,6 +209,9 @@ class VolumePreservingFlow(DomainTF):
 
     def forward(self, x: torch.Tensor, *, conditioner: torch.Tensor):
         assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        # 1D skew-symmetric A is identically 0, so v ≡ 0 and T is the identity.
+        if self.dim == 1:
+            return x, x.new_zeros(x.shape[0])
         conditioner = self._prepare_conditioner(x, conditioner)
         z = self._rk4(x, 0.0, 1.0, conditioner)
         ladj = x.new_zeros(x.shape[0])
@@ -216,6 +219,8 @@ class VolumePreservingFlow(DomainTF):
 
     def inverse(self, z: torch.Tensor, *, conditioner: torch.Tensor):
         assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
+        if self.dim == 1:
+            return z, z.new_zeros(z.shape[0])
         conditioner = self._prepare_conditioner(z, conditioner)
         x = self._rk4(z, 1.0, 0.0, conditioner)
         ladj = z.new_zeros(z.shape[0])

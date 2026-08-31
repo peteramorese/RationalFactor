@@ -67,12 +67,13 @@ class LinearRFF(ConditionalDensityModel):
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         x = conditioner
 
-        log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance)
-        log_g_xp = torch.log(self.g(xp).sum(dim=-1) + self.numerical_tolerance)
+        g_x = self.g(x)
+        g_xp = self.g(xp)
+        log_g_x = torch.log(g_x.sum(dim=-1) + self.numerical_tolerance)
+        log_g_xp = torch.log(g_xp.sum(dim=-1) + self.numerical_tolerance)
 
-        phi = copy.copy(self.g)
-        phi.set_coeffs_to_one()
-        phi_x = phi(x)
+        a = self.g.coeffs().to(dtype=g_x.dtype, device=g_x.device)
+        phi_x = g_x / a.clamp_min(self.numerical_tolerance)
         psi_xp = self.psi(xp)
         b = self.get_b()
 
