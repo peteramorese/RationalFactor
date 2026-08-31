@@ -30,16 +30,15 @@ def _semiseparable(
 
     m = x.shape[-1]
     state = torch.zeros_like(x[..., 0])
-    out = x.new_empty(x.shape)
     sign = -1.0 if solve else 1.0
-
+    cols = []
     for i in range(m):
         yi = x[..., i] + sign * p[..., i] * state
-        out[..., i] = yi
+        cols.append(yi)
         if i < m - 1:
             src = yi if solve else x[..., i]
             state = a[..., i] * state + q[..., i] * src
-
+    out = torch.stack(cols, dim=-1)
     return out.flip(-1) if reverse else out
 
 
@@ -74,8 +73,8 @@ class Order1QSGenerators:
     def row_minmax(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Exact per-row min/max over columns in ``O(m)`` time."""
         m = self.n
-        row_min = self.d.clone()
-        row_max = self.d.clone()
+        row_min_cols = [self.d[..., i] for i in range(m)]
+        row_max_cols = [self.d[..., i] for i in range(m)]
 
         def _sweep(p, a, q, forward: bool) -> None:
             state_min = state_max = None
@@ -87,8 +86,8 @@ class Order1QSGenerators:
 
                 if has_off:
                     z1, z2 = p[..., i] * state_min, p[..., i] * state_max
-                    row_min[..., i] = torch.minimum(row_min[..., i], torch.minimum(z1, z2))
-                    row_max[..., i] = torch.maximum(row_max[..., i], torch.maximum(z1, z2))
+                    row_min_cols[i] = torch.minimum(row_min_cols[i], torch.minimum(z1, z2))
+                    row_max_cols[i] = torch.maximum(row_max_cols[i], torch.maximum(z1, z2))
 
                 if grow:
                     if start:
@@ -100,7 +99,7 @@ class Order1QSGenerators:
 
         _sweep(self.p, self.a, self.q, forward=True)
         _sweep(self.g, self.b, self.h, forward=False)
-        return row_min, row_max
+        return torch.stack(row_min_cols, dim=-1), torch.stack(row_max_cols, dim=-1)
 
     def to_dense(self) -> torch.Tensor:
         """Materialize the full matrix (``O(m^2)``, debug only)."""

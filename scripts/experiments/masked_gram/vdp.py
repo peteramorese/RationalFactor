@@ -41,11 +41,11 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 400
+    n_basis = 200
     sacrificial_index = 0
     conditioner_dim = 8
     flow_n_steps = 4
-    flow_hidden = 32
+    flow_hidden = 16
     flow_layers = 2
     tran_params = {
         "n_epochs_per_group": [5, 5],  # basis, weights
