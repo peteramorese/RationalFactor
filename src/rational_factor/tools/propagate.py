@@ -1,7 +1,7 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
 from rational_factor.models.composite_model import CompositeConditionalModel
-from rational_factor.models.parameters import Parameters
-from rational_factor.models.gram import Omega2Gram
+from rational_factor.models.parameters import FixedParameters
+from rational_factor.models.structured_matrices import Matrix
 import torch
 import copy 
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
@@ -23,8 +23,8 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         psi0 = copy.copy(init_belief.h)
         psi0.set_coeffs_to_one()
 
-        Omega2_0 = Omega2Gram(phi.Omega2(psi0))
-        Omega2 = Omega2Gram(phi.Omega2(transition_model.psi))
+        Omega2_0 = phi.Omega2(psi0)
+        Omega2 = phi.Omega2(transition_model.psi)
 
         b = transition_model.get_b(Omega2=Omega2)
 
@@ -32,16 +32,16 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         c0 = c0_norm_constant * init_belief.h.coeffs()
 
         h0 = copy.copy(init_belief.h)
-        h0.set_coeffs(Parameters(c0))
+        h0.set_coeffs(FixedParameters(c0))
         h_seq = [h0]
         c1 = b * Omega2_0.matvec(c0)
         h1 = copy.copy(transition_model.psi)
-        h1.set_coeffs(Parameters(c1))
+        h1.set_coeffs(FixedParameters(c1))
         h_seq.append(h1)
         for _ in range(1, n_steps):
             ck = b * Omega2.matvec(h_seq[-1].coeffs())
             hk = copy.copy(transition_model.psi)
-            hk.set_coeffs(Parameters(ck))
+            hk.set_coeffs(FixedParameters(ck))
             h_seq.append(hk)
         
         belief_seq = [LinearFF(init_belief.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
@@ -57,8 +57,8 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         psi0 = copy.copy(init_belief.h)
         psi0.set_coeffs_to_one()
 
-        Omega2_0 = Omega2Gram(phi.Omega2(psi0))
-        Omega2 = Omega2Gram(phi.Omega2(transition_model.psi))
+        Omega2_0 = phi.Omega2(psi0)
+        Omega2 = phi.Omega2(transition_model.psi)
         
         B = transition_model.B()
         Gamma = transition_model.get_Gamma(B=B, Omega2=Omega2)
@@ -67,22 +67,22 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         c0 = c0_norm_constant * init_belief.h.coeffs()
 
         h0 = copy.copy(init_belief.h)
-        h0.set_coeffs(Parameters(c0))
+        h0.set_coeffs(FixedParameters(c0))
         h_seq = [h0]
         
-        def _Omega2_GammaT_B_matmul(c : torch.tensor, _Omega2 : Omega2Gram):
-            s1 = _Omega2.matvec(c)  # s1 = Omega2 * c
-            s2 = torch.einsum("bji,bj->bi", Gamma, s1) # s2 = Gamma^T * s1
-            return torch.einsum("bij,bj->bi", B, s2) # B * s2
+        def _Omega2_GammaT_B_matmul(c : torch.tensor, _Omega2 : Matrix):
+            s1 = _Omega2.matvec(c)
+            s2 = Gamma.rev_matvec(s1)
+            return B.matvec(s2)
         
         c1 = _Omega2_GammaT_B_matmul(c0, Omega2_0)
         h1 = copy.copy(transition_model.psi)
-        h1.set_coeffs(Parameters(c1))
+        h1.set_coeffs(FixedParameters(c1))
         h_seq.append(h1)
         for _ in range(1, n_steps):
             ck = _Omega2_GammaT_B_matmul(h_seq[-1].coeffs(), Omega2)
             hk = copy.copy(transition_model.psi)
-            hk.set_coeffs(Parameters(ck))
+            hk.set_coeffs(FixedParameters(ck))
             h_seq.append(hk)
         belief_seq = [LinearFF(transition_model.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False) for h in h_seq]
 
@@ -115,7 +115,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         def _prop(curr_belief : LinearFF | Linear2FF):
             # Compute first belief propagation
             if isinstance(curr_belief, LinearFF):
-                Omega_0 = Omega2Gram(curr_belief.phi_basis.Omega2(curr_belief.psi0_basis))
+                Omega_0 = curr_belief.phi_basis.Omega2(curr_belief.psi0_basis)
                 b = transition_model.get_b()
                 c0 = curr_belief.get_c0(Omega_0=Omega_0.to_dense())
                 c1 = b * Omega_0.matvec(c0)

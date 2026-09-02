@@ -181,6 +181,21 @@ def main() -> None:
     assert unique_raw.grad.abs().sum() > 0
     print(f"unique base n col gap: {(n_u[:, 0] - n_u[:, 1]).abs().max().item():.3e}")
 
+    pair_0d = VolumePreservingPairBasis(
+        _beta_basis(0),
+        MLP(in_features=CONDITIONER_DIM, out_features=1, hidden_features=16, num_hidden_layers=2, zero_init_last=True),
+        torch.nn.Embedding(N_BASIS, CONDITIONER_DIM),
+    )
+    y0 = torch.empty(N_POINTS, 0)
+    n0 = pair_0d.flow_density(y0)
+    a0 = pair_0d.eval(y0, index=0)
+    b0 = pair_0d.eval(y0, index=1)
+    assert torch.allclose(n0, torch.ones(N_POINTS, N_BASIS))
+    assert torch.allclose(a0, torch.ones(N_POINTS, N_BASIS))
+    assert torch.allclose(b0, torch.ones(N_POINTS, N_BASIS))
+    assert torch.allclose(pair_0d.supremum(0), torch.ones(1, N_BASIS))
+    assert torch.allclose(pair_0d.supremum(1), torch.ones(1, N_BASIS))
+
     print("ok")
 
 

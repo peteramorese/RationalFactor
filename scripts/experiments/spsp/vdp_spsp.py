@@ -1,5 +1,5 @@
 import torch
-from rational_factor.models.parameters import TrainableParameters, PositiveParameters, param_group_iter
+from rational_factor.models.parameters import TrainableParameters, PositiveParameters, param_group_iter, DenseMatrixFactorization
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid, check_conditional_pdf_valid
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
@@ -73,8 +73,10 @@ if __name__ == "__main__":
     g_coeffs = PositiveParameters.random_init(shape=(1, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=1e-3).to(device)
     h0_coeffs = PositiveParameters.random_init(shape=(1, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
 
-    B = PositiveParameters.random_init(shape=(1, n_output_basis, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
-    P = PositiveParameters.random_init(shape=(1, n_output_basis, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+    B_params = PositiveParameters.random_init(shape=(1, n_output_basis, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+    P_params = PositiveParameters.random_init(shape=(1, n_output_basis, n_output_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), normalization_dim=2).to(device)
+    B = DenseMatrixFactorization(B_params)
+    P = DenseMatrixFactorization(P_params)
 
     # Create basis functions
     phi_leaf_basis = GaussianBasis(phi_means, phi_stds)
@@ -92,7 +94,7 @@ if __name__ == "__main__":
     mle_loss_fn = loss.conditional_mle_loss
     
     rff_basis_params = param_group_iter([phi_means, phi_stds, psi_means, psi_stds])
-    rff_weight_params = param_group_iter([g_coeffs, phi_matrix_coeffs, psi_matrix_coeffs, B, P])
+    rff_weight_params = param_group_iter([g_coeffs, phi_matrix_coeffs, psi_matrix_coeffs, B_params, P_params])
     optimizers ={"basis": torch.optim.Adam(rff_basis_params, lr=tran_params["lr_basis"]), "weights": torch.optim.Adam(rff_weight_params, lr=tran_params["lr_weights"])} 
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(tran_model,
@@ -121,8 +123,8 @@ if __name__ == "__main__":
     psi_stds.set_requires_grad(False)
     psi_matrix_coeffs.set_requires_grad(False)
     g_coeffs.set_requires_grad(False)
-    B.set_requires_grad(False)
-    P.set_requires_grad(False)
+    B_params.set_requires_grad(False)
+    P_params.set_requires_grad(False)
 
     init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)
 

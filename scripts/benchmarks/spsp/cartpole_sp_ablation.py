@@ -22,7 +22,7 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF
-from rational_factor.models.parameters import PositiveParameters, TrainableParameters, param_group_iter
+from rational_factor.models.parameters import PositiveParameters, TrainableParameters, param_group_iter, DenseMatrixFactorization
 from rational_factor.models.sum_prod_basis import SumProdBasis
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
@@ -220,10 +220,12 @@ def main() -> None:
 
         if sp_model:
             raw = _near_diagonal_raw(n_model_basis, device)
-            B = PositiveParameters.from_values(values=raw.clone(), trainable=True).to(device)
-            P = PositiveParameters.from_values(
+            B_params = PositiveParameters.from_values(values=raw.clone(), trainable=True).to(device)
+            P_params = PositiveParameters.from_values(
                 values=raw.clone(), trainable=True, normalization_dim=2
             ).to(device)
+            B = DenseMatrixFactorization(B_params)
+            P = DenseMatrixFactorization(P_params)
             tran_model = SumProdRFF(g_basis, psi_basis, B, P).to(device)
         else:
             tran_model = LinearRFF(g_basis, psi_basis).to(device)
@@ -240,7 +242,7 @@ def main() -> None:
         ]
         if sp_model:
             adam_groups.append(
-                {"params": param_group_iter([B, P]), "lr": tran_params["lr_bp"]}
+                {"params": param_group_iter([B_params, P_params]), "lr": tran_params["lr_bp"]}
             )
 
         tran_model, best_loss_tran, training_time_tran = train.train_iterate(
@@ -264,8 +266,8 @@ def main() -> None:
             phi_matrix_coeffs.set_requires_grad(False)
             psi_matrix_coeffs.set_requires_grad(False)
         if sp_model:
-            B.set_requires_grad(False)
-            P.set_requires_grad(False)
+            B_params.set_requires_grad(False)
+            P_params.set_requires_grad(False)
 
         # ---- initial belief ----
         init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)

@@ -9,8 +9,9 @@ from nflows.transforms.base import CompositeTransform
 from nflows.transforms.permutations import ReversePermutation
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 
-from .parameters import Parameters, PositiveParameters
-from .gram import BetaGram, GaussianGram, Omega2Gram
+from .parameters import Parameters, FixedParameters, TrainableParameters, PositiveParameters
+from .gram import BetaGram, GaussianGram
+from .structured_matrices import DenseMatrix
 
 
 class Basis:
@@ -86,7 +87,7 @@ class Basis:
     
     def set_coeffs_to_one(self):
         dtype, device = self.dtype_device()
-        self.set_coeffs(Parameters(torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)))
+        self.set_coeffs(FixedParameters(torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)))
     
     def dim(self):
         return self._dim
@@ -275,7 +276,7 @@ class SeparableBasis(Basis):
         return torch.exp(self.log_Omega1_dim(lows, highs).sum(dim=1)) * self.coeffs()
     
     def Omega2(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
-        return Omega2Gram(
+        return DenseMatrix(
             torch.exp(self.log_Omega2_dim(other, lows, highs).sum(dim=1))
             * self.coeffs()[:, :, None]
             * other.coeffs()[:, None, :]
@@ -458,7 +459,7 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
 
         return GaussianBasis(
             params=(
-                Parameters.from_values(mu_flat, trainable=False),
+                TrainableParameters.from_values(mu_flat, trainable=False),
                 self._params[1].with_fixed_values(sigma_flat),
             ),
             coeffs=PositiveParameters.from_values(coeffs_new, trainable=False),

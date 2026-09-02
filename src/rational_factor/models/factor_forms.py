@@ -3,8 +3,8 @@ import copy
 import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
-from .gram import Omega2Gram
-from .parameters import PositiveParameters, Parameters
+from .parameters import Parameters
+from .structured_matrices import Matrix, as_matrix
 
 # Linear models #
 
@@ -90,7 +90,7 @@ class LinearRFF(ConditionalDensityModel):
             phi.set_coeffs_to_one()
             Omega2 = phi.Omega2(self.psi)
 
-        return a / (Omega2Gram(Omega2).rev_matvec(a) + self.numerical_tolerance)
+        return a / (as_matrix(Omega2).rev_matvec(a) + self.numerical_tolerance)
 
 class SumProdRFF(ConditionalDensityModel):
     def __init__(self, g : SeparableBasis, psi : SeparableBasis, B : Parameters, P : Parameters,
@@ -105,10 +105,15 @@ class SumProdRFF(ConditionalDensityModel):
         
         batch_size = g.batch_size()
         n_basis = g.n_basis_functions()
+        expected = (batch_size, n_basis, n_basis)
 
-        assert B().shape == (batch_size, n_basis, n_basis), "B must have shape (batch_size, n_basis, n_basis)"
-        assert P().shape == (batch_size, n_basis, n_basis), "P must have shape (batch_size, n_basis, n_basis)"
-        assert P.get_normalization_dim() == 2, "P must be normalized over the last dimension"
+        B_m, P_m = B(), P()
+        assert isinstance(B_m, Matrix) and B_m.shape == expected, (
+            f"B() must be a Matrix of shape {expected}, got {type(B_m).__name__} {tuple(getattr(B_m, 'shape', ()))}"
+        )
+        assert isinstance(P_m, Matrix) and P_m.shape == expected, (
+            f"P() must be a Matrix of shape {expected}, got {type(P_m).__name__} {tuple(getattr(P_m, 'shape', ()))}"
+        )
 
         self.B = B
         self.P = P
@@ -136,29 +141,26 @@ class SumProdRFF(ConditionalDensityModel):
         B = self.B()
         Gamma = self.get_Gamma(B=B)
 
-        Gamma_phi_x = torch.einsum("bji,bj->bi", Gamma, phi_x) # Gamma_phi_x = Gamma^T * phi(x)
-        B_psi_xp = torch.einsum("bji,bj->bi", B, psi_xp) # B_psi_xp = B^T * psi(x')
-        log_f = torch.log((Gamma_phi_x * B_psi_xp).sum(dim=-1) + self.numerical_tolerance) # Sum (A_phi_x * B_psi_xp)
+        Gamma_phi_x = Gamma.rev_matvec(phi_x)
+        B_psi_xp = B.rev_matvec(psi_xp)
+        log_f = torch.log((Gamma_phi_x * B_psi_xp).sum(dim=-1) + self.numerical_tolerance)
 
-        #print("log_f min: ", log_f.min(), "max: ", log_f.max())
-        #print("log_g_xp min: ", log_g_xp.min(), "max: ", log_g_xp.max())
-        #print("log_g_x min: ", log_g_x.min(), "max: ", log_g_x.max())
         return log_g_xp + log_f - log_g_x
 
-    def get_Gamma(self, B : torch.Tensor = None, Omega2 : torch.Tensor = None): 
+    def get_Gamma(self, B : Matrix = None, Omega2 : torch.Tensor = None) -> Matrix: 
         if B is None:
             B = self.B()
+        else:
+            B = as_matrix(B)
         if Omega2 is None:
             phi = copy.copy(self.g)
             phi.set_coeffs_to_one()
             Omega2 = phi.Omega2(self.psi)
 
         a = self.g.coeffs()
-
-        q1 = Omega2Gram(Omega2).rev_matvec(a)  # q1 = Omega2^T * a
-        q2 = torch.einsum("bji,bj->bi", B, q1) # q2 = B^T * q1
-        Gamma1 = torch.einsum("bij,bj->bij", self.P(), 1.0 / (q2 + self.numerical_tolerance)) # Gamma = P * diag(1.0 / q2)
-        return torch.einsum("bij,bi->bij", Gamma1, a) # Gamma = diag(a) * Gamma1
+        q1 = as_matrix(Omega2).rev_matvec(a)
+        q2 = B.rev_matvec(q1)
+        return self.P().mul_diag_right(1.0 / (q2 + self.numerical_tolerance)).mul_diag_left(a)
     
 
 #class MLPContextLinearRFF(ConditionalDensityModel):
@@ -518,7 +520,7 @@ class LinearFF(DensityModel):
             return 0.0
         if Omega2 is None:
             Omega2 = self.g.Omega2(self.h)
-        return -torch.log(Omega2Gram(Omega2).sum() + self.numerical_tolerance)
+        return -torch.log(as_matrix(Omega2).sum() + self.numerical_tolerance)
         
     def log_density(self, x : torch.Tensor):
         log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance) # (n_data)

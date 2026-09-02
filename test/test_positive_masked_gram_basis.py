@@ -12,15 +12,14 @@ import torch
 from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.domain_transformation import MLP
-from rational_factor.models.gram import Omega2Gram
+from rational_factor.models.structured_matrices import Rank1PlusDiagonal
 from rational_factor.models.mutual_bases import (
     MaskedGramMutualBasis,
     Orthogonal1DPWCBasis,
     PositiveMaskedGramMutualBasis,
     VolumePreservingPairBasis,
 )
-from rational_factor.models.parameters import Parameters, PositiveParameters
-from rational_factor.models.qs_matrix import Order1QuasiseparableFactorization
+from rational_factor.models.parameters import FixedParameters, PositiveParameters, Order1QuasiseparableFactorization
 
 
 SEED = 0
@@ -34,8 +33,8 @@ GRAM_ATOL = 0.08
 MEAN_ATOL = 0.03
 
 
-def _randn(g: torch.Generator, n_basis: int) -> Parameters:
-    return Parameters(torch.randn(1, n_basis, generator=g))
+def _randn(g: torch.Generator, n_basis: int) -> FixedParameters:
+    return FixedParameters(torch.randn(1, n_basis, generator=g))
 
 
 def _make_pwc(n_basis: int, seed: int) -> Orthogonal1DPWCBasis:
@@ -50,19 +49,21 @@ def _make_pwc(n_basis: int, seed: int) -> Orthogonal1DPWCBasis:
         _randn(g, n_basis),
         transition_bound=0.99,
     )
-    lam = Parameters(0.5 + torch.rand(1, n_basis, generator=g))
+    lam = FixedParameters(0.5 + torch.rand(1, n_basis, generator=g))
     return Orthogonal1DPWCBasis(fac, gram_diag_params=lam)
 
 
 def _make_vp(n_basis: int, rest_dim: int) -> VolumePreservingPairBasis:
-    flow = VolumePreservingFlow(
-        dim=rest_dim,
-        conditioner_dim=CONDITIONER_DIM,
-        n_steps=4,
-        hidden_features=16,
-        num_hidden_layers=2,
-        zero_init=False,
-    )
+    flow = None
+    if rest_dim > 0:
+        flow = VolumePreservingFlow(
+            dim=rest_dim,
+            conditioner_dim=CONDITIONER_DIM,
+            n_steps=4,
+            hidden_features=16,
+            num_hidden_layers=2,
+            zero_init=False,
+        )
     shape = (1, rest_dim, 1)
     base = BetaBasis(
         PositiveParameters.set_init(shape, 0.0, epsilon=1.0),
@@ -114,8 +115,7 @@ def main() -> None:
     assert b_mc.min().item() >= -1e-5
 
     gram = pos.Omega2()
-    assert isinstance(gram, Omega2Gram)
-    assert gram.is_structured
+    assert isinstance(gram, Rank1PlusDiagonal)
     dense = gram.to_dense()
     unsigned_gram = unsigned.Omega2().to_dense()
     expected = unsigned_gram + a.unsqueeze(-1) * b.unsqueeze(-2)
@@ -147,12 +147,37 @@ def main() -> None:
     assert torch.allclose(beta_b(y), beta)
     G_ab = alpha_b.Omega2(beta_b)
     G_ba = beta_b.Omega2(alpha_b)
-    assert isinstance(G_ab, Omega2Gram)
-    assert G_ab.is_structured
+    assert isinstance(G_ab, Rank1PlusDiagonal)
     assert torch.allclose(G_ab.to_dense(), dense)
     assert torch.allclose(G_ba.to_dense(), dense.transpose(-2, -1))
 
+    _check_sacrificial_only()
     print("ok")
+
+
+def _check_sacrificial_only() -> None:
+    pwc = _make_pwc(N_BASIS, SEED + 1)
+    vp = _make_vp(N_BASIS, rest_dim=0)
+    unsigned = MaskedGramMutualBasis(pwc, 0, vp)
+    pos = PositiveMaskedGramMutualBasis(pwc, 0, vp)
+    assert unsigned.dim() == 1
+    assert torch.allclose(vp.supremum(0), torch.ones(1, N_BASIS))
+    assert torch.allclose(vp.supremum(1), torch.ones(1, N_BASIS))
+
+    y = 0.05 + 0.9 * torch.rand(N_POINTS, 1)
+    alpha_u, beta_u = unsigned.eval(y, index=0), unsigned.eval(y, index=1)
+    assert torch.allclose(alpha_u, pwc.eval(y, index=0))
+    assert torch.allclose(beta_u, pwc.eval(y, index=1))
+
+    a, b = pos.constant_shifts()
+    assert torch.allclose(a, -pwc.infimum(0))
+    assert torch.allclose(b, -pwc.infimum(1))
+    alpha, beta = pos.eval(y, index=0), pos.eval(y, index=1)
+    assert torch.allclose(alpha, alpha_u + a)
+    assert torch.allclose(beta, beta_u + b)
+    assert alpha.min().item() >= -1e-5
+    assert beta.min().item() >= -1e-5
+    print("sacrificial-only ok")
 
 
 if __name__ == "__main__":

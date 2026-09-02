@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from rational_factor.models.qs_matrix import Order1Quasiseparable, _semiseparable
+from rational_factor.models.structured_matrices import Order1Quasiseparable, Semiseparable
 
 
 def _loop_semiseparable(x, p, a, q, *, reverse=False, solve=False):
@@ -124,10 +124,11 @@ def main() -> None:
         for batch in ((), (3,), (2, 3)):
             P = _make_P(m, batch)
             x = torch.randn(*(batch + (m,)))
-            for reverse, solve in ((False, False), (False, True), (True, False), (True, True)):
-                y = _semiseparable(x, P.lp, P.la, P.lq, reverse=reverse, solve=solve)
-                y_ref = _loop_semiseparable(x, P.lp, P.la, P.lq, reverse=reverse, solve=solve)
-                assert torch.allclose(y, y_ref, atol=1e-5, rtol=1e-4), f"semiseparable m={m} {batch} {reverse} {solve}"
+            for upper, solve in ((False, False), (False, True), (True, False), (True, True)):
+                S = Semiseparable(P.lp, P.la, P.lq, upper=upper)
+                y = S.solve(x) if solve else S.matvec(x)
+                y_ref = _loop_semiseparable(x, P.lp, P.la, P.lq, reverse=upper, solve=solve)
+                assert torch.allclose(y, y_ref, atol=1e-5, rtol=1e-4), f"semiseparable m={m} {batch} {upper} {solve}"
 
             q, d, g = _loop_direct(P)
             gen = P.direct_generators()

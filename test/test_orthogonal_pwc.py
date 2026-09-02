@@ -16,8 +16,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from rational_factor.models.mutual_bases import Orthogonal1DPWCBasis
-from rational_factor.models.parameters import Parameters
-from rational_factor.models.qs_matrix import Order1QuasiseparableFactorization
+from rational_factor.models.parameters import FixedParameters, Order1QuasiseparableFactorization
 
 
 SEED = 0
@@ -29,8 +28,8 @@ EXACT_GRAM_REL_TOL = 2e-3
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "figures", "orthogonal_pwc")
 
 
-def _randn(g: torch.Generator, n_basis: int) -> Parameters:
-    return Parameters(torch.randn(1, n_basis, generator=g))
+def _randn(g: torch.Generator, n_basis: int) -> FixedParameters:
+    return FixedParameters(torch.randn(1, n_basis, generator=g))
 
 
 def _make_basis(
@@ -53,7 +52,7 @@ def _make_basis(
     )
     lam = None
     if gram_diag:
-        lam = Parameters(0.5 + torch.rand(1, n_basis, generator=g))
+        lam = FixedParameters(0.5 + torch.rand(1, n_basis, generator=g))
     return Orthogonal1DPWCBasis(fac, gram_diag_params=lam)
 
 

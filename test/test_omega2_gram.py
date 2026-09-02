@@ -1,5 +1,5 @@
 """
-Checks for Omega2Gram dense vs structured matvec.
+Checks for DenseMatrix vs Rank1PlusDiagonal matvec (the Omega2 matrix-like API).
 
 Run:
   PYTHONPATH=src python test/test_omega2_gram.py
@@ -10,10 +10,9 @@ from __future__ import annotations
 import torch
 
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.factor_forms import LinearFF, LinearRFF
-from rational_factor.models.gram import Omega2Gram
-from rational_factor.models.lrpd import Rank1PlusDiagonal
-from rational_factor.models.parameters import Parameters, PositiveParameters
+from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF
+from rational_factor.models.structured_matrices import DenseMatrix, Rank1PlusDiagonal, as_matrix
+from rational_factor.models.parameters import FixedParameters, PositiveParameters, TrainableParameters, DenseMatrixFactorization, Rank1PlusDiagonalFactorization
 import rational_factor.tools.propagate as propagate
 
 
@@ -27,16 +26,16 @@ def _dense_and_structured() -> tuple[torch.Tensor, Rank1PlusDiagonal]:
     d = 0.5 + torch.rand(BATCH, N)
     u = torch.randn(BATCH, N)
     v = torch.randn(BATCH, N)
-    structured = Rank1PlusDiagonal(d, u, v)
+    structured = Rank1PlusDiagonal(u, v, d)
     return structured.to_dense(), structured
 
 
 def main() -> None:
     dense, structured = _dense_and_structured()
-    G_dense = Omega2Gram(dense)
-    G_struct = Omega2Gram(structured)
-    assert not G_dense.is_structured
-    assert G_struct.is_structured
+    G_dense = DenseMatrix(dense)
+    G_struct = structured
+    assert isinstance(G_dense, DenseMatrix)
+    assert isinstance(G_struct, Rank1PlusDiagonal)
     assert torch.allclose(G_struct.to_dense(), dense)
 
     x = torch.randn(BATCH, N)
@@ -64,32 +63,31 @@ def main() -> None:
     assert torch.allclose(G_dense.sum(), dense.sum())
     assert torch.allclose(G_struct.sum(), dense.sum())
 
-    wrapped = Omega2Gram(G_struct)
-    assert wrapped.is_structured
+    wrapped = as_matrix(G_struct)
+    assert wrapped is G_struct
     assert torch.allclose(wrapped.matvec(x), y_e)
 
     # LinearRFF.get_b / one-step propagate use the same matvec API.
     torch.manual_seed(SEED)
     n_basis, dim = 4, 2
     g = GaussianBasis(
-        Parameters(torch.randn(1, dim, n_basis)),
+        FixedParameters(torch.randn(1, dim, n_basis)),
         PositiveParameters.set_init((1, dim, n_basis), 0.8),
-        coeffs=Parameters(0.4 + torch.rand(1, n_basis)),
+        coeffs=FixedParameters(0.4 + torch.rand(1, n_basis)),
     )
     psi = GaussianBasis(
-        Parameters(torch.randn(1, dim, n_basis)),
+        FixedParameters(torch.randn(1, dim, n_basis)),
         PositiveParameters.set_init((1, dim, n_basis), 0.8),
-        coeffs=Parameters(0.4 + torch.rand(1, n_basis)),
+        coeffs=FixedParameters(0.4 + torch.rand(1, n_basis)),
     )
     h0 = GaussianBasis(
-        Parameters(torch.randn(1, dim, n_basis)),
+        FixedParameters(torch.randn(1, dim, n_basis)),
         PositiveParameters.set_init((1, dim, n_basis), 0.8),
-        coeffs=Parameters(0.4 + torch.rand(1, n_basis)),
+        coeffs=FixedParameters(0.4 + torch.rand(1, n_basis)),
     )
     rff = LinearRFF(g, psi, register_modules=False)
     Omega = g.Omega2(psi)
-    assert isinstance(Omega, Omega2Gram)
-    assert not Omega.is_structured
+    assert isinstance(Omega, DenseMatrix)
     a_coeff = g.coeffs()
     b = rff.get_b(a=a_coeff, Omega2=Omega)
     b_einsum = a_coeff / (torch.einsum("...ij,...i->...j", Omega.to_dense(), a_coeff) + rff.numerical_tolerance)
@@ -110,6 +108,24 @@ def main() -> None:
     M = torch.einsum("...ji,...j->...ij", dense, b_struct)
     c_old = torch.einsum("...ij,...i->...j", M, c)
     assert torch.allclose(c_next, c_old)
+
+    # SumProdRFF B/P are matrix factorizations.
+    n = n_basis
+    raw = torch.eye(n).unsqueeze(0)
+    B = DenseMatrixFactorization(PositiveParameters.from_values(raw, trainable=True))
+    P = Rank1PlusDiagonalFactorization(
+        TrainableParameters.random_init((1, n)),
+        TrainableParameters.random_init((1, n)),
+        normalization_dim=1,
+    )
+    sp = SumProdRFF(g, psi, B, P, register_modules=False)
+    Gamma = sp.get_Gamma()
+    assert isinstance(Gamma, Rank1PlusDiagonal)
+    assert Gamma.shape == (1, n, n)
+    seq_sp = propagate.propagate(init, sp, n_steps=2)
+    assert len(seq_sp) == 3
+    logp = sp.log_density(torch.randn(4, dim), conditioner=torch.randn(4, dim))
+    assert torch.isfinite(logp).all()
 
     print("ok")
 

@@ -17,8 +17,7 @@ from rational_factor.models.mutual_bases import (
     Orthogonal1DPWCBasis,
     VolumePreservingPairBasis,
 )
-from rational_factor.models.parameters import Parameters, PositiveParameters
-from rational_factor.models.qs_matrix import Order1QuasiseparableFactorization
+from rational_factor.models.parameters import FixedParameters, PositiveParameters, Order1QuasiseparableFactorization
 
 
 SEED = 0
@@ -31,8 +30,8 @@ N_MC = 40_000
 GRAM_ATOL = 0.08
 
 
-def _randn(g: torch.Generator, n_basis: int) -> Parameters:
-    return Parameters(torch.randn(1, n_basis, generator=g))
+def _randn(g: torch.Generator, n_basis: int) -> FixedParameters:
+    return FixedParameters(torch.randn(1, n_basis, generator=g))
 
 
 def _make_pwc(n_basis: int, seed: int) -> Orthogonal1DPWCBasis:
@@ -47,7 +46,7 @@ def _make_pwc(n_basis: int, seed: int) -> Orthogonal1DPWCBasis:
         _randn(g, n_basis),
         transition_bound=0.99,
     )
-    lam = Parameters(0.5 + torch.rand(1, n_basis, generator=g))
+    lam = FixedParameters(0.5 + torch.rand(1, n_basis, generator=g))
     return Orthogonal1DPWCBasis(fac, gram_diag_params=lam)
 
 
@@ -126,6 +125,23 @@ def main() -> None:
     beta_b = masked.get_basis(1)(y)
     assert torch.allclose(alpha_b, alpha)
     assert torch.allclose(beta_b, beta)
+
+    pwc_1d = _make_pwc(N_BASIS, SEED)
+    rest_dim_1d = 0
+    base_1d = BetaBasis(
+        PositiveParameters.set_init((1, rest_dim_1d, 1), 0.0, epsilon=1.0),
+        PositiveParameters.set_init((1, rest_dim_1d, 1), 0.0, epsilon=1.0),
+    )
+    vp_1d = VolumePreservingPairBasis(
+        base_1d,
+        MLP(in_features=CONDITIONER_DIM, out_features=1, hidden_features=16, num_hidden_layers=2, zero_init_last=True),
+        torch.nn.Embedding(N_BASIS, CONDITIONER_DIM),
+    )
+    masked_1d = MaskedGramMutualBasis(pwc_1d, 0, vp_1d)
+    y1 = 0.05 + 0.9 * torch.rand(N_POINTS, 1)
+    assert masked_1d.dim() == 1
+    assert torch.allclose(masked_1d.eval(y1, index=0), pwc_1d.eval(y1, index=0))
+    assert torch.allclose(masked_1d.eval(y1, index=1), pwc_1d.eval(y1, index=1))
 
     print("ok")
 

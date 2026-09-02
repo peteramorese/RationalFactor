@@ -1,5 +1,5 @@
 import torch
-from rational_factor.models.parameters import TrainableParameters, PositiveParameters, param_group_iter
+from rational_factor.models.parameters import TrainableParameters, PositiveParameters, param_group_iter, DenseMatrixFactorization
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid, check_conditional_pdf_valid
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
@@ -121,8 +121,10 @@ if __name__ == "__main__":
         eye = torch.eye(n_output_basis, dtype=torch.float32).unsqueeze(0).to(device)
         off = -20
         raw = off + (0.0 - off) * eye
-        B = PositiveParameters.from_values(values=raw, trainable=True).to(device)
-        P = PositiveParameters.from_values(values=raw, trainable=True, normalization_dim=2).to(device)
+        B_params = PositiveParameters.from_values(values=raw, trainable=True).to(device)
+        P_params = PositiveParameters.from_values(values=raw, trainable=True, normalization_dim=2).to(device)
+        B = DenseMatrixFactorization(B_params)
+        P = DenseMatrixFactorization(P_params)
 
         # Create and train the transition model
         tran_model = SumProdRFF(g_basis, psi_basis, B, P)
@@ -138,7 +140,7 @@ if __name__ == "__main__":
         if sp_basis:
             weight_param_list.extend([phi_matrix_coeffs, psi_matrix_coeffs])
         if sp_model:
-            weight_param_list.extend([B, P])
+            weight_param_list.extend([B_params, P_params])
         optimizers = {
             "all": torch.optim.Adam([
                 {"params": param_group_iter(basis_param_list), "lr": tran_params_e2e["lr_basis"]},
@@ -154,7 +156,7 @@ if __name__ == "__main__":
         if sp_basis:
             weight_param_list.extend([phi_matrix_coeffs, psi_matrix_coeffs])
         if sp_model:
-            weight_param_list.extend([B, P])
+            weight_param_list.extend([B_params, P_params])
         weight_params = param_group_iter(weight_param_list)
         optimizers ={"basis": torch.optim.Adam(basis_params, lr=tran_params["lr_basis"]), "weights": torch.optim.Adam(weight_params, lr=tran_params["lr_weights"])} 
         epochs_per_group = tran_params["n_epochs_per_group"]
@@ -186,8 +188,8 @@ if __name__ == "__main__":
         phi_matrix_coeffs.set_requires_grad(False)
         psi_matrix_coeffs.set_requires_grad(False)
     if sp_model:
-        B.set_requires_grad(False)
-        P.set_requires_grad(False)
+        B_params.set_requires_grad(False)
+        P_params.set_requires_grad(False)
 
     init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)
 

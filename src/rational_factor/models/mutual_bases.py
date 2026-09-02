@@ -6,13 +6,13 @@ import torch
 
 from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import Basis, BetaBasis
-from rational_factor.models.gram import Omega2Gram
-from rational_factor.models.lrpd import Rank1PlusDiagonal
-from rational_factor.models.parameters import Parameters
-from rational_factor.models.qs_matrix import (
+from rational_factor.models.parameters import Parameters, Order1QuasiseparableFactorization
+from rational_factor.models.structured_matrices import (
+    DenseMatrix,
+    Matrix,
     Order1QSGenerators,
     Order1Quasiseparable,
-    Order1QuasiseparableFactorization,
+    Rank1PlusDiagonal,
 )
 
 
@@ -40,7 +40,7 @@ class MutualPairBasis:
     def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
         raise NotImplementedError("Omega1 is not implemented for this mutual basis")
 
-    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         raise NotImplementedError("Omega2 is not implemented for this mutual basis")
 
     def eval(self, y: torch.Tensor, index: int = None):
@@ -85,10 +85,10 @@ class MutualPairMemberBasis(Basis):
     def Omega1(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         return self.owner.Omega1(self.index, lows, highs) * self.coeffs()
 
-    def Omega2(self, other: MutualPairMemberBasis, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
+    def Omega2(self, other: MutualPairMemberBasis, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         if not self._is_mate(other):
             raise ValueError("Omega2 is not defined for non-mate bases")
-        G = Omega2Gram(self.owner.Omega2(lows, highs))
+        G = self.owner.Omega2(lows, highs)
         if self.index == 1:
             G = G.T
         return G.mul_diag_left(self.coeffs()).mul_diag_right(other.coeffs())
@@ -244,13 +244,15 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
         w = self._cell_overlaps(lows, highs)
         return torch.einsum("k,bkm->bm", w, self._cell_values(index))
 
-    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         """Cross Gram ``<alpha_i, beta_j>``, shape ``(batch, m, m)``."""
         if lows is None and highs is None:
-            return Omega2Gram(torch.diag_embed(self._get_gram_diag()))
+            d = self._get_gram_diag()
+            z = torch.zeros_like(d)
+            return Rank1PlusDiagonal(z, z, d)
         w = self._cell_overlaps(lows, highs)
         a, b = self._cell_values(0), self._cell_values(1)
-        return Omega2Gram(torch.einsum("k,bki,bkj->bij", w, a, b))
+        return DenseMatrix(torch.einsum("k,bki,bkj->bij", w, a, b))
 
     def _PF_bounds(
         self,
@@ -313,6 +315,9 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
     ``n ≤ N``,
 
         n/N ≤ α ≤ 1,    β ≤ N.
+
+    A 0-d rest space (empty product over no coordinates) is the identity
+    pair ``α = β = n = 1``.
     """
 
     def __init__(
@@ -333,6 +338,8 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
             raise ValueError(
                 f"base n_basis {base_n} must be 1 or match embedding n_basis {n_basis}"
             )
+        if base.dim() == 0 and flow is not None:
+            raise ValueError("flow is not defined for 0-dimensional rest coordinates")
         if flow is not None:
             if flow.dim != base.dim():
                 raise ValueError("flow and base must have the same dimension")
@@ -363,6 +370,12 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
 
     def _as_data(self, y: torch.Tensor) -> torch.Tensor:
         y = torch.as_tensor(y)
+        if self._dim == 0:
+            if y.ndim == 1:
+                y = y.unsqueeze(-1)[:, :0]
+            if y.ndim != 2 or y.shape[1] != 0:
+                raise ValueError(f"y must have shape (n_data, 0) for a 0-d pair, got {tuple(y.shape)}")
+            return y
         if y.ndim == 1:
             y = y.unsqueeze(-1) if self._dim == 1 else y.unsqueeze(0)
         if y.ndim != 2 or y.shape[1] != self._dim:
@@ -380,6 +393,8 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
         """Base-flow densities ``n_i(y)``, shape ``(n_data, n_basis)``."""
         y = self._as_data(y)
         n_data, m = y.shape[0], self._n_basis
+        if self._dim == 0:
+            return y.new_ones(n_data, m)
         if self.flow is None or self.flow.dim == 1:
             return self._eval_base(y)
         cond = self._index_conditioners(y.dtype, y.device)
@@ -410,6 +425,13 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
         if y is None:
             return torch.nn.Module.eval(self)
         y = self._as_data(y)
+        if self._dim == 0:
+            ones = y.new_ones(y.shape[0], self._n_basis)
+            if index in (0, 1):
+                return ones
+            if index is None:
+                return torch.stack([ones, ones], dim=1)
+            raise ValueError("index must be 0, 1, or None")
         n = self.flow_density(y)
         alpha, beta = self._split(y, n)
         if index == 0:
@@ -428,11 +450,13 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
         """
         dtype, device = self.dtype_device()
         ones = torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
+        if index not in (0, 1):
+            raise ValueError("index must be 0 or 1")
+        if self._dim == 0:
+            return ones
         if index == 0:
             return ones
-        if index == 1:
-            return ones * self.base.supremum_bound()
-        raise ValueError("index must be 0 or 1")
+        return ones * self.base.supremum_bound()
 
 
 class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
@@ -442,6 +466,9 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
 
         α_i(x) = α^{pwc}_i(x_l) α^{vp}_i(x_{≠l})
         β_i(x) = β^{pwc}_i(x_l) β^{vp}_i(x_{≠l})
+
+    If ``d = 1``, the rest space is empty and the VP pair is identically 1,
+    so the masked pair reduces to the sacrificial PWC pair.
 
     The PWC Gram is diagonal, so it zeros VP off-diagonal couplings. On the
     full unit cube the VP paired products integrate to 1, and
@@ -534,10 +561,10 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
         dtype, device = self.pwc.dtype_device()
         return torch.zeros(self._batch_size, self._n_basis, dtype=dtype, device=device)
 
-    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         if lows is not None or highs is not None:
             raise ValueError("MaskedGramMutualBasis.Omega2 is only defined on the full domain")
-        return Omega2Gram(self.pwc.Omega2()).scale(self._domain_volume())
+        return self.pwc.Omega2().scale(self._domain_volume())
 
     def supremum(self, index: int) -> torch.Tensor:
         return self.pwc.supremum(index) * self.vp.supremum(index)
@@ -607,11 +634,11 @@ class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
         shift = a if index == 0 else b
         return shift * self._domain_volume()
 
-    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Omega2Gram:
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         unsigned = MaskedGramMutualBasis.Omega2(self, lows, highs)
         a, b = self.constant_shifts()
         vol = self._domain_volume()
-        return Omega2Gram(Rank1PlusDiagonal(unsigned.diag(), a * vol, b))
+        return Rank1PlusDiagonal(a * vol, b, unsigned.diag())
 
     def supremum(self, index: int) -> torch.Tensor:
         a, b = self.constant_shifts()

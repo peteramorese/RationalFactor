@@ -1,7 +1,23 @@
 import torch
 import itertools
+from abc import ABC, abstractmethod
 
-class Parameters:
+from rational_factor.models.structured_matrices import (
+    DenseMatrix,
+    Order1Quasiseparable,
+    Rank1PlusDiagonal,
+)
+
+
+class Parameters(ABC):
+    @abstractmethod
+    def __call__(self): ...
+
+    @abstractmethod
+    def is_trainable(self): ...
+
+
+class FixedParameters(Parameters):
     def __init__(self, fixed_values: torch.Tensor = None):
         self._p = fixed_values
 
@@ -60,6 +76,9 @@ class TrainableParameters(Parameters, torch.nn.Module):
     def is_trainable(self):
         return self._trainable
 
+    def size(self):
+        return self._p.size()
+
     def forward(self) -> torch.Tensor:
         """Unconstrained values. Subclasses override to apply constraints."""
         return self._p
@@ -70,9 +89,13 @@ class TrainableParameters(Parameters, torch.nn.Module):
     def set_requires_grad(self, requires_grad: bool):
         if self._p.is_leaf:
             self._p.requires_grad_(requires_grad)
-        
+
     def is_module(self):
         return True
+
+
+def param_group_iter(params: tuple[TrainableParameters, ...]):
+    return itertools.chain(*[param.parameters() for param in params])
 
 
 class PositiveParameters(TrainableParameters):
@@ -147,6 +170,109 @@ class PositiveParameters(TrainableParameters):
     def get_normalization_dim(self):
         return self._normalization_dim
 
-def param_group_iter(params: tuple[Parameters, ...]):
-    return itertools.chain(*[param.parameters() for param in params])
 
+class Rank1PlusDiagonalFactorization(Parameters):
+    """Stores R1PD factor tensors ``d, u, v`` with shape ``(T, n)``.
+
+    Call ``()`` to get a ``Rank1PlusDiagonal``; apply products with
+    ``sequential_matvec`` / ``inverse`` / ``T`` / ``flip`` on that object.
+    """
+
+    def __init__(
+        self,
+        u: Parameters,
+        v: Parameters,
+        d: Parameters | None = None,
+        normalization_dim: int | None = None,
+    ):
+        assert u.size() == v.size(), "u and v must have the same shape"
+        assert u.size().__len__() == 2, "u and v must have shape (n_factors, n)"
+        if d is not None:
+            assert d.size() == u.size(), "d, u, and v must have the same shape"
+        self.d = d
+        self.u = u
+        self.v = v
+        self.normalization_dim = normalization_dim
+
+    def __call__(self) -> Rank1PlusDiagonal:
+        d = None if self.d is None else self.d()
+        return Rank1PlusDiagonal(self.u(), self.v(), d, normalization_dim=self.normalization_dim)
+    
+    def is_trainable(self):
+        trainable = self.u.is_trainable() or self.v.is_trainable()
+        if self.d is not None:
+            trainable = trainable or self.d.is_trainable()
+        return trainable
+
+    def is_module(self):
+        return False
+
+
+class DenseMatrixFactorization(Parameters):
+    """Wraps a ``(..., n, m)`` tensor parameter; ``()`` returns a ``DenseMatrix``."""
+
+    def __init__(self, values: Parameters):
+        self._values = values
+
+    def __call__(self) -> DenseMatrix:
+        return DenseMatrix(self._values())
+
+    def is_trainable(self):
+        return self._values.is_trainable()
+
+    def is_module(self):
+        return False
+
+
+class Order1QuasiseparableFactorization(Parameters):
+    """Trainable ``P = L D U``. Diagonal is softplus so ``P`` stays nonsingular.
+
+    ``transition_bound`` (e.g. ``0.99``) maps ``la, ub`` through ``bound * tanh``
+    so long products of the transition generators cannot explode.
+    """
+
+    def __init__(
+        self,
+        lower_p: Parameters,
+        lower_a: Parameters,
+        lower_q: Parameters,
+        diag: Parameters,
+        upper_g: Parameters,
+        upper_b: Parameters,
+        upper_h: Parameters,
+        min_diag: float = 1e-4,
+        transition_bound: float | None = None,
+    ):
+        self.lower_p, self.lower_a, self.lower_q = lower_p, lower_a, lower_q
+        self.diag = diag
+        self.upper_g, self.upper_b, self.upper_h = upper_g, upper_b, upper_h
+        self.min_diag = min_diag
+        self.transition_bound = transition_bound
+
+        shape = diag().shape
+        if any(p().shape != shape for p in self.parameters):
+            raise ValueError("all factor Parameters must share the same shape")
+
+    @property
+    def parameters(self) -> tuple[Parameters, ...]:
+        return (
+            self.lower_p, self.lower_a, self.lower_q, self.diag,
+            self.upper_g, self.upper_b, self.upper_h,
+        )
+
+    def __call__(self) -> Order1Quasiseparable:
+        la, ub = self.lower_a(), self.upper_b()
+        if self.transition_bound is not None:
+            la = self.transition_bound * torch.tanh(la)
+            ub = self.transition_bound * torch.tanh(ub)
+        d = torch.nn.functional.softplus(self.diag()) + self.min_diag
+        return Order1Quasiseparable(
+            self.lower_p(), la, self.lower_q(), d,
+            self.upper_g(), ub, self.upper_h(),
+        )
+    
+    def is_trainable(self):
+        return any(p.is_trainable() for p in self.parameters)
+
+    def is_module(self):
+        return False
