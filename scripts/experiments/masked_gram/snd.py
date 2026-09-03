@@ -199,7 +199,7 @@ if __name__ == "__main__":
     tran_params = {
         "n_epochs_per_group": [5, 5],  # basis+wrap, weights
         "iterations": 4,
-        "lr_basis": 1e-2,
+        "lr_basis": 5e-3,
         "lr_weights": 1e-2,
         "lr_wrap": 1e-3,
     }
@@ -285,20 +285,15 @@ if __name__ == "__main__":
     B_u = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
     B_v = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
     B_d = PositiveParameters.random_init(shape=B_shape, mean=0.54, std=0.01, epsilon=1e-3).to(device)
-    B_factors = Rank1PlusDiagonalFactorization(B_u, B_v, B_d)
+    B_factors = Rank1PlusDiagonalFactorization(B_u, B_v, B_d, normalization='r')
     B = SequentialRank1PlusDiagonalFactorization(B_factors, seq_dim=1)
 
-    P_shape = (1, P_rank, n_basis)
-    P_u = TrainableParameters.random_init(shape=P_shape, mean=0.0, std=0.1).to(device)
-    P_v = TrainableParameters.random_init(shape=P_shape, mean=-5.0, std=0.1).to(device)
-    P_factors = Rank1PlusDiagonalFactorization(P_u, P_v, normalization_dim=0)
-    P = SequentialRank1PlusDiagonalFactorization(P_factors, seq_dim=1)
 
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)
 
     wrap_tf = ErfSeparableTF.from_data(x_k, trainable=True).to(device)
-    rff = SumProdRFF(g_basis, psi_basis, B, P, numerical_tolerance=problem.numerical_tolerance)
+    rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
     print("Training transition model")
@@ -311,7 +306,7 @@ if __name__ == "__main__":
             ]
         ),
         "weights": torch.optim.Adam(
-            param_group_iter((g_coeffs, B_u, B_v, B_d, P_u, P_v)),
+            param_group_iter((g_coeffs, B_u, B_v, B_d)),
             lr=tran_params["lr_weights"],
         ),
     }

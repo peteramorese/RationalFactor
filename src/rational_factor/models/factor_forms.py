@@ -94,7 +94,7 @@ class LinearRFF(ConditionalDensityModel):
 
 
 class SumProdRFF(ConditionalDensityModel):
-    def __init__(self, g : SeparableBasis, psi : SeparableBasis, B : Parameters, P : Parameters,
+    def __init__(self, g : SeparableBasis, psi : SeparableBasis, B : Parameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert g.dim() == psi.dim(), "g and psi must have the same dimension"
         assert isinstance(g, Basis), "g must be a Basis"
@@ -108,29 +108,26 @@ class SumProdRFF(ConditionalDensityModel):
         n_basis = g.n_basis_functions()
         expected = (batch_size, n_basis, n_basis)
 
-        B_m, P_m = B(), P()
+        B_m = B()
         assert isinstance(B_m, Matrix) and B_m.shape == expected, (
             f"B() must be a Matrix of shape {expected}, got {type(B_m).__name__} {tuple(getattr(B_m, 'shape', ()))}"
         )
-        assert isinstance(P_m, Matrix) and P_m.shape == expected, (
-            f"P() must be a Matrix of shape {expected}, got {type(P_m).__name__} {tuple(getattr(P_m, 'shape', ()))}"
-        )
 
         self.B = B
-        self.P = P
         self.numerical_tolerance = numerical_tolerance
 
         if register_modules:
             param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, psi])
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
-            matrix_modules = B.parameter_modules() + P.parameter_modules()
+            matrix_modules = B.parameter_modules()
             self._matrix_param_modules = torch.nn.ModuleList(dict.fromkeys(matrix_modules))
 
     def dtype_device(self):
         return self.g.dtype_device()
 
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+        # phi(x)^T @ Q @ psi(xp)
         x = conditioner
 
         log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance)
@@ -141,16 +138,15 @@ class SumProdRFF(ConditionalDensityModel):
         phi_x = phi(x)
         psi_xp = self.psi(xp)
 
-        B = self.B()
-        Gamma = self.get_Gamma(B=B)
+        Q = self.get_Q()
 
-        Gamma_phi_x = Gamma.rev_matvec(phi_x)
-        B_psi_xp = B.rev_matvec(psi_xp)
-        log_f = torch.log((Gamma_phi_x * B_psi_xp).sum(dim=-1) + self.numerical_tolerance)
+        Q_psi_xp = Q.matvec(psi_xp)
+        log_f = torch.log((phi_x * Q_psi_xp).sum(dim=-1) + self.numerical_tolerance)
 
         return log_g_xp + log_f - log_g_x
 
-    def get_Gamma(self, B : Matrix = None, Omega2 : torch.Tensor = None) -> Matrix: 
+    def get_Q(self, B : Matrix = None, Omega2 : torch.Tensor = None) -> Matrix: 
+        # Q = diag(a) @ B @ diag(Omega^T a)^-1
         if B is None:
             B = self.B()
         else:
@@ -161,9 +157,8 @@ class SumProdRFF(ConditionalDensityModel):
             Omega2 = phi.Omega2(self.psi)
 
         a = self.g.coeffs()
-        q1 = as_matrix(Omega2).rev_matvec(a)
-        q2 = B.rev_matvec(q1)
-        return self.P().mul_diag_right(1.0 / (q2 + self.numerical_tolerance)).mul_diag_left(a)
+        q = as_matrix(Omega2).rev_matvec(a)
+        return B.mul_diag_right(1.0 / (q + self.numerical_tolerance)).mul_diag_left(a)
     
 
 #class MLPContextLinearRFF(ConditionalDensityModel):

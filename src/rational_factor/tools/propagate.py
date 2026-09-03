@@ -60,8 +60,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         Omega2_0 = phi.Omega2(psi0)
         Omega2 = phi.Omega2(transition_model.psi)
         
-        B = transition_model.B()
-        Gamma = transition_model.get_Gamma(B=B, Omega2=Omega2)
+        Q = transition_model.get_Q()
 
         c0_norm_constant = torch.exp(init_belief.log_norm_constant())
         c0 = c0_norm_constant * init_belief.h.coeffs()
@@ -72,8 +71,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         
         def _Omega2_GammaT_B_matmul(c : torch.tensor, _Omega2 : Matrix):
             s1 = _Omega2.matvec(c)
-            s2 = Gamma.rev_matvec(s1)
-            return B.matvec(s2)
+            return Q.rev_matvec(s1)
         
         c1 = _Omega2_GammaT_B_matmul(c0, Omega2_0)
         h1 = copy.copy(transition_model.psi)

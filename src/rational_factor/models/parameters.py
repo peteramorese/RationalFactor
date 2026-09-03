@@ -188,7 +188,7 @@ class Rank1PlusDiagonalFactorization(Parameters):
         u: Parameters,
         v: Parameters,
         d: Parameters | None = None,
-        normalization_dim: int | None = None,
+        normalization: str | None = None,
     ):
         assert u.size() == v.size(), "u and v must have the same shape"
         assert len(u.size()) >= 1, "u and v must have shape (..., n)"
@@ -197,11 +197,11 @@ class Rank1PlusDiagonalFactorization(Parameters):
         self.d = d
         self.u = u
         self.v = v
-        self.normalization_dim = normalization_dim
+        self.normalization = normalization
 
     def __call__(self) -> Rank1PlusDiagonal:
         d = None if self.d is None else self.d()
-        return Rank1PlusDiagonal(self.u(), self.v(), d, normalization_dim=self.normalization_dim)
+        return Rank1PlusDiagonal(self.u(), self.v(), d, normalization=self.normalization)
     
     def is_trainable(self):
         trainable = self.u.is_trainable() or self.v.is_trainable()

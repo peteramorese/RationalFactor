@@ -166,7 +166,7 @@ class Rank1PlusDiagonal(Matrix):
     - ``u``, ``v``: ``(..., n)`` vectors
     - ``d``: ``(..., n)`` diagonal entries. Optional: if omitted and
       ``normalization_dim`` is ``None``, the diagonal is ones (``M = I + u vᵀ``).
-    - ``normalization_dim``: ``None``, ``0``, or ``1``. If set, ``d`` is ignored
+    - ``normalization_dim``: ``None``, ``'r'``, or ``'c'``. If set, ``d`` is ignored
       and ``u``, ``v`` are unconstrained parameters of a stochastic matrix
       ``diag(1 - u) + u vᵀ`` (row-stochastic) or its transpose (column-stochastic).
       Every matrix in the batch is normalized independently.
@@ -180,7 +180,7 @@ class Rank1PlusDiagonal(Matrix):
         u: torch.Tensor,
         v: torch.Tensor,
         d: torch.Tensor | None = None,
-        normalization_dim: int | None = None,
+        normalization: str | None = None,
     ):
         u = torch.as_tensor(u)
         v = torch.as_tensor(v)
@@ -194,10 +194,12 @@ class Rank1PlusDiagonal(Matrix):
         if u.device != v.device:
             raise ValueError("u and v must share the same device")
 
-        if normalization_dim is not None:
-            if normalization_dim not in (0, 1):
-                raise ValueError(f"normalization_dim must be None, 0, or 1, got {normalization_dim!r}")
-            if normalization_dim == 1:
+        self._normalization = normalization
+
+        if normalization is not None:
+            if normalization not in ('r', 'c'):
+                raise ValueError(f"normalization must be None, 'r', or 'c', got {normalization!r}")
+            if normalization == 'r':
                 # Row-stochastic: M = diag(1 - u) + u vᵀ with u ∈ [0, 1], v a distribution.
                 u = torch.sigmoid(u)
                 v = torch.softmax(v, dim=-1)
@@ -246,6 +248,10 @@ class Rank1PlusDiagonal(Matrix):
     @property
     def device(self) -> torch.device:
         return self.d.device
+
+    @property
+    def normalization(self) -> str | None:
+        return self._normalization
 
     @property
     def T(self) -> "Rank1PlusDiagonal":
