@@ -92,12 +92,13 @@ class LinearRFF(ConditionalDensityModel):
 
         return a / (as_matrix(Omega2).rev_matvec(a) + self.numerical_tolerance)
 
+
 class SumProdRFF(ConditionalDensityModel):
     def __init__(self, g : SeparableBasis, psi : SeparableBasis, B : Parameters, P : Parameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert g.dim() == psi.dim(), "g and psi must have the same dimension"
-        assert isinstance(g, SeparableBasis), "g must be a SeparableBasis"
-        assert isinstance(psi, SeparableBasis), "psi must be a SeparableBasis"
+        assert isinstance(g, Basis), "g must be a Basis"
+        assert isinstance(psi, Basis), "psi must be a Basis"
         super().__init__(g.dim(), psi.dim())
 
         self.g = g
@@ -123,6 +124,8 @@ class SumProdRFF(ConditionalDensityModel):
             param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, psi])
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
+            matrix_modules = B.parameter_modules() + P.parameter_modules()
+            self._matrix_param_modules = torch.nn.ModuleList(dict.fromkeys(matrix_modules))
 
     def dtype_device(self):
         return self.g.dtype_device()

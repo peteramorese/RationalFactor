@@ -6,6 +6,7 @@ from rational_factor.models.structured_matrices import (
     DenseMatrix,
     Order1Quasiseparable,
     Rank1PlusDiagonal,
+    SequentialRank1PlusDiagonal,
 )
 
 
@@ -15,6 +16,10 @@ class Parameters(ABC):
 
     @abstractmethod
     def is_trainable(self): ...
+
+    def parameter_modules(self) -> list[torch.nn.Module]:
+        """Leaf modules owned by this parameterization."""
+        return [self] if isinstance(self, torch.nn.Module) else []
 
 
 class FixedParameters(Parameters):
@@ -172,7 +177,7 @@ class PositiveParameters(TrainableParameters):
 
 
 class Rank1PlusDiagonalFactorization(Parameters):
-    """Stores R1PD factor tensors ``d, u, v`` with shape ``(T, n)``.
+    """Stores R1PD factor tensors ``d, u, v`` with shape ``(..., n)``.
 
     Call ``()`` to get a ``Rank1PlusDiagonal``; apply products with
     ``sequential_matvec`` / ``inverse`` / ``T`` / ``flip`` on that object.
@@ -186,7 +191,7 @@ class Rank1PlusDiagonalFactorization(Parameters):
         normalization_dim: int | None = None,
     ):
         assert u.size() == v.size(), "u and v must have the same shape"
-        assert u.size().__len__() == 2, "u and v must have shape (n_factors, n)"
+        assert len(u.size()) >= 1, "u and v must have shape (..., n)"
         if d is not None:
             assert d.size() == u.size(), "d, u, and v must have the same shape"
         self.d = d
@@ -207,6 +212,30 @@ class Rank1PlusDiagonalFactorization(Parameters):
     def is_module(self):
         return False
 
+    def parameter_modules(self) -> list[torch.nn.Module]:
+        params = (self.u, self.v) if self.d is None else (self.d, self.u, self.v)
+        return [module for param in params for module in param.parameter_modules()]
+
+
+class SequentialRank1PlusDiagonalFactorization(Parameters):
+    """A product of R1PD factors, consuming ``seq_dim`` from their batch shape."""
+
+    def __init__(self, factors: Rank1PlusDiagonalFactorization, *, seq_dim: int = 0):
+        self.factors = factors
+        self.seq_dim = seq_dim
+
+    def __call__(self) -> SequentialRank1PlusDiagonal:
+        return SequentialRank1PlusDiagonal(self.factors(), seq_dim=self.seq_dim)
+
+    def is_trainable(self):
+        return self.factors.is_trainable()
+
+    def is_module(self):
+        return False
+
+    def parameter_modules(self) -> list[torch.nn.Module]:
+        return self.factors.parameter_modules()
+
 
 class DenseMatrixFactorization(Parameters):
     """Wraps a ``(..., n, m)`` tensor parameter; ``()`` returns a ``DenseMatrix``."""
@@ -219,6 +248,9 @@ class DenseMatrixFactorization(Parameters):
 
     def is_trainable(self):
         return self._values.is_trainable()
+
+    def parameter_modules(self) -> list[torch.nn.Module]:
+        return self._values.parameter_modules()
 
     def is_module(self):
         return False
@@ -276,3 +308,6 @@ class Order1QuasiseparableFactorization(Parameters):
 
     def is_module(self):
         return False
+
+    def parameter_modules(self) -> list[torch.nn.Module]:
+        return [module for param in self.parameters for module in param.parameter_modules()]

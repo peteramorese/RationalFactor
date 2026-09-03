@@ -10,13 +10,20 @@ from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.domain_transformation import ErfSeparableTF, MLP
-from rational_factor.models.factor_forms import LinearRFF, LinearFF
+from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.mutual_bases import (
     Orthogonal1DPWCBasis,
     PositiveMaskedGramMutualBasis,
     VolumePreservingPairBasis,
 )
-from rational_factor.models.parameters import PositiveParameters, TrainableParameters, Order1QuasiseparableFactorization
+from rational_factor.models.parameters import (
+    Order1QuasiseparableFactorization,
+    PositiveParameters,
+    Rank1PlusDiagonalFactorization,
+    SequentialRank1PlusDiagonalFactorization,
+    TrainableParameters,
+    param_group_iter,
+)
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
 import rational_factor.models.loss as loss
@@ -187,9 +194,11 @@ if __name__ == "__main__":
     flow_n_steps = 4
     flow_hidden = 16
     flow_layers = 2
+    B_rank = 10
+    P_rank = 10
     tran_params = {
         "n_epochs_per_group": [5, 5],  # basis+wrap, weights
-        "iterations": 30,
+        "iterations": 4,
         "lr_basis": 1e-2,
         "lr_weights": 1e-2,
         "lr_wrap": 1e-3,
@@ -264,17 +273,32 @@ if __name__ == "__main__":
     ).to(device)
 
     g_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0
+        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=0.1
     ).to(device)
     h0_coeffs = PositiveParameters.random_init(
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
     ).to(device)
 
+    # Shape is (model batch, product sequence, basis).  The product wrapper
+    # consumes dimension 1, so SumProdRFF sees one (n_basis, n_basis) matrix.
+    B_shape = (1, B_rank, n_basis)
+    B_u = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
+    B_v = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
+    B_d = PositiveParameters.random_init(shape=B_shape, mean=0.54, std=0.01, epsilon=1e-3).to(device)
+    B_factors = Rank1PlusDiagonalFactorization(B_u, B_v, B_d)
+    B = SequentialRank1PlusDiagonalFactorization(B_factors, seq_dim=1)
+
+    P_shape = (1, P_rank, n_basis)
+    P_u = TrainableParameters.random_init(shape=P_shape, mean=0.0, std=0.1).to(device)
+    P_v = TrainableParameters.random_init(shape=P_shape, mean=-5.0, std=0.1).to(device)
+    P_factors = Rank1PlusDiagonalFactorization(P_u, P_v, normalization_dim=0)
+    P = SequentialRank1PlusDiagonalFactorization(P_factors, seq_dim=1)
+
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)
 
     wrap_tf = ErfSeparableTF.from_data(x_k, trainable=True).to(device)
-    rff = LinearRFF(g_basis, psi_basis, numerical_tolerance=problem.numerical_tolerance)
+    rff = SumProdRFF(g_basis, psi_basis, B, P, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
     print("Training transition model")
@@ -286,7 +310,10 @@ if __name__ == "__main__":
                 {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
             ]
         ),
-        "weights": torch.optim.Adam(g_coeffs.parameters(), lr=tran_params["lr_weights"]),
+        "weights": torch.optim.Adam(
+            param_group_iter((g_coeffs, B_u, B_v, B_d, P_u, P_v)),
+            lr=tran_params["lr_weights"],
+        ),
     }
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(

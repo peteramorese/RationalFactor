@@ -2,6 +2,7 @@ figures/
 benchmark_data/
 logs/
 slurm_batch.sh
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

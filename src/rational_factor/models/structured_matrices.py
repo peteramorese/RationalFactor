@@ -429,6 +429,98 @@ class Rank1PlusDiagonal(Matrix):
         )
 
 
+class SequentialRank1PlusDiagonal(Matrix):
+    """Product of rank-1-plus-diagonal factors along one batch axis.
+
+    If ``factors`` stores ``M_0, ..., M_{T-1}`` along ``seq_dim``, this
+    object represents ``M_{T-1} ... M_0``.  The sequence axis is consumed by
+    the product and therefore does not appear in :attr:`shape`.
+    """
+
+    def __init__(self, factors: Rank1PlusDiagonal, *, seq_dim: int = 0):
+        batch_ndim = len(factors.batch_shape)
+        if batch_ndim == 0:
+            raise ValueError("factors must have at least one batch axis to use as the sequence axis")
+        if not (-batch_ndim <= seq_dim < batch_ndim):
+            raise ValueError(
+                f"seq_dim must index a factor batch axis, got {seq_dim} for "
+                f"batch_shape={tuple(factors.batch_shape)}"
+            )
+        self.factors = factors
+        self.seq_dim = seq_dim % batch_ndim
+
+    @property
+    def n(self) -> int:
+        return self.factors.n
+
+    @property
+    def batch_shape(self) -> torch.Size:
+        shape = list(self.factors.batch_shape)
+        del shape[self.seq_dim]
+        return torch.Size(shape)
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.batch_shape + torch.Size([self.n, self.n])
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.factors.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.factors.device
+
+    def _factor(self, index: int) -> Rank1PlusDiagonal:
+        return Rank1PlusDiagonal(
+            self.factors.u.select(self.seq_dim, index),
+            self.factors.v.select(self.seq_dim, index),
+            self.factors.d.select(self.seq_dim, index),
+        )
+
+    @property
+    def T(self) -> "SequentialRank1PlusDiagonal":
+        # Reverse the factor order as well as transposing each factor.
+        transposed = Rank1PlusDiagonal(
+            self.factors.v.flip(self.seq_dim),
+            self.factors.u.flip(self.seq_dim),
+            self.factors.d.flip(self.seq_dim),
+        )
+        return SequentialRank1PlusDiagonal(transposed, seq_dim=self.seq_dim)
+
+    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+        result = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        for index in range(self.factors.batch_shape[self.seq_dim]):
+            result = self._factor(index).matvec(result)
+        return result
+
+    def to_dense(self) -> torch.Tensor:
+        eye = torch.eye(self.n, dtype=self.dtype, device=self.device)
+        eye = eye.expand(self.batch_shape + (self.n, self.n)).clone()
+        return self.matvec(eye)
+
+    def _replace_factor(self, index: int, factor: Rank1PlusDiagonal) -> "SequentialRank1PlusDiagonal":
+        u = self.factors.u.clone()
+        v = self.factors.v.clone()
+        d = self.factors.d.clone()
+        selector = [slice(None)] * u.dim()
+        selector[self.seq_dim] = index
+        selector = tuple(selector)
+        u[selector], v[selector], d[selector] = factor.u, factor.v, factor.d
+        return SequentialRank1PlusDiagonal(Rank1PlusDiagonal(u, v, d), seq_dim=self.seq_dim)
+
+    def mul_diag_left(self, a: torch.Tensor) -> "SequentialRank1PlusDiagonal":
+        last = self.factors.batch_shape[self.seq_dim] - 1
+        return self._replace_factor(last, self._factor(last).mul_diag_left(a))
+
+    def mul_diag_right(self, a: torch.Tensor) -> "SequentialRank1PlusDiagonal":
+        return self._replace_factor(0, self._factor(0).mul_diag_right(a))
+
+    def scale(self, s: torch.Tensor | float) -> "SequentialRank1PlusDiagonal":
+        last = self.factors.batch_shape[self.seq_dim] - 1
+        return self._replace_factor(last, self._factor(last).scale(s))
+
+
 class Semiseparable(Matrix):
     """Unit order-1 semiseparable matrix with generators ``p, a, q`` (shape ``(..., n)``).
 
@@ -698,4 +790,3 @@ class Order1Quasiseparable(Matrix):
     def to_dense(self) -> torch.Tensor:
         """Materialize ``P`` (``O(m^2)``, debug only)."""
         return self.direct_generators().to_dense()
-
