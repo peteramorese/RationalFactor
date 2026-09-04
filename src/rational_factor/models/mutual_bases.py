@@ -4,6 +4,10 @@ import math
 
 import torch
 
+import numpy as np
+from numpy.polynomial.legendre import leggauss
+
+
 from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import Basis, BetaBasis
 from rational_factor.models.parameters import Parameters, Order1QuasiseparableFactorization
@@ -292,6 +296,647 @@ class Orthogonal1DPWCBasis(MutualPairBasis):
     def supremum(self, index: int) -> torch.Tensor:
         return self.bounds(index)[1]
 
+
+class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
+    r"""Fixed-degree open-uniform B-spline basis and its L2 dual.
+
+    Let
+
+        alpha(x) = N(x)
+
+    where N is the vector of degree-p open-uniform B-splines on [0, 1].
+    Define
+
+        G = integral N(x) N(x)^T dx
+
+    and
+
+        beta(x) = Lambda G^{-1} N(x).
+
+    Then
+
+        <alpha_i, beta_j> = Lambda_j delta_ij.
+
+    If ``gram_diag_params is None``, Lambda = I.
+
+    Important properties
+    --------------------
+    * alpha_i >= 0.
+    * alpha_i has compact support spanning at most p + 1 knot intervals.
+    * G has half-bandwidth p.
+    * G^{-1} is dense, but its entries decay away from the diagonal.
+    * beta_i is therefore globally supported but typically strongly localized.
+    * alpha and beta are piecewise polynomials of degree p.
+    * Their extrema can be obtained span-by-span by solving degree-(p - 1)
+      derivative polynomials.
+
+    Notes
+    -----
+    The number of basis functions grows by adding knots while keeping p fixed.
+    This distinction is important. If n_basis == degree + 1, these reduce to
+    the Bernstein polynomials and the basis is not spatially local.
+    """
+
+    def __init__(self, n_basis: int, degree: int = 3):
+        if degree < 0:
+            raise ValueError("degree must be >= 0")
+        if n_basis < degree + 1:
+            raise ValueError(
+                "n_basis must be at least degree + 1 "
+                "for an open B-spline basis"
+            )
+
+        MutualPairBasis.__init__(self, 1, 1, n_basis, ())
+        torch.nn.Module.__init__(self)
+
+        self._degree = degree
+
+        self._n_spans = n_basis - degree
+
+        self.register_buffer("_breaks", torch.linspace(0.0, 1.0, self._n_spans + 1))
+
+        self.register_buffer("_knots", torch.cat([torch.zeros(degree + 1), self._breaks[1:-1], torch.ones(degree + 1)]))
+
+        # ---------------------------------------------------------------
+        # Gauss-Legendre quadrature.
+        #
+        # Product of two degree-p splines has degree 2p on each span.
+        # p + 1 Gauss points integrate degree <= 2p + 1 exactly.
+        # ---------------------------------------------------------------
+        qx, qw = leggauss(degree + 1)
+
+        self.register_buffer("_quad_x", torch.as_tensor(qx))
+        self.register_buffer("_quad_w", torch.as_tensor(qw))
+
+        # ---------------------------------------------------------------
+        # Construct exact spline Gram matrix up to floating point.
+        # ---------------------------------------------------------------
+        mass, G = self._interval_moments_raw(
+            torch.zeros(()),
+            torch.ones(()),
+        )
+
+        # Force exact symmetry and exact band structure.
+        G = 0.5 * (G + G.T)
+
+        ids = torch.arange(n_basis)
+        band_mask = torch.abs(ids[:, None] - ids[None, :]) <= degree
+        G = torch.where(band_mask, G, torch.zeros_like(G))
+
+        self.register_buffer("_alpha_mass", mass)
+        self.register_buffer("_gram_matrix", G)
+
+        # Banded Cholesky factor.
+        #
+        # G has half-bandwidth degree, and its Cholesky factor has the
+        # same half-bandwidth.
+        self._L = self._banded_cholesky(G, degree)
+
+        # Bounds/polynomial caches.
+        self._alpha_power_coeffs = None
+        self._beta_power_coeffs = None
+        self._alpha_bounds = None
+        self._beta_bounds = None
+
+    @property
+    def degree(self) -> int:
+        return self._degree
+
+    @property
+    def knots(self) -> torch.Tensor:
+        return self._knots
+
+    @property
+    def breakpoints(self) -> torch.Tensor:
+        return self._breaks
+
+    @property
+    def gram_matrix(self) -> torch.Tensor:
+        return self._gram_matrix
+
+    def _eval_alpha(self, y: torch.Tensor) -> torch.Tensor:
+        """Evaluate all alpha B-splines.
+
+        Parameters
+        ----------
+        y:
+            Tensor of arbitrary shape.
+
+        Returns
+        -------
+        Tensor
+            Shape ``(num_points, n_basis)`` after flattening y.
+        """
+
+        if torch.any(y < 0) or torch.any(y > 1):
+            raise ValueError("B-spline evaluation requires y in [0, 1]")
+
+        t = self._knots
+
+        # Degree-zero B-splines.
+        #
+        # There are len(knots)-1 of these. Recursion reduces this to
+        # n_basis functions after p steps.
+        N = ((y[:, None] >= t[:-1]) & (y[:, None] < t[1:]))
+
+        # Cox-de Boor recursion.
+        for k in range(1, self._degree + 1):
+            n_out = N.shape[-1] - 1
+
+            left_den = t[k:k + n_out] - t[:n_out]
+            right_den = (t[k + 1:k + 1 + n_out] - t[1:1 + n_out])
+
+            left_num = y[:, None] - t[:n_out]
+            right_num = (t[k + 1:k + 1 + n_out] - y[:, None])
+
+            left = torch.where(
+                left_den[None, :] != 0,
+                left_num / torch.where(
+                    left_den == 0,
+                    torch.ones_like(left_den),
+                    left_den,
+                )[None, :] * N[:, :n_out],
+                torch.zeros_like(N[:, :n_out]),
+            )
+
+            right = torch.where(
+                right_den[None, :] != 0,
+                right_num / torch.where(
+                    right_den == 0,
+                    torch.ones_like(right_den),
+                    right_den,
+                )[None, :] * N[:, 1:n_out + 1],
+                torch.zeros_like(N[:, :n_out]),
+            )
+
+            N = left + right
+
+        # Open B-spline convention at x = 1:
+        #
+        #     N_{m-1}(1) = 1.
+        #
+        at_right = y == 1
+        if torch.any(at_right):
+            N = N.clone()
+            N[at_right] = 0
+            N[at_right, -1] = 1
+
+        return N
+
+    @staticmethod
+    def _banded_cholesky(
+        G: torch.Tensor,
+        half_bandwidth: int,
+    ) -> torch.Tensor:
+        """Cholesky factorization exploiting fixed bandwidth.
+
+        Returns lower-triangular L satisfying
+
+            G = L L^T.
+
+        Complexity is O(m p^2), where p is the half-bandwidth.
+        """
+        m = G.shape[-1]
+        p = half_bandwidth
+
+        L = torch.zeros_like(G)
+
+        for i in range(m):
+            j0 = max(0, i - p)
+
+            for j in range(j0, i + 1):
+                k0 = max(0, i - p, j - p)
+
+                if j > k0:
+                    correction = (L[i, k0:j] * L[j, k0:j]).sum()
+                else:
+                    correction = G.new_zeros(())
+
+                value = G[i, j] - correction
+
+                if i == j:
+                    if value <= 0:
+                        raise RuntimeError(
+                            "B-spline Gram matrix is not "
+                            "numerically positive definite"
+                        )
+                    L[i, j] = torch.sqrt(value)
+                else:
+                    L[i, j] = value / L[j, j]
+
+        return L
+
+    def _solve_gram(
+        self,
+        rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Solve G x = rhs along the final dimension.
+
+        ``rhs`` has shape ``(..., m)``.
+
+        Because G is symmetric,
+
+            row @ G^{-1}
+
+        is numerically identical to solving
+
+            G x = row^T.
+
+        Complexity: O(p m) per right-hand side for fixed degree p.
+        """
+        rhs = torch.as_tensor(rhs)
+
+        if rhs.shape[-1] != self._n_basis:
+            raise ValueError(
+                "Last rhs dimension must equal n_basis"
+            )
+
+        L = self._L
+        m = self._n_basis
+        p = self._degree
+
+        # Forward solve: L z = rhs.
+        z_values = []
+
+        for i in range(m):
+            j0 = max(0, i - p)
+
+            if i > j0:
+                previous = torch.stack(z_values[j0:i], dim=-1)
+                correction = (previous * L[i, j0:i]).sum(dim=-1)
+            else:
+                correction = torch.zeros_like(rhs[..., i])
+
+            zi = (rhs[..., i] - correction) / L[i, i]
+
+            z_values.append(zi)
+
+        z = torch.stack(z_values, dim=-1)
+
+        # Backward solve: L^T x = z.
+        x_values = [None] * m
+
+        for i in range(m - 1, -1, -1):
+            j1 = min(m, i + p + 1)
+
+            if i + 1 < j1:
+                following = torch.stack(x_values[i + 1:j1], dim=-1)
+                correction = (following * L[i + 1:j1, i]).sum(dim=-1)
+            else:
+                correction = torch.zeros_like(z[..., i])
+
+            xi = (z[..., i] - correction) / L[i, i]
+
+            x_values[i] = xi
+
+        return torch.stack(x_values, dim=-1)
+
+    # ===================================================================
+    # Public evaluation
+    # ===================================================================
+
+    def eval(self, y: torch.Tensor, index: int | None = None) -> torch.Tensor:
+        """Evaluate alpha and/or beta.
+
+        Returns
+        -------
+        index == 0:
+            alpha, shape ``(N, m)``
+
+        index == 1:
+            beta, shape ``(N, m)``
+
+        index is None:
+            shape ``(N, 2, m)``
+
+        As in ``Orthogonal1DPWCBasis``, evaluation currently requires
+        parameter batch_size == 1.
+        """
+        if self._batch_size != 1:
+            raise ValueError(
+                "eval currently requires parameter batch_size == 1"
+            )
+
+        alpha = self._eval_alpha(y)
+
+        if index == 0:
+            return alpha
+
+        beta = self._solve_gram(alpha)
+
+        if index == 1:
+            return beta
+
+        if index is None:
+            return torch.stack([alpha, beta], dim=1)
+
+        raise ValueError("index must be 0, 1, or None")
+
+    def _parse_interval(self, lows: torch.Tensor | None, highs: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        lo = (torch.zeros(()) if lows is None else torch.as_tensor(lows).reshape(-1)[0])
+
+        hi = (torch.ones(()) if highs is None else torch.as_tensor(highs).reshape(-1)[0])
+
+        lo = lo.clamp(0.0, 1.0)
+        hi = hi.clamp(0.0, 1.0)
+
+        return lo, hi
+
+    def _interval_moments_raw(self, lo: torch.Tensor, hi: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return
+
+            s_i = integral alpha_i
+            M_ij = integral alpha_i alpha_j
+
+        over [lo, hi].
+
+        Gauss-Legendre quadrature is exact on every knot span because
+        alpha_i alpha_j has degree <= 2p.
+        """
+        left = torch.maximum(self._breaks[:-1], lo)
+        right = torch.minimum(self._breaks[1:], hi)
+
+        half = 0.5 * (right - left).clamp(min=0)
+
+        mid = 0.5 * (right + left)
+
+        # Shape: (n_spans, n_quad)
+        x = (mid[:, None] + half[:, None] * self._quad_x[None, :])
+
+        n_spans, n_quad = x.shape
+
+        values = self._eval_alpha(x.reshape(-1)).reshape(n_spans, n_quad, self._n_basis)
+
+        weights = (half[:, None] * self._quad_w[None, :])
+
+        mass = torch.einsum("sq,sqi->i", weights, values)
+
+        gram = torch.einsum("sq,sqi,sqj->ij", weights, values, values)
+
+        return mass, gram
+
+    def _interval_moments(self, lows: torch.Tensor | None, highs: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        lo, hi = self._parse_interval(lows, highs)
+        return self._interval_moments_raw(lo, hi)
+
+    def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
+        """Integral of each alpha_i or beta_i.
+
+        Shape: ``(batch, m)``.
+        """
+        if index not in (0, 1):
+            raise ValueError("index must be 0 or 1")
+
+
+        # Full-domain identities.
+        if lows is None and highs is None:
+            if index == 0:
+                return self._alpha_mass.unsqueeze(0).expand(self._batch_size, -1)
+
+            return torch.ones_like(self._alpha_mass).unsqueeze(0).expand(self._batch_size, -1)
+
+        mass, _ = self._interval_moments(lows, highs)
+
+        if index == 0:
+            return mass.unsqueeze(0).expand(self._batch_size, -1)
+
+        beta_mass = self._solve_gram(mass)
+
+        return (beta_mass.unsqueeze(0))
+
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
+        """Cross Gram
+
+            Omega2_ij = integral alpha_i(x) beta_j(x) dx.
+
+        Full domain:
+            diag(Lambda)
+
+        Restricted domain:
+            M_[lo,hi] G^{-1} Lambda
+        """
+        lam = self._get_gram_diag()
+
+        if lows is None and highs is None:
+            z = torch.zeros_like(lam)
+            return Rank1PlusDiagonal(z, z, lam)
+
+        _, local_gram = self._interval_moments(lows, highs)
+
+        cross_unscaled = self._solve_gram(local_gram)
+
+        # Scale beta index, i.e. matrix columns.
+        cross = (cross_unscaled.unsqueeze(0) * lam[:, None, :])
+
+        return DenseMatrix(cross)
+
+    def _get_alpha_power_coeffs(self,) -> torch.Tensor:
+        """Polynomial coefficients of alpha on every knot span.
+
+        Returns
+        -------
+        coeffs:
+            Shape ``(n_spans, m, degree + 1)``.
+
+        For span s, with
+
+            u = (x - break_s) / (break_{s+1} - break_s),
+
+        we have
+
+            alpha_i(x)
+              = sum_r coeffs[s, i, r] u^r.
+        """
+        if self._alpha_power_coeffs is not None:
+            return self._alpha_power_coeffs
+
+        p = self._degree
+        q = p + 1
+
+        # Interior interpolation nodes avoid ambiguity at knots.
+        nodes, _ = leggauss(q)
+        u = 0.5 * (torch.as_tensor(nodes) + 1.0)
+
+        # Vandermonde:
+        #
+        # V[k, r] = u_k^r.
+        #
+        V = torch.stack([ u ** r for r in range(q) ], dim=-1)
+
+        V_inv = torch.linalg.inv(V)
+
+        left = self._breaks[:-1]
+        right = self._breaks[1:]
+
+        x = (left[:, None] + (right - left)[:, None] * u[None, :])
+
+        values = self._eval_alpha(x.reshape(-1)).reshape(self._n_spans, q, self._n_basis)
+
+        # (span, power, basis)
+        coeff = torch.einsum("rq,sqm->srm", V_inv, values)
+
+        # (span, basis, power)
+        coeff = coeff.permute(0, 2, 1)
+
+        self._alpha_power_coeffs = coeff
+        return coeff
+
+    def _get_beta_power_coeffs(
+        self,
+    ) -> torch.Tensor:
+        """Power coefficients of the unscaled dual basis G^{-1} alpha."""
+        if self._beta_power_coeffs is not None:
+            return self._beta_power_coeffs
+
+        alpha_coeff = self._get_alpha_power_coeffs()
+
+        # For every span and every polynomial power, solve
+        #
+        #     G c_beta = c_alpha.
+        #
+        rhs = alpha_coeff.permute(0, 2, 1)
+
+        beta_coeff = self._solve_gram(rhs).permute(0, 2, 1)
+
+        self._beta_power_coeffs = beta_coeff
+        return beta_coeff
+
+    @staticmethod
+    def _polyval_ascending(
+        coeff: np.ndarray,
+        x: float,
+    ) -> float:
+        """Evaluate c0 + c1*x + ... using Horner."""
+        out = 0.0
+        for c in coeff[::-1]:
+            out = out * x + c
+        return float(out)
+
+    @classmethod
+    def _exact_piecewise_bounds(cls, coeffs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Numerical global extrema of piecewise polynomials.
+
+        For each span, solve the derivative polynomial exactly as a
+        finite root problem and evaluate endpoints + all real roots in
+        [0, 1].
+
+        ``coeffs`` has shape
+
+            (n_spans, n_basis, degree + 1).
+
+        Returns shape ``(n_basis,)`` for lower and upper.
+
+        This is mathematically exact modulo floating-point polynomial
+        reconstruction and root solving.
+        """
+        device = coeffs.device
+        dtype = coeffs.dtype
+
+        c_np = coeffs.detach().cpu().double().numpy()
+
+        n_spans, n_basis, q = c_np.shape
+        degree = q - 1
+
+        lower = np.full(n_basis, np.inf, dtype=np.float64)
+        upper = np.full(n_basis, -np.inf, dtype=np.float64)
+
+        for s in range(n_spans):
+            for i in range(n_basis):
+                c = c_np[s, i]
+
+                candidates = [0.0, 1.0]
+
+                if degree >= 1:
+                    # Ascending derivative coefficients.
+                    d = np.array([ r * c[r] for r in range(1, q) ], dtype=np.float64)
+
+                    scale = max(1.0, float(np.max(np.abs(d))) if d.size > 0 else 1.0)
+                    tol = 1e-12 * scale
+
+                    # Trim numerically-zero leading terms.
+                    while (d.size > 0 and abs(d[-1]) <= tol):
+                        d = d[:-1]
+
+                    # Constant derivative has no interior root.
+                    if d.size >= 2:
+                        roots = np.roots(d[::-1])
+
+                        for root in roots:
+                            if abs(root.imag) <= 1e-10:
+                                r = float(root.real)
+
+                                if r >= -1e-10 and r <= 1.0 + 1e-10:
+                                    candidates.append(min(1.0, max(0.0, r)))
+
+                vals = [cls._polyval_ascending(c, u) for u in candidates]
+
+                lower[i] = min(lower[i], min(vals))
+                upper[i] = max(upper[i], max(vals))
+
+        return (torch.as_tensor(lower, dtype=dtype, device=device), torch.as_tensor(upper, dtype=dtype, device=device))
+
+    # ===================================================================
+    # Bounds
+    # ===================================================================
+
+    @staticmethod
+    def _scale_interval(lower: torch.Tensor, upper: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        a = scale * lower
+        b = scale * upper
+
+        return (torch.minimum(a, b), torch.maximum(a, b))
+
+    def bounds(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Global lower/upper extrema of every basis function.
+
+        Returns
+        -------
+        lower, upper:
+            Each has shape ``(batch, m)``.
+
+        For alpha and beta, extrema are found span-by-span from their
+        exact degree-p polynomial representation.
+
+        For cubic B-splines this means solving only quadratic derivative
+        equations on each knot span.
+        """
+        if index == 0:
+            if self._alpha_bounds is None:
+                self._alpha_bounds = (
+                    self._exact_piecewise_bounds(
+                        self._get_alpha_power_coeffs()
+                    )
+                )
+
+            lower, upper = self._alpha_bounds
+
+            return (
+                lower.unsqueeze(0).expand(self._batch_size, -1),
+                upper.unsqueeze(0).expand(self._batch_size, -1),
+            )
+
+        if index == 1:
+            if self._beta_bounds is None:
+                self._beta_bounds = (
+                    self._exact_piecewise_bounds(
+                        self._get_beta_power_coeffs()
+                    )
+                )
+
+            lower, upper = self._beta_bounds
+
+            lower = lower.unsqueeze(0).expand(self._batch_size, -1)
+            upper = upper.unsqueeze(0).expand(self._batch_size, -1)
+
+            return self._scale_interval(lower, upper, self._get_gram_diag())
+
+        raise ValueError("index must be 0 or 1")
+
+    def infimum(self, index: int) -> torch.Tensor:
+        return self.bounds(index)[0]
+
+    def supremum(self, index: int,) -> torch.Tensor:
+        return self.bounds(index)[1]
 
 class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
     """Mutual pair whose matched products are conditional VP-flow densities.

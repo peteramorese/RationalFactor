@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import copy
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -8,6 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import BetaBasis
+from rational_factor.models.parameters import DenseMatrixFactorization
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.domain_transformation import ErfSeparableTF, MLP
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
@@ -31,18 +33,30 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 
 
-def _make_qs_factorization(n_basis: int, device: torch.device) -> Order1QuasiseparableFactorization:
+def _make_qs_factorization(n_basis: int, device: torch.device, random_init: bool = True) -> Order1QuasiseparableFactorization:
     shape = (1, n_basis)
-    return Order1QuasiseparableFactorization(
-        TrainableParameters.random_init(shape=shape).to(device),
-        TrainableParameters.random_init(shape=shape).to(device),
-        TrainableParameters.random_init(shape=shape).to(device),
-        TrainableParameters.random_init(shape=shape).to(device),
-        TrainableParameters.random_init(shape=shape).to(device),
-        TrainableParameters.random_init(shape=shape).to(device),
-        TrainableParameters.random_init(shape=shape).to(device),
-        transition_bound=0.99,
-    )
+    if random_init:
+        return Order1QuasiseparableFactorization(
+            TrainableParameters.random_init(shape=shape).to(device),
+            TrainableParameters.random_init(shape=shape).to(device),
+            TrainableParameters.random_init(shape=shape).to(device),
+            TrainableParameters.random_init(shape=shape).to(device),
+            TrainableParameters.random_init(shape=shape).to(device),
+            TrainableParameters.random_init(shape=shape).to(device),
+            TrainableParameters.random_init(shape=shape).to(device),
+            transition_bound=0.99,
+        )
+    else:
+        return Order1QuasiseparableFactorization(
+            TrainableParameters.set_init(shape, 0.0).to(device),
+            TrainableParameters.set_init(shape, 0.0).to(device),
+            TrainableParameters.set_init(shape, 0.0).to(device),
+            TrainableParameters.set_init(shape, 1.0).to(device),
+            TrainableParameters.set_init(shape, 0.0).to(device),
+            TrainableParameters.set_init(shape, 0.0).to(device),
+            TrainableParameters.set_init(shape, 0.0).to(device),
+            transition_bound=0.99,
+        )
 
 
 def _plot_snd_conditional_true_vs_learned(
@@ -53,7 +67,7 @@ def _plot_snd_conditional_true_vs_learned(
     xp_train: torch.Tensor,
     *,
     problem,
-    n_grid: int = 200,
+    n_grid: int = 400,
     title: str = "",
 ) -> None:
     """Compare true and learned p(x'|x) on a 2D grid (conditioner vs next state)."""
@@ -132,6 +146,69 @@ def _plot_snd_conditional_true_vs_learned(
     plt.close(fig)
 
 
+def _plot_basis_functions(
+    basis,
+    out_path: Path,
+    *,
+    basis_name: str,
+    n_grid: int = 500,
+    dev = torch.device("cpu"), dt=torch.float32
+) -> None:
+    """Plot every coefficient-free 1D basis function over [0, 1]."""
+    raw_basis = copy.copy(basis)
+    raw_basis.set_coeffs_to_one()
+
+
+    x_grid = torch.linspace(0.0, 1.0, n_grid, device=dev, dtype=dt).reshape(-1, 1)
+
+    with torch.no_grad():
+        values = raw_basis(x_grid).detach().cpu()
+
+    # Remove singleton model-batch dimensions, if present. Expected final
+    # shape is (n_grid, n_basis).
+    while values.ndim > 2 and values.shape[0] == 1:
+        values = values.squeeze(0)
+    if values.ndim == 1:
+        values = values.unsqueeze(-1)
+    if values.ndim != 2:
+        raise ValueError(
+            f"Expected {basis_name} evaluations to have shape (n_grid, n_basis), "
+            f"got {tuple(values.shape)}"
+        )
+
+    x_np = x_grid.squeeze(-1).detach().cpu().numpy()
+    values_np = values.numpy()
+    n_basis = values_np.shape[-1]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    cmap = plt.get_cmap("turbo")
+    color_norm = Normalize(vmin=0, vmax=max(n_basis - 1, 1))
+
+    for i in range(n_basis):
+        ax.plot(
+            x_np,
+            values_np[:, i],
+            color=cmap(color_norm(i)),
+            lw=1.5,
+            alpha=0.9,
+        )
+
+    # A colorbar is much more readable than a 100-entry legend.
+    sm = plt.cm.ScalarMappable(norm=color_norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_label("basis function index")
+
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("x")
+    ax.set_ylabel(f"{basis_name}_i(x)")
+    ax.set_title(f"{basis_name} basis functions")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_snd_1d_belief_trajectory(
     problem,
     beliefs: list[CompositeDensityModel],
@@ -185,7 +262,7 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 200
+    n_basis = 100
     sacrificial_index = 0
     embedding_dim = 4
     splitter_hidden = 16
@@ -195,17 +272,16 @@ if __name__ == "__main__":
     flow_hidden = 16
     flow_layers = 2
     B_rank = 10
-    P_rank = 10
     tran_params = {
-        "n_epochs_per_group": [5, 5],  # basis+wrap, weights
-        "iterations": 4,
+        "n_epochs_per_group": [5, 10],  # basis+wrap, weights
+        "iterations": 30,
         "lr_basis": 5e-3,
-        "lr_weights": 1e-2,
+        "lr_weights": 5e-3,
         "lr_wrap": 1e-3,
     }
     init_params = {
         "n_epochs_per_group": [20],  # h0 coeffs only
-        "iterations": 30,
+        "iterations": 10,
         "lr_weights": 1e-2,
     }
 
@@ -260,10 +336,9 @@ if __name__ == "__main__":
     vp_mutual = VolumePreservingPairBasis(vp_base_dist, vp_splitter, vp_embedding, vp_flow)
 
     # Orthogonal 1D PWC pair on the sacrificial coordinate
-    qs_factorization = _make_qs_factorization(n_basis, device)
-    gram_diag_params = PositiveParameters.random_init(
-        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([0.5]), epsilon=1e-3
-    ).to(device)
+    qs_factorization = _make_qs_factorization(n_basis, device, random_init=False)
+    #gram_diag_params = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([0.5]), epsilon=1e-6).to(device)
+    gram_diag_params = PositiveParameters.set_init((1, n_basis), 1.0, epsilon=1e-6).to(device)
     orth_pwc_mutual = Orthogonal1DPWCBasis(qs_factorization, gram_diag_params=gram_diag_params)
 
     phi_psi_mutual = PositiveMaskedGramMutualBasis(
@@ -273,20 +348,23 @@ if __name__ == "__main__":
     ).to(device)
 
     g_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=0.1
+        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=0.0
     ).to(device)
     h0_coeffs = PositiveParameters.random_init(
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
     ).to(device)
 
-    # Shape is (model batch, product sequence, basis).  The product wrapper
-    # consumes dimension 1, so SumProdRFF sees one (n_basis, n_basis) matrix.
-    B_shape = (1, B_rank, n_basis)
-    B_u = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
-    B_v = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
-    B_d = PositiveParameters.random_init(shape=B_shape, mean=0.54, std=0.01, epsilon=1e-3).to(device)
-    B_factors = Rank1PlusDiagonalFactorization(B_u, B_v, B_d, normalization='r')
-    B = SequentialRank1PlusDiagonalFactorization(B_factors, seq_dim=1)
+    ## Shape is (model batch, product sequence, basis).  The product wrapper
+    ## consumes dimension 1, so SumProdRFF sees one (n_basis, n_basis) matrix.
+    #B_shape = (1, B_rank, n_basis)
+    #B_u = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
+    #B_v = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
+    #B_d = PositiveParameters.random_init(shape=B_shape, mean=0.54, std=0.01, epsilon=1e-3).to(device)
+    #B_factors = Rank1PlusDiagonalFactorization(B_u, B_v, B_d, normalization='r')
+    #B = SequentialRank1PlusDiagonalFactorization(B_factors, seq_dim=1)
+
+    B_params = PositiveParameters.random_init(shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), normalization_dim=2).to(device)
+    B = DenseMatrixFactorization(B_params)
 
 
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
@@ -306,7 +384,8 @@ if __name__ == "__main__":
             ]
         ),
         "weights": torch.optim.Adam(
-            param_group_iter((g_coeffs, B_u, B_v, B_d)),
+            #param_group_iter((g_coeffs, B_u, B_v, B_d)),
+            param_group_iter((g_coeffs, B_params)),
             lr=tran_params["lr_weights"],
         ),
     }
@@ -323,6 +402,24 @@ if __name__ == "__main__":
         use_best="mle",
     )
     print("Done! \n")
+
+    # DEBUG
+    Q = rff.get_Q().to_dense()
+    print(Q)
+    s = torch.linalg.svdvals(Q)
+    print(s)
+    print("condition number:", s.max() / s.min())
+    phi = copy.copy(g_basis)
+    phi.set_coeffs_to_one()
+
+    x_grid = torch.linspace(0, 1, 100, device=device, dtype=torch.float32).reshape(-1, 1)
+    phi_x = phi(x_grid)                 # [..., m]
+    a = g_coeffs()
+
+    g_x = (phi_x * a).sum(dim=-1)
+    phi_normalized = phi_x / g_x.unsqueeze(-1)
+
+    print(phi_normalized.std(dim=0))
 
     # Freeze the shared pair, g coeffs, and wrap; reuse psi for h0
     for p in phi_psi_mutual.parameters():
@@ -387,6 +484,28 @@ if __name__ == "__main__":
 
     output_dir = Path("figures/masked_gram/snd")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    phi_out_path = output_dir / "phi_basis_functions.png"
+    _plot_basis_functions(
+        g_basis,
+        phi_out_path,
+        basis_name="phi",
+        n_grid=500,
+        dev=device,
+        dt=torch.float32,
+    )
+    print(f"Saved phi basis functions to {phi_out_path}")
+
+    psi_out_path = output_dir / "psi_basis_functions.png"
+    _plot_basis_functions(
+        psi_basis,
+        psi_out_path,
+        basis_name="psi",
+        n_grid=500,
+        dev=device,
+        dt=torch.float32,
+    )
+    print(f"Saved psi basis functions to {psi_out_path}")
 
     beliefs_out_path = output_dir / "beliefs.png"
     _plot_snd_1d_belief_trajectory(
