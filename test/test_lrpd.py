@@ -13,11 +13,10 @@ from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.factor_forms import SumProdRFF
 from rational_factor.models.parameters import (
     PositiveParameters,
-    Rank1PlusDiagonalFactorization,
-    SequentialRank1PlusDiagonalFactorization,
+    R1PDFactorizationParameters,
     TrainableParameters,
 )
-from rational_factor.models.structured_matrices import Rank1PlusDiagonal, SequentialRank1PlusDiagonal
+from rational_factor.models.structured_matrices import Rank1PlusDiagonal, R1PDFactorization
 
 
 SEED = 0
@@ -45,7 +44,7 @@ def main() -> None:
     u_raw = torch.randn(BATCH, N)
     v_raw = torch.randn(BATCH, N)
 
-    M_row = Rank1PlusDiagonal(u_raw, v_raw, normalization_dim=1)
+    M_row = Rank1PlusDiagonal(u_raw, v_raw, normalization="r")
     assert torch.allclose(M_row.u, torch.sigmoid(u_raw))
     assert torch.allclose(M_row.v, torch.softmax(v_raw, dim=-1))
     assert torch.allclose(M_row.d, 1.0 - M_row.u)
@@ -54,7 +53,7 @@ def main() -> None:
     assert (M_row.u >= 0).all() and (M_row.u <= 1).all()
     assert torch.allclose(M_row.v.sum(dim=-1), torch.ones(BATCH))
 
-    M_col = Rank1PlusDiagonal(u_raw, v_raw, normalization_dim=0)
+    M_col = Rank1PlusDiagonal(u_raw, v_raw, normalization="c")
     assert torch.allclose(M_col.u, torch.softmax(u_raw, dim=-1))
     assert torch.allclose(M_col.v, torch.sigmoid(v_raw))
     assert torch.allclose(M_col.d, 1.0 - M_col.v)
@@ -68,13 +67,13 @@ def main() -> None:
 
     # A sequence axis is consumed into one matrix product per outer batch.
     n_factors = 4
-    seq_factors = Rank1PlusDiagonal(
+    product = R1PDFactorization(
         torch.randn(BATCH, n_factors, N),
         torch.randn(BATCH, n_factors, N),
         0.5 + torch.rand(BATCH, n_factors, N),
+        seq_dim=1,
     )
-    product = SequentialRank1PlusDiagonal(seq_factors, seq_dim=1)
-    dense_factors = seq_factors.to_dense()
+    dense_factors = torch.diag_embed(product.d) + product.u.unsqueeze(-1) * product.v.unsqueeze(-2)
     expected = torch.eye(N).expand(BATCH, N, N)
     for index in range(n_factors):
         expected = dense_factors[:, index] @ expected
@@ -83,6 +82,11 @@ def main() -> None:
     x = torch.randn(BATCH, N)
     assert torch.allclose(product.matvec(x), torch.einsum("bij,bj->bi", expected, x), atol=1e-5)
     assert torch.allclose(product.T.to_dense(), expected.transpose(-2, -1), atol=1e-5)
+
+    traj = product.matvec(x, return_trajectory=True)
+    assert traj.shape == (BATCH, n_factors + 1, N)
+    assert torch.allclose(traj[:, 0], x)
+    assert torch.allclose(traj[:, -1], product.matvec(x), atol=1e-5)
 
     left_diag = torch.rand(BATCH, N)
     right_diag = torch.rand(BATCH, N)
@@ -107,26 +111,21 @@ def main() -> None:
 
     factor_shape = (1, n_factors, N)
     b_params = tuple(TrainableParameters.random_init(factor_shape, std=0.1) for _ in range(3))
-    p_params = tuple(TrainableParameters.random_init(factor_shape, std=0.1) for _ in range(2))
-    B = SequentialRank1PlusDiagonalFactorization(
-        Rank1PlusDiagonalFactorization(*b_params), seq_dim=1
-    )
-    P = SequentialRank1PlusDiagonalFactorization(
-        Rank1PlusDiagonalFactorization(*p_params, normalization_dim=0), seq_dim=1
-    )
-    model = SumProdRFF(g, psi, B, P)
-    assert B().shape == P().shape == (1, N, N)
+    B = R1PDFactorizationParameters(*b_params, seq_dim=1)
+    model = SumProdRFF(g, psi, B)
+    assert isinstance(B(), R1PDFactorization)
+    assert B().shape == (1, N, N)
     model_param_ids = {id(param) for param in model.parameters()}
-    assert all(id(param._p) in model_param_ids for param in (*b_params, *p_params))
+    assert all(id(param._p) in model_param_ids for param in b_params)
 
     data = torch.randn(7, 1)
     model.log_density(data, conditioner=data).sum().backward()
-    assert all(param._p.grad is not None for param in (*b_params, *p_params))
+    assert all(param._p.grad is not None for param in b_params)
     model.cpu()
 
     try:
-        Rank1PlusDiagonal(u_raw, v_raw, normalization_dim=2)
-        raise AssertionError("expected ValueError for invalid normalization_dim")
+        Rank1PlusDiagonal(u_raw, v_raw, normalization="bad")
+        raise AssertionError("expected ValueError for invalid normalization")
     except ValueError:
         pass
 

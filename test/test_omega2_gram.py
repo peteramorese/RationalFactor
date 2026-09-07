@@ -11,9 +11,9 @@ import torch
 
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF
-from rational_factor.models.structured_matrices import DenseMatrix, Rank1PlusDiagonal, as_matrix
-from rational_factor.models.parameters import FixedParameters, PositiveParameters, TrainableParameters, DenseMatrixFactorization, Rank1PlusDiagonalFactorization
+from rational_factor.models.parameters import FixedParameters, PositiveParameters, TrainableParameters, R1PDFactorizationParameters
 import rational_factor.tools.propagate as propagate
+from rational_factor.models.structured_matrices import DenseMatrix, Rank1PlusDiagonal, R1PDFactorization, as_matrix
 
 
 SEED = 0
@@ -109,19 +109,18 @@ def main() -> None:
     c_old = torch.einsum("...ij,...i->...j", M, c)
     assert torch.allclose(c_next, c_old)
 
-    # SumProdRFF B/P are matrix factorizations.
+    # SumProdRFF B is a sequential R1PD factorization.
     n = n_basis
-    raw = torch.eye(n).unsqueeze(0)
-    B = DenseMatrixFactorization(PositiveParameters.from_values(raw, trainable=True))
-    P = Rank1PlusDiagonalFactorization(
-        TrainableParameters.random_init((1, n)),
-        TrainableParameters.random_init((1, n)),
-        normalization_dim=1,
+    B = R1PDFactorizationParameters(
+        TrainableParameters.random_init((1, 2, n), std=0.1),
+        TrainableParameters.random_init((1, 2, n), std=0.1),
+        seq_dim=1,
+        normalization="r",
     )
-    sp = SumProdRFF(g, psi, B, P, register_modules=False)
-    Gamma = sp.get_Gamma()
-    assert isinstance(Gamma, Rank1PlusDiagonal)
-    assert Gamma.shape == (1, n, n)
+    sp = SumProdRFF(g, psi, B, register_modules=False)
+    Q = sp.get_Q()
+    assert isinstance(Q, R1PDFactorization)
+    assert Q.shape == (1, n, n)
     seq_sp = propagate.propagate(init, sp, n_steps=2)
     assert len(seq_sp) == 3
     logp = sp.log_density(torch.randn(4, dim), conditioner=torch.randn(4, dim))

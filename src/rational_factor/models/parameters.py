@@ -5,8 +5,7 @@ from abc import ABC, abstractmethod
 from rational_factor.models.structured_matrices import (
     DenseMatrix,
     Order1Quasiseparable,
-    Rank1PlusDiagonal,
-    SequentialRank1PlusDiagonal,
+    R1PDFactorization,
 )
 
 
@@ -176,11 +175,22 @@ class PositiveParameters(TrainableParameters):
         return self._normalization_dim
 
 
-class Rank1PlusDiagonalFactorization(Parameters):
-    """Stores R1PD factor tensors ``d, u, v`` with shape ``(..., n)``.
+class R1PDFactorizationParameters(Parameters):
+    """Trainable factors of a sequential rank-1-plus-diagonal product.
 
-    Call ``()`` to get a ``Rank1PlusDiagonal``; apply products with
-    ``sequential_matvec`` / ``inverse`` / ``T`` / ``flip`` on that object.
+    Stores ``d, u, v`` with shape ``(..., T, ..., n)`` where ``seq_dim`` indexes
+    the product factors. Calling ``()`` returns an
+    :class:`~rational_factor.models.structured_matrices.R1PDFactorization`
+    representing ``M_{T-1} ⋯ M_0``.
+
+    For row-/column-stochastic factors (``normalization in {'r','c'}``), pass
+    unconstrained :class:`TrainableParameters` for ``u`` and ``v`` and omit
+    ``d`` (it is ignored). Initialize ``u`` large-negative so ``sigmoid(u)≈0``
+    and each factor starts near the identity; otherwise a product of many
+    moderately mixing stochastic factors collapses to the uniform matrix.
+    Do not wrap ``u``/``v`` in :class:`PositiveParameters` when using
+    ``normalization`` — softplus+sigmoid/softmax stacks and destroys the
+    intended near-identity initialization.
     """
 
     def __init__(
@@ -188,21 +198,41 @@ class Rank1PlusDiagonalFactorization(Parameters):
         u: Parameters,
         v: Parameters,
         d: Parameters | None = None,
+        *,
+        seq_dim: int = -2,
         normalization: str | None = None,
     ):
         assert u.size() == v.size(), "u and v must have the same shape"
-        assert len(u.size()) >= 1, "u and v must have shape (..., n)"
+        assert len(u.size()) >= 2, "u and v must have shape (..., T, ..., n) with a sequence axis"
+        if normalization is not None and d is not None:
+            raise ValueError(
+                "d is ignored when normalization is set; omit d and pass "
+                "unconstrained TrainableParameters for u and v"
+            )
         if d is not None:
             assert d.size() == u.size(), "d, u, and v must have the same shape"
+        batch_ndim = len(u.size()) - 1
+        if not (-batch_ndim <= seq_dim < batch_ndim):
+            raise ValueError(
+                f"seq_dim must index a batch axis of u/v/d, got seq_dim={seq_dim} "
+                f"for shape {tuple(u.size())}"
+            )
         self.d = d
         self.u = u
         self.v = v
+        self.seq_dim = seq_dim % batch_ndim
         self.normalization = normalization
 
-    def __call__(self) -> Rank1PlusDiagonal:
+    def __call__(self) -> R1PDFactorization:
         d = None if self.d is None else self.d()
-        return Rank1PlusDiagonal(self.u(), self.v(), d, normalization=self.normalization)
-    
+        return R1PDFactorization(
+            self.u(),
+            self.v(),
+            d,
+            seq_dim=self.seq_dim,
+            normalization=self.normalization,
+        )
+
     def is_trainable(self):
         trainable = self.u.is_trainable() or self.v.is_trainable()
         if self.d is not None:
@@ -215,26 +245,6 @@ class Rank1PlusDiagonalFactorization(Parameters):
     def parameter_modules(self) -> list[torch.nn.Module]:
         params = (self.u, self.v) if self.d is None else (self.d, self.u, self.v)
         return [module for param in params for module in param.parameter_modules()]
-
-
-class SequentialRank1PlusDiagonalFactorization(Parameters):
-    """A product of R1PD factors, consuming ``seq_dim`` from their batch shape."""
-
-    def __init__(self, factors: Rank1PlusDiagonalFactorization, *, seq_dim: int = 0):
-        self.factors = factors
-        self.seq_dim = seq_dim
-
-    def __call__(self) -> SequentialRank1PlusDiagonal:
-        return SequentialRank1PlusDiagonal(self.factors(), seq_dim=self.seq_dim)
-
-    def is_trainable(self):
-        return self.factors.is_trainable()
-
-    def is_module(self):
-        return False
-
-    def parameter_modules(self) -> list[torch.nn.Module]:
-        return self.factors.parameter_modules()
 
 
 class DenseMatrixFactorization(Parameters):

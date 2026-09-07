@@ -10,10 +10,12 @@ from numpy.polynomial.legendre import leggauss
 from normalizing_flow.normalizing_flow import ConditionalNormalizingFlow
 from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import Basis, BetaBasis
+from rational_factor.models.composite_model import CompositeConditionalModel
 from rational_factor.models.parameters import Parameters, Order1QuasiseparableFactorization
 from rational_factor.models.structured_matrices import (
     DenseMatrix,
     Identity,
+    Diagonal,
     Matrix,
     Order1QSGenerators,
     Order1Quasiseparable,
@@ -143,8 +145,12 @@ class DisjointSupport1DPWCBasis(MutualPairBasis):
     """Disjoint support piecewise-constant mutual pair on variable-width cells.
     
     Divides [0, 1] into n_basis cells with normalized widths. On cell i, only
-    alpha_i and beta_i are active (constant), and zero elsewhere. The constraint
-    alpha_i * beta_i = 1 makes beta_i = 1/alpha_i, giving an identity Gram matrix.
+    alpha_i and beta_i are active (constant), and zero elsewhere. With
+    alpha_i * beta_i = 1 on cell i,
+
+        <alpha_i, beta_j> = delta_ij * width_i,
+
+    so the Gram matrix is ``diag(widths)``, not the identity.
     
     Parameters
     ----------
@@ -276,25 +282,20 @@ class DisjointSupport1DPWCBasis(MutualPairBasis):
         return result
     
     def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
+        """Cross Gram ``<alpha_i, beta_j>`` over ``[lows, highs]``.
+
+        Because ``alpha_i beta_i = 1`` on cell ``i`` and both vanish elsewhere,
+
+            <alpha_i, beta_j> = delta_ij * overlap(cell_i, [lows, highs]).
+
+        On the full domain this is ``diag(widths)``.
+        """
         alphas = self._alpha_params()
         dtype, device = alphas.dtype, alphas.device
-        
-        if lows is None and highs is None:
-            # Full domain: exact identity
-            batch_shape = (self._batch_size,) if self._batch_size > 1 else ()
-            return Identity(self._n_basis, batch_shape=batch_shape, dtype=dtype, device=device)
-        
-        # Partial domain: diagonal with overlap lengths
-        batch_size = self._batch_size
-        
-        diag_values = torch.zeros(batch_size, self._n_basis, dtype=dtype, device=device)
-        
-        for b in range(batch_size):
-            overlaps = self._cell_overlaps(lows, highs, batch_index=b)
-            diag_values[b] = overlaps
-        
-        z = torch.zeros_like(diag_values)
-        return Rank1PlusDiagonal(z, z, diag_values)
+        diag_values = torch.zeros(self._batch_size, self._n_basis, dtype=dtype, device=device)
+        for b in range(self._batch_size):
+            diag_values[b] = self._cell_overlaps(lows, highs, batch_index=b)
+        return Diagonal(diag_values)
     
     def bounds(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         alphas = self._alpha_params()
@@ -1121,7 +1122,7 @@ class NFPairBasis(torch.nn.Module, MutualPairBasis):
 
     def __init__(
         self,
-        nf: ConditionalNormalizingFlow,
+        nf: ConditionalNormalizingFlow | CompositeConditionalModel,
         splitter: torch.nn.Module,
         embedding: torch.nn.Embedding,
         eps: float = 1e-6,
@@ -1301,7 +1302,7 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
     def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         if lows is not None or highs is not None:
             raise ValueError("MaskedGramMutualBasis.Omega2 is only defined on the full domain")
-        return self.masking_basis.Omega2() * self.free_basis.Omega2_diag()
+        return self.masking_basis.Omega2().mul_diag_right(self.free_basis.Omega2_diag())
 
     def supremum(self, index: int) -> torch.Tensor:
         return self.masking_basis.supremum(index) * self.free_basis.supremum(index)

@@ -231,11 +231,21 @@ class Identity(Matrix):
 
 class Diagonal(Matrix):
     def __init__(self, d: torch.Tensor):
-        self.d = d
+        self.d = torch.as_tensor(d)
+        if self.d.dim() < 1:
+            raise ValueError(f"diagonal must have shape (..., n), got {tuple(self.d.shape)}")
+
+    @property
+    def n(self) -> int:
+        return self.d.shape[-1]
+
+    @property
+    def batch_shape(self) -> torch.Size:
+        return self.d.shape[:-1]
 
     @property
     def shape(self) -> torch.Size:
-        return self.d.shape
+        return self.batch_shape + torch.Size([self.n, self.n])
 
     @property
     def dtype(self) -> torch.dtype:
@@ -289,11 +299,14 @@ class Rank1PlusDiagonal(Matrix):
 
     - ``u``, ``v``: ``(..., n)`` vectors
     - ``d``: ``(..., n)`` diagonal entries. Optional: if omitted and
-      ``normalization_dim`` is ``None``, the diagonal is ones (``M = I + u vᵀ``).
-    - ``normalization_dim``: ``None``, ``'r'``, or ``'c'``. If set, ``d`` is ignored
+      ``normalization`` is ``None``, the diagonal is ones (``M = I + u vᵀ``).
+    - ``normalization``: ``None``, ``'r'``, or ``'c'``. If set, ``d`` is ignored
       and ``u``, ``v`` are unconstrained parameters of a stochastic matrix
       ``diag(1 - u) + u vᵀ`` (row-stochastic) or its transpose (column-stochastic).
       Every matrix in the batch is normalized independently.
+
+    This class represents a single R1PD (with optional outer batch axes). Products
+    of several factors along a sequence axis live in :class:`R1PDFactorization`.
 
     Matrix–vector products use ``Mx = d ⊙ x + u (vᵀ x)`` and cost ``O(n)``
     per batch element, never forming the dense ``n × n`` matrix.
@@ -453,91 +466,6 @@ class Rank1PlusDiagonal(Matrix):
         u_inv = -u_scaled / alpha.unsqueeze(-1)
         return Rank1PlusDiagonal(u_inv, v_scaled, d_inv)
 
-    def flip(self, seq_dim: int = 0) -> "Rank1PlusDiagonal":
-        """Reverse factor order along ``seq_dim`` (e.g. for ``(M₀⋯M_{T-1})⁻¹``)."""
-        return Rank1PlusDiagonal(
-            self.u.flip(seq_dim),
-            self.v.flip(seq_dim),
-            self.d.flip(seq_dim),
-        )
-
-    def sequential_matvec(
-        self,
-        x0: torch.Tensor,
-        *,
-        seq_dim: int = 0,
-        reverse: bool = False,
-        return_trajectory: bool = False,
-    ) -> torch.Tensor:
-        """Apply ``M_t`` sequentially: ``x_{t+1} = M_t x_t``.
-
-        One batch axis (``seq_dim``) indexes the time-ordered factors; all other
-        batch axes are independent sequences updated in parallel.
-
-        With ``reverse=False`` (default), applies ``M_0``, then ``M_1``, … so the
-        product is ``M_{T-1} ⋯ M_0``. With ``reverse=True``, applies ``M_{T-1}``,
-        then ``M_{T-2}``, … (same as ``self.flip(seq_dim).sequential_matvec(...)``).
-
-        Args:
-            x0: ``(..., n)`` where ``...`` is ``batch_shape`` with ``seq_dim``
-                removed (e.g. factors ``(B, T, n)``, ``seq_dim=1`` → ``x0`` is
-                ``(B, n)``).
-            seq_dim: batch axis along which factors are ordered in time.
-            reverse: if True, traverse the sequence axis backward.
-            return_trajectory: if True, return all states with shape
-                ``batch_shape + (n,)`` (same as factors but ``seq_dim`` length
-                is ``T + 1``). Otherwise return the final state only.
-
-        Returns:
-            Final state ``(..., n)``, or full trajectory if
-            ``return_trajectory=True``.
-        """
-        if reverse:
-            return self.flip(seq_dim).sequential_matvec(
-                x0, seq_dim=seq_dim, reverse=False, return_trajectory=return_trajectory
-            )
-
-        batch_ndim = self.d.dim() - 1
-        if batch_ndim == 0:
-            raise ValueError(
-                "sequential_matvec requires at least one batch dim (sequence length); "
-                f"got factor shape {tuple(self.d.shape)}"
-            )
-        if not (-batch_ndim <= seq_dim < batch_ndim):
-            raise ValueError(
-                f"seq_dim must index a batch axis of d/u/v, got seq_dim={seq_dim} "
-                f"for batch_shape={tuple(self.batch_shape)}"
-            )
-        if seq_dim < 0:
-            seq_dim += batch_ndim
-
-        d = self.d.movedim(seq_dim, 0)
-        u = self.u.movedim(seq_dim, 0)
-        v = self.v.movedim(seq_dim, 0)
-        T_seq = d.shape[0]
-        state_shape = d.shape[1:]
-
-        x = torch.as_tensor(x0, dtype=self.dtype, device=self.device)
-        if x.shape != state_shape:
-            raise ValueError(
-                f"x0 must have shape {tuple(state_shape)} (batch without seq_dim + (n,)), "
-                f"got {tuple(x.shape)}"
-            )
-
-        if return_trajectory:
-            traj = x.new_empty((T_seq + 1,) + state_shape)
-            traj[0] = x
-            for t in range(T_seq):
-                vx = (v[t] * x).sum(dim=-1)
-                x = d[t] * x + u[t] * vx.unsqueeze(-1)
-                traj[t + 1] = x
-            return traj.movedim(0, seq_dim)
-
-        for t in range(T_seq):
-            vx = (v[t] * x).sum(dim=-1)
-            x = d[t] * x + u[t] * vx.unsqueeze(-1)
-        return x
-
     def matvec(self, x: torch.Tensor) -> torch.Tensor:
         """Compute ``M @ x`` in ``O(n)`` time (per batch / RHS).
 
@@ -559,33 +487,48 @@ class Rank1PlusDiagonal(Matrix):
         )
 
 
-class SequentialRank1PlusDiagonal(Matrix):
-    """Product of rank-1-plus-diagonal factors along one batch axis.
+class R1PDFactorization(Rank1PlusDiagonal):
+    """Product of rank-1-plus-diagonal factors along one tensor axis.
 
-    If ``factors`` stores ``M_0, ..., M_{T-1}`` along ``seq_dim``, this
-    object represents ``M_{T-1} ... M_0``.  The sequence axis is consumed by
-    the product and therefore does not appear in :attr:`shape`.
+    Stores the same ``d, u, v`` tensors as :class:`Rank1PlusDiagonal`, but with
+    an extra sequence axis ``seq_dim`` indexing the factors ``M_0, ..., M_{T-1}``.
+    This object represents the product ``M_{T-1} ⋯ M_0``; the sequence axis is
+    consumed and therefore does not appear in :attr:`shape`.
+
+    ``matvec`` applies the factors sequentially in ``O(T n)`` without forming
+    the dense product.
     """
 
-    def __init__(self, factors: Rank1PlusDiagonal, *, seq_dim: int = 0):
-        batch_ndim = len(factors.batch_shape)
-        if batch_ndim == 0:
-            raise ValueError("factors must have at least one batch axis to use as the sequence axis")
+    def __init__(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        d: torch.Tensor | None = None,
+        *,
+        seq_dim: int = -2,
+        normalization: str | None = None,
+    ):
+        super().__init__(u, v, d, normalization=normalization)
+        batch_ndim = self.d.dim() - 1
+        if batch_ndim < 1:
+            raise ValueError(
+                "R1PDFactorization requires a sequence axis; "
+                f"got factor shape {tuple(self.d.shape)}"
+            )
         if not (-batch_ndim <= seq_dim < batch_ndim):
             raise ValueError(
-                f"seq_dim must index a factor batch axis, got {seq_dim} for "
-                f"batch_shape={tuple(factors.batch_shape)}"
+                f"seq_dim must index a batch axis of d/u/v, got seq_dim={seq_dim} "
+                f"for shape {tuple(self.d.shape)}"
             )
-        self.factors = factors
         self.seq_dim = seq_dim % batch_ndim
 
     @property
-    def n(self) -> int:
-        return self.factors.n
+    def n_factors(self) -> int:
+        return self.d.shape[self.seq_dim]
 
     @property
     def batch_shape(self) -> torch.Size:
-        shape = list(self.factors.batch_shape)
+        shape = list(self.d.shape[:-1])
         del shape[self.seq_dim]
         return torch.Size(shape)
 
@@ -593,61 +536,147 @@ class SequentialRank1PlusDiagonal(Matrix):
     def shape(self) -> torch.Size:
         return self.batch_shape + torch.Size([self.n, self.n])
 
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.factors.dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self.factors.device
-
     def _factor(self, index: int) -> Rank1PlusDiagonal:
         return Rank1PlusDiagonal(
-            self.factors.u.select(self.seq_dim, index),
-            self.factors.v.select(self.seq_dim, index),
-            self.factors.d.select(self.seq_dim, index),
+            self.u.select(self.seq_dim, index),
+            self.v.select(self.seq_dim, index),
+            self.d.select(self.seq_dim, index),
+        )
+
+    def to(self, *args, **kwargs) -> "R1PDFactorization":
+        return R1PDFactorization(
+            self.u.to(*args, **kwargs),
+            self.v.to(*args, **kwargs),
+            self.d.to(*args, **kwargs),
+            seq_dim=self.seq_dim,
+        )
+
+    def flip(self) -> "R1PDFactorization":
+        """Reverse factor order along the sequence axis."""
+        return R1PDFactorization(
+            self.u.flip(self.seq_dim),
+            self.v.flip(self.seq_dim),
+            self.d.flip(self.seq_dim),
+            seq_dim=self.seq_dim,
         )
 
     @property
-    def T(self) -> "SequentialRank1PlusDiagonal":
-        # Reverse the factor order as well as transposing each factor.
-        transposed = Rank1PlusDiagonal(
-            self.factors.v.flip(self.seq_dim),
-            self.factors.u.flip(self.seq_dim),
-            self.factors.d.flip(self.seq_dim),
+    def T(self) -> "R1PDFactorization":
+        """Transpose: reverse factor order and transpose each factor."""
+        return R1PDFactorization(
+            self.v.flip(self.seq_dim),
+            self.u.flip(self.seq_dim),
+            self.d.flip(self.seq_dim),
+            seq_dim=self.seq_dim,
         )
-        return SequentialRank1PlusDiagonal(transposed, seq_dim=self.seq_dim)
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
-        result = torch.as_tensor(x, dtype=self.dtype, device=self.device)
-        for index in range(self.factors.batch_shape[self.seq_dim]):
-            result = self._factor(index).matvec(result)
-        return result
+    def matvec(
+        self,
+        x: torch.Tensor,
+        *,
+        reverse: bool = False,
+        return_trajectory: bool = False,
+    ) -> torch.Tensor:
+        """Apply ``M_t`` sequentially: ``x_{t+1} = M_t x_t``.
+
+        With ``reverse=False`` (default), applies ``M_0``, then ``M_1``, … so the
+        product is ``M_{T-1} ⋯ M_0``. With ``reverse=True``, applies ``M_{T-1}``,
+        then ``M_{T-2}``, … (same as ``self.flip().matvec(...)``).
+
+        Args:
+            x: ``(..., n)`` or ``(..., n, m)``. Leading dims broadcast with
+                :attr:`batch_shape` (the factor batch with ``seq_dim`` removed).
+            reverse: if True, traverse the sequence axis backward.
+            return_trajectory: if True, return all states with the sequence axis
+                length ``T + 1`` inserted at ``seq_dim``. Requires ``x`` to match
+                :attr:`batch_shape` exactly (no extra data-batch dims).
+
+        Returns:
+            Final state, or full trajectory if ``return_trajectory=True``.
+        """
+        if reverse:
+            return self.flip().matvec(x, reverse=False, return_trajectory=return_trajectory)
+
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        d = self.d.movedim(self.seq_dim, 0)
+        u = self.u.movedim(self.seq_dim, 0)
+        v = self.v.movedim(self.seq_dim, 0)
+        T_seq = d.shape[0]
+        factor_batch = d.shape[1:]  # batch_shape + (n,)
+
+        if return_trajectory:
+            if x.shape != factor_batch:
+                raise ValueError(
+                    f"return_trajectory requires x shape {tuple(factor_batch)}, got {tuple(x.shape)}"
+                )
+            traj = x.new_empty((T_seq + 1,) + factor_batch)
+            traj[0] = x
+            for t in range(T_seq):
+                vx = (v[t] * x).sum(dim=-1)
+                x = d[t] * x + u[t] * vx.unsqueeze(-1)
+                traj[t + 1] = x
+            return traj.movedim(0, self.seq_dim)
+
+        # Multi-RHS: (..., n, m), possibly with a data batch in front of factor batch.
+        if x.dim() >= len(factor_batch) + 1 and x.shape[-2] == self.n:
+            for t in range(T_seq):
+                vx = (v[t].unsqueeze(-1) * x).sum(dim=-2)
+                x = d[t].unsqueeze(-1) * x + u[t].unsqueeze(-1) * vx.unsqueeze(-2)
+            return x
+
+        if x.shape[-1] != self.n:
+            raise ValueError(
+                f"x must have shape (..., {self.n}) or (..., {self.n}, m), got {tuple(x.shape)}"
+            )
+
+        for t in range(T_seq):
+            vx = (v[t] * x).sum(dim=-1)
+            x = d[t] * x + u[t] * vx.unsqueeze(-1)
+        return x
 
     def to_dense(self) -> torch.Tensor:
         eye = torch.eye(self.n, dtype=self.dtype, device=self.device)
         eye = eye.expand(self.batch_shape + (self.n, self.n)).clone()
         return self.matvec(eye)
 
-    def _replace_factor(self, index: int, factor: Rank1PlusDiagonal) -> "SequentialRank1PlusDiagonal":
-        u = self.factors.u.clone()
-        v = self.factors.v.clone()
-        d = self.factors.d.clone()
+    def diag(self) -> torch.Tensor:
+        return self.to_dense().diagonal(dim1=-2, dim2=-1)
+
+    def sum(self) -> torch.Tensor:
+        return self.to_dense().sum()
+
+    def inverse(self) -> "R1PDFactorization":
+        """Inverse of the product: reverse order and invert each factor."""
+        inv_factors = [
+            self._factor(index).inverse()
+            for index in range(self.n_factors - 1, -1, -1)
+        ]
+        return R1PDFactorization(
+            torch.stack([f.u for f in inv_factors], dim=self.seq_dim),
+            torch.stack([f.v for f in inv_factors], dim=self.seq_dim),
+            torch.stack([f.d for f in inv_factors], dim=self.seq_dim),
+            seq_dim=self.seq_dim,
+        )
+
+    def _replace_factor(self, index: int, factor: Rank1PlusDiagonal) -> "R1PDFactorization":
+        u = self.u.clone()
+        v = self.v.clone()
+        d = self.d.clone()
         selector = [slice(None)] * u.dim()
         selector[self.seq_dim] = index
         selector = tuple(selector)
         u[selector], v[selector], d[selector] = factor.u, factor.v, factor.d
-        return SequentialRank1PlusDiagonal(Rank1PlusDiagonal(u, v, d), seq_dim=self.seq_dim)
+        return R1PDFactorization(u, v, d, seq_dim=self.seq_dim)
 
-    def mul_diag_left(self, a: torch.Tensor) -> "SequentialRank1PlusDiagonal":
-        last = self.factors.batch_shape[self.seq_dim] - 1
+    def mul_diag_left(self, a: torch.Tensor) -> "R1PDFactorization":
+        last = self.n_factors - 1
         return self._replace_factor(last, self._factor(last).mul_diag_left(a))
 
-    def mul_diag_right(self, a: torch.Tensor) -> "SequentialRank1PlusDiagonal":
+    def mul_diag_right(self, a: torch.Tensor) -> "R1PDFactorization":
         return self._replace_factor(0, self._factor(0).mul_diag_right(a))
 
-    def scale(self, s: torch.Tensor | float) -> "SequentialRank1PlusDiagonal":
-        last = self.factors.batch_shape[self.seq_dim] - 1
+    def scale(self, s: torch.Tensor | float) -> "R1PDFactorization":
+        last = self.n_factors - 1
         return self._replace_factor(last, self._factor(last).scale(s))
 
 

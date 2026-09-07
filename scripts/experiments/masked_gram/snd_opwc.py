@@ -21,8 +21,7 @@ from rational_factor.models.mutual_bases import (
 from rational_factor.models.parameters import (
     Order1QuasiseparableFactorization,
     PositiveParameters,
-    Rank1PlusDiagonalFactorization,
-    SequentialRank1PlusDiagonalFactorization,
+    R1PDFactorizationParameters,
     TrainableParameters,
     param_group_iter,
 )
@@ -354,14 +353,12 @@ if __name__ == "__main__":
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
     ).to(device)
 
-    ## Shape is (model batch, product sequence, basis).  The product wrapper
-    ## consumes dimension 1, so SumProdRFF sees one (n_basis, n_basis) matrix.
+    ## Shape is (model batch, product sequence, basis). Use TrainableParameters
+    ## for u,v with u init << 0 when normalization='r'; omit d.
     #B_shape = (1, B_rank, n_basis)
-    #B_u = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
-    #B_v = PositiveParameters.random_init(shape=B_shape, mean=-5.0, std=0.1, epsilon=1e-6).to(device)
-    #B_d = PositiveParameters.random_init(shape=B_shape, mean=0.54, std=0.01, epsilon=1e-3).to(device)
-    #B_factors = Rank1PlusDiagonalFactorization(B_u, B_v, B_d, normalization='r')
-    #B = SequentialRank1PlusDiagonalFactorization(B_factors, seq_dim=1)
+    #B_u = TrainableParameters.random_init(shape=B_shape, mean=-4.0, std=0.1).to(device)
+    #B_v = TrainableParameters.random_init(shape=B_shape, mean=0.0, std=0.1).to(device)
+    #B = R1PDFactorizationParameters(B_u, B_v, seq_dim=1, normalization='r')
 
     B_params = PositiveParameters.random_init(shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), normalization_dim=2).to(device)
     B = DenseMatrixFactorization(B_params)

@@ -106,17 +106,17 @@ def _check_disjoint_support(basis: DisjointSupport1DPWCBasis) -> None:
     print(f"✓ Disjoint support verified: at most 1 alpha and 1 beta active per point")
 
 
-def _check_gram_identity(basis: DisjointSupport1DPWCBasis) -> None:
-    """Verify that Omega2 is the identity matrix."""
+def _check_gram_diag_widths(basis: DisjointSupport1DPWCBasis) -> None:
+    """Verify that Omega2 is diag(cell widths), not identity."""
     G = basis.Omega2().to_dense()
-    
-    if G.ndim == 3:
-        G = G[0]  # Take first batch
-    
-    I = torch.eye(basis.n_basis_functions(), dtype=G.dtype, device=G.device)
-    
-    assert torch.allclose(G, I, atol=1e-5, rtol=1e-4), f"Gram is not identity:\n{G}"
-    print(f"✓ Gram matrix is identity (max |G - I| = {(G - I).abs().max().item():.2e})")
+    if G.ndim == 2:
+        G = G.unsqueeze(0)
+
+    widths = basis._cell_widths_params()
+    expected = torch.diag_embed(widths)
+
+    assert torch.allclose(G, expected, atol=1e-5, rtol=1e-4), f"Gram is not diag(widths):\n{G}\nvs\n{expected}"
+    print(f"✓ Gram matrix is diag(widths) (max |G - diag(w)| = {(G - expected).abs().max().item():.2e})")
 
 
 def _check_alpha_beta_product(basis: DisjointSupport1DPWCBasis) -> None:
@@ -174,7 +174,7 @@ def main() -> None:
     print(f"beta values (1/alpha): {(1.0 / basis._alpha_params()[0]).tolist()}")
 
     _check_disjoint_support(basis)
-    _check_gram_identity(basis)
+    _check_gram_diag_widths(basis)
     _check_alpha_beta_product(basis)
     _check_integrals(basis)
 
