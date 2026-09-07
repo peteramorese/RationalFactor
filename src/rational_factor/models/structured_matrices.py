@@ -160,6 +160,130 @@ def as_matrix(obj: torch.Tensor | Matrix) -> Matrix:
     return DenseMatrix(obj)
 
 
+class Identity(Matrix):
+    """Identity matrix of size n × n.
+    
+    Optionally batched with shape (..., n, n). The batch shape is inferred
+    from operations that provide tensor inputs.
+    """
+    
+    def __init__(self, n: int, batch_shape: tuple[int, ...] = (), dtype: torch.dtype | None = None, device: torch.device | None = None):
+        self.n = n
+        self._batch_shape = batch_shape
+        self._dtype = dtype if dtype is not None else torch.float32
+        self._device = device if device is not None else torch.device("cpu")
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size(self._batch_shape + (self.n, self.n))
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def T(self) -> "Identity":
+        return Identity(self.n, self._batch_shape, self._dtype, self._device)
+
+    def to_dense(self) -> torch.Tensor:
+        eye = torch.eye(self.n, dtype=self._dtype, device=self._device)
+        if self._batch_shape:
+            eye = eye.expand(*self._batch_shape, self.n, self.n)
+        return eye
+
+    def diag(self) -> torch.Tensor:
+        ones = torch.ones(*self._batch_shape, self.n, dtype=self._dtype, device=self._device)
+        return ones
+
+    def sum(self) -> torch.Tensor:
+        return torch.full(self._batch_shape, self.n, dtype=self._dtype, device=self._device)
+
+    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+        return x.to(dtype=self._dtype, device=self._device)
+
+    def mul_diag_left(self, a: torch.Tensor) -> "Diagonal":
+        a = torch.as_tensor(a, dtype=self._dtype, device=self._device)
+        return Diagonal(a)
+
+    def mul_diag_right(self, a: torch.Tensor) -> "Diagonal":
+        a = torch.as_tensor(a, dtype=self._dtype, device=self._device)
+        return Diagonal(a)
+
+    def mul_diag(self, a: torch.Tensor, *, side: str = "left") -> "Diagonal":
+        if side == "left":
+            return self.mul_diag_left(a)
+        if side == "right":
+            return self.mul_diag_right(a)
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+    def scale(self, s: torch.Tensor | float) -> "Diagonal":
+        s = torch.as_tensor(s, dtype=self._dtype, device=self._device)
+        d = torch.full((*self._batch_shape, self.n), s.item() if s.numel() == 1 else s, dtype=self._dtype, device=self._device)
+        return Diagonal(d)
+
+    def inverse(self) -> "Identity":
+        return Identity(self.n, self._batch_shape, self._dtype, self._device)
+
+
+class Diagonal(Matrix):
+    def __init__(self, d: torch.Tensor):
+        self.d = d
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.d.shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.d.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.d.device
+
+    @property
+    def T(self) -> Diagonal:
+        return Diagonal(self.d)
+
+    def to_dense(self) -> torch.Tensor:
+        return torch.diag_embed(self.d)
+
+    def diag(self) -> torch.Tensor:
+        return self.d
+
+    def sum(self) -> torch.Tensor:
+        return self.d.sum()
+
+    def scale(self, s: torch.Tensor | float) -> Diagonal:
+        s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
+        return Diagonal(self.d * s)
+
+    def mul_diag_left(self, a: torch.Tensor) -> Diagonal:
+        a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
+        return Diagonal(a * self.d)
+
+    def mul_diag_right(self, a: torch.Tensor) -> Diagonal:
+        a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
+        return Diagonal(self.d * a)
+
+    def mul_diag(self, a: torch.Tensor, *, side: str = "left") -> Diagonal:
+        if side == "left":
+            return self.mul_diag_left(a)
+        if side == "right":
+            return self.mul_diag_right(a)
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+    def inverse(self) -> Diagonal:
+        return Diagonal(self.d.reciprocal())
+
+    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+        return self.d * x
+
+
 class Rank1PlusDiagonal(Matrix):
     """Batched rank-1-plus-diagonal matrix ``M = diag(d) + u vᵀ``.
 

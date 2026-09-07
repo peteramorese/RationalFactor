@@ -1,30 +1,3 @@
-"""Volume-preserving continuous normalizing flow on the unit box [0, 1]^d.
-
-A continuous normalizing flow is the time-1 map of an ODE
-
-    dx/dt = v_θ(x, t, c).
-
-Volume preservation is equivalent to ∇ · v = 0. Trajectories stay in the unit
-box if the field is tangent to the boundary, i.e. the normal component vanishes
-on every face:
-
-    v_i(x, t, c) = 0  whenever  x_i ∈ {0, 1}.
-
-Both constraints are built into the parameterization. Let A_θ(x, t, c) be a
-skew-symmetric matrix produced by a neural net, and set
-
-    Ψ_{ij}(x, t, c) = x_i (1 - x_i) x_j (1 - x_j) A_{ij}(x, t, c).
-
-Then the velocity
-
-    v_i = Σ_j ∂Ψ_{ij} / ∂x_j
-
-is divergence-free (mixed partials of a skew matrix cancel) and has zero normal
-component on ∂[0, 1]^d (Ψ_{i·} vanishes identically on the faces x_i ∈ {0, 1},
-so its tangential derivatives do too). Because ∇ · v = 0, log |det J_x| = 0
-along the flow. The conditioner c is held fixed along each trajectory.
-"""
-
 from __future__ import annotations
 
 import copy

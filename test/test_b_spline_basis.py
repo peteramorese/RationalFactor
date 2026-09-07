@@ -2,7 +2,7 @@
 Sanity checks for FixedDegreeBSplineMutualBasis.
 
 Run:
-  PYTHONPATH=src python test/test_bspline_basis.py
+  PYTHONPATH=src python test/test_b_spline_basis.py
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from rational_factor.models.mutual_bases import FixedDegreeBSplineMutualBasis
 
 
 SEED = 0
-N_BASIS = 12
+N_BASIS = 20
 DEGREE = 3
 N_GRID = 20_001
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "figures", "bspline")
@@ -28,7 +28,8 @@ def _make_basis() -> FixedDegreeBSplineMutualBasis:
     return FixedDegreeBSplineMutualBasis(
         n_basis=N_BASIS,
         degree=DEGREE,
-    ).to(dtype=torch.float64)
+        dtype=torch.float64,
+    )
 
 
 def _numerical_integral(y: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
@@ -46,20 +47,28 @@ def _numerical_gram(
 def _plot(basis: FixedDegreeBSplineMutualBasis) -> None:
     y = torch.linspace(0, 1, 2000, dtype=torch.float64)
     a, b = basis.eval(y, 0).detach(), basis.eval(y, 1).detach()
+    y_np = y.numpy()
 
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    fig.suptitle(rf"FixedDegreeBSplineMutualBasis  ($n={N_BASIS}$, $p={DEGREE}$)")
+
+    cmap = plt.cm.viridis
     for i in range(N_BASIS):
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(y, a[:, i], label=rf"$\alpha_{i}$")
-        ax.plot(y, b[:, i], label=rf"$\beta_{i}$")
+        color = cmap(i / max(N_BASIS - 1, 1))
+        axes[0].plot(y_np, a[:, i].numpy(), color=color, lw=1.4, label=rf"$\alpha_{{{i}}}$")
+        axes[1].plot(y_np, b[:, i].numpy(), color=color, lw=1.4, label=rf"$\beta_{{{i}}}$")
 
+    for ax, title in zip(axes, (r"primal $\alpha$", r"dual $\beta$")):
         for x in basis.breakpoints:
             ax.axvline(float(x), color="0.85", lw=0.7)
-
-        ax.legend()
+        ax.set_ylabel(title)
         ax.grid(alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(os.path.join(OUT_DIR, f"basis_{i}.png"), dpi=150)
-        plt.close(fig)
+        ax.legend(ncol=min(N_BASIS, 6), fontsize=8, loc="best")
+
+    axes[1].set_xlabel("y")
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "alpha_beta_basis.png"), dpi=150)
+    plt.close(fig)
 
 
 def main() -> None:
@@ -72,6 +81,7 @@ def main() -> None:
         f"n_basis={N_BASIS}, degree={DEGREE}, "
         f"n_spans={len(basis.breakpoints) - 1}"
     )
+    assert sum(p.numel() for p in basis.parameters()) == 0
 
     # ------------------------------------------------------------------
     # Evaluation / basic spline properties
@@ -91,7 +101,10 @@ def main() -> None:
 
     # B-splines are nonnegative and form a partition of unity.
     assert a.min() >= -1e-12
-    #assert torch.allclose(a.sum(-1), torch.ones(len(y_test)), atol=1e-12)
+    assert torch.allclose(a.sum(-1), torch.ones(len(y_test), dtype=a.dtype), atol=1e-12)
+
+    a_col = basis.eval(y_test.unsqueeze(-1), 0)
+    assert torch.allclose(a, a_col)
 
     # At most degree + 1 primal B-splines are active in an interior span.
     y_interior = torch.linspace(1e-5, 1 - 1e-5, 1000, dtype=torch.float64)
@@ -123,7 +136,7 @@ def main() -> None:
     # For beta = Lambda G^{-1} alpha:
     #
     #     integral beta = Lambda 1.
-    assert torch.allclose(int_b, torch.as_tensor(1.0), atol=1e-10, rtol=1e-10)
+    assert torch.allclose(int_b, torch.ones_like(int_b), atol=1e-10, rtol=1e-10)
 
     G_num = _numerical_gram(y, a, b)
     G = basis.Omega2().to_dense()[0]

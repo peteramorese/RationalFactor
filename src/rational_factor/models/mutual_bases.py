@@ -7,17 +7,18 @@ import torch
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 
-
+from normalizing_flow.normalizing_flow import ConditionalNormalizingFlow
 from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import Basis, BetaBasis
 from rational_factor.models.parameters import Parameters, Order1QuasiseparableFactorization
 from rational_factor.models.structured_matrices import (
     DenseMatrix,
+    Identity,
     Matrix,
     Order1QSGenerators,
     Order1Quasiseparable,
     Rank1PlusDiagonal,
-)
+    )
 
 
 class MutualPairBasis:
@@ -136,6 +137,182 @@ class FeasibleZeroMeanPWC:
         head = self.sqrt_p * torch.eye(m, dtype=dtype, device=device) - self.eta
         tail = -torch.ones(m, 1, dtype=dtype, device=device)
         return torch.cat([head, tail], dim=-1)
+
+
+class DisjointSupport1DPWCBasis(MutualPairBasis):
+    """Disjoint support piecewise-constant mutual pair on variable-width cells.
+    
+    Divides [0, 1] into n_basis cells with normalized widths. On cell i, only
+    alpha_i and beta_i are active (constant), and zero elsewhere. The constraint
+    alpha_i * beta_i = 1 makes beta_i = 1/alpha_i, giving an identity Gram matrix.
+    
+    Parameters
+    ----------
+    cell_widths_params : Parameters
+        Normalized positive parameters summing to 1, defining relative cell widths.
+    alpha_params : Parameters
+        Positive parameters for alpha values on each cell.
+    coeffs : tuple, optional
+        Optional coefficients for alpha and beta bases.
+    """
+    
+    def __init__(
+        self,
+        cell_widths_params: Parameters,
+        alpha_params: Parameters,
+        coeffs: tuple[Parameters | None, Parameters | None] | None = None,
+    ):
+        widths = cell_widths_params()
+        alphas = alpha_params()
+        
+        if widths.ndim != 2:
+            raise ValueError("cell_widths_params must have shape (batch_size, n_basis)")
+        if alphas.ndim != 2:
+            raise ValueError("alpha_params must have shape (batch_size, n_basis)")
+        
+        batch_size, n_basis = widths.shape
+        if alphas.shape != (batch_size, n_basis):
+            raise ValueError("alpha_params and cell_widths_params must have the same shape")
+        
+        # Ensure widths are normalized
+        if not torch.allclose(widths.sum(dim=-1), torch.ones(batch_size, dtype=widths.dtype, device=widths.device)):
+            raise ValueError("cell widths must sum to 1 (use normalized PositiveParameters)")
+        
+        super().__init__(1, batch_size, n_basis, (cell_widths_params, alpha_params), coeffs)
+        self._cell_widths_params = cell_widths_params
+        self._alpha_params = alpha_params
+        self._n_cells = n_basis
+    
+    @property
+    def n_cells(self) -> int:
+        return self._n_cells
+    
+    def cell_edges(self, batch_index: int = 0) -> torch.Tensor:
+        widths = self._cell_widths_params()[batch_index]
+        edges = torch.cat([
+            torch.zeros(1, dtype=widths.dtype, device=widths.device),
+            torch.cumsum(widths, dim=0)
+        ])
+        return edges
+    
+    def _cell_index(self, y: torch.Tensor, batch_index: int = 0) -> torch.Tensor:
+        widths = self._cell_widths_params()
+        y = torch.as_tensor(y, dtype=widths.dtype, device=widths.device).reshape(-1)
+        y = y.clamp(0.0, 1.0)
+        
+        edges = self.cell_edges(batch_index)
+        # searchsorted returns the insertion index; subtract 1 to get cell index
+        cell = torch.searchsorted(edges, y, right=False) - 1
+        # Clamp to valid range [0, n_cells-1]
+        cell = cell.clamp(0, self._n_cells - 1)
+        
+        # Handle edge case: y = 1.0 should be in the last cell
+        cell = torch.where(y >= edges[-1], torch.full_like(cell, self._n_cells - 1), cell)
+        
+        return cell
+    
+    def _cell_overlaps(self, lows: torch.Tensor | None, highs: torch.Tensor | None, batch_index: int = 0) -> torch.Tensor:
+        widths = self._cell_widths_params()
+        dtype, device = widths.dtype, widths.device
+        
+        lo = torch.zeros((), dtype=dtype, device=device) if lows is None else torch.as_tensor(lows, dtype=dtype, device=device).reshape(-1)[0]
+        hi = torch.ones((), dtype=dtype, device=device) if highs is None else torch.as_tensor(highs, dtype=dtype, device=device).reshape(-1)[0]
+        
+        edges = self.cell_edges(batch_index)
+        # For each cell [edges[i], edges[i+1]], compute overlap with [lo, hi]
+        cell_starts = edges[:-1]
+        cell_ends = edges[1:]
+        
+        overlap_starts = torch.maximum(cell_starts, lo)
+        overlap_ends = torch.minimum(cell_ends, hi)
+        overlaps = (overlap_ends - overlap_starts).clamp(min=0)
+        
+        return overlaps
+    
+    def eval(self, y: torch.Tensor, index: int | None = None) -> torch.Tensor:
+        alphas = self._alpha_params()
+        y = torch.as_tensor(y, dtype=alphas.dtype, device=alphas.device).reshape(-1)
+        
+        if self._batch_size != 1:
+            raise ValueError("eval currently requires parameter batch_size == 1")
+        
+        # Get cell indices for each y value
+        cells = self._cell_index(y, batch_index=0)
+        
+        # Vectorized: create one-hot encoding of cell indices and multiply by values
+        N = y.shape[0]
+        # Create one-hot encoding: shape (N, n_basis)
+        one_hot = torch.zeros(N, self._n_basis, dtype=alphas.dtype, device=alphas.device)
+        one_hot.scatter_(1, cells.unsqueeze(1), 1.0)
+        
+        # Multiply by alpha or beta values
+        result_alpha = one_hot * alphas[0]
+        result_beta = one_hot / alphas[0]
+        
+        if index == 0:
+            return result_alpha
+        if index == 1:
+            return result_beta
+        if index is None:
+            return torch.stack([result_alpha, result_beta], dim=1)
+        raise ValueError("index must be 0, 1, or None")
+    
+    def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
+        if index not in (0, 1):
+            raise ValueError("index must be 0 or 1")
+        
+        alphas = self._alpha_params()
+        batch_size = self._batch_size
+        
+        result = torch.zeros(batch_size, self._n_basis, dtype=alphas.dtype, device=alphas.device)
+        
+        for b in range(batch_size):
+            overlaps = self._cell_overlaps(lows, highs, batch_index=b)
+            if index == 0:
+                result[b] = alphas[b] * overlaps
+            else:  # index == 1
+                result[b] = (1.0 / alphas[b]) * overlaps
+        
+        return result
+    
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
+        alphas = self._alpha_params()
+        dtype, device = alphas.dtype, alphas.device
+        
+        if lows is None and highs is None:
+            # Full domain: exact identity
+            batch_shape = (self._batch_size,) if self._batch_size > 1 else ()
+            return Identity(self._n_basis, batch_shape=batch_shape, dtype=dtype, device=device)
+        
+        # Partial domain: diagonal with overlap lengths
+        batch_size = self._batch_size
+        
+        diag_values = torch.zeros(batch_size, self._n_basis, dtype=dtype, device=device)
+        
+        for b in range(batch_size):
+            overlaps = self._cell_overlaps(lows, highs, batch_index=b)
+            diag_values[b] = overlaps
+        
+        z = torch.zeros_like(diag_values)
+        return Rank1PlusDiagonal(z, z, diag_values)
+    
+    def bounds(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        alphas = self._alpha_params()
+        zeros = torch.zeros_like(alphas)
+        
+        if index == 0:
+            # alpha: min is 0, max is alpha_i
+            return zeros, alphas
+        if index == 1:
+            # beta: min is 0, max is 1/alpha_i
+            return zeros, 1.0 / alphas
+        raise ValueError("index must be 0 or 1")
+    
+    def infimum(self, index: int) -> torch.Tensor:
+        return self.bounds(index)[0]
+    
+    def supremum(self, index: int) -> torch.Tensor:
+        return self.bounds(index)[1]
         
 
 class Orthogonal1DPWCBasis(MutualPairBasis):
@@ -317,7 +494,8 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
 
         <alpha_i, beta_j> = Lambda_j delta_ij.
 
-    If ``gram_diag_params is None``, Lambda = I.
+    Lambda = I, so ``<alpha_i, beta_j> = delta_ij``. None of the knot,
+    Gram, or dual maps are trainable.
 
     Important properties
     --------------------
@@ -337,7 +515,14 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
     the Bernstein polynomials and the basis is not spatially local.
     """
 
-    def __init__(self, n_basis: int, degree: int = 3):
+    def __init__(
+        self,
+        n_basis: int,
+        degree: int = 3,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ):
         if degree < 0:
             raise ValueError("degree must be >= 0")
         if n_basis < degree + 1:
@@ -349,50 +534,43 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
         MutualPairBasis.__init__(self, 1, 1, n_basis, ())
         torch.nn.Module.__init__(self)
 
-        self._degree = degree
+        if dtype is None:
+            dtype = torch.float32
 
+        self._degree = degree
         self._n_spans = n_basis - degree
 
-        self.register_buffer("_breaks", torch.linspace(0.0, 1.0, self._n_spans + 1))
-
-        self.register_buffer("_knots", torch.cat([torch.zeros(degree + 1), self._breaks[1:-1], torch.ones(degree + 1)]))
-
-        # ---------------------------------------------------------------
-        # Gauss-Legendre quadrature.
-        #
-        # Product of two degree-p splines has degree 2p on each span.
-        # p + 1 Gauss points integrate degree <= 2p + 1 exactly.
-        # ---------------------------------------------------------------
-        qx, qw = leggauss(degree + 1)
-
-        self.register_buffer("_quad_x", torch.as_tensor(qx))
-        self.register_buffer("_quad_w", torch.as_tensor(qw))
-
-        # ---------------------------------------------------------------
-        # Construct exact spline Gram matrix up to floating point.
-        # ---------------------------------------------------------------
-        mass, G = self._interval_moments_raw(
-            torch.zeros(()),
-            torch.ones(()),
+        self.register_buffer("_breaks", torch.linspace(0.0, 1.0, self._n_spans + 1, dtype=dtype, device=device))
+        self.register_buffer(
+            "_knots",
+            torch.cat(
+                [
+                    torch.zeros(degree + 1, dtype=dtype, device=device),
+                    self._breaks[1:-1],
+                    torch.ones(degree + 1, dtype=dtype, device=device),
+                ]
+            ),
         )
 
-        # Force exact symmetry and exact band structure.
-        G = 0.5 * (G + G.T)
+        # Product of two degree-p splines has degree 2p on each span.
+        # p + 1 Gauss points integrate degree <= 2p + 1 exactly.
+        qx, qw = leggauss(degree + 1)
+        self.register_buffer("_quad_x", torch.as_tensor(qx, dtype=dtype, device=device))
+        self.register_buffer("_quad_w", torch.as_tensor(qw, dtype=dtype, device=device))
 
-        ids = torch.arange(n_basis)
+        mass, G = self._interval_moments_raw(
+            torch.zeros((), dtype=dtype, device=device),
+            torch.ones((), dtype=dtype, device=device),
+        )
+        G = 0.5 * (G + G.T)
+        ids = torch.arange(n_basis, device=G.device)
         band_mask = torch.abs(ids[:, None] - ids[None, :]) <= degree
         G = torch.where(band_mask, G, torch.zeros_like(G))
 
         self.register_buffer("_alpha_mass", mass)
         self.register_buffer("_gram_matrix", G)
+        self.register_buffer("_gram_inv", torch.linalg.inv(G))
 
-        # Banded Cholesky factor.
-        #
-        # G has half-bandwidth degree, and its Cholesky factor has the
-        # same half-bandwidth.
-        self._L = self._banded_cholesky(G, degree)
-
-        # Bounds/polynomial caches.
         self._alpha_power_coeffs = None
         self._beta_power_coeffs = None
         self._alpha_bounds = None
@@ -414,6 +592,12 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
     def gram_matrix(self) -> torch.Tensor:
         return self._gram_matrix
 
+    def dtype_device(self):
+        return self._knots.dtype, self._knots.device
+
+    def _get_gram_diag(self) -> torch.Tensor:
+        return torch.ones(self._batch_size, self._n_basis, dtype=self._knots.dtype, device=self._knots.device)
+
     def _eval_alpha(self, y: torch.Tensor) -> torch.Tensor:
         """Evaluate all alpha B-splines.
 
@@ -427,169 +611,43 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
         Tensor
             Shape ``(num_points, n_basis)`` after flattening y.
         """
-
-        if torch.any(y < 0) or torch.any(y > 1):
-            raise ValueError("B-spline evaluation requires y in [0, 1]")
+        y = torch.as_tensor(y, dtype=self._knots.dtype, device=self._knots.device).reshape(-1).clamp(0.0, 1.0)
 
         t = self._knots
-
-        # Degree-zero B-splines.
-        #
-        # There are len(knots)-1 of these. Recursion reduces this to
-        # n_basis functions after p steps.
-        N = ((y[:, None] >= t[:-1]) & (y[:, None] < t[1:]))
-
-        # Cox-de Boor recursion.
-        for k in range(1, self._degree + 1):
-            n_out = N.shape[-1] - 1
-
-            left_den = t[k:k + n_out] - t[:n_out]
-            right_den = (t[k + 1:k + 1 + n_out] - t[1:1 + n_out])
-
-            left_num = y[:, None] - t[:n_out]
-            right_num = (t[k + 1:k + 1 + n_out] - y[:, None])
-
-            left = torch.where(
-                left_den[None, :] != 0,
-                left_num / torch.where(
-                    left_den == 0,
-                    torch.ones_like(left_den),
-                    left_den,
-                )[None, :] * N[:, :n_out],
-                torch.zeros_like(N[:, :n_out]),
-            )
-
-            right = torch.where(
-                right_den[None, :] != 0,
-                right_num / torch.where(
-                    right_den == 0,
-                    torch.ones_like(right_den),
-                    right_den,
-                )[None, :] * N[:, 1:n_out + 1],
-                torch.zeros_like(N[:, :n_out]),
-            )
-
-            N = left + right
-
-        # Open B-spline convention at x = 1:
-        #
-        #     N_{m-1}(1) = 1.
-        #
-        at_right = y == 1
-        if torch.any(at_right):
-            N = N.clone()
-            N[at_right] = 0
-            N[at_right, -1] = 1
-
-        return N
-
-    @staticmethod
-    def _banded_cholesky(
-        G: torch.Tensor,
-        half_bandwidth: int,
-    ) -> torch.Tensor:
-        """Cholesky factorization exploiting fixed bandwidth.
-
-        Returns lower-triangular L satisfying
-
-            G = L L^T.
-
-        Complexity is O(m p^2), where p is the half-bandwidth.
-        """
-        m = G.shape[-1]
-        p = half_bandwidth
-
-        L = torch.zeros_like(G)
-
-        for i in range(m):
-            j0 = max(0, i - p)
-
-            for j in range(j0, i + 1):
-                k0 = max(0, i - p, j - p)
-
-                if j > k0:
-                    correction = (L[i, k0:j] * L[j, k0:j]).sum()
-                else:
-                    correction = G.new_zeros(())
-
-                value = G[i, j] - correction
-
-                if i == j:
-                    if value <= 0:
-                        raise RuntimeError(
-                            "B-spline Gram matrix is not "
-                            "numerically positive definite"
-                        )
-                    L[i, j] = torch.sqrt(value)
-                else:
-                    L[i, j] = value / L[j, j]
-
-        return L
-
-    def _solve_gram(
-        self,
-        rhs: torch.Tensor,
-    ) -> torch.Tensor:
-        """Solve G x = rhs along the final dimension.
-
-        ``rhs`` has shape ``(..., m)``.
-
-        Because G is symmetric,
-
-            row @ G^{-1}
-
-        is numerically identical to solving
-
-            G x = row^T.
-
-        Complexity: O(p m) per right-hand side for fixed degree p.
-        """
-        rhs = torch.as_tensor(rhs)
-
-        if rhs.shape[-1] != self._n_basis:
-            raise ValueError(
-                "Last rhs dimension must equal n_basis"
-            )
-
-        L = self._L
-        m = self._n_basis
         p = self._degree
+        m = self._n_basis
+        n = m - 1
 
-        # Forward solve: L z = rhs.
-        z_values = []
+        # Last nonempty span is [t[n], t[n+1]]; map the right endpoint there.
+        span = torch.searchsorted(t, y, right=True) - 1
+        span = torch.where(y >= t[n + 1], torch.full_like(span, n), span)
+        span = span.clamp(p, n)
 
-        for i in range(m):
-            j0 = max(0, i - p)
+        # Compact Cox–de Boor: Nloc[:, j] = N_{span-p+j, p}(y).
+        Nloc = y.new_zeros(y.shape[0], p + 1)
+        Nloc[:, 0] = 1.0
+        left = y.new_zeros(y.shape[0], p + 1)
+        right = y.new_zeros(y.shape[0], p + 1)
+        for j in range(1, p + 1):
+            left[:, j] = y - t[span + 1 - j]
+            right[:, j] = t[span + j] - y
+            saved = torch.zeros_like(y)
+            for r in range(j):
+                tmp = Nloc[:, r] / (right[:, r + 1] + left[:, j - r])
+                Nloc[:, r] = saved + right[:, r + 1] * tmp
+                saved = left[:, j - r] * tmp
+            Nloc[:, j] = saved
 
-            if i > j0:
-                previous = torch.stack(z_values[j0:i], dim=-1)
-                correction = (previous * L[i, j0:i]).sum(dim=-1)
-            else:
-                correction = torch.zeros_like(rhs[..., i])
+        idx = span.unsqueeze(1) - p + torch.arange(p + 1, device=y.device)
+        out = y.new_zeros(y.shape[0], m)
+        return out.scatter(1, idx, Nloc)
 
-            zi = (rhs[..., i] - correction) / L[i, i]
-
-            z_values.append(zi)
-
-        z = torch.stack(z_values, dim=-1)
-
-        # Backward solve: L^T x = z.
-        x_values = [None] * m
-
-        for i in range(m - 1, -1, -1):
-            j1 = min(m, i + p + 1)
-
-            if i + 1 < j1:
-                following = torch.stack(x_values[i + 1:j1], dim=-1)
-                correction = (following * L[i + 1:j1, i]).sum(dim=-1)
-            else:
-                correction = torch.zeros_like(z[..., i])
-
-            xi = (z[..., i] - correction) / L[i, i]
-
-            x_values[i] = xi
-
-        return torch.stack(x_values, dim=-1)
+    def _solve_gram(self, rhs: torch.Tensor) -> torch.Tensor:
+        """Solve ``G x = rhs`` along the last dimension via ``x = rhs @ G^{-1}``."""
+        rhs = torch.as_tensor(rhs, dtype=self._gram_inv.dtype, device=self._gram_inv.device)
+        if rhs.shape[-1] != self._n_basis:
+            raise ValueError("Last rhs dimension must equal n_basis")
+        return rhs @ self._gram_inv
 
     # ===================================================================
     # Public evaluation
@@ -667,12 +725,9 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
 
         values = self._eval_alpha(x.reshape(-1)).reshape(n_spans, n_quad, self._n_basis)
 
-        weights = (half[:, None] * self._quad_w[None, :])
-
-        mass = torch.einsum("sq,sqi->i", weights, values)
-
-        gram = torch.einsum("sq,sqi,sqj->ij", weights, values, values)
-
+        weighted = values * (half[:, None] * self._quad_w[None, :]).unsqueeze(-1)
+        mass = weighted.sum(dim=(0, 1))
+        gram = weighted.reshape(-1, self._n_basis).T @ values.reshape(-1, self._n_basis)
         return mass, gram
 
     def _interval_moments(self, lows: torch.Tensor | None, highs: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -701,8 +756,7 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
             return mass.unsqueeze(0).expand(self._batch_size, -1)
 
         beta_mass = self._solve_gram(mass)
-
-        return (beta_mass.unsqueeze(0))
+        return beta_mass.unsqueeze(0).expand(self._batch_size, -1)
 
     def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         """Cross Gram
@@ -731,52 +785,25 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
         return DenseMatrix(cross)
 
     def _get_alpha_power_coeffs(self,) -> torch.Tensor:
-        """Polynomial coefficients of alpha on every knot span.
-
-        Returns
-        -------
-        coeffs:
-            Shape ``(n_spans, m, degree + 1)``.
-
-        For span s, with
-
-            u = (x - break_s) / (break_{s+1} - break_s),
-
-        we have
-
-            alpha_i(x)
-              = sum_r coeffs[s, i, r] u^r.
-        """
         if self._alpha_power_coeffs is not None:
             return self._alpha_power_coeffs
 
         p = self._degree
         q = p + 1
+        dtype, device = self.dtype_device()
 
         # Interior interpolation nodes avoid ambiguity at knots.
         nodes, _ = leggauss(q)
-        u = 0.5 * (torch.as_tensor(nodes) + 1.0)
-
-        # Vandermonde:
-        #
-        # V[k, r] = u_k^r.
-        #
-        V = torch.stack([ u ** r for r in range(q) ], dim=-1)
-
-        V_inv = torch.linalg.inv(V)
+        u = 0.5 * (torch.as_tensor(nodes, dtype=dtype, device=device) + 1.0)
+        V = torch.stack([u ** r for r in range(q)], dim=-1)
 
         left = self._breaks[:-1]
         right = self._breaks[1:]
-
-        x = (left[:, None] + (right - left)[:, None] * u[None, :])
-
+        x = left[:, None] + (right - left)[:, None] * u[None, :]
         values = self._eval_alpha(x.reshape(-1)).reshape(self._n_spans, q, self._n_basis)
 
-        # (span, power, basis)
-        coeff = torch.einsum("rq,sqm->srm", V_inv, values)
-
         # (span, basis, power)
-        coeff = coeff.permute(0, 2, 1)
+        coeff = torch.linalg.solve(V, values).permute(0, 2, 1)
 
         self._alpha_power_coeffs = coeff
         return coeff
@@ -814,21 +841,6 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
 
     @classmethod
     def _exact_piecewise_bounds(cls, coeffs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Numerical global extrema of piecewise polynomials.
-
-        For each span, solve the derivative polynomial exactly as a
-        finite root problem and evaluate endpoints + all real roots in
-        [0, 1].
-
-        ``coeffs`` has shape
-
-            (n_spans, n_basis, degree + 1).
-
-        Returns shape ``(n_basis,)`` for lower and upper.
-
-        This is mathematically exact modulo floating-point polynomial
-        reconstruction and root solving.
-        """
         device = coeffs.device
         dtype = coeffs.dtype
 
@@ -887,19 +899,6 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
         return (torch.minimum(a, b), torch.maximum(a, b))
 
     def bounds(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Global lower/upper extrema of every basis function.
-
-        Returns
-        -------
-        lower, upper:
-            Each has shape ``(batch, m)``.
-
-        For alpha and beta, extrema are found span-by-span from their
-        exact degree-p polynomial representation.
-
-        For cubic B-splines this means solving only quadratic derivative
-        equations on each knot span.
-        """
         if index == 0:
             if self._alpha_bounds is None:
                 self._alpha_bounds = (
@@ -1102,86 +1101,182 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
         if index == 0:
             return ones
         return ones * self.base.supremum_bound()
+    
+    def Omega2_diag(self):
+        return torch.eye(self._n_basis)
 
+class NFPairBasis(torch.nn.Module, MutualPairBasis):
+    """Mutual pair split from index-conditioned normalizing-flow densities.
 
-class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
-    """Product of a 1D PWC pair on a sacrificial coordinate and a VP pair on the rest.
+    For index embedding ``e_i`` and conditional density ``n_i(x)``:
 
-    For sacrificial index ``l`` in ``{0, …, d-1}``,
+        alpha_i(x) = s(x, e_i)
+        beta_i(x) = n_i(x) / alpha_i(x)
 
-        α_i(x) = α^{pwc}_i(x_l) α^{vp}_i(x_{≠l})
-        β_i(x) = β^{pwc}_i(x_l) β^{vp}_i(x_{≠l})
-
-    If ``d = 1``, the rest space is empty and the VP pair is identically 1,
-    so the masked pair reduces to the sacrificial PWC pair.
-
-    The PWC Gram is diagonal, so it zeros VP off-diagonal couplings. On the
-    full unit cube the VP paired products integrate to 1, and
-
-        Ω2_ij = Ω2^{pwc}_ij * δ_ij = Λ_i δ_ij.
+    The splitter is evaluated on the concatenated vector ``[x, e_i]`` and is
+    expected to be nonnegative. Its output is clamped below by ``eps`` to keep
+    the quotient finite. All point/index pairs are evaluated in one splitter
+    call and one conditional-flow call.
     """
 
     def __init__(
         self,
-        pwc: Orthogonal1DPWCBasis,
-        sacrificial_index: int,
-        vp: VolumePreservingPairBasis,
+        nf: ConditionalNormalizingFlow,
+        splitter: torch.nn.Module,
+        embedding: torch.nn.Embedding,
+        eps: float = 1e-6,
         coeffs: tuple[Parameters | None, Parameters | None] | None = None,
-        domain_lows: torch.Tensor | None = None,
-        domain_highs: torch.Tensor | None = None,
     ):
         torch.nn.Module.__init__(self)
-        if pwc.dim() != 1:
-            raise ValueError("pwc must be 1-dimensional")
-        dim = vp.dim() + 1
+        if nf.dim < 1:
+            raise ValueError("nf.dim must be at least 1")
+        if embedding.num_embeddings < 1:
+            raise ValueError("embedding must contain at least one index")
+        if embedding.embedding_dim != nf.conditioner_dim:
+            raise ValueError(
+                f"embedding dim {embedding.embedding_dim} must match "
+                f"nf conditioner_dim {nf.conditioner_dim}"
+            )
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+
+        MutualPairBasis.__init__(
+            self,
+            nf.dim,
+            1,
+            embedding.num_embeddings,
+            (),
+            coeffs,
+        )
+        self.nf = nf
+        self.splitter = splitter
+        self.index_embedding = embedding
+        self.eps = eps
+
+    def dtype_device(self):
+        weight = self.index_embedding.weight
+        return weight.dtype, weight.device
+
+    def _as_data(self, y: torch.Tensor) -> torch.Tensor:
+        dtype, device = self.dtype_device()
+        y = torch.as_tensor(y, dtype=dtype, device=device)
+        if y.ndim == 1:
+            y = y.unsqueeze(-1) if self._dim == 1 else y.unsqueeze(0)
+        if y.ndim != 2 or y.shape[1] != self._dim:
+            raise ValueError(
+                f"y must have shape (n_data, {self._dim}), got {tuple(y.shape)}"
+            )
+        return y
+
+    def _expanded_inputs(
+        self,
+        y: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Flatten the Cartesian product of data points and basis indices."""
+        n_data, m = y.shape[0], self._n_basis
+        indices = torch.arange(m, device=y.device)
+        conditioners = self.index_embedding(indices).to(dtype=y.dtype)
+        y_pairs = y[:, None, :].expand(-1, m, -1)
+        c_pairs = conditioners[None, :, :].expand(n_data, -1, -1)
+        flat_y = y_pairs.reshape(n_data * m, self._dim)
+        flat_c = c_pairs.reshape(n_data * m, conditioners.shape[-1])
+        splitter_inputs = torch.cat((flat_y, flat_c), dim=-1)
+        return flat_y, flat_c, splitter_inputs
+
+    def _alpha_from_inputs(
+        self,
+        splitter_inputs: torch.Tensor,
+        n_data: int,
+    ) -> torch.Tensor:
+        raw = self.splitter(splitter_inputs)
+        expected = n_data * self._n_basis
+        if raw.numel() != expected:
+            raise ValueError(
+                "splitter must return one value per point/index pair; "
+                f"expected {expected} values, got shape {tuple(raw.shape)}"
+            )
+        return raw.reshape(n_data, self._n_basis).clamp_min(self.eps)
+
+    def flow_density(self, y: torch.Tensor) -> torch.Tensor:
+        """Evaluate every ``n_i(x)`` in one conditional-flow call."""
+        y = self._as_data(y)
+        flat_y, flat_c, _ = self._expanded_inputs(y)
+        return self.nf(flat_y, conditioner=flat_c).reshape(
+            y.shape[0], self._n_basis
+        )
+
+    def eval(self, y: torch.Tensor | None = None, index: int | None = None):
+        if y is None:
+            return torch.nn.Module.eval(self)
+        if index not in (0, 1, None):
+            raise ValueError("index must be 0, 1, or None")
+
+        y = self._as_data(y)
+        flat_y, flat_c, splitter_inputs = self._expanded_inputs(y)
+        alpha = self._alpha_from_inputs(splitter_inputs, y.shape[0])
+        if index == 0:
+            return alpha
+
+        density = self.nf(flat_y, conditioner=flat_c).reshape(
+            y.shape[0], self._n_basis
+        )
+        beta = density / alpha
+        if index == 1:
+            return beta
+        return torch.stack((alpha, beta), dim=1)
+
+    def Omega2_diag(self) -> torch.Tensor:
+        """Known matched Gram entries ``integral alpha_i beta_i = 1``."""
+        dtype, device = self.dtype_device()
+        return torch.ones(
+            self._batch_size,
+            self._n_basis,
+            dtype=dtype,
+            device=device,
+        )
+
+
+class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
+    """
+    Element wise product of a masking basis and a free basis to achieve a diagonal Gram matrix.
+    """
+
+    def __init__(
+        self,
+        masking_basis: DisjointSupport1DPWCBasis | Orthogonal1DPWCBasis,
+        sacrificial_index: int,
+        free_basis: VolumePreservingPairBasis,
+        coeffs: tuple[Parameters | None, Parameters | None] | None = None,
+    ):
+        torch.nn.Module.__init__(self)
+        if masking_basis.dim() != 1:
+            raise ValueError("masking_basis must be 1-dimensional")
+        dim = free_basis.dim() + 1
         if not (0 <= sacrificial_index < dim):
             raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
-        if pwc.n_basis_functions() != vp.n_basis_functions():
+        if masking_basis.n_basis_functions() != free_basis.n_basis_functions():
             raise ValueError(
-                f"pwc n_basis {pwc.n_basis_functions()} must match "
-                f"vp n_basis {vp.n_basis_functions()}"
+                f"masking_basis n_basis {masking_basis.n_basis_functions()} must match "
+                f"free_basis n_basis {free_basis.n_basis_functions()}"
             )
-        if (domain_lows is None) != (domain_highs is None):
-            raise ValueError("domain_lows and domain_highs must be provided together")
 
         MutualPairBasis.__init__(
             self,
             dim,
-            pwc.batch_size(),
-            pwc.n_basis_functions(),
-            pwc._params,
+            masking_basis.batch_size(),
+            masking_basis.n_basis_functions(),
+            masking_basis._params,
             coeffs,
         )
-        self.pwc = pwc
-        self.vp = vp
+        self.masking_basis = masking_basis
+        self.free_basis = free_basis
         self.sacrificial_index = sacrificial_index
         self._pwc_param_modules = torch.nn.ModuleList(
-            [p for p in pwc._params if p.is_module()]
+            [p for p in masking_basis._params if p.is_module()]
         )
-        if domain_lows is None:
-            self.domain_lows = None
-            self.domain_highs = None
-        else:
-            self.register_buffer("domain_lows", torch.as_tensor(domain_lows, dtype=torch.float32).reshape(-1))
-            self.register_buffer("domain_highs", torch.as_tensor(domain_highs, dtype=torch.float32).reshape(-1))
-            if self.domain_lows.numel() != dim or self.domain_highs.numel() != dim:
-                raise ValueError(f"domain bounds must have length {dim}")
 
     def dtype_device(self):
-        return self.pwc.dtype_device()
-
-    def _domain_volume(self) -> torch.Tensor | float:
-        if self.domain_lows is None:
-            return 1.0
-        return (self.domain_highs - self.domain_lows).prod()
-
-    def _to_unit(self, y: torch.Tensor) -> torch.Tensor:
-        if self.domain_lows is None:
-            return y
-        lo = self.domain_lows.to(dtype=y.dtype, device=y.device)
-        hi = self.domain_highs.to(dtype=y.dtype, device=y.device)
-        u = (y - lo) / (hi - lo).clamp_min(1e-12)
-        return u.clamp(1e-4, 1.0 - 1e-4)
+        return self.masking_basis.dtype_device()
 
     def _split_coords(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         y = torch.as_tensor(y)
@@ -1189,7 +1284,6 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
             y = y.unsqueeze(0)
         if y.ndim != 2 or y.shape[1] != self._dim:
             raise ValueError(f"y must have shape (n_data, {self._dim}), got {tuple(y.shape)}")
-        y = self._to_unit(y)
         l = self.sacrificial_index
         rest = [i for i in range(self._dim) if i != l]
         return y[:, l], y[:, rest]
@@ -1198,21 +1292,19 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
         if y is None:
             return torch.nn.Module.eval(self)
         x_l, x_rest = self._split_coords(y)
-        return self.pwc.eval(x_l, index) * self.vp.eval(x_rest, index)
+        return self.masking_basis.eval(x_l, index) * self.free_basis.eval(x_rest, index)
 
     def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
-        if lows is not None or highs is not None:
-            raise ValueError("MaskedGramMutualBasis.Omega1 is only defined on the full domain")
-        dtype, device = self.pwc.dtype_device()
-        return torch.zeros(self._batch_size, self._n_basis, dtype=dtype, device=device)
+        #TODO
+        pass
 
     def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         if lows is not None or highs is not None:
             raise ValueError("MaskedGramMutualBasis.Omega2 is only defined on the full domain")
-        return self.pwc.Omega2().scale(self._domain_volume())
+        return self.masking_basis.Omega2() * self.free_basis.Omega2_diag()
 
     def supremum(self, index: int) -> torch.Tensor:
-        return self.pwc.supremum(index) * self.vp.supremum(index)
+        return self.masking_basis.supremum(index) * self.free_basis.supremum(index)
 
 
 class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
@@ -1235,7 +1327,7 @@ class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
 
     def _shift_cache_key(self) -> tuple:
         key = []
-        for param in self.pwc._params:
+        for param in self.masking_basis._params:
             leaves = list(param.parameters()) + list(param.buffers()) if param.is_module() else [param()]
             for t in leaves:
                 key.append((t.data_ptr(), t._version, bool(t.requires_grad)))
@@ -1246,8 +1338,8 @@ class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
         cached = getattr(self, "_shift_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1], cached[2]
-        a = -self.pwc.infimum(0) * self.vp.supremum(0)
-        b = -self.pwc.infimum(1) * self.vp.supremum(1)
+        a = -self.masking_basis.infimum(0) * self.free_basis.supremum(0)
+        b = -self.masking_basis.infimum(1) * self.free_basis.supremum(1)
         self._shift_cache = (key, a, b)
         def _invalidate(_grad):
             self._shift_cache = None
