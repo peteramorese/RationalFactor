@@ -28,7 +28,7 @@ def _make_qs_factorization(n_basis: int, device: torch.device) -> Order1Quasisep
         TrainableParameters.random_init(shape=shape).to(device),
         TrainableParameters.random_init(shape=shape).to(device),
         TrainableParameters.random_init(shape=shape).to(device),
-        TrainableParameters.random_init(shape=shape).to(device),
+        PositiveParameters.random_init(shape=shape).to(device),
         TrainableParameters.random_init(shape=shape).to(device),
         TrainableParameters.random_init(shape=shape).to(device),
         TrainableParameters.random_init(shape=shape).to(device),

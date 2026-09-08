@@ -34,13 +34,17 @@ def _randn(g: torch.Generator, n_basis: int) -> FixedParameters:
     return FixedParameters(torch.randn(1, n_basis, generator=g))
 
 
+def _pos_diag(g: torch.Generator, n_basis: int) -> FixedParameters:
+    return FixedParameters(torch.nn.functional.softplus(torch.randn(1, n_basis, generator=g)) + 1e-4)
+
+
 def _make_pwc(n_basis: int, seed: int) -> Orthogonal1DPWCBasis:
     g = torch.Generator().manual_seed(seed)
     fac = Order1QuasiseparableFactorization(
         _randn(g, n_basis),
         _randn(g, n_basis),
         _randn(g, n_basis),
-        _randn(g, n_basis),
+        _pos_diag(g, n_basis),
         _randn(g, n_basis),
         _randn(g, n_basis),
         _randn(g, n_basis),

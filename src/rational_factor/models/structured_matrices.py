@@ -1,4 +1,4 @@
-"""Structured matrix approximators: rank-1-plus-diagonal and order-1 quasiseparable."""
+"""Structured matrix approximators: rank-1-plus-diagonal and quasiseparable."""
 
 from __future__ import annotations
 
@@ -317,7 +317,6 @@ class Rank1PlusDiagonal(Matrix):
         u: torch.Tensor,
         v: torch.Tensor,
         d: torch.Tensor | None = None,
-        normalization: str | None = None,
     ):
         u = torch.as_tensor(u)
         v = torch.as_tensor(v)
@@ -331,22 +330,7 @@ class Rank1PlusDiagonal(Matrix):
         if u.device != v.device:
             raise ValueError("u and v must share the same device")
 
-        self._normalization = normalization
-
-        if normalization is not None:
-            if normalization not in ('r', 'c'):
-                raise ValueError(f"normalization must be None, 'r', or 'c', got {normalization!r}")
-            if normalization == 'r':
-                # Row-stochastic: M = diag(1 - u) + u vᵀ with u ∈ [0, 1], v a distribution.
-                u = torch.sigmoid(u)
-                v = torch.softmax(v, dim=-1)
-                d = 1.0 - u
-            else:
-                # Column-stochastic: M = diag(1 - v) + u vᵀ with v ∈ [0, 1], u a distribution.
-                u = torch.softmax(u, dim=-1)
-                v = torch.sigmoid(v)
-                d = 1.0 - v
-        elif d is None:
+        if d is None:
             d = torch.ones_like(u)
         else:
             d = torch.as_tensor(d)
@@ -506,9 +490,8 @@ class R1PDFactorization(Rank1PlusDiagonal):
         d: torch.Tensor | None = None,
         *,
         seq_dim: int = -2,
-        normalization: str | None = None,
     ):
-        super().__init__(u, v, d, normalization=normalization)
+        super().__init__(u, v, d)
         batch_ndim = self.d.dim() - 1
         if batch_ndim < 1:
             raise ValueError(
@@ -681,16 +664,19 @@ class R1PDFactorization(Rank1PlusDiagonal):
 
 
 class Semiseparable(Matrix):
-    """Unit order-1 semiseparable matrix with generators ``p, a, q`` (shape ``(..., n)``).
+    """Unit semiseparable matrix of order ``k`` with diagonal transitions.
 
-    Lower (``upper=False``):
+    Generators ``p, a, q`` always have shape ``(..., n, k)``. Lower
+    (``upper=False``):
 
-        M[i, j] = p[i] (prod_{k=j+1}^{i-1} a[k]) q[j]   i > j
+        M[i, j] = sum_r p[i,r] (prod_{t=j+1}^{i-1} a[t,r]) q[j,r]   i > j
         M[i, i] = 1
-        M[i, j] = 0                                      i < j
+        M[i, j] = 0                                                    i < j
 
     Upper is the same recurrence on reversed indices. Matvec and triangular
-    solve are ``O(n)`` via an affine scan; ``to_dense`` is ``O(n^2)``.
+    solve cost ``O(k n)`` arithmetic via a length-``n`` affine scan, implemented
+    with batched parallel prefix (``O(k n log n)`` torch ops). ``to_dense`` is
+    ``O(k n^2)``.
     """
 
     def __init__(
@@ -702,8 +688,10 @@ class Semiseparable(Matrix):
         upper: bool = False,
     ):
         p, a, q = torch.as_tensor(p), torch.as_tensor(a), torch.as_tensor(q)
-        if p.dim() < 1:
-            raise ValueError("p, a, and q must have shape (..., n)")
+        if p.dim() < 2:
+            raise ValueError(
+                f"p, a, and q must have shape (..., n, k), got {tuple(p.shape)}"
+            )
         if p.shape != a.shape or p.shape != q.shape:
             raise ValueError(
                 f"p, a, and q must have the same shape, got "
@@ -714,11 +702,15 @@ class Semiseparable(Matrix):
 
     @property
     def n(self) -> int:
+        return self.p.shape[-2]
+
+    @property
+    def order(self) -> int:
         return self.p.shape[-1]
 
     @property
     def shape(self) -> torch.Size:
-        return self.p.shape[:-1] + torch.Size([self.n, self.n])
+        return self.p.shape[:-2] + torch.Size([self.n, self.n])
 
     @property
     def dtype(self) -> torch.dtype:
@@ -736,21 +728,52 @@ class Semiseparable(Matrix):
         return self._apply(x, solve=False)
 
     def solve(self, x: torch.Tensor) -> torch.Tensor:
-        """Solve ``M y = x`` (unit triangular, ``O(n)``)."""
+        """Solve ``M y = x`` (unit triangular, ``O(k n)``)."""
         return self._apply(x, solve=True)
 
     def _apply(self, x: torch.Tensor, *, solve: bool) -> torch.Tensor:
         x = torch.as_tensor(x, dtype=self.p.dtype, device=self.p.device)
         p, a, q = self.p, self.a, self.q
         if self.upper:
-            x, p, a, q = x.flip(-1), p.flip(-1), a.flip(-1), q.flip(-1)
+            x = x.flip(-1)
+            p, a, q = p.flip(-2), a.flip(-2), q.flip(-2)
         if x.shape[-1] == 1:
             y = x
+        elif solve and self.order > 1:
+            # Inverse couples modes: s ← (diag(a) - q pᵀ) s + q x, so the
+            # transition is no longer diagonal. A short sequential scan is
+            # still O(k n) and avoids a dense k×k prefix scan.
+            y = self._apply_solve_sequential(x, p, a, q)
         else:
-            trans_a = a[..., :-1] - q[..., :-1] * p[..., :-1] if solve else a[..., :-1]
-            s = self.scan_from_zero(trans_a, q[..., :-1] * x[..., :-1])
-            y = x + (-p if solve else p) * s
+            a_t = a[..., :-1, :]
+            q_t = q[..., :-1, :]
+            p_t = p[..., :-1, :]
+            b = q_t * x[..., :-1].unsqueeze(-1)
+            if solve:
+                # Order-1: q (p s) = (q p) s, so the transition stays diagonal.
+                a_t = a_t - q_t * p_t
+            s = self.scan_modes_from_zero(a_t, b)
+            sign = -1.0 if solve else 1.0
+            y = x + sign * (p * s).sum(dim=-1)
         return y.flip(-1) if self.upper else y
+
+    @staticmethod
+    def _apply_solve_sequential(
+        x: torch.Tensor,
+        p: torch.Tensor,
+        a: torch.Tensor,
+        q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Unit-triangular solve with diagonal generators, ``O(k n)`` sequential."""
+        m = x.shape[-1]
+        state = x.new_zeros(x.shape[:-1] + (p.shape[-1],))
+        cols = []
+        for i in range(m):
+            yi = x[..., i] - (p[..., i, :] * state).sum(dim=-1)
+            cols.append(yi)
+            if i < m - 1:
+                state = a[..., i, :] * state + q[..., i, :] * yi.unsqueeze(-1)
+        return torch.stack(cols, dim=-1)
 
     @staticmethod
     def scan_from_zero(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -762,44 +785,52 @@ class Semiseparable(Matrix):
         zero = b.new_zeros(b.shape[:-1] + (1,))
         if a.shape[-1] == 0:
             return zero
-        n, k = a.shape[-1], 1
-        while k < n:
-            a_l, b_l = a[..., :-k], b[..., :-k]
-            a_r, b_r = a[..., k:], b[..., k:]
-            b = torch.cat((b[..., :k], a_r * b_l + b_r), dim=-1)
-            a = torch.cat((a[..., :k], a_r * a_l), dim=-1)
-            k *= 2
+        n, step = a.shape[-1], 1
+        while step < n:
+            a_l, b_l = a[..., :-step], b[..., :-step]
+            a_r, b_r = a[..., step:], b[..., step:]
+            b = torch.cat((b[..., :step], a_r * b_l + b_r), dim=-1)
+            a = torch.cat((a[..., :step], a_r * a_l), dim=-1)
+            step *= 2
         return torch.cat((zero, b), dim=-1)
+
+    @classmethod
+    def scan_modes_from_zero(cls, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Mode-wise scan: ``a, b`` are ``(..., n, k)`` → state ``(..., n+1, k)``."""
+        a, b = torch.broadcast_tensors(a, b)
+        s = cls.scan_from_zero(a.transpose(-1, -2), b.transpose(-1, -2))
+        return s.transpose(-1, -2)
 
     def strict_triangle(self) -> torch.Tensor:
         """Off-diagonal triangle (zeros on and above/below the diagonal)."""
         p, a, q = self.p, self.a, self.q
         if self.upper:
-            p, a, q = p.flip(-1), a.flip(-1), q.flip(-1)
-        m = a.shape[-1]
+            p, a, q = p.flip(-2), a.flip(-2), q.flip(-2)
+        m, k = self.n, self.order
         ones = torch.ones_like(a)
-        idx_i = torch.arange(m, device=a.device).view(*([1] * (a.ndim - 1)), m, 1)
-        idx_j = torch.arange(m, device=a.device).view(*([1] * (a.ndim - 1)), 1, m)
-        factors = torch.where(idx_i > idx_j, a.unsqueeze(-1), ones.unsqueeze(-1))
-        scale = a.new_zeros(a.shape + (m,))
-        scale[..., 1:, :] = torch.cumprod(factors, dim=-2)[..., :-1, :]
-        tri = torch.tril(p.unsqueeze(-1) * scale * q.unsqueeze(-2), diagonal=-1)
+        idx_i = torch.arange(m, device=a.device).view(*([1] * (a.ndim - 2)), m, 1, 1)
+        idx_j = torch.arange(m, device=a.device).view(*([1] * (a.ndim - 2)), 1, m, 1)
+        factors = torch.where(idx_i > idx_j, a.unsqueeze(-2), ones.unsqueeze(-2))
+        scale = a.new_zeros(a.shape[:-2] + (m, m, k))
+        scale[..., 1:, :, :] = torch.cumprod(factors, dim=-3)[..., :-1, :, :]
+        tri = torch.tril((p.unsqueeze(-2) * scale * q.unsqueeze(-3)).sum(-1), diagonal=-1)
         return tri.flip(-1).flip(-2) if self.upper else tri
 
     def to_dense(self) -> torch.Tensor:
-        return torch.diag_embed(torch.ones_like(self.p)) + self.strict_triangle()
+        ones = torch.ones(self.p.shape[:-1], dtype=self.dtype, device=self.device)
+        return torch.diag_embed(ones) + self.strict_triangle()
 
 
 @dataclass
-class Order1QSGenerators:
-    """Direct scalar generators of an order-1 quasiseparable matrix
+class QSGenerators:
+    """Direct generators of an order-``k`` quasiseparable matrix with diagonal transitions.
 
         Q[i,j] =
-            p[i] * prod_{k=j+1}^{i-1} a[k] * q[j],   i > j
-            d[i],                                     i = j
-            g[i] * prod_{k=i+1}^{j-1} b[k] * h[j],   i < j
+            sum_r p[i,r] * prod_{t=j+1}^{i-1} a[t,r] * q[j,r],   i > j
+            d[i],                                                 i = j
+            sum_r g[i,r] * prod_{t=i+1}^{j-1} b[t,r] * h[j,r],   i < j
 
-    Every tensor has shape ``(..., m)``. Used for row extrema and debug densify.
+    ``p, a, q, g, b, h`` have shape ``(..., m, k)``; ``d`` has shape ``(..., m)``.
     """
 
     p: torch.Tensor
@@ -814,25 +845,53 @@ class Order1QSGenerators:
     def n(self) -> int:
         return self.d.shape[-1]
 
+    @property
+    def order(self) -> int:
+        if self.p.shape == self.d.shape:
+            return 1
+        return self.p.shape[-1]
+
     def row_minmax(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Exact per-row min/max over columns."""
         M = self.to_dense()
         return M.amin(dim=-1), M.amax(dim=-1)
 
+    def _mode_gens(self) -> tuple[torch.Tensor, ...]:
+        """Return generators with an explicit mode axis ``(..., m, k)``."""
+        if self.p.shape == self.d.shape:
+            return (
+                self.p.unsqueeze(-1),
+                self.a.unsqueeze(-1),
+                self.q.unsqueeze(-1),
+                self.g.unsqueeze(-1),
+                self.b.unsqueeze(-1),
+                self.h.unsqueeze(-1),
+            )
+        return self.p, self.a, self.q, self.g, self.b, self.h
+
     def to_dense(self) -> torch.Tensor:
-        """Materialize the full matrix (``O(m^2)``, debug / row extrema)."""
-        lower = Semiseparable(self.p, self.a, self.q)
-        upper = Semiseparable(self.g, self.b, self.h, upper=True)
+        """Materialize the full matrix (``O(k m^2)``, debug / row extrema)."""
+        p, a, q, g, b, h = self._mode_gens()
+        lower = Semiseparable(p, a, q)
+        upper = Semiseparable(g, b, h, upper=True)
         return torch.diag_embed(self.d) + lower.strict_triangle() + upper.strict_triangle()
 
 
-class Order1Quasiseparable(Matrix):
-    """Invertible order-1 quasiseparable ``P = L D U``.
+# Backward-compatible alias.
+Order1QSGenerators = QSGenerators
 
-    ``L`` / ``U`` are unit lower / upper ``Semiseparable`` factors; ``D`` is a
-    nonzero diagonal. All generators have shape ``(..., m)``.
 
-    Matvecs ``P x``, ``P^{-1} x``, ``P^T x``, ``P^{-T} x`` are ``O(m)``.
+class Quasiseparable(Matrix):
+    """Invertible order-``k`` quasiseparable ``P = L D U`` with diagonal transitions.
+
+    ``L`` / ``U`` are unit lower / upper :class:`Semiseparable` factors of order
+    ``k``; ``D`` is a nonzero diagonal. Generator shapes:
+
+    - ``lower_p, lower_a, lower_q, upper_g, upper_b, upper_h``: ``(..., m, k)``
+    - ``diag``: ``(..., m)``
+
+    Matvecs ``P x``, ``P^{-1} x``, ``P^T x``, ``P^{-T} x`` are ``O(k m)``
+    (``O(k m log m)`` torch work via parallel scans).
     """
 
     def __init__(
@@ -845,16 +904,29 @@ class Order1Quasiseparable(Matrix):
         upper_b: torch.Tensor,
         upper_h: torch.Tensor,
     ):
-        tensors = (lower_p, lower_a, lower_q, diag, upper_g, upper_b, upper_h)
-        if any(x.shape != diag.shape for x in tensors):
-            raise ValueError("all generators must share the same shape")
-        self.L = Semiseparable(lower_p, lower_a, lower_q)
+        diag = torch.as_tensor(diag)
+        gens = [torch.as_tensor(x) for x in (lower_p, lower_a, lower_q, upper_g, upper_b, upper_h)]
+        if gens[0].dim() != diag.dim() + 1:
+            raise ValueError(
+                f"generators must have shape diag.shape + (k,), got diag={tuple(diag.shape)}, "
+                f"gen={tuple(gens[0].shape)}"
+            )
+        expected = diag.shape + (gens[0].shape[-1],)
+        if any(x.shape != expected for x in gens):
+            raise ValueError(
+                "all generators must share shape (..., m, k) matching diag's (..., m)"
+            )
+        self.L = Semiseparable(gens[0], gens[1], gens[2])
         self.d = diag
-        self.U = Semiseparable(upper_g, upper_b, upper_h, upper=True)
+        self.U = Semiseparable(gens[3], gens[4], gens[5], upper=True)
 
     @property
     def n(self) -> int:
         return self.d.shape[-1]
+
+    @property
+    def order(self) -> int:
+        return self.L.order
 
     @property
     def shape(self) -> torch.Size:
@@ -869,9 +941,9 @@ class Order1Quasiseparable(Matrix):
         return self.d.device
 
     @property
-    def T(self) -> Order1Quasiseparable:
+    def T(self) -> Quasiseparable:
         """``Pᵀ = Uᵀ D Lᵀ``."""
-        return Order1Quasiseparable(self.uh, self.ub, self.ug, self.d, self.lq, self.la, self.lp)
+        return Quasiseparable(self.uh, self.ub, self.ug, self.d, self.lq, self.la, self.lp)
 
     @property
     def lp(self) -> torch.Tensor:
@@ -913,39 +985,175 @@ class Order1Quasiseparable(Matrix):
         """``P^{-T} x = L^{-T} D^{-1} U^{-T} x``."""
         return self.T.inverse_matvec(x)
 
-    def direct_generators(self) -> Order1QSGenerators:
-        """Direct QS generators of ``P`` itself (``O(m)``)."""
-        trans_a = self.la[..., :-1] * self.ub[..., :-1]
-        trans_b = self.lq[..., :-1] * self.d[..., :-1] * self.ug[..., :-1]
-        S = Semiseparable.scan_from_zero(trans_a, trans_b)
-        return Order1QSGenerators(
-            p=self.lp,
-            a=self.la,
-            q=self.lq * self.d + self.la * self.uh * S,
-            d=self.d + self.lp * self.uh * S,
-            g=self.d * self.ug + self.lp * self.ub * S,
-            b=self.ub,
-            h=self.uh,
-        )
+    def direct_generators(self) -> QSGenerators:
+        """Direct QS generators of ``P`` itself (``O(k^2 m)``; ``O(m log m)`` when ``k=1``)."""
+        lp, la, lq = self.L.p, self.L.a, self.L.q
+        d, ug, ub, uh = self.d, self.U.p, self.U.a, self.U.q
+        if self.order == 1:
+            # Scalar coupling scan (matches the classical order-1 formulas).
+            trans_a = (la * ub)[..., :-1, 0]
+            trans_b = (lq * d.unsqueeze(-1) * ug)[..., :-1, 0]
+            S = Semiseparable.scan_from_zero(trans_a, trans_b).unsqueeze(-1)
+            return QSGenerators(
+                p=lp,
+                a=la,
+                q=lq * d.unsqueeze(-1) + la * uh * S,
+                d=d + (lp * uh * S).squeeze(-1),
+                g=d.unsqueeze(-1) * ug + lp * ub * S,
+                b=ub,
+                h=uh,
+            )
+        k = self.order
+        batch = self.d.shape[:-1]
+        S = self.d.new_zeros(batch + (k, k))
+        qP = torch.empty_like(lq)
+        dP = torch.empty_like(d)
+        gP = torch.empty_like(ug)
+        for i in range(self.n):
+            uh_i = uh[..., i, :]
+            lp_i = lp[..., i, :]
+            dP[..., i] = d[..., i] + torch.einsum("...r,...rs,...s->...", lp_i, S, uh_i)
+            qP[..., i, :] = d[..., i].unsqueeze(-1) * lq[..., i, :] + la[..., i, :] * torch.einsum(
+                "...rs,...s->...r", S, uh_i
+            )
+            gP[..., i, :] = d[..., i].unsqueeze(-1) * ug[..., i, :] + ub[..., i, :] * torch.einsum(
+                "...rs,...r->...s", S, lp_i
+            )
+            outer = torch.einsum(
+                "...,...r,...s->...rs",
+                d[..., i],
+                lq[..., i, :],
+                ug[..., i, :],
+            )
+            S = outer + la[..., i, :, None] * S * ub[..., i, None, :]
+        return QSGenerators(p=lp, a=la, q=qP, d=dP, g=gP, b=ub, h=uh)
 
-    def inverse_transpose_generators(self) -> Order1QSGenerators:
-        """Direct QS generators of ``P^{-T}`` (``O(m)``)."""
-        A_g, A_b, A_h = self.lq, self.la - self.lq * self.lp, -self.lp
-        B_p, B_a, B_q = self.uh, self.ub - self.uh * self.ug, -self.ug
+    def inverse_transpose_generators(self) -> QSGenerators:
+        """Direct QS generators of ``P^{-T}``.
+
+        For order 1 this is ``O(m log m)``. For ``k > 1``, diagonal-transition
+        generators cannot represent ``P^{-T}`` in general (mode coupling in the
+        triangular solves), so this raises; use :meth:`invT_matvec` instead.
+        """
+        if self.order > 1:
+            raise NotImplementedError(
+                "inverse_transpose_generators requires order 1; "
+                "for k>1 use invT_matvec or to_dense()/linalg.inv"
+            )
+        lp, la, lq = self.L.p, self.L.a, self.L.q
+        ug, ub, uh = self.U.p, self.U.a, self.U.q
+        A_g, A_b, A_h = lq, la - lq * lp, -lp
+        B_p, B_a, B_q = uh, ub - uh * ug, -ug
         Dinv = self.d.reciprocal()
-        trans_a = (A_b * B_a).flip(-1)[..., :-1]
-        trans_b = (A_h * Dinv * B_p).flip(-1)[..., :-1]
-        T = Semiseparable.scan_from_zero(trans_a, trans_b).flip(-1)
-        return Order1QSGenerators(
-            p=Dinv * B_p + A_g * B_a * T,
+        trans_a = (A_b * B_a).squeeze(-1).flip(-1)[..., :-1]
+        trans_b = (A_h * Dinv.unsqueeze(-1) * B_p).squeeze(-1).flip(-1)[..., :-1]
+        T = Semiseparable.scan_from_zero(trans_a, trans_b).flip(-1).unsqueeze(-1)
+        return QSGenerators(
+            p=Dinv.unsqueeze(-1) * B_p + A_g * B_a * T,
             a=B_a,
             q=B_q,
-            d=Dinv + A_g * B_q * T,
+            d=Dinv + (A_g * B_q * T).squeeze(-1),
             g=A_g,
             b=A_b,
-            h=A_h * Dinv + A_b * B_q * T,
+            h=A_h * Dinv.unsqueeze(-1) + A_b * B_q * T,
         )
 
     def to_dense(self) -> torch.Tensor:
-        """Materialize ``P`` (``O(m^2)``, debug only)."""
+        """Materialize ``P`` (``O(k m^2)``, debug only)."""
         return self.direct_generators().to_dense()
+
+
+class Order1Quasiseparable(Quasiseparable):
+    """Invertible order-1 quasiseparable ``P = L D U``.
+
+    Convenience wrapper around :class:`Quasiseparable` with scalar generators of
+    shape ``(..., m)``. Matvecs are ``O(m)``.
+    """
+
+    def __init__(
+        self,
+        lower_p: torch.Tensor,
+        lower_a: torch.Tensor,
+        lower_q: torch.Tensor,
+        diag: torch.Tensor,
+        upper_g: torch.Tensor,
+        upper_b: torch.Tensor,
+        upper_h: torch.Tensor,
+    ):
+        tensors = tuple(
+            torch.as_tensor(x)
+            for x in (lower_p, lower_a, lower_q, diag, upper_g, upper_b, upper_h)
+        )
+        diag = tensors[3]
+        if any(x.shape != diag.shape for x in tensors):
+            raise ValueError("all generators must share the same shape")
+        super().__init__(
+            tensors[0].unsqueeze(-1),
+            tensors[1].unsqueeze(-1),
+            tensors[2].unsqueeze(-1),
+            diag,
+            tensors[4].unsqueeze(-1),
+            tensors[5].unsqueeze(-1),
+            tensors[6].unsqueeze(-1),
+        )
+
+    @property
+    def T(self) -> Order1Quasiseparable:
+        """``Pᵀ = Uᵀ D Lᵀ``."""
+        return Order1Quasiseparable(
+            self.uh.squeeze(-1),
+            self.ub.squeeze(-1),
+            self.ug.squeeze(-1),
+            self.d,
+            self.lq.squeeze(-1),
+            self.la.squeeze(-1),
+            self.lp.squeeze(-1),
+        )
+
+    @property
+    def lp(self) -> torch.Tensor:
+        return self.L.p.squeeze(-1)
+
+    @property
+    def la(self) -> torch.Tensor:
+        return self.L.a.squeeze(-1)
+
+    @property
+    def lq(self) -> torch.Tensor:
+        return self.L.q.squeeze(-1)
+
+    @property
+    def ug(self) -> torch.Tensor:
+        return self.U.p.squeeze(-1)
+
+    @property
+    def ub(self) -> torch.Tensor:
+        return self.U.a.squeeze(-1)
+
+    @property
+    def uh(self) -> torch.Tensor:
+        return self.U.q.squeeze(-1)
+
+    def direct_generators(self) -> QSGenerators:
+        gen = Quasiseparable.direct_generators(self)
+        return QSGenerators(
+            p=gen.p.squeeze(-1),
+            a=gen.a.squeeze(-1),
+            q=gen.q.squeeze(-1),
+            d=gen.d,
+            g=gen.g.squeeze(-1),
+            b=gen.b.squeeze(-1),
+            h=gen.h.squeeze(-1),
+        )
+
+    def inverse_transpose_generators(self) -> QSGenerators:
+        gen = Quasiseparable.inverse_transpose_generators(self)
+        return QSGenerators(
+            p=gen.p.squeeze(-1),
+            a=gen.a.squeeze(-1),
+            q=gen.q.squeeze(-1),
+            d=gen.d,
+            g=gen.g.squeeze(-1),
+            b=gen.b.squeeze(-1),
+            h=gen.h.squeeze(-1),
+        )

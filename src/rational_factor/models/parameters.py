@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from rational_factor.models.structured_matrices import (
     DenseMatrix,
     Order1Quasiseparable,
+    Quasiseparable,
     R1PDFactorization,
 )
 
@@ -266,8 +267,11 @@ class DenseMatrixFactorization(Parameters):
         return False
 
 
-class Order1QuasiseparableFactorization(Parameters):
-    """Trainable ``P = L D U``. Diagonal is softplus so ``P`` stays nonsingular.
+class Order1Quasiseparable1Parameters(Parameters):
+    """Trainable ``P = L D U``.
+
+    ``diag`` must already be positive (e.g. :class:`PositiveParameters`); it is
+    used as the factor diagonal ``D`` with no further transform.
 
     ``transition_bound`` (e.g. ``0.99``) maps ``la, ub`` through ``bound * tanh``
     so long products of the transition generators cannot explode.
@@ -282,13 +286,11 @@ class Order1QuasiseparableFactorization(Parameters):
         upper_g: Parameters,
         upper_b: Parameters,
         upper_h: Parameters,
-        min_diag: float = 1e-4,
         transition_bound: float | None = None,
     ):
         self.lower_p, self.lower_a, self.lower_q = lower_p, lower_a, lower_q
         self.diag = diag
         self.upper_g, self.upper_b, self.upper_h = upper_g, upper_b, upper_h
-        self.min_diag = min_diag
         self.transition_bound = transition_bound
 
         shape = diag().shape
@@ -307,9 +309,8 @@ class Order1QuasiseparableFactorization(Parameters):
         if self.transition_bound is not None:
             la = self.transition_bound * torch.tanh(la)
             ub = self.transition_bound * torch.tanh(ub)
-        d = torch.nn.functional.softplus(self.diag()) + self.min_diag
         return Order1Quasiseparable(
-            self.lower_p(), la, self.lower_q(), d,
+            self.lower_p(), la, self.lower_q(), self.diag(),
             self.upper_g(), ub, self.upper_h(),
         )
     
@@ -321,3 +322,75 @@ class Order1QuasiseparableFactorization(Parameters):
 
     def parameter_modules(self) -> list[torch.nn.Module]:
         return [module for param in self.parameters for module in param.parameter_modules()]
+
+
+class QuasiseparableParameters(Parameters):
+    """Trainable order-``k`` ``P = L D U`` with diagonal transitions.
+
+    Generator parameters have shape ``(..., m, k)``; ``diag`` has shape ``(..., m)``.
+    ``diag`` must already be positive (e.g. :class:`PositiveParameters`); it is
+    used as the factor diagonal ``D`` with no further transform.
+
+    Same ``transition_bound`` stabilization as
+    :class:`Order1QuasiseparableFactorization`.
+    """
+
+    def __init__(
+        self,
+        lower_p: Parameters,
+        lower_a: Parameters,
+        lower_q: Parameters,
+        diag: Parameters,
+        upper_g: Parameters,
+        upper_b: Parameters,
+        upper_h: Parameters,
+        transition_bound: float | None = None,
+    ):
+        self.lower_p, self.lower_a, self.lower_q = lower_p, lower_a, lower_q
+        self.diag = diag
+        self.upper_g, self.upper_b, self.upper_h = upper_g, upper_b, upper_h
+        self.transition_bound = transition_bound
+
+        d_shape = diag().shape
+        gen_shape = lower_p().shape
+        if gen_shape != d_shape + (gen_shape[-1],):
+            raise ValueError(
+                f"generators must have shape diag.shape + (k,), got diag={tuple(d_shape)}, "
+                f"gen={tuple(gen_shape)}"
+            )
+        if any(p().shape != gen_shape for p in (
+            self.lower_p, self.lower_a, self.lower_q,
+            self.upper_g, self.upper_b, self.upper_h,
+        )):
+            raise ValueError("all generator Parameters must share shape (..., m, k)")
+
+    @property
+    def parameters(self) -> tuple[Parameters, ...]:
+        return (
+            self.lower_p, self.lower_a, self.lower_q, self.diag,
+            self.upper_g, self.upper_b, self.upper_h,
+        )
+
+    def __call__(self) -> Quasiseparable:
+        la, ub = self.lower_a(), self.upper_b()
+        if self.transition_bound is not None:
+            la = self.transition_bound * torch.tanh(la)
+            ub = self.transition_bound * torch.tanh(ub)
+        return Quasiseparable(
+            self.lower_p(), la, self.lower_q(), self.diag(),
+            self.upper_g(), ub, self.upper_h(),
+        )
+
+    def is_trainable(self):
+        return any(p.is_trainable() for p in self.parameters)
+
+    def is_module(self):
+        return False
+
+    def parameter_modules(self) -> list[torch.nn.Module]:
+        return [module for param in self.parameters for module in param.parameter_modules()]
+
+
+# Backward-compatible aliases.
+Order1QuasiseparableFactorization = Order1Quasiseparable1Parameters
+QuasiseparableFactorization = QuasiseparableParameters

@@ -146,11 +146,16 @@ class SumProdRFF(ConditionalDensityModel):
         return log_g_xp + log_f - log_g_x
 
     def get_Q(self, B : Matrix = None, Omega2 : torch.Tensor = None) -> Matrix: 
-        # Q = diag(a) @ B @ diag(Omega^T a)^-1
+        # Q = diag(a) @ B_row @ diag(Omega^T a)^-1 with B_row @ 1 = 1, so Q q = a.
         if B is None:
             B = self.B()
         else:
             B = as_matrix(B)
+
+        # Row-stochasticize: diag(1 / (B 1)) @ B  (must be mul_diag_left, not right).
+        row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
+        B_normalized = B.mul_diag_left(1.0 / (row_sums + self.numerical_tolerance))
+        
         if Omega2 is None:
             phi = copy.copy(self.g)
             phi.set_coeffs_to_one()
@@ -158,7 +163,7 @@ class SumProdRFF(ConditionalDensityModel):
 
         a = self.g.coeffs()
         q = as_matrix(Omega2).rev_matvec(a)
-        return B.mul_diag_right(1.0 / (q + self.numerical_tolerance)).mul_diag_left(a)
+        return B_normalized.mul_diag_right(1.0 / (q + self.numerical_tolerance)).mul_diag_left(a)
     
 
 #class MLPContextLinearRFF(ConditionalDensityModel):

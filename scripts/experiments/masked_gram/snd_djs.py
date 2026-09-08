@@ -18,8 +18,7 @@ from rational_factor.models.mutual_bases import (
 )
 from rational_factor.models.parameters import (
     PositiveParameters,
-    TrainableParameters,
-    R1PDFactorizationParameters,
+    QuasiseparableFactorization,
     DenseMatrixFactorization,
     param_group_iter,
 )
@@ -28,6 +27,30 @@ from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
 import rational_factor.models.loss as loss
 import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
+
+def _make_qs_B(n_basis: int, order: int, device: torch.device) -> QuasiseparableFactorization:
+    """Order-``order`` quasiseparable ``B = L D U`` with nonnegative factors.
+
+    Zero LDU generators are a critical point (off-diagonal grads vanish), and
+    signed generators make ``B`` indefinite — both break SumProdRFF. Use small
+    positive random generators; ``transition_bound`` keeps ``a, b ∈ (0, 1)``.
+    """
+    gen_shape = (1, n_basis, order)
+    diag_shape = (1, n_basis)
+    # softplus(N(-2, 0.3)) ≈ small positive off-diagonals; transitions use
+    # softplus then tanh·bound so products along the chain stay stable.
+    pos_off = lambda: PositiveParameters.random_init(gen_shape, mean=-2.0, std=0.3, epsilon=1e-4).to(device)
+    pos_trans = lambda: PositiveParameters.random_init(gen_shape, mean=0.0, std=0.3, epsilon=1e-4).to(device)
+    return QuasiseparableFactorization(
+        pos_off(),
+        pos_trans(),
+        pos_off(),
+        PositiveParameters.random_init(diag_shape, mean=1.0, std=0.1, epsilon=1e-4).to(device),
+        pos_off(),
+        pos_trans(),
+        pos_off(),
+        transition_bound=0.99,
+    )
 
 
 def _plot_snd_conditional_true_vs_learned(
@@ -233,19 +256,19 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 100
+    n_basis = 200
     sacrificial_index = 0
     embedding_dim = 4
     splitter_hidden = 16
     splitter_layers = 2
-    B_rank = 50
+    B_order = 20  # full order-n quasiseparable
     flow_hidden = 16
     flow_layers = 2
     tran_params = {
-        "n_epochs_per_group": [5, 5],  # basis+wrap, weights
-        "iterations": 100,
+        "n_epochs_per_group": [1, 5],  # basis+wrap, weights
+        "iterations": 10,
         "lr_basis": 1e-3,
-        "lr_weights": 1e-3,
+        "lr_weights": 5e-3,
         "lr_wrap": 1e-3,
     }
     init_params = {
@@ -278,7 +301,8 @@ if __name__ == "__main__":
 
     # Orthogonal 1D PWC pair on the sacrificial coordinate
     cell_widths = PositiveParameters.set_init(shape=(1, n_basis), value=torch.tensor([1.0]), normalization_dim=1).to(device)
-    alpha_params = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([0.5])).to(device)
+    #alpha_params = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([0.5])).to(device)
+    alpha_params = PositiveParameters.set_init(shape=(1, n_basis), value=torch.tensor([1.0])).to(device)
     orth_pwc_mutual = DisjointSupport1DPWCBasis(cell_widths, alpha_params)
 
     g_coeffs = PositiveParameters.random_init(
@@ -288,17 +312,16 @@ if __name__ == "__main__":
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
     ).to(device)
 
-    # R1PD row-stochastic product. Use unconstrained TrainableParameters and
-    # omit d when normalization='r'. Init u << 0 so each factor starts near I;
-    # PositiveParameters + normalization='r' collapses the product to uniform.
+    
 
-    #B_shape = (1, B_rank, n_basis)
-    #B_u = TrainableParameters.random_init(shape=B_shape, mean=-4.0, std=0.1).to(device)
-    #B_v = TrainableParameters.random_init(shape=B_shape, mean=0.0, std=0.1).to(device)
-    #B = R1PDFactorizationParameters(B_u, B_v, seq_dim=1, normalization='r')
 
-    B_params = PositiveParameters.random_init(shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), normalization_dim=2).to(device)
-    B = DenseMatrixFactorization(B_params)
+    B = _make_qs_B(n_basis, B_order, device)
+
+    #B_params = PositiveParameters.random_init(shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
+    #B = DenseMatrixFactorization(B_params)
+
+
+
 
     g_basis = orth_pwc_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = orth_pwc_mutual.get_basis(1)
@@ -320,8 +343,8 @@ if __name__ == "__main__":
             ]
         ),
         "weights": torch.optim.Adam(
-            #param_group_iter((g_coeffs, B_u, B_v)),
-            param_group_iter((g_coeffs, B_params)),
+            param_group_iter((g_coeffs, *B.parameters)),
+            #param_group_iter((g_coeffs, B_params)),
             lr=tran_params["lr_weights"],
         ),
     }

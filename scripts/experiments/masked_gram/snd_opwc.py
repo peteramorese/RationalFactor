@@ -39,7 +39,7 @@ def _make_qs_factorization(n_basis: int, device: torch.device, random_init: bool
             TrainableParameters.random_init(shape=shape).to(device),
             TrainableParameters.random_init(shape=shape).to(device),
             TrainableParameters.random_init(shape=shape).to(device),
-            TrainableParameters.random_init(shape=shape).to(device),
+            PositiveParameters.random_init(shape=shape).to(device),
             TrainableParameters.random_init(shape=shape).to(device),
             TrainableParameters.random_init(shape=shape).to(device),
             TrainableParameters.random_init(shape=shape).to(device),
@@ -50,7 +50,7 @@ def _make_qs_factorization(n_basis: int, device: torch.device, random_init: bool
             TrainableParameters.set_init(shape, 0.0).to(device),
             TrainableParameters.set_init(shape, 0.0).to(device),
             TrainableParameters.set_init(shape, 0.0).to(device),
-            TrainableParameters.set_init(shape, 1.0).to(device),
+            PositiveParameters.set_init(shape, 1.0, epsilon=1e-4).to(device),
             TrainableParameters.set_init(shape, 0.0).to(device),
             TrainableParameters.set_init(shape, 0.0).to(device),
             TrainableParameters.set_init(shape, 0.0).to(device),
@@ -358,9 +358,9 @@ if __name__ == "__main__":
     #B_shape = (1, B_rank, n_basis)
     #B_u = TrainableParameters.random_init(shape=B_shape, mean=-4.0, std=0.1).to(device)
     #B_v = TrainableParameters.random_init(shape=B_shape, mean=0.0, std=0.1).to(device)
-    #B = R1PDFactorizationParameters(B_u, B_v, seq_dim=1, normalization='r')
+    #B = R1PDFactorizationParameters(B_u, B_v, seq_dim=1)
 
-    B_params = PositiveParameters.random_init(shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), normalization_dim=2).to(device)
+    B_params = PositiveParameters.random_init(shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])).to(device)
     B = DenseMatrixFactorization(B_params)
 
 

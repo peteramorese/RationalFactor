@@ -2,7 +2,7 @@ import torch
 from pathlib import Path
 from torch.utils.data import DataLoader, TensorDataset
 
-from normalizing_flow.normalizing_flow import ConditionalNormalizingFlow
+from normalizing_flow.normalizing_flow import ConditionalNSFNormalizingFlow
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.domain_transformation import ErfSeparableTF, MLP
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
@@ -11,7 +11,7 @@ from rational_factor.models.mutual_bases import (
     DisjointSupport1DPWCBasis,
     MaskedGramMutualBasis,
 )
-from rational_factor.models.parameters import PositiveParameters, TrainableParameters, R1PDFactorizationParameters, param_group_iter
+from rational_factor.models.parameters import PositiveParameters, TrainableParameters, R1PDFactorizationParameters, param_group_iter, QuasiseparableFactorization
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
 from rational_factor.tools.visualization import plot_belief
@@ -20,24 +20,48 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 import matplotlib.pyplot as plt
 
+def _make_qs_B(n_basis: int, order: int, device: torch.device) -> QuasiseparableFactorization:
+    """Order-``order`` quasiseparable ``B = L D U`` with nonnegative factors.
+
+    Zero LDU generators are a critical point (off-diagonal grads vanish), and
+    signed generators make ``B`` indefinite — both break SumProdRFF. Use small
+    positive random generators; ``transition_bound`` keeps ``a, b ∈ (0, 1)``.
+    """
+    gen_shape = (1, n_basis, order)
+    diag_shape = (1, n_basis)
+    # softplus(N(-2, 0.3)) ≈ small positive off-diagonals; transitions use
+    # softplus then tanh·bound so products along the chain stay stable.
+    pos_off = lambda: PositiveParameters.random_init(gen_shape, mean=-2.0, std=0.3, epsilon=1e-4).to(device)
+    pos_trans = lambda: PositiveParameters.random_init(gen_shape, mean=0.0, std=0.3, epsilon=1e-4).to(device)
+    return QuasiseparableFactorization(
+        pos_off(),
+        pos_trans(),
+        pos_off(),
+        PositiveParameters.random_init(diag_shape, mean=1.0, std=0.1, epsilon=1e-4).to(device),
+        pos_off(),
+        pos_trans(),
+        pos_off(),
+        transition_bound=0.99,
+    )
+
 
 if __name__ == "__main__":
     problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 20
+    n_basis = 200
     sacrificial_index = 0
     embedding_dim = 4
     splitter_hidden = 16
     splitter_layers = 2
-    B_rank = 5
+    B_order = 20
     flow_hidden = 16
     flow_layers = 2
     tran_params = {
-        "n_epochs_per_group": [5, 5],  # basis+wrap, weights
-        "iterations": 3,
-        "lr_basis": 5e-3,
+        "n_epochs_per_group": [5, 5],  # weights, basis+wrap 
+        "iterations": 10,
+        "lr_basis": 1e-3,
         "lr_weights": 1e-2,
         "lr_wrap": 1e-3,
     }
@@ -67,7 +91,7 @@ if __name__ == "__main__":
     rest_dim = dim - 1
 
     # Create nf mutual basis
-    nf = ConditionalNormalizingFlow(
+    nf = ConditionalNSFNormalizingFlow(
         dim=rest_dim,
         conditioner_dim=embedding_dim,
         num_layers=flow_layers,
@@ -89,8 +113,10 @@ if __name__ == "__main__":
     nf_mutual = NFPairBasis(nf_wrapped, nf_splitter, nf_embedding)
 
     # Orthogonal 1D PWC pair on the sacrificial coordinate
-    cell_widths = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([0.5]), normalization_dim=1).to(device)
-    alpha_params = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([0.5])).to(device)
+    #cell_widths = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([0.5]), normalization_dim=1).to(device)
+    #alpha_params = PositiveParameters.random_init(shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([0.5])).to(device)
+    cell_widths = PositiveParameters.set_init(shape=(1, n_basis), value=torch.tensor([1.0]), normalization_dim=1).to(device)
+    alpha_params = PositiveParameters.set_init(shape=(1, n_basis), value=torch.tensor([1.0])).to(device)
     orth_pwc_mutual = DisjointSupport1DPWCBasis(cell_widths, alpha_params)
 
     phi_psi_mutual = MaskedGramMutualBasis(orth_pwc_mutual, sacrificial_index, nf_mutual).to(device)
@@ -102,10 +128,7 @@ if __name__ == "__main__":
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
     ).to(device)
 
-    B_shape = (1, B_rank, n_basis)
-    B_u = TrainableParameters.random_init(shape=B_shape, mean=-4.0, std=0.1).to(device)
-    B_v = TrainableParameters.random_init(shape=B_shape, mean=0.0, std=0.1).to(device)
-    B = R1PDFactorizationParameters(B_u, B_v, seq_dim=1, normalization='r')
+    B = _make_qs_B(n_basis, B_order, device)
 
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)
@@ -117,16 +140,16 @@ if __name__ == "__main__":
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     optimizers = {
+        "weights": torch.optim.Adam(
+            param_group_iter((g_coeffs, *B.parameters)),
+            lr=tran_params["lr_weights"],
+        ),
         "basis": torch.optim.Adam(
             [
                 {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
                 {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
                 {"params": nf_wrapper.parameters(), "lr": tran_params["lr_wrap"]},
             ]
-        ),
-        "weights": torch.optim.Adam(
-            param_group_iter((g_coeffs, B_u, B_v)),
-            lr=tran_params["lr_weights"],
         ),
     }
 
