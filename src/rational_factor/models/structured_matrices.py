@@ -1,4 +1,4 @@
-"""Structured matrix approximators: rank-1-plus-diagonal and quasiseparable."""
+"""Structured matrix approximators: banded, rank-1-plus-diagonal, and quasiseparable."""
 
 from __future__ import annotations
 
@@ -292,6 +292,174 @@ class Diagonal(Matrix):
 
     def matvec(self, x: torch.Tensor) -> torch.Tensor:
         return self.d * x
+
+
+class Banded(Matrix):
+    """Square banded matrix in column-oriented diagonal storage.
+
+    ``data[..., r, j]`` stores ``A[..., j + offsets[r], j]`` when that row is
+    in range. Storage is ``O(n * number_of_diagonals)``, never ``O(n^2)``.
+
+    - ``offsets``: ``(n_diag,)`` integer row−column offsets
+    - ``data``: ``(..., n_diag, n)`` diagonal values
+    """
+
+    def __init__(self, offsets: torch.Tensor, data: torch.Tensor):
+        offsets = torch.as_tensor(offsets)
+        data = torch.as_tensor(data)
+        if offsets.dim() != 1:
+            raise ValueError(f"offsets must have shape (n_diag,), got {tuple(offsets.shape)}")
+        if data.dim() < 2:
+            raise ValueError(f"data must have shape (..., n_diag, n), got {tuple(data.shape)}")
+        if data.shape[-2] != offsets.shape[0]:
+            raise ValueError(
+                f"data n_diag={data.shape[-2]} must match offsets length {offsets.shape[0]}"
+            )
+        self.offsets = offsets.to(dtype=torch.long, device=data.device)
+        self.data = data
+
+    @property
+    def n(self) -> int:
+        return self.data.shape[-1]
+
+    @property
+    def n_diag(self) -> int:
+        return self.offsets.shape[0]
+
+    @property
+    def batch_shape(self) -> torch.Size:
+        return self.data.shape[:-2]
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.batch_shape + torch.Size([self.n, self.n])
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.data.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.data.device
+
+    @property
+    def T(self) -> Banded:
+        """Transpose: negate offsets and shift each stored diagonal."""
+        n = self.n
+        new_data = torch.zeros_like(self.data)
+        for r, off in enumerate(self.offsets.tolist()):
+            off = int(off)
+            if off >= 0:
+                if off < n:
+                    new_data[..., r, off:] = self.data[..., r, : n - off]
+            elif -off < n:
+                new_data[..., r, : n + off] = self.data[..., r, -off:]
+        return Banded(-self.offsets, new_data)
+
+    def to_dense(self) -> torch.Tensor:
+        n = self.n
+        out = self.data.new_zeros(self.batch_shape + (n, n))
+        for r, off in enumerate(self.offsets.tolist()):
+            off = int(off)
+            if off >= 0:
+                cols = torch.arange(0, n - off, device=self.device)
+            else:
+                cols = torch.arange(-off, n, device=self.device)
+            rows = cols + off
+            out[..., rows, cols] = self.data[..., r, cols]
+        return out
+
+    def diag(self) -> torch.Tensor:
+        zero = (self.offsets == 0).nonzero(as_tuple=False)
+        if zero.numel() == 0:
+            return self.data.new_zeros(self.batch_shape + (self.n,))
+        return self.data[..., int(zero[0]), :]
+
+    def sum(self) -> torch.Tensor:
+        total = None
+        n = self.n
+        for r, off in enumerate(self.offsets.tolist()):
+            off = int(off)
+            if off >= 0:
+                part = self.data[..., r, : n - off]
+            else:
+                part = self.data[..., r, -off:]
+            total = part.sum() if total is None else total + part.sum()
+        if total is None:
+            return self.data.new_zeros(())
+        return total
+
+    def scale(self, s: torch.Tensor | float) -> Banded:
+        s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
+        return Banded(self.offsets, self.data * s)
+
+    def mul_diag_left(self, a: torch.Tensor) -> Banded:
+        """Left-multiply by ``diag(a)``: ``(diag(a) A)[i, j] = a[i] A[i, j]``."""
+        a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
+        if a.shape[-1] != self.n:
+            raise ValueError(
+                f"diagonal must have trailing size n={self.n}, got shape {tuple(a.shape)}"
+            )
+        n = self.n
+        new_data = torch.zeros_like(self.data)
+        for r, off in enumerate(self.offsets.tolist()):
+            off = int(off)
+            if off >= 0:
+                cols = torch.arange(0, n - off, device=self.device)
+            else:
+                cols = torch.arange(-off, n, device=self.device)
+            rows = cols + off
+            new_data[..., r, cols] = a[..., rows] * self.data[..., r, cols]
+        return Banded(self.offsets, new_data)
+
+    def mul_diag_right(self, a: torch.Tensor) -> Banded:
+        """Right-multiply by ``diag(a)``: ``(A diag(a))[i, j] = A[i, j] a[j]``."""
+        a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
+        if a.shape[-1] != self.n:
+            raise ValueError(
+                f"diagonal must have trailing size n={self.n}, got shape {tuple(a.shape)}"
+            )
+        return Banded(self.offsets, self.data * a.unsqueeze(-2))
+
+    def mul_diag(self, a: torch.Tensor, *, side: str = "left") -> Banded:
+        if side == "left":
+            return self.mul_diag_left(a)
+        if side == "right":
+            return self.mul_diag_right(a)
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute ``A @ x`` in ``O(n * n_diag)`` time.
+
+        Args:
+            x: ``(..., n)`` or ``(..., n, k)``. Leading dims broadcast with
+                ``batch_shape``.
+        """
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        n = self.n
+        batch_ndim = len(self.batch_shape)
+        multi_rhs = x.dim() >= batch_ndim + 2 and x.shape[-2] == n
+        if not multi_rhs and x.shape[-1] != n:
+            raise ValueError(
+                f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
+            )
+
+        out = torch.zeros_like(x)
+        for r, off in enumerate(self.offsets.tolist()):
+            off = int(off)
+            if off >= 0:
+                cols = torch.arange(0, n - off, device=self.device)
+            else:
+                cols = torch.arange(-off, n, device=self.device)
+            rows = cols + off
+            diag = self.data[..., r, cols]
+            if multi_rhs:
+                src = x[..., cols, :] * diag.unsqueeze(-1)
+                out.index_add_(-2, rows, src)
+            else:
+                src = x[..., cols] * diag
+                out.index_add_(-1, rows, src)
+        return out
 
 
 class Rank1PlusDiagonal(Matrix):

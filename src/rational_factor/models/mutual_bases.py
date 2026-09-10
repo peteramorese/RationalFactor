@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from math import ceil
 
 import torch
 
@@ -13,6 +14,7 @@ from rational_factor.models.basis_functions import Basis, BetaBasis
 from rational_factor.models.composite_model import CompositeConditionalModel
 from rational_factor.models.parameters import Parameters, Order1QuasiseparableFactorization
 from rational_factor.models.structured_matrices import (
+    Banded,
     DenseMatrix,
     Identity,
     Diagonal,
@@ -937,6 +939,481 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
 
     def supremum(self, index: int,) -> torch.Tensor:
         return self.bounds(index)[1]
+
+
+class LocalBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
+    r"""Compact biorthogonal 1-D spline pair.
+
+    alpha
+        Open-uniform cardinal B-splines of degree ``k_alpha - 1``.  Interior
+        alpha_i therefore spans exactly ``k_alpha`` grid cells and is >= 0.
+
+    beta
+        Each beta_j is a compact C0 cubic spline on ``k_beta`` consecutive
+        cells.  Internal knots have multiplicity 3, and the first/last local
+        B-spline coefficients are fixed to zero, so beta_j joins continuously
+        to zero outside its window.
+
+        The remaining local coefficients are parameterized as
+
+            d_j = d0_j + N_j theta_j,
+
+        where M_j d0_j = e_j and columns of N_j span null(M_j).  Hence every
+        theta_j preserves <alpha_i, beta_j> = delta_ij exactly up to numerical
+        linear-algebra precision.
+
+    Notes
+    -----
+    * Cubic beta pieces make roots cellwise cubic and cheap to recover offline.
+    * With C0 cubics, the number of free local beta coefficients is
+      3*k_beta - 1.  The number of biorthogonality constraints is
+      k_alpha + k_beta - 1, leaving 2*k_beta - k_alpha trainable nullspace DOFs.
+    * Omega2_alpha_b() returns a Banded for b = relu(-beta).  The cache is
+      rebuilt offline from the current beta coefficients.
+    """
+
+    def __init__(
+        self,
+        n_basis: int,
+        k_alpha: int,
+        k_beta: int,
+        *,
+        trainable_beta: bool = False,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ):
+        if k_alpha < 1 or k_beta < 1:
+            raise ValueError("k_alpha and k_beta must be >= 1")
+        if n_basis < k_alpha:
+            raise ValueError("n_basis must be >= k_alpha")
+
+        MutualPairBasis.__init__(self, 1, 1, n_basis, ())
+        torch.nn.Module.__init__(self)
+        dtype = torch.float32 if dtype is None else dtype
+
+        self._k_alpha = int(k_alpha)
+        self._k_beta = int(k_beta)
+        self._p_alpha = self._k_alpha - 1
+        self._p_beta = 3
+        self._n_cells = n_basis - self._p_alpha
+        if self._k_beta > self._n_cells:
+            raise ValueError("k_beta cannot exceed the number of grid cells")
+
+        # C0 cubic beta: 3*k_beta + 1 local B-splines; endpoints fixed to zero.
+        self._n_beta_local = 3 * self._k_beta + 1
+        self._n_beta_free = self._n_beta_local - 2
+        self._n_constraints = self._k_alpha + self._k_beta - 1
+        self._n_beta_null = self._n_beta_free - self._n_constraints
+        if self._n_beta_null < 0:
+            raise ValueError(
+                "Not enough local cubic beta DOFs. C0 cubics require "
+                "2*k_beta >= k_alpha. Increase k_beta or enrich beta."
+            )
+
+        breaks = torch.linspace(0.0, 1.0, self._n_cells + 1, dtype=dtype, device=device)
+        self.register_buffer("_breaks", breaks)
+        self._h = 1.0 / self._n_cells
+
+        # alpha: simple interior knots -> maximal smoothness, support k_alpha cells.
+        pa = self._p_alpha
+        alpha_knots = torch.cat([
+            torch.zeros(pa + 1, dtype=dtype, device=device),
+            breaks[1:-1],
+            torch.ones(pa + 1, dtype=dtype, device=device),
+        ])
+        self.register_buffer("_alpha_knots", alpha_knots)
+
+        # beta local template on [0, k_beta]: cubic with multiplicity 3 at
+        # interior cell boundaries -> C0 continuity and many local DOFs.
+        pb = self._p_beta
+        parts = [torch.zeros(pb + 1, dtype=dtype, device=device)]
+        for r in range(1, self._k_beta):
+            parts.append(torch.full((pb,), float(r), dtype=dtype, device=device))
+        parts.append(torch.full((pb + 1,), float(self._k_beta), dtype=dtype, device=device))
+        self.register_buffer("_beta_local_knots", torch.cat(parts))
+
+        # Fixed cellwise power representations.  These make eval and exact
+        # cellwise integration/root finding cheap.
+        a_idx, a_pow = self._build_alpha_cell_power()
+        b_idx, b_pow = self._build_beta_cell_power()
+        self.register_buffer("_alpha_cell_idx", a_idx)       # (cells, k_alpha)
+        self.register_buffer("_alpha_cell_power", a_pow)     # (cells, k_alpha, k_alpha)
+        self.register_buffer("_beta_cell_idx", b_idx)        # (k_beta, 4)
+        self.register_buffer("_beta_basis_power", b_pow)     # (k_beta, 4, 4)
+
+        # Center each beta window on alpha_j as closely as the cell grid permits.
+        q = self._n_constraints
+        starts = torch.arange(n_basis, device=device) - (q - 1) // 2
+        starts = starts.clamp(0, self._n_cells - self._k_beta).long()
+        self.register_buffer("_beta_window_start", starts)
+
+        d0, null = self._build_beta_constraints()
+        self.register_buffer("_beta_d0", d0)                 # (m, n_beta_free)
+        self.register_buffer("_beta_null", null)             # (m, n_beta_free, n_null)
+
+        theta = torch.zeros(n_basis, self._n_beta_null, dtype=dtype, device=device)
+        if trainable_beta:
+            self.beta_theta = torch.nn.Parameter(theta)
+        else:
+            self.register_buffer("beta_theta", theta)
+
+        self.register_buffer("_alpha_mass", self._compute_alpha_mass())
+
+        # A fixed diagonal layout; only values are recomputed when beta changes.
+        bw = self._n_constraints - 1
+        self.register_buffer("_ab_offsets", torch.arange(-bw, bw + 1, dtype=torch.long, device=device))
+        self.register_buffer("_ab_diagonals", torch.zeros(2 * bw + 1, n_basis, dtype=dtype, device=device))
+        self.rebuild_alpha_b_gram()
+
+    # ------------------------------------------------------------------
+    # Basic properties
+    # ------------------------------------------------------------------
+
+    @property
+    def degree(self) -> int:
+        return self._p_alpha
+
+    @property
+    def breakpoints(self) -> torch.Tensor:
+        return self._breaks
+
+    @property
+    def knots(self) -> torch.Tensor:
+        return self._alpha_knots
+
+    @property
+    def n_beta_free(self) -> int:
+        return self._n_beta_free
+
+    @property
+    def n_beta_trainable(self) -> int:
+        return self._n_beta_null
+
+    def dtype_device(self):
+        return self._breaks.dtype, self._breaks.device
+
+    def _get_gram_diag(self) -> torch.Tensor:
+        return torch.ones(self._batch_size, self._n_basis, dtype=self._breaks.dtype, device=self._breaks.device)
+
+    # ------------------------------------------------------------------
+    # Fixed spline utilities
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bspline_all(x: torch.Tensor, knots: torch.Tensor, degree: int) -> torch.Tensor:
+        """Evaluate every B-spline in ``knots`` at x; used only at setup."""
+        x = x.reshape(-1)
+        m = knots.numel() - degree - 1
+        n = m - 1
+        span = torch.searchsorted(knots, x, right=True) - 1
+        span = torch.where(x >= knots[n + 1], torch.full_like(span, n), span)
+        span = span.clamp(degree, n)
+
+        N = x.new_zeros(x.numel(), degree + 1)
+        N[:, 0] = 1.0
+        left = x.new_zeros(x.numel(), degree + 1)
+        right = x.new_zeros(x.numel(), degree + 1)
+        eps = torch.finfo(x.dtype).eps
+        for j in range(1, degree + 1):
+            left[:, j] = x - knots[span + 1 - j]
+            right[:, j] = knots[span + j] - x
+            saved = torch.zeros_like(x)
+            for r in range(j):
+                den = right[:, r + 1] + left[:, j - r]
+                tmp = torch.where(den.abs() > eps, N[:, r] / den, torch.zeros_like(den))
+                N[:, r] = saved + right[:, r + 1] * tmp
+                saved = left[:, j - r] * tmp
+            N[:, j] = saved
+
+        idx = span[:, None] - degree + torch.arange(degree + 1, device=x.device)
+        return x.new_zeros(x.numel(), m).scatter(1, idx, N)
+
+    @staticmethod
+    def _polyval(coeff: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """Ascending-power Horner; coeff shape (..., degree+1)."""
+        out = torch.zeros(torch.broadcast_shapes(coeff.shape[:-1], u.shape), dtype=coeff.dtype, device=coeff.device)
+        for c in coeff.unbind(-1)[::-1]:
+            out = out * u + c
+        return out
+
+    def _build_alpha_cell_power(self) -> tuple[torch.Tensor, torch.Tensor]:
+        p = self._p_alpha
+        q = p + 1
+        dtype, device = self.dtype_device()
+        xn, _ = leggauss(q)
+        u = 0.5 * (torch.as_tensor(xn, dtype=dtype, device=device) + 1.0)
+        V = torch.stack([u ** r for r in range(q)], dim=-1)
+
+        idx = torch.arange(self._n_cells, device=device)[:, None] + torch.arange(q, device=device)[None, :]
+        x = self._breaks[:-1, None] + (self._breaks[1:] - self._breaks[:-1])[:, None] * u[None, :]
+        vals = self._bspline_all(x.reshape(-1), self._alpha_knots, p)
+        vals = vals.reshape(self._n_cells, q, self._n_basis)
+        vals = vals.gather(2, idx[:, None, :].expand(-1, q, -1))
+        # (cell, active_alpha, ascending_power)
+        coeff = torch.linalg.solve(V, vals).permute(0, 2, 1)
+        return idx.long(), coeff
+
+    def _build_beta_cell_power(self) -> tuple[torch.Tensor, torch.Tensor]:
+        p = self._p_beta
+        q = p + 1
+        dtype, device = self.dtype_device()
+        xn, _ = leggauss(q)
+        u = 0.5 * (torch.as_tensor(xn, dtype=dtype, device=device) + 1.0)
+        V = torch.stack([u ** r for r in range(q)], dim=-1)
+
+        # With multiplicity p at each interior knot, cell c has active local
+        # B-spline indices p*c, ..., p*c+p.
+        idx = p * torch.arange(self._k_beta, device=device)[:, None] + torch.arange(q, device=device)[None, :]
+        x = torch.arange(self._k_beta, dtype=dtype, device=device)[:, None] + u[None, :]
+        vals = self._bspline_all(x.reshape(-1), self._beta_local_knots, p)
+        vals = vals.reshape(self._k_beta, q, self._n_beta_local)
+        vals = vals.gather(2, idx[:, None, :].expand(-1, q, -1))
+        coeff = torch.linalg.solve(V, vals).permute(0, 2, 1)
+        return idx.long(), coeff
+
+    # ------------------------------------------------------------------
+    # Biorthogonal local beta construction
+    # ------------------------------------------------------------------
+
+    def _constraint_matrix(self, start: int) -> torch.Tensor:
+        """M for a beta window beginning at global cell ``start``."""
+        dtype, device = self.dtype_device()
+        qa = self._k_alpha
+        pb = self._p_beta
+        nq = ceil((self._p_alpha + pb + 1) / 2)
+        gx, gw = leggauss(nq)
+        u = 0.5 * (torch.as_tensor(gx, dtype=dtype, device=device) + 1.0)
+        w = 0.5 * torch.as_tensor(gw, dtype=dtype, device=device)
+        pa_pow = torch.stack([u ** r for r in range(self._p_alpha + 1)], dim=0)
+        pb_pow = torch.stack([u ** r for r in range(pb + 1)], dim=0)
+
+        M = torch.zeros(self._n_constraints, self._n_beta_free, dtype=dtype, device=device)
+        for c in range(self._k_beta):
+            s = start + c
+            A = self._alpha_cell_power[s] @ pa_pow              # (k_alpha, nq)
+            B = self._beta_basis_power[c] @ pb_pow              # (4, nq)
+            G = self._h * (A * w) @ B.T                         # (k_alpha, 4)
+
+            rows = c + torch.arange(qa, device=device)
+            bids = self._beta_cell_idx[c]
+            keep = (bids > 0) & (bids < self._n_beta_local - 1)
+            cols = bids[keep] - 1
+            M[rows[:, None], cols[None, :]] += G[:, keep]
+        return M
+
+    def _build_beta_constraints(self) -> tuple[torch.Tensor, torch.Tensor]:
+        dtype, device = self.dtype_device()
+        m, nf, nr = self._n_basis, self._n_beta_free, self._n_beta_null
+        d0 = torch.empty(m, nf, dtype=dtype, device=device)
+        null = torch.empty(m, nf, nr, dtype=dtype, device=device)
+
+        cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for j, start_t in enumerate(self._beta_window_start):
+            start = int(start_t)
+            if start not in cache:
+                M = self._constraint_matrix(start)
+                if int(torch.linalg.matrix_rank(M)) != self._n_constraints:
+                    raise RuntimeError(
+                        f"Local beta constraint matrix at window {start} is rank deficient; "
+                        "increase k_beta or change the local spline space."
+                    )
+                pinv = torch.linalg.pinv(M)
+                if nr:
+                    # Full Vh is needed for an explicit nullspace basis.
+                    _, _, Vh = torch.linalg.svd(M, full_matrices=True)
+                    N = Vh[self._n_constraints:].T.contiguous()
+                else:
+                    N = torch.empty(nf, 0, dtype=dtype, device=device)
+                cache[start] = (pinv, N)
+
+            pinv, N = cache[start]
+            target = j - start
+            if target < 0 or target >= self._n_constraints:
+                raise RuntimeError("beta window does not overlap its matching alpha")
+            d0[j] = pinv[:, target]
+            if nr:
+                null[j] = N
+
+        return d0, null
+
+    def _beta_free_coeffs(self) -> torch.Tensor:
+        if self._n_beta_null == 0:
+            return self._beta_d0
+        return self._beta_d0 + torch.einsum("jfr,jr->jf", self._beta_null, self.beta_theta)
+
+    def _beta_full_coeffs(self) -> torch.Tensor:
+        free = self._beta_free_coeffs()
+        z = free.new_zeros(self._n_basis, 1)
+        return torch.cat([z, free, z], dim=-1)
+
+    def _beta_cell_power_coeffs(self) -> torch.Tensor:
+        """Current beta polynomial coefficients: (beta, local_cell, power 0..3)."""
+        d = self._beta_full_coeffs()
+        active = d[:, self._beta_cell_idx]                         # (m, k_beta, 4)
+        return torch.einsum("jck,ckr->jcr", active, self._beta_basis_power)
+
+    # ------------------------------------------------------------------
+    # Fast evaluation
+    # ------------------------------------------------------------------
+
+    def _eval_alpha(self, y: torch.Tensor) -> torch.Tensor:
+        y = torch.as_tensor(y, dtype=self._breaks.dtype, device=self._breaks.device).reshape(-1).clamp(0.0, 1.0)
+        z = y * self._n_cells
+        cell = torch.floor(z).long().clamp(max=self._n_cells - 1)
+        u = torch.where(y >= 1.0, torch.ones_like(y), z - cell)
+
+        coeff = self._alpha_cell_power[cell]                       # (N, k_alpha, k_alpha)
+        vals = torch.zeros(y.numel(), self._k_alpha, dtype=y.dtype, device=y.device)
+        for r in range(self._p_alpha, -1, -1):
+            vals = vals * u[:, None] + coeff[..., r]
+
+        idx = self._alpha_cell_idx[cell]
+        return y.new_zeros(y.numel(), self._n_basis).scatter(1, idx, vals)
+
+    def _eval_beta(self, y: torch.Tensor) -> torch.Tensor:
+        y = torch.as_tensor(y, dtype=self._breaks.dtype, device=self._breaks.device).reshape(-1).clamp(0.0, 1.0)
+        cell_coeff = self._beta_cell_power_coeffs()                # (m, k_beta, 4)
+
+        t = y[:, None] * self._n_cells - self._beta_window_start[None, :]
+        active = (t >= 0.0) & (t <= float(self._k_beta))
+        local_cell = torch.floor(t).long().clamp(0, self._k_beta - 1)
+        u = t - local_cell
+        u = torch.where(t >= float(self._k_beta), torch.ones_like(u), u)
+
+        j = torch.arange(self._n_basis, device=y.device)[None, :].expand(y.numel(), -1)
+        coeff = cell_coeff[j, local_cell]                          # (N, m, 4)
+        out = torch.zeros_like(t)
+        for r in range(3, -1, -1):
+            out = out * u + coeff[..., r]
+        return torch.where(active, out, torch.zeros_like(out))
+
+    def eval(self, y: torch.Tensor, index: int | None = None) -> torch.Tensor:
+        if self._batch_size != 1:
+            raise ValueError("eval currently requires parameter batch_size == 1")
+        if index == 0:
+            return self._eval_alpha(y)
+        if index == 1:
+            return self._eval_beta(y)
+        if index is None:
+            return torch.stack([self._eval_alpha(y), self._eval_beta(y)], dim=1)
+        raise ValueError("index must be 0, 1, or None")
+
+    def eval_b(self, y: torch.Tensor) -> torch.Tensor:
+        return torch.relu(-self._eval_beta(y))
+
+    # ------------------------------------------------------------------
+    # Moments / structured Grams
+    # ------------------------------------------------------------------
+
+    def _compute_alpha_mass(self) -> torch.Tensor:
+        out = torch.zeros(self._n_basis, dtype=self._breaks.dtype, device=self._breaks.device)
+        denom = torch.arange(1, self._p_alpha + 2, dtype=self._breaks.dtype, device=self._breaks.device)
+        cell_int = self._h * (self._alpha_cell_power / denom).sum(-1)
+        out.scatter_add_(0, self._alpha_cell_idx.reshape(-1), cell_int.reshape(-1))
+        return out
+
+    def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
+        if lows is not None or highs is not None:
+            raise NotImplementedError("Restricted-domain moments are not implemented")
+        if index == 0:
+            out = self._alpha_mass
+        elif index == 1:
+            coeff = self._beta_cell_power_coeffs()
+            denom = torch.arange(1, 5, dtype=coeff.dtype, device=coeff.device)
+            out = self._h * (coeff / denom).sum(dim=(-1, -2))
+        else:
+            raise ValueError("index must be 0 or 1")
+        return out.unsqueeze(0).expand(self._batch_size, -1)
+
+    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
+        if lows is not None or highs is not None:
+            raise NotImplementedError("Restricted-domain cross Grams are not identity")
+        lam = self._get_gram_diag()
+        return Diagonal(lam)
+
+    # ------------------------------------------------------------------
+    # Offline cubic roots and alpha-b Gram, b = relu(-beta)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _real_unit_roots(c: np.ndarray) -> list[float]:
+        scale = max(1.0, float(np.max(np.abs(c))))
+        tol = 1e-11 * scale
+        c = c.copy()
+        while c.size > 1 and abs(c[-1]) <= tol:
+            c = c[:-1]
+        if c.size <= 1:
+            return []
+        roots = np.roots(c[::-1])
+        out = sorted(float(r.real) for r in roots if abs(r.imag) <= 1e-9 and 1e-10 < r.real < 1.0 - 1e-10)
+        # Merge numerical duplicates (e.g. repeated roots).
+        uniq: list[float] = []
+        for r in out:
+            if not uniq or abs(r - uniq[-1]) > 1e-8:
+                uniq.append(r)
+        return uniq
+
+    def beta_roots(self) -> list[list[float]]:
+        """Current roots of each beta_j in global x coordinates (offline/CPU)."""
+        coeff = self._beta_cell_power_coeffs().detach().cpu().double().numpy()
+        starts = self._beta_window_start.detach().cpu().numpy()
+        roots: list[list[float]] = []
+        for j in range(self._n_basis):
+            rj = [float(starts[j] * self._h), float((starts[j] + self._k_beta) * self._h)]
+            for c in range(self._k_beta):
+                rj.extend(float((starts[j] + c + r) * self._h) for r in self._real_unit_roots(coeff[j, c]))
+            roots.append(sorted(set(rj)))
+        return roots
+
+    @torch.no_grad()
+    def rebuild_alpha_b_gram(self) -> Banded:
+        """Recompute <alpha_i, relu(-beta_j)> exactly up to cubic root finding.
+
+        This intentionally detaches beta parameters: it is an offline cache build,
+        not a differentiable training operation.
+        """
+        beta = self._beta_cell_power_coeffs().detach().cpu().double().numpy()
+        aidx = self._alpha_cell_idx.detach().cpu().numpy()
+        apow = self._alpha_cell_power.detach().cpu().double().numpy()
+        starts = self._beta_window_start.detach().cpu().numpy()
+        offsets = self._ab_offsets.detach().cpu().numpy()
+        off0 = int(offsets[0])
+        data = np.zeros((len(offsets), self._n_basis), dtype=np.float64)
+
+        nq = ceil((self._p_alpha + self._p_beta + 1) / 2)
+        gx, gw = leggauss(nq)
+
+        for j in range(self._n_basis):
+            for c in range(self._k_beta):
+                bc = beta[j, c]
+                cuts = [0.0, *self._real_unit_roots(bc), 1.0]
+                gcell = int(starts[j] + c)
+                for lo, hi in zip(cuts[:-1], cuts[1:]):
+                    if hi - lo <= 1e-13:
+                        continue
+                    mid = 0.5 * (lo + hi)
+                    if np.polynomial.polynomial.polyval(mid, bc) >= 0.0:
+                        continue
+
+                    half = 0.5 * (hi - lo)
+                    u = 0.5 * (lo + hi) + half * gx
+                    bv = -np.polynomial.polynomial.polyval(u, bc)
+                    powers = np.stack([u ** r for r in range(self._p_alpha + 1)], axis=0)
+                    av = apow[gcell] @ powers                            # (k_alpha, nq)
+                    ints = self._h * half * (av * (gw * bv)[None, :]).sum(axis=1)
+
+                    for a, i in enumerate(aidx[gcell]):
+                        off = int(i) - j
+                        data[off - off0, j] += ints[a]
+
+        self._ab_diagonals.copy_(torch.as_tensor(data, dtype=self._ab_diagonals.dtype, device=self._ab_diagonals.device))
+        return Banded(self._ab_offsets, self._ab_diagonals)
+
+    def Omega2_alpha_b(self, *, recompute: bool = False) -> Banded:
+        if recompute:
+            return self.rebuild_alpha_b_gram()
+        return Banded(self._ab_offsets, self._ab_diagonals)
+
 
 class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
     """Mutual pair whose matched products are conditional VP-flow densities.
