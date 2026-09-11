@@ -10,6 +10,30 @@ from rational_factor.models.density_model import DensityModel
 from rational_factor.models.gram import BetaGram
 
 
+class StandardNormalDensity(DensityModel):
+    """Isotropic standard normal on ``R^d``."""
+
+    def __init__(self, dim: int):
+        super().__init__(dim=dim)
+        self.register_buffer("_anchor", torch.zeros(()))
+
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor) -> torch.Tensor:
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        log_z = -0.5 * self.dim * math.log(2.0 * math.pi)
+        return self._clip_log_density(log_z - 0.5 * (x * x).sum(dim=-1))
+
+    def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
+        return torch.randn(
+            n_samples, self.dim, device=self._anchor.device, dtype=self._anchor.dtype
+        )
+
+    def supremum_bound(self) -> torch.Tensor:
+        return self._anchor.new_tensor((2.0 * math.pi) ** (-0.5 * self.dim))
+
+    def dtype_device(self):
+        return self._anchor.dtype, self._anchor.device
+
+
 class SeparableBeta(DensityModel):
     """Product of independent Beta(α_i, β_i) densities on [0, 1]^d.
 

@@ -71,6 +71,9 @@ class ConditionalDensityModel(torch.nn.Module):
     def dtype_device(self):
         raise NotImplementedError("dtype_device not implemented")
     
+    def supremum_bound(self):
+        raise NotImplementedError("supremum_bound not implemented")
+    
 
 ###### Special Distributions ######
 class LogisticSigmoid(DensityModel):

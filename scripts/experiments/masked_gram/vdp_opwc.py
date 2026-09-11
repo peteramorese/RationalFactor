@@ -2,7 +2,7 @@ import torch
 from pathlib import Path
 from torch.utils.data import DataLoader, TensorDataset
 
-from normalizing_flow.vp_flow import VolumePreservingFlow
+from normalizing_flow.vp_flow import ConditionalUnitBoxVolumePreservingFlow
 from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.domain_transformation import ErfSeparableTF, MLP
@@ -100,7 +100,7 @@ if __name__ == "__main__":
     ).to(device)
     vp_flow = None
     if use_vp_flow:
-        vp_flow = VolumePreservingFlow(
+        vp_flow = ConditionalUnitBoxVolumePreservingFlow(
             dim=rest_dim,
             conditioner_dim=embedding_dim,
             n_steps=flow_n_steps,

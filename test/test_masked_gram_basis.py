@@ -1,5 +1,5 @@
 """
-Checks for MaskedGramMutualBasis.
+Checks for MaskedGramMutualBasis with LocalBSplineMutualBasis masking.
 
 Run:
   PYTHONPATH=src python test/test_masked_gram_basis.py
@@ -9,100 +9,75 @@ from __future__ import annotations
 
 import torch
 
-from normalizing_flow.vp_flow import VolumePreservingFlow
 from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.domain_transformation import MLP
 from rational_factor.models.mutual_bases import (
+    LocalBSplineMutualBasis,
     MaskedGramMutualBasis,
-    Orthogonal1DPWCBasis,
     VolumePreservingPairBasis,
 )
-from rational_factor.models.parameters import FixedParameters, PositiveParameters, Order1QuasiseparableFactorization
+from rational_factor.models.parameters import PositiveParameters
 
 
 SEED = 0
-DIM = 2
-N_BASIS = 3
-SACRIFICIAL = 0
+N_BASIS = 8
+K_ALPHA = 3
+K_BETA = 2
 CONDITIONER_DIM = 4
 N_POINTS = 32
 N_MC = 40_000
 GRAM_ATOL = 0.08
 
 
-def _randn(g: torch.Generator, n_basis: int) -> FixedParameters:
-    return FixedParameters(torch.randn(1, n_basis, generator=g))
-
-
-def _pos_diag(g: torch.Generator, n_basis: int) -> FixedParameters:
-    return FixedParameters(torch.nn.functional.softplus(torch.randn(1, n_basis, generator=g)) + 1e-4)
-
-
-def _make_pwc(n_basis: int, seed: int) -> Orthogonal1DPWCBasis:
-    g = torch.Generator().manual_seed(seed)
-    fac = Order1QuasiseparableFactorization(
-        _randn(g, n_basis),
-        _randn(g, n_basis),
-        _randn(g, n_basis),
-        _pos_diag(g, n_basis),
-        _randn(g, n_basis),
-        _randn(g, n_basis),
-        _randn(g, n_basis),
-        transition_bound=0.99,
+def _make_masking() -> LocalBSplineMutualBasis:
+    return LocalBSplineMutualBasis(
+        n_basis=N_BASIS,
+        k_alpha=K_ALPHA,
+        k_beta=K_BETA,
+        dtype=torch.float64,
     )
-    lam = FixedParameters(0.5 + torch.rand(1, n_basis, generator=g))
-    return Orthogonal1DPWCBasis(fac, gram_diag_params=lam)
 
 
-def main() -> None:
-    torch.manual_seed(SEED)
-    pwc = _make_pwc(N_BASIS, SEED)
-    rest_dim = DIM - 1
-    flow = VolumePreservingFlow(
-        dim=rest_dim,
-        conditioner_dim=CONDITIONER_DIM,
-        n_steps=4,
-        hidden_features=16,
-        num_hidden_layers=2,
-        zero_init=False,
-    )
+def _make_vp(n_basis: int, rest_dim: int) -> VolumePreservingPairBasis:
     shape = (1, rest_dim, 1)
     base = BetaBasis(
         PositiveParameters.set_init(shape, 0.0, epsilon=1.0),
         PositiveParameters.set_init(shape, 0.0, epsilon=1.0),
     )
-    embedding = torch.nn.Embedding(N_BASIS, CONDITIONER_DIM)
+    embedding = torch.nn.Embedding(n_basis, CONDITIONER_DIM)
     splitter = MLP(
-        in_features=rest_dim + CONDITIONER_DIM,
+        in_features=max(rest_dim, 0) + CONDITIONER_DIM,
         out_features=1,
         hidden_features=16,
         num_hidden_layers=2,
         zero_init_last=True,
     )
-    vp = VolumePreservingPairBasis(base, splitter, embedding, flow)
-    masked = MaskedGramMutualBasis(pwc, SACRIFICIAL, vp)
+    return VolumePreservingPairBasis(base, splitter, embedding, flow=None)
+
+
+def main() -> None:
+    torch.manual_seed(SEED)
+    masking = _make_masking()
+    vp = _make_vp(N_BASIS, rest_dim=0)
+    masked = MaskedGramMutualBasis(masking, 0, vp)
     masked.eval()
 
-    y = 0.05 + 0.9 * torch.rand(N_POINTS, DIM)
+    assert masked.dim() == 1
+    y = torch.linspace(0.05, 0.95, N_POINTS, dtype=torch.float64).unsqueeze(-1)
     x_l, x_rest = masked._split_coords(y)
     alpha = masked.eval(y, index=0)
     beta = masked.eval(y, index=1)
-    alpha_pwc, beta_pwc = pwc.eval(x_l, index=0), pwc.eval(x_l, index=1)
-    alpha_vp, beta_vp = vp.eval(x_rest, index=0), vp.eval(x_rest, index=1)
-
-    assert torch.allclose(alpha, alpha_pwc * alpha_vp)
-    assert torch.allclose(beta, beta_pwc * beta_vp)
+    assert torch.allclose(alpha, masking.eval(x_l, index=0) * vp.eval(x_rest, index=0))
+    assert torch.allclose(beta, masking.eval(x_l, index=1) * vp.eval(x_rest, index=1))
     stacked = masked.eval(y, index=None)
     assert torch.allclose(stacked[:, 0, :], alpha)
     assert torch.allclose(stacked[:, 1, :], beta)
 
     gram = masked.Omega2().to_dense()
-    pwc_gram = pwc.Omega2().to_dense()
+    masking_gram = masking.Omega2().to_dense()
     print(f"Omega2 diagonal: {gram[0].diag().tolist()}")
-    print(f"PWC  diagonal:   {pwc_gram[0].diag().tolist()}")
-    assert torch.allclose(gram, pwc_gram)
-    off = gram[0] - torch.diag(gram[0].diag())
-    assert off.abs().max().item() == 0.0
+    assert torch.allclose(gram, masking_gram)
+    assert torch.allclose(gram[0], torch.eye(N_BASIS, dtype=gram.dtype), atol=1e-12)
 
     try:
         masked.Omega2(lows=torch.zeros(1), highs=torch.ones(1))
@@ -116,37 +91,18 @@ def main() -> None:
         pass
 
     omega1 = masked.Omega1(0)
-    assert torch.allclose(omega1, torch.zeros_like(omega1))
+    assert torch.allclose(omega1, masking.Omega1(0) * vp.Omega1(0))
+    print(f"Omega1 alpha: {omega1[0].tolist()}")
 
-    y_mc = torch.rand(N_MC, DIM)
+    y_mc = torch.rand(N_MC, 1, dtype=torch.float64)
     a_mc = masked.eval(y_mc, index=0)
     b_mc = masked.eval(y_mc, index=1)
     gram_mc = (a_mc.T @ b_mc) / N_MC
-    print(f"MC gram diag:    {gram_mc.diag().tolist()}")
+    print(f"MC gram diag: {gram_mc.diag().tolist()}")
     assert torch.allclose(gram_mc, gram[0], atol=GRAM_ATOL, rtol=0.15)
 
-    alpha_b = masked.get_basis(0)(y)
-    beta_b = masked.get_basis(1)(y)
-    assert torch.allclose(alpha_b, alpha)
-    assert torch.allclose(beta_b, beta)
-
-    pwc_1d = _make_pwc(N_BASIS, SEED)
-    rest_dim_1d = 0
-    base_1d = BetaBasis(
-        PositiveParameters.set_init((1, rest_dim_1d, 1), 0.0, epsilon=1.0),
-        PositiveParameters.set_init((1, rest_dim_1d, 1), 0.0, epsilon=1.0),
-    )
-    vp_1d = VolumePreservingPairBasis(
-        base_1d,
-        MLP(in_features=CONDITIONER_DIM, out_features=1, hidden_features=16, num_hidden_layers=2, zero_init_last=True),
-        torch.nn.Embedding(N_BASIS, CONDITIONER_DIM),
-    )
-    masked_1d = MaskedGramMutualBasis(pwc_1d, 0, vp_1d)
-    y1 = 0.05 + 0.9 * torch.rand(N_POINTS, 1)
-    assert masked_1d.dim() == 1
-    assert torch.allclose(masked_1d.eval(y1, index=0), pwc_1d.eval(y1, index=0))
-    assert torch.allclose(masked_1d.eval(y1, index=1), pwc_1d.eval(y1, index=1))
-
+    assert torch.allclose(masked.get_basis(0)(y), alpha)
+    assert torch.allclose(masked.get_basis(1)(y), beta)
     print("ok")
 
 
