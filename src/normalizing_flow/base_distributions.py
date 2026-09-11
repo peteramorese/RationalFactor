@@ -1,4 +1,4 @@
-"""Parametric separable base densities on the unit cube [0, 1]^d."""
+"""Parametric base densities on the unit cube [0, 1]^d."""
 
 from __future__ import annotations
 
@@ -194,17 +194,21 @@ class SeparableBeta(DensityModel):
         )
 
 
-class SeparableBernstein(DensityModel):
-    """Product of independent degree-n Bernstein polynomial densities on [0, 1]^d.
+class Bernstein1D(DensityModel):
+    """Degree-n Bernstein density on [0, 1].
 
-    Each coordinate has nonnegative Bernstein coefficients ``c_{i,0}, …, c_{i,n}``
-    summing to ``n + 1``, so
+    The joint density is
 
-        p_i(x) = Σ_{k=0}^n c_{i,k} binom(n, k) x^k (1-x)^{n-k}
+        p(x) = B(x_s)
 
-    integrates to 1. Equivalently, ``p_i`` is a mixture of Beta(k+1, n-k+1)
-    with weights ``c_{i,k} / (n + 1)``. The coefficient bound ``max_k c_k`` is
-    a differentiable function of the logits (subgradient through the argmax).
+    where ``x_s = x[sacrificial_index]`` and ``B`` is the 1D Bernstein PDF
+
+        B(t) = Σ_{k=0}^n c_k binom(n, k) t^k (1-t)^{n-k}
+
+    with nonnegative coefficients ``c_0, …, c_n`` summing to ``n + 1``. Other
+    coordinates are independent Uniform[0, 1]. Equivalently, ``B`` is a mixture
+    of Beta(k+1, n-k+1) with weights ``c_k / (n + 1)``. The bound ``max_k c_k``
+    is a differentiable function of the logits (subgradient through the argmax).
     """
 
     def __init__(
@@ -212,21 +216,25 @@ class SeparableBernstein(DensityModel):
         dim: int,
         degree: int,
         logits: torch.Tensor | None = None,
+        sacrificial_index: int = 0,
         eps: float = 1e-6,
     ):
         super().__init__(dim=dim)
         if degree < 0:
             raise ValueError("degree must be nonnegative")
+        if not (0 <= sacrificial_index < dim):
+            raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
         self.degree = degree
+        self.sacrificial_index = sacrificial_index
         self.eps = eps
         n_coeff = degree + 1
 
         if logits is None:
-            logits = torch.zeros(dim, n_coeff)
+            logits = torch.zeros(n_coeff)
         else:
-            logits = torch.as_tensor(logits, dtype=torch.float32)
-            if logits.shape != (dim, n_coeff):
-                raise ValueError(f"logits must have shape ({dim}, {n_coeff}), got {tuple(logits.shape)}")
+            logits = torch.as_tensor(logits, dtype=torch.float32).reshape(-1)
+            if logits.shape != (n_coeff,):
+                raise ValueError(f"logits must have shape ({n_coeff},), got {tuple(logits.shape)}")
 
         self.logits = torch.nn.Parameter(logits)
         k = torch.arange(n_coeff, dtype=torch.float32)
@@ -237,7 +245,7 @@ class SeparableBernstein(DensityModel):
         )
 
     def coefficients(self) -> torch.Tensor:
-        """Bernstein PDF coefficients, shape ``(dim, degree + 1)``, each row sums to ``degree + 1``."""
+        """Bernstein PDF coefficients, shape ``(degree + 1,)``, summing to ``degree + 1``."""
         weights = torch.nn.functional.softmax(self.logits, dim=-1)
         return (self.degree + 1.0) * weights
 
@@ -246,15 +254,15 @@ class SeparableBernstein(DensityModel):
 
     def log_density(self, x: torch.Tensor, **contexts: torch.Tensor) -> torch.Tensor:
         assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        x_c = x.clamp(self.eps, 1.0 - self.eps)
+        x_s = x[:, self.sacrificial_index].clamp(self.eps, 1.0 - self.eps)
         k = torch.arange(self.degree + 1, device=x.device, dtype=x.dtype)
         log_b = (
             self.log_binom.to(dtype=x.dtype)
-            + k * torch.log(x_c).unsqueeze(-1)
-            + (self.degree - k) * torch.log1p(-x_c).unsqueeze(-1)
+            + k * torch.log(x_s).unsqueeze(-1)
+            + (self.degree - k) * torch.log1p(-x_s).unsqueeze(-1)
         )
         log_c = self.coefficients().clamp_min(self.eps).log()
-        log_p = torch.logsumexp(log_c.unsqueeze(0) + log_b, dim=-1).sum(dim=-1)
+        log_p = torch.logsumexp(log_c.unsqueeze(0) + log_b, dim=-1)
         return self._clip_log_density(log_p)
 
     def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
@@ -262,23 +270,38 @@ class SeparableBernstein(DensityModel):
         idx = torch.multinomial(weights, n_samples, replacement=True)
         alpha = (idx + 1).to(dtype=self.logits.dtype)
         beta = (self.degree - idx + 1).to(dtype=self.logits.dtype)
-        samples = torch.distributions.Beta(alpha, beta).sample()
-        return samples.transpose(0, 1)
+        x_s = torch.distributions.Beta(alpha, beta).sample()
+        samples = torch.rand(
+            n_samples, self.dim, device=self.logits.device, dtype=self.logits.dtype
+        )
+        samples[:, self.sacrificial_index] = x_s
+        return samples
 
     def supremum_bound(self) -> torch.Tensor:
-        """Tight coefficient bound: min_k c_k ≤ B(x) ≤ max_k c_k on [0, 1].
+        """Tight coefficient bound: min_k c_k ≤ B(t) ≤ max_k c_k on [0, 1].
 
-        Sharp at the endpoints, since B(0) = c_0 and B(1) = c_n. The joint bound
-        is the product of the per-coordinate maxima.
+        Sharp at the endpoints, since B(0) = c_0 and B(1) = c_n. Other
+        coordinates are Uniform[0, 1], so the joint supremum equals that of ``B``.
         """
-        return self.coefficients().max(dim=-1).values.prod()
+        return self.coefficients().max()
 
     def marginal(self, marginal_dims: tuple[int, ...]) -> "SeparableBernstein":
         dims = tuple(marginal_dims)
         assert all(0 <= i < self.dim for i in dims), "marginal_dims must be in [0, dim)"
+        if self.sacrificial_index not in dims:
+            # Uniform on the remaining coordinates: degree-0 Bernstein (constant 1).
+            return SeparableBernstein(
+                dim=len(dims),
+                degree=0,
+                logits=torch.zeros(1),
+                sacrificial_index=0,
+                eps=self.eps,
+            )
+        new_s = dims.index(self.sacrificial_index)
         return SeparableBernstein(
             dim=len(dims),
             degree=self.degree,
-            logits=self.logits.detach().clone()[list(dims), :],
+            logits=self.logits.detach().clone(),
+            sacrificial_index=new_s,
             eps=self.eps,
         )

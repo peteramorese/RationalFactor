@@ -87,7 +87,8 @@ def main() -> None:
     logp_b = bern_uniform.log_density(x)
     print(f"uniform Bernstein log-density:    {logp_b.abs().max().item():.3e}")
     assert logp_b.abs().max().item() < 1e-5
-    assert torch.allclose(bern_uniform.coefficients().sum(dim=-1), torch.full((2,), 5.0))
+    assert torch.allclose(bern_uniform.coefficients().sum(), torch.tensor(5.0))
+    assert bern_uniform.coefficients().shape == (5,)
     assert torch.allclose(bern_uniform.supremum_bound(), torch.tensor(1.0), atol=1e-5)
 
     integral_u = mc_integral_box(bern_uniform.forward, _unit_box(2), n_samples=50_000)
@@ -95,7 +96,7 @@ def main() -> None:
     assert abs(integral_u.item() - 1.0) < 0.02
 
     # --- Bernstein: endpoint spike, bound is exact ------------------------
-    logits_end = torch.tensor([[8.0, -8.0, -8.0, -8.0, -8.0]])
+    logits_end = torch.tensor([8.0, -8.0, -8.0, -8.0, -8.0])
     bern_end = SeparableBernstein(dim=1, degree=4, logits=logits_end)
     xs = _grid_1d().unsqueeze(1)
     emp = bern_end.forward(xs).max()
@@ -104,22 +105,25 @@ def main() -> None:
     print(f"endpoint Bernstein grid max:      {emp.item():.6f}")
     assert abs(emp.item() / bound.item() - 1.0) < 0.02
 
-    # --- Bernstein: interior mode, bound is valid and ≥ empirical max -----
-    logits_int = torch.tensor([[-4.0, -4.0, 6.0, -4.0, -4.0], [-2.0, 3.0, 3.0, -2.0, -4.0]])
-    bern = SeparableBernstein(dim=2, degree=4, logits=logits_int)
+    # --- Bernstein: 1D on x_s, uniform elsewhere; integral and bound ------
+    logits_int = torch.tensor([-4.0, -4.0, 6.0, -4.0, -4.0])
+    bern = SeparableBernstein(dim=2, degree=4, logits=logits_int, sacrificial_index=0)
     integral_b = mc_integral_box(bern.forward, _unit_box(2), n_samples=200_000)
-    print(f"Bernstein product MC integral:    {integral_b.item():.4f}")
+    print(f"Bernstein p(x)=B(x_s) MC integral: {integral_b.item():.4f}")
     assert abs(integral_b.item() - 1.0) < INTEGRAL_TOL
 
     emp_b = bern.forward(grid).max()
     bound_b = bern.supremum_bound()
-    print(f"Bernstein product supremum_bound:     {bound_b.item():.6f}")
-    print(f"Bernstein product grid max:       {emp_b.item():.6f}")
+    print(f"Bernstein supremum_bound:         {bound_b.item():.6f}")
+    print(f"Bernstein grid max:               {emp_b.item():.6f}")
     assert emp_b <= bound_b * (1.0 + 1e-5)
 
     samples_b = bern.sample(1024)
     assert samples_b.shape == (1024, 2)
     assert torch.all(samples_b >= 0) and torch.all(samples_b <= 1)
+    # Density depends only on x_s: same x_0 ⇒ same density regardless of x_1.
+    x_same_s = torch.tensor([[0.3, 0.1], [0.3, 0.9]])
+    assert torch.allclose(bern.log_density(x_same_s[0:1]), bern.log_density(x_same_s[1:2]))
 
     fam = SeparableBeta(dim=1, n_basis=3, alpha=torch.tensor([2.0, 3.0, 4.0]), beta=2.0)
     y_f = torch.rand(32, 1, generator=g)

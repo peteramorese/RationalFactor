@@ -330,6 +330,19 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         log_dim = -0.5 * (log_two_pi + 2.0 * torch.log(std) + ((y_e - mu) / std).square())
         return torch.exp(log_dim)  # (batch, dim, n_basis)
 
+    def supremum_bound(self) -> torch.Tensor:
+        """Product of per-coordinate Gaussian PDF maxima, shape ``(batch, n_basis)``.
+
+        Each 1-D factor ``N(x | μ, σ²)`` peaks at ``x = μ`` with height
+        ``(2π σ²)^{-1/2}``, so the separable product peaks at the mean with
+        height ``∏_d (2π σ_d²)^{-1/2}``.
+        """
+        _, std = self.means_stds()
+        std = std.clamp_min(torch.finfo(std.dtype).eps)
+        log_two_pi = std.new_tensor(2.0 * math.pi).log()
+        log_sup = (-0.5 * (log_two_pi + 2.0 * torch.log(std))).sum(dim=1)
+        return log_sup.exp() * self.coeffs()
+
     def log_Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None):
         mu, std = self.means_stds()
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu)
