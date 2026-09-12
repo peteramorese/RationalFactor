@@ -150,6 +150,16 @@ class SeparableBeta(DensityModel):
         return torch.distributions.Beta(alpha, beta).sample((n_samples,))
 
     @staticmethod
+    def _xlogx(x: torch.Tensor) -> torch.Tensor:
+        """``x log x`` with the convention ``0 log 0 = 0`` and a zero subgradient at 0.
+
+        ``torch.xlogy(x, x)`` is NaN in the backward pass at ``x = 0``, which
+        breaks ``supremum_bound`` at the Uniform ``Beta(1, 1)`` point used at init.
+        """
+        safe = torch.where(x > 0, x, torch.ones_like(x))
+        return torch.where(x > 0, x * torch.log(safe), torch.zeros_like(x))
+
+    @staticmethod
     def _log_mode_1d(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         """Exact log-supremum of each 1D Beta(α, β) density on [0, 1].
 
@@ -164,7 +174,9 @@ class SeparableBeta(DensityModel):
         b1 = (beta - 1.0).clamp(min=0.0)
         s = a1 + b1
         log_sup = (
-            torch.xlogy(a1, a1) + torch.xlogy(b1, b1) - torch.xlogy(s, s)
+            SeparableBeta._xlogx(a1)
+            + SeparableBeta._xlogx(b1)
+            - SeparableBeta._xlogx(s)
             - BetaGram.log_beta(alpha, beta)
         )
         finite = (alpha >= 1.0) & (beta >= 1.0)
@@ -285,12 +297,12 @@ class Bernstein1D(DensityModel):
         """
         return self.coefficients().max()
 
-    def marginal(self, marginal_dims: tuple[int, ...]) -> "SeparableBernstein":
+    def marginal(self, marginal_dims: tuple[int, ...]) -> "Bernstein1D":
         dims = tuple(marginal_dims)
         assert all(0 <= i < self.dim for i in dims), "marginal_dims must be in [0, dim)"
         if self.sacrificial_index not in dims:
             # Uniform on the remaining coordinates: degree-0 Bernstein (constant 1).
-            return SeparableBernstein(
+            return Bernstein1D(
                 dim=len(dims),
                 degree=0,
                 logits=torch.zeros(1),
@@ -298,7 +310,7 @@ class Bernstein1D(DensityModel):
                 eps=self.eps,
             )
         new_s = dims.index(self.sacrificial_index)
-        return SeparableBernstein(
+        return Bernstein1D(
             dim=len(dims),
             degree=self.degree,
             logits=self.logits.detach().clone(),

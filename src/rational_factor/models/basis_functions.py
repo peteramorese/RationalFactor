@@ -516,10 +516,13 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         a1 = (alpha - 1.0).clamp(min=0.0)
         b1 = (beta - 1.0).clamp(min=0.0)
         s = a1 + b1
-        log_sup = (
-            torch.xlogy(a1, a1) + torch.xlogy(b1, b1) - torch.xlogy(s, s)
-            - BetaGram.log_beta(alpha, beta)
-        )
+
+        # 0 log 0 = 0 with zero subgradient; torch.xlogy(0,0) has NaN grads.
+        def _xlogx(x: torch.Tensor) -> torch.Tensor:
+            safe = torch.where(x > 0, x, torch.ones_like(x))
+            return torch.where(x > 0, x * torch.log(safe), torch.zeros_like(x))
+
+        log_sup = _xlogx(a1) + _xlogx(b1) - _xlogx(s) - BetaGram.log_beta(alpha, beta)
         finite = (alpha >= 1.0) & (beta >= 1.0)
         log_sup = torch.where(finite, log_sup, torch.full_like(log_sup, math.inf))
         return log_sup.sum(dim=1).exp() * self.coeffs()

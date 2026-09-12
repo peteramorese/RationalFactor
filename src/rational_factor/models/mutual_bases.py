@@ -11,6 +11,7 @@ from numpy.polynomial.legendre import leggauss
 from normalizing_flow.vp_flow import ConditionalUnitBoxVolumePreservingFlow
 from rational_factor.models.basis_functions import Basis, BetaBasis, GaussianBasis
 from rational_factor.models.density_model import ConditionalDensityModel
+from rational_factor.models.conditional_domain_transformation import ConditionalDomainTF
 from rational_factor.models.parameters import Parameters, Order1QuasiseparableFactorization
 from rational_factor.models.structured_matrices import (
     Banded,
@@ -1605,103 +1606,66 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
 
 
 class NormalizedProductPairBasis(torch.nn.Module, MutualPairBasis):
-    """Mutual pair from a conditional product density and a normalized index splitter.
+    """Mutual pair from conditional base density ``q(·|e)`` and map ``T(·|e)``.
 
-    With index embedding ``e_i``:
+    Each basis index ``i`` has embedding ``e_i``. With ``u = T(x | e_i)``:
 
-        alpha_i(y) = splitter(y | e_i)
-        beta_i(y)  = product(y | e_i) / splitter(y | e_i)
+        α_i(x) = |det J_{T(·|e_i)}(x)|
+        β_i(x) = q(T(x | e_i) | e_i)
 
-    ``product`` is a ``ConditionalDensityModel``. ``splitter`` is either another
-    ``ConditionalDensityModel`` (same conditioner API), a nonnegative ``Basis``
-    with matching ``n_basis`` (index ``i`` selects basis function ``i``; the
-    embedding is unused for the splitter), or an ``nn.Module`` that maps the
-    concatenated vector ``[y, e_i]`` to a nonnegative scalar. Outputs are
-    clamped below by ``eps`` so the quotient stays finite. Matched products
-    integrate to one, so ``Omega2_diag`` is the identity. If the splitter is a
-    conditional density or a normalized ``Basis``, ``Omega1(0)`` and
-    ``supremum(0)`` are also available. ``supremum(1)`` requires an explicit
-    ``beta_supremum`` (no closed form for a general product).
+    so ``α_i β_i`` is the conditional change-of-variables density. Matched
+    products integrate to one (``Omega2_diag`` is the identity). ``Omega1(0)``
+    returns ones. ``supremum_bound(1)`` is ``q.supremum_bound(e_i)`` for each
+    index embedding.
     """
 
     def __init__(
         self,
-        product: ConditionalDensityModel,
-        splitter: torch.nn.Module | ConditionalDensityModel | Basis,
+        base_box_distribution: ConditionalDensityModel,
+        domain_transformation: ConditionalDomainTF,
         embedding: torch.nn.Embedding,
-        eps: float = 1e-6,
-        beta_supremum: float | torch.Tensor | None = None,
         coeffs: tuple[Parameters | None, Parameters | None] | None = None,
     ):
         torch.nn.Module.__init__(self)
-        if not isinstance(product, ConditionalDensityModel):
-            raise TypeError("product must be a ConditionalDensityModel")
-        if product.dim < 1:
-            raise ValueError("product.dim must be at least 1")
-        if embedding.num_embeddings < 1:
+        n_basis = embedding.num_embeddings
+        if n_basis < 1:
             raise ValueError("embedding must contain at least one index")
-        if embedding.embedding_dim != product.conditioner_dim:
+        if base_box_distribution.dim != domain_transformation.dim:
+            raise ValueError(
+                f"base dim {base_box_distribution.dim} must match "
+                f"domain_transformation dim {domain_transformation.dim}"
+            )
+        if embedding.embedding_dim != base_box_distribution.conditioner_dim:
             raise ValueError(
                 f"embedding dim {embedding.embedding_dim} must match "
-                f"product conditioner_dim {product.conditioner_dim}"
+                f"base conditioner_dim {base_box_distribution.conditioner_dim}"
             )
-        if eps <= 0:
-            raise ValueError("eps must be positive")
-
-        self._splitter_is_density = isinstance(splitter, ConditionalDensityModel)
-        self._splitter_is_basis = isinstance(splitter, Basis)
-        if self._splitter_is_density and self._splitter_is_basis:
-            # ConditionalDensityModel is not a Basis; keep flags mutually exclusive.
-            self._splitter_is_basis = False
-        if self._splitter_is_density:
-            if splitter.dim != product.dim:
-                raise ValueError("splitter.dim must match product.dim")
-            if splitter.conditioner_dim != embedding.embedding_dim:
-                raise ValueError(
-                    f"splitter conditioner_dim {splitter.conditioner_dim} must match "
-                    f"embedding dim {embedding.embedding_dim}"
-                )
-        elif self._splitter_is_basis:
-            if splitter.dim() != product.dim:
-                raise ValueError("splitter.dim must match product.dim")
-            n_split = splitter.n_basis_functions()
-            if n_split not in (1, embedding.num_embeddings):
-                raise ValueError(
-                    f"splitter n_basis {n_split} must be 1 or match "
-                    f"embedding n_basis {embedding.num_embeddings}"
-                )
+        if embedding.embedding_dim != domain_transformation.conditioner_dim:
+            raise ValueError(
+                f"embedding dim {embedding.embedding_dim} must match "
+                f"domain_transformation conditioner_dim "
+                f"{domain_transformation.conditioner_dim}"
+            )
 
         MutualPairBasis.__init__(
             self,
-            product.dim,
+            domain_transformation.dim,
             1,
-            embedding.num_embeddings,
+            n_basis,
             (),
             coeffs,
         )
-        self.product = product
-        self.splitter = splitter
+        self.base_box_distribution = base_box_distribution
+        self.domain_transformation = domain_transformation
         self.index_embedding = embedding
-        self.eps = eps
-        if self._splitter_is_basis:
-            self._splitter_param_modules = torch.nn.ModuleList(
-                [p for p in splitter._params if p.is_module()]
-            )
-            if splitter.coeffs.is_module():
-                self._splitter_coeff_modules = torch.nn.ModuleList([splitter.coeffs])
-            else:
-                self._splitter_coeff_modules = torch.nn.ModuleList()
-        if beta_supremum is None:
-            self.beta_supremum = None
-        else:
-            self.register_buffer(
-                "beta_supremum",
-                torch.as_tensor(beta_supremum, dtype=torch.float32).reshape(-1),
-            )
 
     def dtype_device(self):
         weight = self.index_embedding.weight
         return weight.dtype, weight.device
+
+    def _index_conditioners(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        idx = torch.arange(self._n_basis, device=device)
+        return self.index_embedding(idx).to(dtype=dtype)
 
     def _as_data(self, y: torch.Tensor) -> torch.Tensor:
         dtype, device = self.dtype_device()
@@ -1717,46 +1681,10 @@ class NormalizedProductPairBasis(torch.nn.Module, MutualPairBasis):
     def _expanded_inputs(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Flatten the Cartesian product of data points and basis indices."""
         n_data, m = y.shape[0], self._n_basis
-        indices = torch.arange(m, device=y.device)
-        conditioners = self.index_embedding(indices).to(dtype=y.dtype)
-        flat_y = y[:, None, :].expand(-1, m, -1).reshape(n_data * m, self._dim)
-        flat_c = conditioners[None, :, :].expand(n_data, -1, -1).reshape(
-            n_data * m, conditioners.shape[-1]
-        )
-        return flat_y, flat_c
-
-    def _eval_basis_splitter(self, y: torch.Tensor) -> torch.Tensor:
-        """Evaluate a ``Basis`` splitter without conditioner expansion."""
-        n = self.splitter(y)
-        if n.shape[-1] == 1:
-            n = n.expand(-1, self._n_basis)
-        elif n.shape[-1] != self._n_basis:
-            raise ValueError(
-                f"basis splitter returned n_basis={n.shape[-1]}, expected {self._n_basis}"
-            )
-        return n.clamp_min(self.eps)
-
-    def _eval_splitter(self, y: torch.Tensor, flat_y: torch.Tensor, flat_c: torch.Tensor) -> torch.Tensor:
-        n_data = y.shape[0]
-        if self._splitter_is_basis:
-            return self._eval_basis_splitter(y)
-        if self._splitter_is_density:
-            raw = self.splitter(flat_y, conditioner=flat_c)
-        else:
-            raw = self.splitter(torch.cat((flat_y, flat_c), dim=-1))
-        expected = n_data * self._n_basis
-        if raw.numel() != expected:
-            raise ValueError(
-                "splitter must return one value per point/index pair; "
-                f"expected {expected} values, got shape {tuple(raw.shape)}"
-            )
-        return raw.reshape(n_data, self._n_basis).clamp_min(self.eps)
-
-    def flow_density(self, y: torch.Tensor) -> torch.Tensor:
-        """Evaluate every ``product(y | e_i)`` in one conditional call."""
-        y = self._as_data(y)
-        flat_y, flat_c = self._expanded_inputs(y)
-        return self.product(flat_y, conditioner=flat_c).reshape(y.shape[0], self._n_basis)
+        cond = self._index_conditioners(y.dtype, y.device)
+        y_rep = y.unsqueeze(1).expand(-1, m, -1).reshape(n_data * m, self._dim)
+        c_rep = cond.unsqueeze(0).expand(n_data, -1, -1).reshape(n_data * m, -1)
+        return y_rep, c_rep
 
     def eval(self, y: torch.Tensor | None = None, index: int | None = None):
         if y is None:
@@ -1765,73 +1693,46 @@ class NormalizedProductPairBasis(torch.nn.Module, MutualPairBasis):
             raise ValueError("index must be 0, 1, or None")
 
         y = self._as_data(y)
-        flat_y, flat_c = self._expanded_inputs(y)
-        alpha = self._eval_splitter(y, flat_y, flat_c)
-        need_density = index != 0 or self.beta_supremum is not None
-        if need_density:
-            density = self.product(flat_y, conditioner=flat_c).reshape(y.shape[0], self._n_basis)
-        else:
-            density = None
-        if self.beta_supremum is not None:
-            # Floor alpha so beta = density/alpha stays <= beta_supremum, matching
-            # the PositiveMaskedGram free-beta bound used in the positivity correction.
-            bound = self.beta_supremum.to(dtype=alpha.dtype, device=alpha.device)
-            if bound.numel() == 1:
-                bound = bound.reshape(())
-            else:
-                bound = bound.reshape(1, self._n_basis)
-            alpha = torch.maximum(alpha, density / bound.clamp_min(self.eps))
+        n_data, m = y.shape[0], self._n_basis
+        y_rep, c_rep = self._expanded_inputs(y)
+        u, ladj = self.domain_transformation.forward(y_rep, c_rep)
+        alpha = torch.exp(ladj).reshape(n_data, m)
         if index == 0:
             return alpha
 
-        beta = density / alpha
+        beta = self.base_box_distribution(u, conditioner=c_rep).reshape(n_data, m)
         if index == 1:
             return beta
         return torch.stack((alpha, beta), dim=1)
 
     def Omega2_diag(self) -> torch.Tensor:
-        """Matched Gram diagonal ``∫ alpha_i beta_i = 1``."""
+        """Matched Gram diagonal ``∫ α_i β_i = 1``."""
         dtype, device = self.dtype_device()
         return torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
 
     def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
         if lows is not None or highs is not None:
             raise NotImplementedError("Restricted-domain moments are not implemented")
-        if not (self._splitter_is_density or self._splitter_is_basis):
-            raise NotImplementedError(
-                "Omega1 is only available when splitter is a ConditionalDensityModel or Basis"
-            )
-        if index != 0:
-            raise NotImplementedError("Omega1 is only defined for alpha (index=0)")
-        dtype, device = self.dtype_device()
-        return torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
-
-    def supremum(self, index: int) -> torch.Tensor:
-        if index not in (0, 1):
-            raise ValueError("index must be 0 or 1")
-        dtype, device = self.dtype_device()
-        ones = torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
         if index == 0:
-            if not (self._splitter_is_density or self._splitter_is_basis):
-                raise NotImplementedError(
-                    "supremum(0) requires a ConditionalDensityModel or Basis splitter"
-                )
-            return ones * self.splitter.supremum_bound().to(dtype=dtype, device=device)
-        if self.beta_supremum is None:
-            raise NotImplementedError(
-                "supremum(1) requires beta_supremum; no closed form for a general product"
-            )
-        bound = self.beta_supremum.to(dtype=dtype, device=device)
-        if bound.numel() == 1:
-            return ones * bound
-        if bound.numel() != self._n_basis:
-            raise ValueError(
-                f"beta_supremum length {bound.numel()} must be 1 or n_basis={self._n_basis}"
-            )
-        return ones * bound.reshape(1, self._n_basis)
+            dtype, device = self.dtype_device()
+            return torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
+        if index == 1:
+            raise NotImplementedError("Omega1 is only defined for alpha (index=0)")
+        raise ValueError("index must be 0 or 1")
 
     def supremum_bound(self, index: int) -> torch.Tensor:
-        return self.supremum(index)
+        if index == 1:
+            dtype, device = self.dtype_device()
+            cond = self._index_conditioners(dtype, device)
+            bound = self.base_box_distribution.supremum_bound(cond).to(
+                dtype=dtype, device=device
+            )
+            ones = torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
+            return ones * bound.reshape(-1)
+        raise NotImplementedError("supremum_bound is only defined for beta (index=1)")
+
+    def supremum(self, index: int) -> torch.Tensor:
+        return self.supremum_bound(index)
 
 
 # Backward-compatible alias.

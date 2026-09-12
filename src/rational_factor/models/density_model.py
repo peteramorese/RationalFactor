@@ -71,7 +71,11 @@ class ConditionalDensityModel(torch.nn.Module):
     def dtype_device(self):
         raise NotImplementedError("dtype_device not implemented")
     
-    def supremum_bound(self):
+    def supremum_bound(self, conditioner : torch.Tensor | None):
+        f"""
+        Returns the supremum bound of the density. If conditioner is provided, it returns b \geq sup_x p(x | conditioner),
+        otherwise if conditoner is None, it returns the supremum across all possible conditioners.
+        """
         raise NotImplementedError("supremum_bound not implemented")
     
 

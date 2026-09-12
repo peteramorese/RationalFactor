@@ -6,10 +6,10 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from normalizing_flow.normalizing_flow import ConditionalNSFNormalizingFlow
-from rational_factor.models.basis_functions import GaussianBasis
+from normalizing_flow.conditional_base_distributions import ConditionalSeparableBeta
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF, IdentityTF, StackedTF
+from rational_factor.models.conditional_domain_transformation import ConditionalMaskedRQSNFTF
+from rational_factor.models.domain_transformation import ErfSeparableTF, IdentityTF, MLP, StackedTF
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.mutual_bases import (
     LocalBSplineMutualBasis,
@@ -19,15 +19,195 @@ from rational_factor.models.mutual_bases import (
 from rational_factor.models.parameters import (
     PositiveParameters,
     QuasiseparableFactorization,
-    TrainableParameters,
+    DenseMatrixFactorization,
     param_group_iter,
 )
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
 from rational_factor.tools.visualization import plot_belief
+from rational_factor.models.kde import GaussianKDE
 import rational_factor.models.loss as loss
 import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
+
+
+def _plot_conditional_slices_model_vs_data(
+    tran_model: CompositeConditionalModel,
+    x_k_data: torch.Tensor,
+    x_kp1_data: torch.Tensor,
+    out_path: Path,
+    *,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    n_random_points: int = 10,
+    n_grid: int = 120,
+    min_points_per_slice: int = 40,
+    bin_width: float = 0.4,
+    random_seed: int = 0,
+    title: str = "",
+) -> None:
+    """Compare trained p(x'|x_i) to binned empirical samples and a conditional KDE."""
+    if x_k_data.shape[1] != 2 or x_kp1_data.shape[1] != 2:
+        raise ValueError("_plot_conditional_slices_model_vs_data expects 2D state data")
+
+    param = next(iter(tran_model.parameters()), None)
+    buffer = next(iter(tran_model.buffers()), None)
+    dev = (
+        param.device
+        if param is not None
+        else (buffer.device if buffer is not None else torch.device("cpu"))
+    )
+    dt = (
+        param.dtype
+        if param is not None
+        else (buffer.dtype if buffer is not None else torch.float32)
+    )
+
+    xk_cpu = x_k_data.detach().cpu()
+    xkp1_cpu = x_kp1_data.detach().cpu()
+    lo = torch.tensor([x_range[0], y_range[0]], dtype=xk_cpu.dtype)
+    hi = torch.tensor([x_range[1], y_range[1]], dtype=xk_cpu.dtype)
+
+    x_lin = torch.linspace(float(lo[0]), float(hi[0]), n_grid)
+    y_lin = torch.linspace(float(lo[1]), float(hi[1]), n_grid)
+    X, Y = torch.meshgrid(x_lin, y_lin, indexing="xy")
+    xp_grid = torch.stack([X.reshape(-1), Y.reshape(-1)], dim=1).to(device=dev, dtype=dt)
+
+    n_data = xk_cpu.shape[0]
+    if n_data == 0:
+        raise ValueError("x_k_data is empty")
+    n_random_points = max(1, min(n_random_points, n_data))
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(random_seed)
+    centers = xk_cpu[torch.randperm(n_data, generator=rng)[:n_random_points]]
+    half_width = torch.full((2,), 0.5 * float(bin_width), dtype=xk_cpu.dtype)
+
+    fig, axes = plt.subplots(
+        n_random_points, 3, figsize=(15, 3.2 * n_random_points), squeeze=False
+    )
+    cmap = "viridis"
+    eps = torch.finfo(dt).eps
+
+    xk_dev = xk_cpu.to(device=dev, dtype=dt)
+    xkp1_dev = xkp1_cpu.to(device=dev, dtype=dt)
+    bw_x = GaussianKDE.scott_bandwidth(xk_dev).clamp_min(eps)
+    bw_xp = GaussianKDE.scott_bandwidth(xkp1_dev).clamp_min(eps)
+
+    with torch.no_grad():
+        tran_model.eval()
+        for row, center in enumerate(centers):
+            lo_box = center - half_width
+            hi_box = center + half_width
+            mask = (
+                (xk_cpu[:, 0] >= lo_box[0])
+                & (xk_cpu[:, 0] < hi_box[0])
+                & (xk_cpu[:, 1] >= lo_box[1])
+                & (xk_cpu[:, 1] < hi_box[1])
+            )
+            xp_slice = xkp1_cpu[mask]
+
+            ax_emp = axes[row, 0]
+            if xp_slice.shape[0] >= min_points_per_slice:
+                ax_emp.scatter(
+                    xp_slice[:, 0].numpy(),
+                    xp_slice[:, 1].numpy(),
+                    s=5,
+                    alpha=1.0,
+                    c="orange",
+                    edgecolors="none",
+                    rasterized=True,
+                )
+            else:
+                ax_emp.text(
+                    0.5,
+                    0.5,
+                    f"Too few samples\nn={xp_slice.shape[0]}",
+                    ha="center",
+                    va="center",
+                    transform=ax_emp.transAxes,
+                )
+            ax_emp.set_title(
+                "empirical samples x' | x in bin\n"
+                f"n={xp_slice.shape[0]}, "
+                f"x=({float(center[0]):.3f}, {float(center[1]):.3f})"
+            )
+            ax_emp.set_xlim(float(lo[0]), float(hi[0]))
+            ax_emp.set_ylim(float(lo[1]), float(hi[1]))
+            ax_emp.set_aspect("equal")
+            ax_emp.set_ylabel("x'_2")
+
+            center_dev = center.to(device=dev, dtype=dt)
+            cond = center_dev.unsqueeze(0).expand(xp_grid.shape[0], -1)
+            model_pdf = (
+                tran_model.log_density(xp_grid, conditioner=cond)
+                .exp()
+                .reshape(n_grid, n_grid)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            ax_model = axes[row, 1]
+            cf = ax_model.contourf(X.numpy(), Y.numpy(), model_pdf, levels=40, cmap=cmap)
+            fig.colorbar(cf, ax=ax_model, fraction=0.046, pad=0.04)
+            ax_model.set_title(
+                "model p(x'|x_i)\n"
+                f"bin_w=({float(2 * half_width[0]):.3f}, {float(2 * half_width[1]):.3f})"
+            )
+            ax_model.set_xlim(float(lo[0]), float(hi[0]))
+            ax_model.set_ylim(float(lo[1]), float(hi[1]))
+            ax_model.set_aspect("equal")
+            if xp_slice.shape[0] > 0:
+                ax_model.scatter(
+                    xp_slice[:, 0].numpy(),
+                    xp_slice[:, 1].numpy(),
+                    s=5,
+                    alpha=1.0,
+                    c="orange",
+                    edgecolors="none",
+                    rasterized=True,
+                )
+
+            # Conditional KDE at fixed x_i: w(x) ∝ N(x_i, h_x^2), then mix N(x'_k, h_xp^2).
+            diff_x = xk_dev - center_dev.unsqueeze(0)
+            w_x = torch.exp(-0.5 * diff_x.square().sum(dim=1) / (bw_x * bw_x))
+            w_sum = w_x.sum().clamp_min(eps)
+            kde_vals = []
+            block = 1024
+            for start in range(0, xp_grid.shape[0], block):
+                end = min(start + block, xp_grid.shape[0])
+                xp_blk = xp_grid[start:end]
+                diff_xp = xp_blk[:, None, :] - xkp1_dev[None, :, :]
+                k_xp = torch.exp(-0.5 * diff_xp.square().sum(dim=2) / (bw_xp * bw_xp))
+                kde_vals.append((k_xp * w_x.unsqueeze(0)).sum(dim=1) / w_sum)
+            kde_pdf = (
+                torch.cat(kde_vals, dim=0).reshape(n_grid, n_grid).detach().cpu().numpy()
+            )
+
+            ax_kde = axes[row, 2]
+            cf_kde = ax_kde.contourf(X.numpy(), Y.numpy(), kde_pdf, levels=40, cmap=cmap)
+            fig.colorbar(cf_kde, ax=ax_kde, fraction=0.046, pad=0.04)
+            ax_kde.set_title("conditional KDE p(x'|x_i)")
+            ax_kde.set_xlim(float(lo[0]), float(hi[0]))
+            ax_kde.set_ylim(float(lo[1]), float(hi[1]))
+            ax_kde.set_aspect("equal")
+            if xp_slice.shape[0] > 0:
+                ax_kde.scatter(
+                    xp_slice[:, 0].numpy(),
+                    xp_slice[:, 1].numpy(),
+                    s=5,
+                    alpha=1.0,
+                    c="orange",
+                    edgecolors="none",
+                    rasterized=True,
+                )
+
+    for col in range(3):
+        axes[-1, col].set_xlabel("x'_1")
+    if title:
+        fig.suptitle(title, y=1.0)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _make_qs_B(n_basis: int, order: int, device: torch.device) -> QuasiseparableFactorization:
@@ -53,52 +233,6 @@ def _make_qs_B(n_basis: int, order: int, device: torch.device) -> Quasiseparable
     )
 
 
-def _make_wrap_tf(
-    x_data: torch.Tensor,
-    *,
-    dim: int,
-    sacrificial_index: int,
-    trainable: bool = True,
-) -> StackedTF | ErfSeparableTF:
-    """Erf on the sacrificial coordinate; identity on the free ``R^{d-1}`` coords."""
-    if not (0 <= sacrificial_index < dim):
-        raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
-
-    parts = []
-    if sacrificial_index > 0:
-        parts.append(IdentityTF(sacrificial_index))
-
-    x_s = x_data[:, sacrificial_index : sacrificial_index + 1]
-    parts.append(ErfSeparableTF.from_data(x_s, trainable=trainable))
-
-    n_after = dim - sacrificial_index - 1
-    if n_after > 0:
-        parts.append(IdentityTF(n_after))
-
-    if len(parts) == 1:
-        return parts[0]
-    return StackedTF(parts)
-
-
-def _freeze_wrap_tf(wrap: StackedTF | ErfSeparableTF) -> StackedTF | ErfSeparableTF:
-    """Detach a trained wrap so initial-state / belief models stay fixed."""
-    if isinstance(wrap, ErfSeparableTF):
-        return ErfSeparableTF.copy_from_trainable(wrap)
-
-    frozen = []
-    for tf in wrap.tfs:
-        if isinstance(tf, ErfSeparableTF):
-            frozen.append(ErfSeparableTF.copy_from_trainable(tf))
-        elif isinstance(tf, IdentityTF):
-            frozen.append(IdentityTF(tf.dim))
-        else:
-            part = copy.deepcopy(tf)
-            for p in part.parameters():
-                p.requires_grad_(False)
-            frozen.append(part)
-    return StackedTF(frozen)
-
-
 def _make_free_basis(
     *,
     rest_dim: int,
@@ -108,42 +242,34 @@ def _make_free_basis(
     flow_hidden: int,
     device: torch.device,
 ) -> NormalizedProductPairBasis:
-    """Free pair on ``R^{rest_dim}``: conditional NSF product + GaussianBasis splitter.
+    """Free pair on rest coords: ConditionalSeparableBeta × ConditionalMaskedRQSNFTF.
 
-    Additive VP splitters are unavailable in 1-D, and MAF is similarly restricted,
-    so the product is a conditional NSF and the splitter is a trainable Gaussian
-    PDF basis (one component per free-basis index).
+    Index embedding ``e_i`` conditions both the domain map ``T(·|e_i)`` and the
+    box base ``q(·|e_i)``, yielding ``α_i = |det JT|`` and ``β_i = q(T(x)|e_i)``.
     """
     if rest_dim < 1:
         raise ValueError(f"VDP free basis requires rest_dim >= 1, got {rest_dim}")
 
     embedding = torch.nn.Embedding(n_basis, embedding_dim).to(device)
-    product = ConditionalNSFNormalizingFlow(
+    domain_tf = ConditionalMaskedRQSNFTF(
         dim=rest_dim,
         conditioner_dim=embedding_dim,
-        num_layers=flow_layers,
+        n_layers=flow_layers,
+        hidden_features=flow_hidden,
+        tails=None,  # free coords are already on the unit box after Erf wrap
+    ).to(device)
+    base_mlp = MLP(
+        in_features=embedding_dim,
+        out_features=2 * rest_dim,  # raw alpha/beta for n_basis=1
         hidden_features=flow_hidden,
     ).to(device)
-
-    shape = (1, rest_dim, n_basis)
-    means = TrainableParameters.random_init(shape=shape, mean=0.0, std=2.0).to(device)
-    stds = PositiveParameters.random_init(
-        shape=shape, mean=1.0, std=0.5, epsilon=1e-2
+    base = ConditionalSeparableBeta(
+        dim=rest_dim,
+        conditioner_dim=embedding_dim,
+        mlp=base_mlp,
+        n_basis=1,
     ).to(device)
-    splitter = GaussianBasis(means, stds)
-
-    # PositiveMaskedGram needs a finite free-beta bound; NSF/Gaussian has no
-    # closed form, so use a multiple of the Gaussian PDF peak as a soft bound.
-    with torch.no_grad():
-        gauss_peak = float(splitter.supremum_bound().amax().item())
-    beta_supremum = max(10.0, 20.0 * gauss_peak)
-
-    return NormalizedProductPairBasis(
-        product,
-        splitter,
-        embedding,
-        beta_supremum=beta_supremum,
-    ).to(device)
+    return NormalizedProductPairBasis(base, domain_tf, embedding).to(device)
 
 
 if __name__ == "__main__":
@@ -151,17 +277,17 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 100
+    n_basis = 50
     sacrificial_index = 0
-    embedding_dim = 4
+    embedding_dim = 10
     k_alpha = 3
-    k_beta = 5
+    k_beta = 7
     trainable_beta = True
     B_order = 10
     flow_hidden = 32
     flow_layers = 3
     tran_params = {
-        "n_epochs_per_group": [1, 5],  # basis+wrap, weights
+        "n_epochs_per_group": [3, 3],  # basis+wrap, weights
         "iterations": 5,
         "lr_basis": 1e-3,
         "lr_weights": 5e-2,
@@ -204,7 +330,7 @@ if __name__ == "__main__":
         device=device,
     ).to(device)
 
-    # Free pair on R^{d-1}: NSF product + GaussianBasis splitter.
+    # Free pair on rest coords: conditional Beta base + conditional RQS map.
     free_basis = _make_free_basis(
         rest_dim=rest_dim,
         n_basis=n_basis,
@@ -227,14 +353,15 @@ if __name__ == "__main__":
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
     ).to(device)
 
-    B = _make_qs_B(n_basis, B_order, device)
+    #B = _make_qs_B(n_basis, B_order, device)
+    B_coeffs = PositiveParameters.random_init(
+        shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
+    B = DenseMatrixFactorization(B_coeffs)
 
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)
 
-    wrap_tf = _make_wrap_tf(
-        x_k, dim=dim, sacrificial_index=sacrificial_index, trainable=True
-    ).to(device)
+    wrap_tf = ErfSeparableTF.from_data(x_k, trainable=True).to(device)
     rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
@@ -248,7 +375,8 @@ if __name__ == "__main__":
             ]
         ),
         "weights": torch.optim.Adam(
-            param_group_iter((g_coeffs, *B.parameters)),
+            #param_group_iter((g_coeffs, *B.parameters)),
+            param_group_iter((g_coeffs, B_coeffs)),
             lr=tran_params["lr_weights"],
         ),
     }
@@ -270,7 +398,8 @@ if __name__ == "__main__":
     for p in phi_psi_mutual.parameters():
         p.requires_grad_(False)
     g_coeffs.set_requires_grad(False)
-    trained_wrap_tf = _freeze_wrap_tf(wrap_tf).to(device)
+    #trained_wrap_tf = wrap_tf.
+    trained_wrap_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
 
     h0_basis = phi_psi_mutual.get_basis(1, coeffs=h0_coeffs)
     init_model = CompositeDensityModel(
@@ -305,8 +434,29 @@ if __name__ == "__main__":
     tran_model = tran_model.to(analysis_device).eval()
     trained_wrap_tf = trained_wrap_tf.to(analysis_device).eval()
 
+    output_dir = Path("figures/masked_gram/vdp_lbs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     box_lows = tuple(problem.plot_bounds_low.tolist())
     box_highs = tuple(problem.plot_bounds_high.tolist())
+
+    cond_slice_out_path = output_dir / "conditional_slices_model_vs_data.png"
+    _plot_conditional_slices_model_vs_data(
+        tran_model,
+        x_k,
+        x_kp1,
+        cond_slice_out_path,
+        x_range=(box_lows[0], box_highs[0]),
+        y_range=(box_lows[1], box_highs[1]),
+        n_random_points=10,
+        n_grid=120,
+        min_points_per_slice=20,
+        bin_width=0.4,
+        random_seed=0,
+        title="VDP LBS: random conditional bins — empirical vs model vs KDE",
+    )
+    print(f"Saved conditional slice comparison to {cond_slice_out_path}")
+
     n_slices = n_timesteps_prop + 1
 
     base_belief_seq = propagate.propagate(
@@ -326,9 +476,6 @@ if __name__ == "__main__":
         ll_per_step.append(float(ll.detach().cpu()))
         print(f"Avg log-likelihood at time {i}: {ll_per_step[-1]:.6f}")
         check_pdf_valid(belief_seq[i], (box_lows, box_highs), device=analysis_device)
-
-    output_dir = Path("figures/masked_gram/vdp_lbs")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     n_plot = min(n_timesteps_prop, len(belief_seq))
     fig, axes = plt.subplots(2, n_plot, figsize=(3.2 * n_plot, 6.5), squeeze=False)
