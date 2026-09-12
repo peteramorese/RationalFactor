@@ -6,7 +6,7 @@ from nflows.transforms.permutations import RandomPermutation
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform, MaskedPiecewiseRationalQuadraticAutoregressiveTransform
 
 
-class DomainTF(torch.nn.Module):
+class DomainTF(Transform):
     def __init__(self, dim : int):
         super().__init__()
 
