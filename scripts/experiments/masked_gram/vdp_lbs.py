@@ -1,4 +1,5 @@
 from pathlib import Path
+from math import ceil, sqrt
 
 import copy
 
@@ -210,6 +211,85 @@ def _plot_conditional_slices_model_vs_data(
     plt.close(fig)
 
 
+def _plot_separable_phi_psi_grid(
+    pair_basis,
+    out_path: Path,
+    *,
+    title: str,
+    n_grid: int = 256,
+) -> None:
+    """Plot every 1D phi/psi factor of a separable pair on a square subplot grid.
+
+    Domain is the unit interval (post-wrap coordinates). Subplots are filled in
+    index order left-to-right, top-to-bottom; unused cells are hidden.
+    """
+    dtype, device = pair_basis.dtype_device()
+    dim = pair_basis.dim()
+    if dim != 1:
+        raise ValueError(
+            f"_plot_separable_phi_psi_grid expects a 1D pair basis, got dim={dim}"
+        )
+
+    x = torch.linspace(0.0, 1.0, n_grid, device=device, dtype=dtype).reshape(-1, 1)
+    with torch.no_grad():
+        if isinstance(pair_basis, torch.nn.Module):
+            torch.nn.Module.eval(pair_basis)
+        phi = pair_basis.eval(x, 0).detach().cpu()
+        psi = pair_basis.eval(x, 1).detach().cpu()
+
+    while phi.ndim > 2 and phi.shape[0] == 1:
+        phi = phi.squeeze(0)
+    while psi.ndim > 2 and psi.shape[0] == 1:
+        psi = psi.squeeze(0)
+    if phi.ndim != 2 or psi.ndim != 2:
+        raise ValueError(
+            f"Expected phi/psi shapes (n_grid, n_basis), got "
+            f"{tuple(phi.shape)} and {tuple(psi.shape)}"
+        )
+
+    x_np = x.squeeze(-1).detach().cpu().numpy()
+    phi_np = phi.numpy()
+    psi_np = psi.numpy()
+    n_basis = phi_np.shape[-1]
+    if psi_np.shape[-1] != n_basis:
+        raise ValueError(
+            f"phi/psi n_basis mismatch: {phi_np.shape[-1]} vs {psi_np.shape[-1]}"
+        )
+
+    n_cols = max(1, ceil(sqrt(n_basis)))
+    n_rows = max(1, ceil(n_basis / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(1.35 * n_cols, 1.15 * n_rows),
+        sharex=True,
+        squeeze=False,
+    )
+    if title:
+        fig.suptitle(title, y=1.01)
+
+    for i in range(n_basis):
+        r, c = divmod(i, n_cols)
+        ax = axes[r, c]
+        ax.plot(x_np, phi_np[:, i], color="C0", lw=1.0, label="phi" if i == 0 else None)
+        ax.plot(x_np, psi_np[:, i], color="C1", lw=1.0, label="psi" if i == 0 else None)
+        ax.set_title(str(i), fontsize=7, pad=1)
+        ax.set_xlim(0.0, 1.0)
+        ax.tick_params(labelsize=6)
+        ax.grid(True, alpha=0.2)
+
+    for j in range(n_basis, n_rows * n_cols):
+        r, c = divmod(j, n_cols)
+        axes[r, c].set_visible(False)
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper right", fontsize=8, frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _make_qs_B(n_basis: int, order: int, device: torch.device) -> QuasiseparableFactorization:
     """Order-``order`` quasiseparable ``B = L D U`` with nonnegative factors.
 
@@ -277,15 +357,15 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 50
+    n_basis = 100
     sacrificial_index = 0
     embedding_dim = 10
     k_alpha = 3
-    k_beta = 7
-    trainable_beta = True
+    k_beta = 17
+    trainable_beta = False
     B_order = 10
-    flow_hidden = 32
-    flow_layers = 3
+    flow_hidden = 8
+    flow_layers = 2
     tran_params = {
         "n_epochs_per_group": [3, 3],  # basis+wrap, weights
         "iterations": 5,
@@ -295,7 +375,7 @@ if __name__ == "__main__":
     }
     init_params = {
         "n_epochs_per_group": [20],  # h0 coeffs only
-        "iterations": 10,
+        "iterations": 30,
         "lr_weights": 1e-2,
     }
 
@@ -370,7 +450,7 @@ if __name__ == "__main__":
     optimizers = {
         "basis": torch.optim.Adam(
             [
-                {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
+                {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"], "weight_decay": 1e-2},
                 {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
             ]
         ),
@@ -436,6 +516,22 @@ if __name__ == "__main__":
 
     output_dir = Path("figures/masked_gram/vdp_lbs")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    masking_basis_out = output_dir / "masking_basis_phi_psi.png"
+    _plot_separable_phi_psi_grid(
+        masking,
+        masking_basis_out,
+        title="VDP LBS: masking basis (sacrificial dim) — phi / psi by index",
+    )
+    print(f"Saved masking basis grid to {masking_basis_out}")
+
+    free_basis_out = output_dir / "free_basis_phi_psi.png"
+    _plot_separable_phi_psi_grid(
+        free_basis,
+        free_basis_out,
+        title="VDP LBS: free basis (rest dim) — phi / psi by index",
+    )
+    print(f"Saved free basis grid to {free_basis_out}")
 
     box_lows = tuple(problem.plot_bounds_low.tolist())
     box_highs = tuple(problem.plot_bounds_high.tolist())
