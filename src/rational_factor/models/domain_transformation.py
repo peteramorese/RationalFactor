@@ -7,62 +7,64 @@ from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 
 
 class DomainTF(Transform):
-    def __init__(self, dim : int):
+    """Domain transform with nflows ``Transform`` API (``context`` optional).
+
+    Unconditional maps (e.g. ``IdentityTF``, ``ErfSeparableTF``) ignore ``context``.
+    Flow maps may set ``context_features`` and condition on ``context``.
+    """
+
+    def __init__(self, dim: int, context_features: int | None = None):
         super().__init__()
-
         self.dim = dim
-    
-    def forward(self, x : torch.Tensor):
-        """
-        Forward transformation of the domain (from the physical space to the latent space)
+        self.context_features = context_features
 
-        Returns:
-            z : torch.Tensor corresponding latent state
-            ladj : torch.Tensor log absolute determinant of the Jacobian of the transformation
-        """
-        raise NotImplementedError("Forward TF is not implemented")
-
-    def inverse(self, z : torch.Tensor):
-        '''
-        Inverse transformation of the domain (from the latent space to the physical space)
-
-        Returns:
-            x : torch.Tensor corresponding physical state
-            ladj : torch.Tensor log absolute determinant of the Jacobian of the transformation
-        '''
-        raise NotImplementedError("Inverse TF is not implemented")
-    
-    def marginal(self, marginal_dims : tuple[int, ...]):
+    def marginal(self, marginal_dims: tuple[int, ...]):
         raise NotImplementedError("Marginal is not implemented")
 
 
 class IdentityTF(DomainTF):
-    def __init__(self, dim : int):
+    def __init__(self, dim: int):
         super().__init__(dim)
 
-    def forward(self, x : torch.Tensor):
-        return x, x.new_zeros(x.shape[0])
+    def forward(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        return inputs, inputs.new_zeros(inputs.shape[0])
 
-    def inverse(self, z : torch.Tensor):
-        return z, z.new_zeros(z.shape[0])
+    def inverse(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        return inputs, inputs.new_zeros(inputs.shape[0])
+
+    def marginal(self, marginal_dims: tuple[int, ...]):
+        marginal_dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim for i in marginal_dims), "marginal_dims must be in [0, dim)"
+        return IdentityTF(len(marginal_dims))
 
 
 class StackedTF(DomainTF):
-    def __init__(self, tfs : list[DomainTF]):
+    def __init__(self, tfs: list[DomainTF]):
         stacked_dim = sum(tf.dim for tf in tfs)
-        super().__init__(stacked_dim)
+        ctxs = {
+            tf.context_features
+            for tf in tfs
+            if tf.context_features is not None
+        }
+        if len(ctxs) > 1:
+            raise ValueError(
+                "StackedTF children must share the same context_features "
+                f"(got {sorted(ctxs)})"
+            )
+        context_features = next(iter(ctxs)) if ctxs else None
+        super().__init__(stacked_dim, context_features=context_features)
         self.tfs = torch.nn.ModuleList(tfs)
-        
-    def forward(self, x : torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+
+    def forward(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
 
         z_parts = []
-        ladj = x.new_zeros(x.shape[0])
+        ladj = inputs.new_zeros(inputs.shape[0])
         cursor = 0
 
         for tf in self.tfs:
-            x_part = x[:, cursor : cursor + tf.dim]
-            z_part, ladj_part = tf.forward(x_part)
+            x_part = inputs[:, cursor : cursor + tf.dim]
+            z_part, ladj_part = tf.forward(x_part, context=context)
             z_parts.append(z_part)
             ladj = ladj + ladj_part
             cursor += tf.dim
@@ -70,16 +72,16 @@ class StackedTF(DomainTF):
         z = torch.cat(z_parts, dim=1)
         return z, ladj
 
-    def inverse(self, z : torch.Tensor):
-        assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
+    def inverse(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
 
         x_parts = []
-        ladj = z.new_zeros(z.shape[0])
+        ladj = inputs.new_zeros(inputs.shape[0])
         cursor = 0
 
         for tf in self.tfs:
-            z_part = z[:, cursor : cursor + tf.dim]
-            x_part, ladj_part = tf.inverse(z_part)
+            z_part = inputs[:, cursor : cursor + tf.dim]
+            x_part, ladj_part = tf.inverse(z_part, context=context)
             x_parts.append(x_part)
             ladj = ladj + ladj_part
             cursor += tf.dim
@@ -87,12 +89,41 @@ class StackedTF(DomainTF):
         x = torch.cat(x_parts, dim=1)
         return x, ladj
 
+    def marginal(self, marginal_dims: tuple[int, ...]):
+        marginal_dims = tuple(marginal_dims)
+        assert len(marginal_dims) == len(set(marginal_dims)), "marginal_dims must be unique"
+        assert all(0 <= i < self.dim for i in marginal_dims), "marginal_dims must be in [0, dim)"
+
+        owners: list[tuple[int, int]] = []
+        for tf_idx, tf in enumerate(self.tfs):
+            for local_i in range(tf.dim):
+                owners.append((tf_idx, local_i))
+
+        locals_per_tf: dict[int, list[int]] = {}
+        last_tf = -1
+        for g in marginal_dims:
+            tf_idx, local_i = owners[g]
+            if tf_idx < last_tf:
+                raise ValueError(
+                    "marginal_dims must not interleave stacked transforms; "
+                    "kept dims must appear in block order"
+                )
+            last_tf = tf_idx
+            locals_per_tf.setdefault(tf_idx, []).append(local_i)
+
+        marg_tfs = [
+            self.tfs[tf_idx].marginal(tuple(local_dims))
+            for tf_idx, local_dims in locals_per_tf.items()
+        ]
+        if len(marg_tfs) == 1:
+            return marg_tfs[0]
+        return StackedTF(marg_tfs)
 
 
 class ErfSeparableTF(DomainTF):
     """Maps x to z via a parameterized Gaussian CDF per dimension: z_d = Phi((x_d - loc_d) / scale_d)."""
 
-    def __init__(self, dim : int, loc : torch.Tensor, scale : torch.Tensor, trainable : bool = True, min_scale : float = 1e-3, numerical_tolerance : float = 1e-20):
+    def __init__(self, dim: int, loc: torch.Tensor, scale: torch.Tensor, trainable: bool = True, min_scale: float = 1e-3, numerical_tolerance: float = 1e-20):
         super().__init__(dim)
         # (dim, 2): column 0 = location, column 1 = raw scale (softplus applied in forward)
         self.trainable = trainable
@@ -107,7 +138,7 @@ class ErfSeparableTF(DomainTF):
         self.numerical_tolerance = numerical_tolerance
 
     @classmethod
-    def copy_from_trainable(cls, other : 'ErfSeparableTF'):
+    def copy_from_trainable(cls, other: "ErfSeparableTF"):
         return cls(
             other.dim,
             other.params[:, 0].detach().clone(),
@@ -118,7 +149,7 @@ class ErfSeparableTF(DomainTF):
         )
 
     @classmethod
-    def from_data(cls, x_data : torch.Tensor, trainable : bool = True, min_scale : float = 1e-3):
+    def from_data(cls, x_data: torch.Tensor, trainable: bool = True, min_scale: float = 1e-3):
         dim = x_data.shape[1]
         mean = x_data.mean(dim=0)
         std = x_data.std(dim=0).clamp_min(min_scale)
@@ -133,23 +164,23 @@ class ErfSeparableTF(DomainTF):
             scale = self.params[:, 1]  # (dim,)
         return loc, torch.clamp(scale, min=self.min_scale)
 
-    def forward(self, x : torch.Tensor):
+    def forward(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
         loc, scale = self.loc_scale()
-        sqrt_2 = torch.sqrt(x.new_tensor(2.0))
-        u = (x - loc) / (scale * sqrt_2)
+        sqrt_2 = torch.sqrt(inputs.new_tensor(2.0))
+        u = (inputs - loc) / (scale * sqrt_2)
         z = 0.5 * (1.0 + torch.special.erf(u))
-        ladj = (-torch.log(scale) - 0.5 * torch.log(x.new_tensor(2.0 * torch.pi)) - u ** 2).sum(dim=-1)
+        ladj = (-torch.log(scale) - 0.5 * torch.log(inputs.new_tensor(2.0 * torch.pi)) - u ** 2).sum(dim=-1)
         return z, ladj
 
-    def inverse(self, z : torch.Tensor):
+    def inverse(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
         loc, scale = self.loc_scale()
-        sqrt_2 = torch.sqrt(z.new_tensor(2.0))
-        u = torch.special.erfinv(2.0 * z.clamp(self.numerical_tolerance, 1.0 - self.numerical_tolerance) - 1.0)
+        sqrt_2 = torch.sqrt(inputs.new_tensor(2.0))
+        u = torch.special.erfinv(2.0 * inputs.clamp(self.numerical_tolerance, 1.0 - self.numerical_tolerance) - 1.0)
         x = loc + scale * sqrt_2 * u
-        ladj = (torch.log(scale) + 0.5 * (torch.log(z.new_tensor(2.0 * torch.pi)) + u ** 2)).sum(dim=-1) 
+        ladj = (torch.log(scale) + 0.5 * (torch.log(inputs.new_tensor(2.0 * torch.pi)) + u ** 2)).sum(dim=-1)
         return x, ladj
-    
-    def marginal(self, marginal_dims : tuple[int, ...]):
+
+    def marginal(self, marginal_dims: tuple[int, ...]):
         marginal_dims = tuple(marginal_dims)
         assert all(0 <= i < self.dim for i in marginal_dims), "marginal_dims must be in [0, dim)"
 
@@ -165,8 +196,16 @@ class ErfSeparableTF(DomainTF):
 
 
 class MaskedAffineNFTF(DomainTF):
-    def __init__(self, dim : int, n_layers : int = 5, hidden_features : int = 128, trainable : bool = True, init_wo_warping : bool = False):
-        super().__init__(dim)
+    def __init__(
+        self,
+        dim: int,
+        n_layers: int = 5,
+        hidden_features: int = 128,
+        trainable: bool = True,
+        init_wo_warping: bool = False,
+        context_features: int | None = None,
+    ):
+        super().__init__(dim, context_features=context_features)
 
         transforms = []
         for _ in range(n_layers):
@@ -174,6 +213,7 @@ class MaskedAffineNFTF(DomainTF):
             maf = MaskedAffineAutoregressiveTransform(
                 features=dim,
                 hidden_features=hidden_features,
+                context_features=context_features,
                 num_blocks=2,
                 use_residual_blocks=True,
                 random_mask=False,
@@ -186,7 +226,6 @@ class MaskedAffineNFTF(DomainTF):
             transforms.append(maf)
 
         self.T = CompositeTransform(transforms)
-
 
         if not trainable:
             raise NotImplementedError("Initializing as non trainable is not implemented")
@@ -203,26 +242,36 @@ class MaskedAffineNFTF(DomainTF):
 
         torch.nn.init.zeros_(last_linear.weight)
         torch.nn.init.zeros_(last_linear.bias)
-    
+
     @classmethod
-    def copy_from_trainable(cls, other : 'MaskedAffineNFTF'):
+    def copy_from_trainable(cls, other: "MaskedAffineNFTF"):
         new_module = copy.deepcopy(other)
         for p in new_module.parameters():
             p.requires_grad_(False)
         return new_module
-    
-    def forward(self, x : torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        return self.T(x)
 
-    def inverse(self, z : torch.Tensor):
-        assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
-        return self.T.inverse(z)
+    def forward(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
+        return self.T(inputs, context=context)
+
+    def inverse(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
+        return self.T.inverse(inputs, context=context)
 
 
 class MaskedRQSNFTF(DomainTF):
-    def __init__(self, dim: int, n_layers: int = 5, hidden_features: int = 128, trainable: bool = True, num_bins: int = 8, tails: str = "linear", tail_bound: float = 3.0):
-        super().__init__(dim)
+    def __init__(
+        self,
+        dim: int,
+        n_layers: int = 5,
+        hidden_features: int = 128,
+        trainable: bool = True,
+        num_bins: int = 8,
+        tails: str | None = "linear",
+        tail_bound: float = 3.0,
+        context_features: int | None = None,
+    ):
+        super().__init__(dim, context_features=context_features)
 
         transforms = []
         for _ in range(n_layers):
@@ -231,7 +280,7 @@ class MaskedRQSNFTF(DomainTF):
                 MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
                     features=dim,
                     hidden_features=hidden_features,
-                    context_features=None,
+                    context_features=context_features,
                     num_bins=num_bins,
                     tails=tails,
                     tail_bound=tail_bound,
@@ -257,13 +306,13 @@ class MaskedRQSNFTF(DomainTF):
             p.requires_grad_(False)
         return new_module
 
-    def forward(self, x: torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        return self.T(x)
+    def forward(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
+        return self.T(inputs, context=context)
 
-    def inverse(self, z: torch.Tensor):
-        assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
-        return self.T.inverse(z)
+    def inverse(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
+        return self.T.inverse(inputs, context=context)
 
 
 class MLP(torch.nn.Module):
@@ -489,17 +538,16 @@ class VolumePreservingNFTF(DomainTF):
             p.requires_grad_(False)
         return new_module
 
-    def forward(self, x: torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        z, ladj = self.T(x)
+    def forward(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
+        z, ladj = self.T(inputs, context=context)
 
         # Should be exactly zero except for dtype/device shape.
         return z, ladj
 
-    def inverse(self, z: torch.Tensor):
-        assert z.shape[1] == self.dim, "z must have shape (n_data, dim)"
-        x, ladj = self.T.inverse(z)
+    def inverse(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
+        x, ladj = self.T.inverse(inputs, context=context)
 
         # Should be exactly zero except for dtype/device shape.
         return x, ladj
-

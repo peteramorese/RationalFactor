@@ -7,10 +7,9 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from normalizing_flow.conditional_base_distributions import ConditionalSeparableBeta
+from normalizing_flow.conditional_base_distributions import ConditionalBernstein1D
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.conditional_domain_transformation import ConditionalMaskedRQSNFTF
-from rational_factor.models.domain_transformation import ErfSeparableTF, IdentityTF, MLP, StackedTF
+from rational_factor.models.domain_transformation import ErfSeparableTF, IdentityTF, MaskedRQSNFTF, MLP, StackedTF
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.mutual_bases import (
     LocalBSplineMutualBasis,
@@ -30,6 +29,7 @@ from rational_factor.models.kde import GaussianKDE
 import rational_factor.models.loss as loss
 import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
+from nflows.transforms import CompositeTransform
 
 
 def _plot_conditional_slices_model_vs_data(
@@ -322,7 +322,7 @@ def _make_free_basis(
     flow_hidden: int,
     device: torch.device,
 ) -> NormalizedProductPairBasis:
-    """Free pair on rest coords: ConditionalSeparableBeta × ConditionalMaskedRQSNFTF.
+    """Free pair on rest coords: ConditionalSeparableBeta × MaskedRQSNFTF(context).
 
     Index embedding ``e_i`` conditions both the domain map ``T(·|e_i)`` and the
     box base ``q(·|e_i)``, yielding ``α_i = |det JT|`` and ``β_i = q(T(x)|e_i)``.
@@ -331,24 +331,31 @@ def _make_free_basis(
         raise ValueError(f"VDP free basis requires rest_dim >= 1, got {rest_dim}")
 
     embedding = torch.nn.Embedding(n_basis, embedding_dim).to(device)
-    domain_tf = ConditionalMaskedRQSNFTF(
+    domain_tf = MaskedRQSNFTF(
         dim=rest_dim,
-        conditioner_dim=embedding_dim,
+        context_features=embedding_dim,
         n_layers=flow_layers,
         hidden_features=flow_hidden,
         tails=None,  # free coords are already on the unit box after Erf wrap
+        num_bins=4
     ).to(device)
+    #wrapper_tf = ErfSeparableTF(dim=rest_dim, loc=torch.tensor([0.0]), scale=torch.tensor([10.0]), trainable=True).to(device)
+    #tf = CompositeTransform([wrapper_tf, domain_tf])
+
+    bernstein_deg = 50
     base_mlp = MLP(
         in_features=embedding_dim,
-        out_features=2 * rest_dim,  # raw alpha/beta for n_basis=1
+        out_features=bernstein_deg + 1,
         hidden_features=flow_hidden,
+        zero_init_last=False,
     ).to(device)
-    base = ConditionalSeparableBeta(
+    base = ConditionalBernstein1D(
         dim=rest_dim,
         conditioner_dim=embedding_dim,
+        degree=bernstein_deg,
         mlp=base_mlp,
-        n_basis=1,
     ).to(device)
+
     return NormalizedProductPairBasis(base, domain_tf, embedding).to(device)
 
 
@@ -368,18 +375,18 @@ if __name__ == "__main__":
     flow_layers = 2
     tran_params = {
         "n_epochs_per_group": [3, 3],  # basis+wrap, weights
-        "iterations": 5,
+        "iterations": 10,
         "lr_basis": 1e-3,
         "lr_weights": 5e-2,
         "lr_wrap": 1e-3,
     }
     init_params = {
-        "n_epochs_per_group": [20],  # h0 coeffs only
-        "iterations": 30,
+        "n_epochs_per_group": [10],  # h0 coeffs only
+        "iterations": 10,
         "lr_weights": 1e-2,
     }
 
-    batch_size = 256
+    batch_size = 128
     n_timesteps_prop = problem.n_timesteps
     ###
 
@@ -450,7 +457,8 @@ if __name__ == "__main__":
     optimizers = {
         "basis": torch.optim.Adam(
             [
-                {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"], "weight_decay": 1e-2},
+                #{"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"], "weight_decay": 1e-2},
+                {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
                 {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
             ]
         ),
