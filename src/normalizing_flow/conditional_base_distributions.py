@@ -6,7 +6,13 @@ import math
 
 import torch
 
-from normalizing_flow.base_distributions import SeparableBeta
+from normalizing_flow.base_distributions import (
+    SeparableBeta,
+    bspline_basis_mass,
+    eval_open_bsplines,
+    open_uniform_knots,
+    sample_normalized_bsplines,
+)
 from rational_factor.models.density_model import ConditionalDensityModel
 
 
@@ -225,6 +231,104 @@ class ConditionalBernstein1D(ConditionalDensityModel):
         alpha = (idx + 1).to(dtype=weights.dtype)
         beta = (self.degree - idx + 1).to(dtype=weights.dtype)
         x_s = torch.distributions.Beta(alpha, beta).sample()
+        samples = torch.rand(
+            conditioner.shape[0], self.dim, device=conditioner.device, dtype=weights.dtype
+        )
+        samples[:, self.sacrificial_index] = x_s
+        return samples
+
+    def supremum_bound(self, conditioner: torch.Tensor | None = None) -> torch.Tensor:
+        conditioner = _require_conditioner(conditioner)
+        if conditioner.ndim == 1:
+            conditioner = conditioner.unsqueeze(0)
+        return self.coefficients(conditioner).max(dim=-1).values
+
+
+class ConditionalBSpline1D(ConditionalDensityModel):
+    """Conditional open-uniform B-spline density on a sacrificial coordinate.
+
+    The MLP maps the conditioner to spline logits of shape ``(batch, n_basis)``.
+    The joint conditional density is ``p(x | c) = S(x_s | c)`` with other
+    coordinates independent Uniform[0, 1]. See :class:`BSpline1D` for the
+    spline parameterization (zero logits → Uniform; local support → sharp bumps).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        conditioner_dim: int,
+        n_basis: int,
+        mlp: torch.nn.Module,
+        degree: int = 3,
+        sacrificial_index: int = 0,
+        eps: float = 1e-6,
+    ):
+        super().__init__(dim=dim, conditioner_dim=conditioner_dim)
+        if degree < 0:
+            raise ValueError("degree must be nonnegative")
+        if n_basis < degree + 1:
+            raise ValueError("n_basis must be at least degree + 1")
+        if not (0 <= sacrificial_index < dim):
+            raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
+        self.n_basis = n_basis
+        self.degree = degree
+        self.sacrificial_index = sacrificial_index
+        self.eps = eps
+        self.mlp = mlp
+
+        knots = open_uniform_knots(n_basis, degree)
+        mass = bspline_basis_mass(knots, degree)
+        self.register_buffer("knots", knots)
+        self.register_buffer("mass", mass)
+        self.register_buffer("log_mass", mass.clamp_min(torch.finfo(mass.dtype).tiny).log())
+
+    def logits(self, conditioner: torch.Tensor) -> torch.Tensor:
+        logits = self.mlp(conditioner)
+        if logits.shape != (conditioner.shape[0], self.n_basis):
+            raise ValueError(
+                f"mlp output must have shape (batch, {self.n_basis}), got {tuple(logits.shape)}"
+            )
+        return logits
+
+    def coefficients(self, conditioner: torch.Tensor) -> torch.Tensor:
+        """Spline PDF coefficients ``α``, shape ``(batch, n_basis)``."""
+        logits = self.logits(conditioner)
+        log_z = torch.logsumexp(logits + self.log_mass.unsqueeze(0), dim=-1, keepdim=True)
+        return (logits - log_z).exp()
+
+    def mixture_weights(self, conditioner: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.softmax(
+            self.logits(conditioner) + self.log_mass.unsqueeze(0), dim=-1
+        )
+
+    def eval_basis(self, t: torch.Tensor) -> torch.Tensor:
+        return eval_open_bsplines(
+            t.to(dtype=self.knots.dtype, device=self.knots.device),
+            self.knots,
+            self.degree,
+            self.n_basis,
+        )
+
+    def dtype_device(self):
+        p = next(self.mlp.parameters())
+        return p.dtype, p.device
+
+    def log_density(self, x: torch.Tensor, *, conditioner: torch.Tensor, **contexts) -> torch.Tensor:
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        x_s = x[:, self.sacrificial_index].clamp(self.eps, 1.0 - self.eps)
+        N = self.eval_basis(x_s)
+        log_alpha = self.coefficients(conditioner).clamp_min(self.eps).log()
+        log_p = torch.logsumexp(log_alpha + N.clamp_min(self.eps).log(), dim=-1)
+        return self._clip_log_density(log_p)
+
+    def sample(self, conditioner: torch.Tensor, **contexts) -> torch.Tensor:
+        if conditioner.ndim == 1:
+            conditioner = conditioner.unsqueeze(0)
+        weights = self.mixture_weights(conditioner)
+        idx = torch.multinomial(weights, 1).squeeze(-1)
+        x_s = sample_normalized_bsplines(
+            idx, self.knots, self.degree, self.n_basis, dtype=weights.dtype
+        )
         samples = torch.rand(
             conditioner.shape[0], self.dim, device=conditioner.device, dtype=weights.dtype
         )

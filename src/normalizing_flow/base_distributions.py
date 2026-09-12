@@ -317,3 +317,260 @@ class Bernstein1D(DensityModel):
             sacrificial_index=new_s,
             eps=self.eps,
         )
+
+
+def open_uniform_knots(
+    n_basis: int,
+    degree: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Open-uniform knot vector on ``[0, 1]`` with ``n_basis`` degree-``degree`` B-splines."""
+    if degree < 0:
+        raise ValueError("degree must be nonnegative")
+    if n_basis < degree + 1:
+        raise ValueError("n_basis must be at least degree + 1")
+    n_spans = n_basis - degree
+    breaks = torch.linspace(0.0, 1.0, n_spans + 1, dtype=dtype, device=device)
+    return torch.cat(
+        [
+            torch.zeros(degree + 1, dtype=dtype, device=device),
+            breaks[1:-1],
+            torch.ones(degree + 1, dtype=dtype, device=device),
+        ]
+    )
+
+
+def bspline_basis_mass(knots: torch.Tensor, degree: int) -> torch.Tensor:
+    """Exact integrals ``∫ N_{i,p}`` via ``(t_{i+p+1} - t_i) / (p + 1)``."""
+    n_basis = knots.numel() - degree - 1
+    return (knots[degree + 1 : degree + 1 + n_basis] - knots[:n_basis]) / (degree + 1.0)
+
+
+def eval_open_bsplines(
+    x: torch.Tensor,
+    knots: torch.Tensor,
+    degree: int,
+    n_basis: int,
+) -> torch.Tensor:
+    """Cox–de Boor evaluation of every open-uniform B-spline at ``x``.
+
+    Parameters
+    ----------
+    x:
+        Points in ``[0, 1]``, shape ``(n,)``.
+    knots:
+        Open-uniform knot vector of length ``n_basis + degree + 1``.
+    degree, n_basis:
+        Spline degree and number of basis functions.
+
+    Returns
+    -------
+    Tensor
+        Shape ``(n, n_basis)``, nonnegative and summing to 1 (partition of unity).
+
+    Notes
+    -----
+    Built without in-place writes so gradients w.r.t. ``x`` are well-defined.
+    """
+    x = x.reshape(-1).clamp(0.0, 1.0)
+    t = knots
+    p = degree
+    n = n_basis - 1
+
+    span = torch.searchsorted(t, x, right=True) - 1
+    span = torch.where(x >= t[n + 1], torch.full_like(span, n), span)
+    span = span.clamp(p, n)
+
+    # Compact support values at the current degree; start at degree 0.
+    N_curr = torch.ones(x.shape[0], 1, dtype=x.dtype, device=x.device)
+    eps = torch.finfo(x.dtype).eps
+    for j in range(1, p + 1):
+        # left[k] = x - t[span+1-k], right[k] = t[span+k] - x for k = 1..j
+        ks = torch.arange(1, j + 1, device=x.device)
+        left = x.unsqueeze(1) - t[span.unsqueeze(1) + 1 - ks]
+        right = t[span.unsqueeze(1) + ks] - x.unsqueeze(1)
+        cols: list[torch.Tensor] = []
+        saved = torch.zeros_like(x)
+        for r in range(j):
+            den = right[:, r] + left[:, j - 1 - r]
+            tmp = torch.where(den.abs() > eps, N_curr[:, r] / den, torch.zeros_like(den))
+            cols.append(saved + right[:, r] * tmp)
+            saved = left[:, j - 1 - r] * tmp
+        cols.append(saved)
+        N_curr = torch.stack(cols, dim=1)
+
+    idx = span.unsqueeze(1) - p + torch.arange(p + 1, device=x.device)
+    return x.new_zeros(x.shape[0], n_basis).scatter(1, idx, N_curr)
+
+def sample_normalized_bsplines(
+    idx: torch.Tensor,
+    knots: torch.Tensor,
+    degree: int,
+    n_basis: int,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Draw from ``N_{idx,p} / μ_{idx}`` by rejection (accept with probability ``N``)."""
+    if dtype is None:
+        dtype = knots.dtype
+    p = degree
+    lo = knots[idx]
+    hi = knots[idx + p + 1]
+    n = idx.shape[0]
+    out = torch.empty(n, device=idx.device, dtype=dtype)
+    pending = torch.ones(n, dtype=torch.bool, device=idx.device)
+    for _ in range(64):
+        if not pending.any():
+            break
+        n_pend = int(pending.sum().item())
+        u = lo[pending] + (hi[pending] - lo[pending]) * torch.rand(
+            n_pend, device=idx.device, dtype=dtype
+        )
+        N = eval_open_bsplines(u, knots, degree, n_basis)
+        n_i = N.gather(1, idx[pending].unsqueeze(1)).squeeze(1)
+        ok = torch.rand(n_pend, device=idx.device, dtype=dtype) <= n_i
+        filled_idx = pending.nonzero(as_tuple=False).squeeze(-1)
+        out[filled_idx[ok]] = u[ok]
+        pending[filled_idx[ok]] = False
+    if pending.any():
+        u = lo[pending] + (hi[pending] - lo[pending]) * torch.rand(
+            int(pending.sum().item()), device=idx.device, dtype=dtype
+        )
+        out[pending] = u
+    return out
+
+
+class BSpline1D(DensityModel):
+    """Open-uniform B-spline density on a sacrificial coordinate.
+
+    The joint density is
+
+        p(x) = S(x_s)
+
+    where ``x_s = x[sacrificial_index]`` and ``S`` is the 1D spline PDF
+
+        S(t) = Σ_{i=0}^{m-1} α_i N_{i,p}(t)
+
+    with open-uniform degree-``p`` B-splines ``N_{i,p}`` on ``[0, 1]`` (a
+    partition of unity) and nonnegative coefficients satisfying
+    ``Σ_i α_i ∫ N_{i,p} = 1``. Other coordinates are independent Uniform[0, 1].
+
+    Logits parameterize
+
+        α_i = exp(ℓ_i) / Σ_j exp(ℓ_j) μ_j,    μ_j = ∫ N_{j,p},
+
+    so zero logits give the Uniform density (``α_i ≡ 1``). When
+    ``n_basis == degree + 1`` this reduces to :class:`Bernstein1D`. Local
+    support (``n_basis > degree + 1``) lets a single large ``α_i`` produce a
+    sharp bump. The bound ``max_i α_i`` is a differentiable function of the
+    logits (subgradient through the argmax).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_basis: int,
+        degree: int = 3,
+        logits: torch.Tensor | None = None,
+        sacrificial_index: int = 0,
+        eps: float = 1e-6,
+    ):
+        super().__init__(dim=dim)
+        if degree < 0:
+            raise ValueError("degree must be nonnegative")
+        if n_basis < degree + 1:
+            raise ValueError("n_basis must be at least degree + 1")
+        if not (0 <= sacrificial_index < dim):
+            raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
+        self.n_basis = n_basis
+        self.degree = degree
+        self.sacrificial_index = sacrificial_index
+        self.eps = eps
+
+        if logits is None:
+            logits = torch.zeros(n_basis)
+        else:
+            logits = torch.as_tensor(logits, dtype=torch.float32).reshape(-1)
+            if logits.shape != (n_basis,):
+                raise ValueError(f"logits must have shape ({n_basis},), got {tuple(logits.shape)}")
+
+        self.logits = torch.nn.Parameter(logits)
+        knots = open_uniform_knots(n_basis, degree)
+        mass = bspline_basis_mass(knots, degree)
+        self.register_buffer("knots", knots)
+        self.register_buffer("mass", mass)
+        self.register_buffer("log_mass", mass.clamp_min(torch.finfo(mass.dtype).tiny).log())
+
+    def coefficients(self) -> torch.Tensor:
+        """Spline PDF coefficients ``α``, shape ``(n_basis,)``, with ``α · mass = 1``."""
+        log_z = torch.logsumexp(self.logits + self.log_mass, dim=-1)
+        return (self.logits - log_z).exp()
+
+    def mixture_weights(self) -> torch.Tensor:
+        """Mixture weights ``w_i = α_i μ_i`` for the normalized bases ``N_i / μ_i``."""
+        return torch.nn.functional.softmax(self.logits + self.log_mass, dim=-1)
+
+    def eval_basis(self, t: torch.Tensor) -> torch.Tensor:
+        """Evaluate ``N_{i,p}(t)``, shape ``(n, n_basis)``."""
+        return eval_open_bsplines(
+            t.to(dtype=self.knots.dtype, device=self.knots.device),
+            self.knots,
+            self.degree,
+            self.n_basis,
+        )
+
+    def dtype_device(self):
+        return self.logits.dtype, self.logits.device
+
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor) -> torch.Tensor:
+        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        x_s = x[:, self.sacrificial_index].clamp(self.eps, 1.0 - self.eps)
+        N = self.eval_basis(x_s)
+        log_alpha = self.coefficients().clamp_min(self.eps).log()
+        log_p = torch.logsumexp(log_alpha.unsqueeze(0) + N.clamp_min(self.eps).log(), dim=-1)
+        return self._clip_log_density(log_p)
+
+    def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
+        """Mixture of normalized B-splines; each component via rejection on its support."""
+        weights = self.mixture_weights()
+        idx = torch.multinomial(weights, n_samples, replacement=True)
+        x_s = sample_normalized_bsplines(
+            idx, self.knots, self.degree, self.n_basis, dtype=self.logits.dtype
+        )
+        samples = torch.rand(
+            n_samples, self.dim, device=self.logits.device, dtype=self.logits.dtype
+        )
+        samples[:, self.sacrificial_index] = x_s
+        return samples
+
+    def supremum_bound(self) -> torch.Tensor:
+        """Coefficient bound: ``min α ≤ S(t) ≤ max α`` by partition of unity.
+
+        Sharp when a single basis dominates near a point where that basis is 1
+        (e.g. endpoints for the first/last open-uniform spline).
+        """
+        return self.coefficients().max()
+
+    def marginal(self, marginal_dims: tuple[int, ...]) -> "BSpline1D":
+        dims = tuple(marginal_dims)
+        assert all(0 <= i < self.dim for i in dims), "marginal_dims must be in [0, dim)"
+        if self.sacrificial_index not in dims:
+            return BSpline1D(
+                dim=len(dims),
+                n_basis=1,
+                degree=0,
+                logits=torch.zeros(1),
+                sacrificial_index=0,
+                eps=self.eps,
+            )
+        new_s = dims.index(self.sacrificial_index)
+        return BSpline1D(
+            dim=len(dims),
+            n_basis=self.n_basis,
+            degree=self.degree,
+            logits=self.logits.detach().clone(),
+            sacrificial_index=new_s,
+            eps=self.eps,
+        )

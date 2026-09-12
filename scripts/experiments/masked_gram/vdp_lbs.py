@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from normalizing_flow.conditional_base_distributions import ConditionalBernstein1D
+from normalizing_flow.conditional_base_distributions import ConditionalBernstein1D, ConditionalBSpline1D
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.domain_transformation import ErfSeparableTF, IdentityTF, MaskedRQSNFTF, MLP, StackedTF
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
@@ -330,33 +330,6 @@ def _make_free_basis(
     if rest_dim < 1:
         raise ValueError(f"VDP free basis requires rest_dim >= 1, got {rest_dim}")
 
-    embedding = torch.nn.Embedding(n_basis, embedding_dim).to(device)
-    domain_tf = MaskedRQSNFTF(
-        dim=rest_dim,
-        context_features=embedding_dim,
-        n_layers=flow_layers,
-        hidden_features=flow_hidden,
-        tails=None,  # free coords are already on the unit box after Erf wrap
-        num_bins=4
-    ).to(device)
-    #wrapper_tf = ErfSeparableTF(dim=rest_dim, loc=torch.tensor([0.0]), scale=torch.tensor([10.0]), trainable=True).to(device)
-    #tf = CompositeTransform([wrapper_tf, domain_tf])
-
-    bernstein_deg = 50
-    base_mlp = MLP(
-        in_features=embedding_dim,
-        out_features=bernstein_deg + 1,
-        hidden_features=flow_hidden,
-        zero_init_last=False,
-    ).to(device)
-    base = ConditionalBernstein1D(
-        dim=rest_dim,
-        conditioner_dim=embedding_dim,
-        degree=bernstein_deg,
-        mlp=base_mlp,
-    ).to(device)
-
-    return NormalizedProductPairBasis(base, domain_tf, embedding).to(device)
 
 
 if __name__ == "__main__":
@@ -368,15 +341,16 @@ if __name__ == "__main__":
     sacrificial_index = 0
     embedding_dim = 10
     k_alpha = 3
-    k_beta = 17
+    k_beta = 5
     trainable_beta = False
     B_order = 10
     flow_hidden = 8
     flow_layers = 2
     tran_params = {
-        "n_epochs_per_group": [3, 3],  # basis+wrap, weights
+        "n_epochs_per_group": [3, 5, 3],  # domain_tf+wrap, embedding+base_mlp, weights
         "iterations": 10,
-        "lr_basis": 1e-3,
+        "lr_domain_tf": 1e-3,
+        "lr_base": 1e-2,
         "lr_weights": 5e-2,
         "lr_wrap": 1e-3,
     }
@@ -417,15 +391,47 @@ if __name__ == "__main__":
         device=device,
     ).to(device)
 
-    # Free pair on rest coords: conditional Beta base + conditional RQS map.
-    free_basis = _make_free_basis(
-        rest_dim=rest_dim,
-        n_basis=n_basis,
-        embedding_dim=embedding_dim,
-        flow_layers=flow_layers,
-        flow_hidden=flow_hidden,
-        device=device,
-    )
+
+    embedding = torch.nn.Embedding(n_basis, embedding_dim).to(device)
+    domain_tf = MaskedRQSNFTF(
+        dim=rest_dim,
+        context_features=embedding_dim,
+        n_layers=flow_layers,
+        hidden_features=flow_hidden,
+        tails=None,  # free coords are already on the unit box after Erf wrap
+        num_bins=4
+    ).to(device)
+
+    b_spline_params = 15
+    base_mlp = MLP(
+        in_features=embedding_dim,
+        out_features=b_spline_params,
+        hidden_features=flow_hidden,
+        zero_init_last=False,
+    ).to(device)
+    base = ConditionalBSpline1D(
+        dim=rest_dim,
+        conditioner_dim=embedding_dim,
+        n_basis=b_spline_params,
+        mlp=base_mlp,
+        degree=3,
+    ).to(device)
+    #bernstein_deg = 50
+    #base_mlp = MLP(
+    #    in_features=embedding_dim,
+    #    out_features=bernstein_deg + 1,
+    #    hidden_features=flow_hidden,
+    #    zero_init_last=False,
+    #).to(device)
+    #base = ConditionalBernstein1D(
+    #    dim=rest_dim,
+    #    conditioner_dim=embedding_dim,
+    #    degree=bernstein_deg,
+    #    mlp=base_mlp,
+    #).to(device)
+
+    free_basis = NormalizedProductPairBasis(base, domain_tf, embedding).to(device)
+
 
     phi_psi_mutual = PositiveMaskedGramMutualBasis(
         masking,
@@ -455,15 +461,19 @@ if __name__ == "__main__":
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     optimizers = {
-        "basis": torch.optim.Adam(
+        "domain_tf": torch.optim.Adam(
             [
-                #{"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"], "weight_decay": 1e-2},
-                {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
+                {"params": domain_tf.parameters(), "lr": tran_params["lr_domain_tf"]},
                 {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
             ]
         ),
+        "base": torch.optim.Adam(
+            [
+                {"params": embedding.parameters(), "lr": tran_params["lr_base"]},
+                {"params": base_mlp.parameters(), "lr": tran_params["lr_base"]},
+            ]
+        ),
         "weights": torch.optim.Adam(
-            #param_group_iter((g_coeffs, *B.parameters)),
             param_group_iter((g_coeffs, B_coeffs)),
             lr=tran_params["lr_weights"],
         ),
