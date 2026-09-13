@@ -337,26 +337,40 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 100
+    n_basis = 50
     sacrificial_index = 0
-    embedding_dim = 10
+    embedding_dim = 4
     k_alpha = 3
     k_beta = 5
     trainable_beta = False
     B_order = 10
-    flow_hidden = 8
+    flow_hidden = 64
     flow_layers = 2
+    #tran_params = {
+    #    "n_epochs_per_group": [3, 5, 3],  # domain_tf+wrap, embedding+base_mlp, weights
+    #    "iterations": 10,
+    #    "lr_domain_tf": 1e-3,
+    #    "lr_base": 1e-2,
+    #    "lr_weights": 5e-2,
+    #    "lr_wrap": 1e-3,
+    #}
+    #tran_params = {
+    #    "n_epochs_per_group": [5, 5],  # basis params, weights
+    #    "iterations": 100,
+    #    "lr_basis": 1e-3,
+    #    "lr_weights": 5e-2,
+    #    "lr_wrap": 1e-3,
+    #}
     tran_params = {
-        "n_epochs_per_group": [3, 5, 3],  # domain_tf+wrap, embedding+base_mlp, weights
-        "iterations": 10,
-        "lr_domain_tf": 1e-3,
-        "lr_base": 1e-2,
-        "lr_weights": 5e-2,
+        "n_epochs_per_group": [5],  # basis params, weights
+        "iterations": 100,
+        "lr_basis": 1e-4,
+        "lr_weights": 8e-2,
         "lr_wrap": 1e-3,
     }
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
-        "iterations": 10,
+        "iterations": 30,
         "lr_weights": 1e-2,
     }
 
@@ -461,21 +475,35 @@ if __name__ == "__main__":
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     optimizers = {
-        "domain_tf": torch.optim.Adam(
+        #"domain_tf": torch.optim.Adam(
+        #    [
+        #        {"params": domain_tf.parameters(), "lr": tran_params["lr_domain_tf"]},
+        #        {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
+        #    ]
+        #),
+        #"base": torch.optim.Adam(
+        #    [
+        #        {"params": embedding.parameters(), "lr": tran_params["lr_base"]},
+        #        {"params": base_mlp.parameters(), "lr": tran_params["lr_base"]},
+        #    ]
+        #),
+
+        #"basis": torch.optim.Adam(
+        #    [
+        #        {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
+        #        #{"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
+        #    ]
+        #),
+        #"weights": torch.optim.Adam(
+        #    param_group_iter((g_coeffs, B_coeffs)),
+        #    lr=tran_params["lr_weights"],
+        #),
+
+        "all": torch.optim.Adam(
             [
-                {"params": domain_tf.parameters(), "lr": tran_params["lr_domain_tf"]},
-                {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
+                {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
+                {"params": param_group_iter((g_coeffs, B_coeffs)), "lr": tran_params["lr_weights"]},
             ]
-        ),
-        "base": torch.optim.Adam(
-            [
-                {"params": embedding.parameters(), "lr": tran_params["lr_base"]},
-                {"params": base_mlp.parameters(), "lr": tran_params["lr_base"]},
-            ]
-        ),
-        "weights": torch.optim.Adam(
-            param_group_iter((g_coeffs, B_coeffs)),
-            lr=tran_params["lr_weights"],
         ),
     }
 
