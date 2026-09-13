@@ -1751,6 +1751,10 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
 
     If ``free_basis`` is ``None``, the rest space is 0-dimensional and the free
     pair is the identity ``α = β = 1``.
+
+    If ``swap_alpha_beta`` is True, logical index 0 is the underlying beta and
+    index 1 is the underlying alpha; ``Omega2`` is transposed accordingly so
+    it remains ``∫ logical_α_i logical_β_j``.
     """
 
     def __init__(
@@ -1759,6 +1763,7 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
         sacrificial_index: int,
         free_basis: VolumePreservingPairBasis | NormalizedProductPairBasis | None = None,
         coeffs: tuple[Parameters | None, Parameters | None] | None = None,
+        swap_alpha_beta: bool = False,
     ):
         torch.nn.Module.__init__(self)
         if masking_basis.dim() != 1:
@@ -1793,9 +1798,16 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
         self.masking_basis = masking_basis
         self.free_basis = free_basis
         self.sacrificial_index = sacrificial_index
+        self.swap_alpha_beta = bool(swap_alpha_beta)
 
     def dtype_device(self):
         return self.masking_basis.dtype_device()
+
+    def _pair_index(self, index: int | None) -> int | None:
+        """Map logical (α, β) index to underlying (α, β) index."""
+        if self.swap_alpha_beta and index in (0, 1):
+            return 1 - index
+        return index
 
     def _ones(self, n_data: int | None = None) -> torch.Tensor:
         dtype, device = self.dtype_device()
@@ -1843,26 +1855,35 @@ class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
         rest = [i for i in range(self._dim) if i != l]
         return y[:, l], y[:, rest]
 
+    def _omega2_unswapped(self) -> Matrix:
+        return self.masking_basis.Omega2().mul_diag_right(self._free_Omega2_diag())
+
     def eval(self, y: torch.Tensor | None = None, index: int | None = None):
         if y is None:
             return torch.nn.Module.eval(self)
         x_l, x_rest = self._split_coords(y)
-        return self.masking_basis.eval(x_l, index) * self._free_eval(x_rest, index)
+        raw = self._pair_index(index)
+        if raw is None:
+            out = self.masking_basis.eval(x_l, None) * self._free_eval(x_rest, None)
+            return out.flip(1) if self.swap_alpha_beta else out
+        return self.masking_basis.eval(x_l, raw) * self._free_eval(x_rest, raw)
 
     def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
         if lows is not None or highs is not None:
             raise ValueError("MaskedGramMutualBasis.Omega1 is only defined on the full domain")
-        return self.masking_basis.Omega1(index) * self._free_Omega1(index)
+        raw = self._pair_index(index)
+        return self.masking_basis.Omega1(raw) * self._free_Omega1(raw)
 
     def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         if lows is not None or highs is not None:
             raise ValueError("MaskedGramMutualBasis.Omega2 is only defined on the full domain")
-        return self.masking_basis.Omega2().mul_diag_right(self._free_Omega2_diag())
+        G = self._omega2_unswapped()
+        return G.T if self.swap_alpha_beta else G
 
     def supremum(self, index: int) -> torch.Tensor:
         # Local B-spline alpha is a partition of unity (≤ 1), so
         # α = α_mask α_free ≤ α_free ≤ free.supremum(0).
-        if index == 0:
+        if self._pair_index(index) == 0:
             return self._free_supremum(0)
         raise NotImplementedError("MaskedGramMutualBasis.supremum is only implemented for alpha")
 
@@ -1890,6 +1911,9 @@ class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
             + G^{αb}_{ij} (Ω¹_free_α)_i u_{b,j}
 
     i.e. ``Omega2_alpha_b().mul_diag_left(free.Omega1(0)).mul_diag_right(u_b)``.
+
+    With ``swap_alpha_beta=True``, logical index 0 is the corrected beta and
+    index 1 is unsigned alpha; ``Omega2`` is transposed to match.
     """
 
     def eval(self, y: torch.Tensor | None = None, index: int | None = None):
@@ -1897,24 +1921,26 @@ class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
             return torch.nn.Module.eval(self)
         if index not in (0, 1, None):
             raise ValueError("index must be 0, 1, or None")
-        if index == 0:
-            return MaskedGramMutualBasis.eval(self, y, 0)
 
         x_l, x_rest = self._split_coords(y)
         u_b = self._free_supremum(1)
-        beta_u = self.masking_basis.eval(x_l, 1) * self._free_eval(x_rest, 1)
-        beta = beta_u + self.masking_basis.eval_b(x_l) * u_b
+        alpha = self.masking_basis.eval(x_l, 0) * self._free_eval(x_rest, 0)
+        beta = self.masking_basis.eval(x_l, 1) * self._free_eval(x_rest, 1) + self.masking_basis.eval_b(x_l) * u_b
+        if self.swap_alpha_beta:
+            alpha, beta = beta, alpha
+
+        if index == 0:
+            return alpha
         if index == 1:
             return beta
-
-        alpha = self.masking_basis.eval(x_l, 0) * self._free_eval(x_rest, 0)
         return torch.stack([alpha, beta], dim=1)
 
     def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
         if lows is not None or highs is not None:
             raise ValueError("PositiveMaskedGramMutualBasis.Omega1 is only defined on the full domain")
-        if index == 0:
-            return MaskedGramMutualBasis.Omega1(self, 0)
+        # Integral of unsigned alpha only; corrected beta needs ∫b.
+        if self._pair_index(index) == 0:
+            return self.masking_basis.Omega1(0) * self._free_Omega1(0)
         raise NotImplementedError(
             "PositiveMaskedGramMutualBasis.Omega1 for beta requires ∫b, not yet implemented"
         )
@@ -1922,18 +1948,20 @@ class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
     def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         if lows is not None or highs is not None:
             raise ValueError("PositiveMaskedGramMutualBasis.Omega2 is only defined on the full domain")
-        unsigned = MaskedGramMutualBasis.Omega2(self)
+        unsigned = self._omega2_unswapped()
         gab = self.masking_basis.Omega2_alpha_b()
         omega1 = self._free_Omega1(0)
         u_b = self._free_supremum(1)
-        # extra_ij = Gab_ij * omega1_i * u_b_j
+        # extra_ij = Gab_ij * omega1_i * u_b_j  (underlying α row, β column)
         if omega1.shape[0] == 1 and u_b.shape[0] == 1:
             extra = gab.mul_diag_left(omega1[0]).mul_diag_right(u_b[0])
-            return DenseMatrix(unsigned.to_dense() + extra.to_dense())
-        extra_dense = omega1.unsqueeze(-1) * gab.to_dense() * u_b.unsqueeze(-2)
-        return DenseMatrix(unsigned.to_dense() + extra_dense)
+            G = DenseMatrix(unsigned.to_dense() + extra.to_dense())
+        else:
+            extra_dense = omega1.unsqueeze(-1) * gab.to_dense() * u_b.unsqueeze(-2)
+            G = DenseMatrix(unsigned.to_dense() + extra_dense)
+        return G.T if self.swap_alpha_beta else G
 
     def supremum(self, index: int) -> torch.Tensor:
-        if index == 0:
-            return MaskedGramMutualBasis.supremum(self, 0)
+        if self._pair_index(index) == 0:
+            return self._free_supremum(0)
         raise NotImplementedError("PositiveMaskedGramMutualBasis.supremum is only implemented for alpha")

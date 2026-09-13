@@ -313,31 +313,12 @@ def _make_qs_B(n_basis: int, order: int, device: torch.device) -> Quasiseparable
     )
 
 
-def _make_free_basis(
-    *,
-    rest_dim: int,
-    n_basis: int,
-    embedding_dim: int,
-    flow_layers: int,
-    flow_hidden: int,
-    device: torch.device,
-) -> NormalizedProductPairBasis:
-    """Free pair on rest coords: ConditionalSeparableBeta × MaskedRQSNFTF(context).
-
-    Index embedding ``e_i`` conditions both the domain map ``T(·|e_i)`` and the
-    box base ``q(·|e_i)``, yielding ``α_i = |det JT|`` and ``β_i = q(T(x)|e_i)``.
-    """
-    if rest_dim < 1:
-        raise ValueError(f"VDP free basis requires rest_dim >= 1, got {rest_dim}")
-
-
-
 if __name__ == "__main__":
     problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 100
+    n_basis = 50
     sacrificial_index = 0
     embedding_dim = 10
     k_alpha = 3
@@ -437,6 +418,7 @@ if __name__ == "__main__":
         masking,
         sacrificial_index,
         free_basis,
+        swap_alpha_beta=True,
     ).to(device)
 
     g_coeffs = PositiveParameters.random_init(
