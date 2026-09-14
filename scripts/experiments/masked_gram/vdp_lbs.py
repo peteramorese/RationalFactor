@@ -12,9 +12,11 @@ from rational_factor.models.composite_model import CompositeConditionalModel, Co
 from rational_factor.models.domain_transformation import ErfSeparableTF, IdentityTF, MaskedRQSNFTF, MLP, StackedTF
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.mutual_bases import (
-    LocalBSplineMutualBasis,
     NormalizedProductPairBasis,
     PositiveMaskedGramMutualBasis,
+)
+from rational_factor.models.masking_bases import (
+    LocalBSplineMutualBasis,
 )
 from rational_factor.models.parameters import (
     PositiveParameters,
@@ -47,7 +49,11 @@ def _plot_conditional_slices_model_vs_data(
     random_seed: int = 0,
     title: str = "",
 ) -> None:
-    """Compare trained p(x'|x_i) to binned empirical samples and a conditional KDE."""
+    """Compare trained p(x'|x) to binned empirical samples and a conditional KDE.
+
+    Conditioners share one randomly chosen x1 and span different x2 values so
+    rows can be compared for conditional dependence on x2.
+    """
     if x_k_data.shape[1] != 2 or x_kp1_data.shape[1] != 2:
         raise ValueError("_plot_conditional_slices_model_vs_data expects 2D state data")
 
@@ -80,8 +86,39 @@ def _plot_conditional_slices_model_vs_data(
     n_random_points = max(1, min(n_random_points, n_data))
     rng = torch.Generator(device="cpu")
     rng.manual_seed(random_seed)
-    centers = xk_cpu[torch.randperm(n_data, generator=rng)[:n_random_points]]
     half_width = torch.full((2,), 0.5 * float(bin_width), dtype=xk_cpu.dtype)
+
+    # Shared x1, varied x2: pick a random reference x1, then take points near that
+    # x1 whose x2 values span the local support (so rows compare x2 dependence).
+    ref_idx = int(torch.randint(0, n_data, (1,), generator=rng).item())
+    x1_fixed = 0.0 #float(xk_cpu[ref_idx, 0])
+    near_x1 = (xk_cpu[:, 0] - x1_fixed).abs() <= half_width[0]
+    near_pts = xk_cpu[near_x1]
+    if near_pts.shape[0] < n_random_points:
+        # Fall back to all points ordered by x2 if the x1 strip is too thin.
+        near_pts = xk_cpu
+        x1_fixed = float(near_pts[ref_idx, 0])
+    order = torch.argsort(near_pts[:, 1])
+    near_sorted = near_pts[order]
+    if near_sorted.shape[0] == n_random_points:
+        pick = torch.arange(n_random_points)
+    else:
+        pick = torch.linspace(
+            0, near_sorted.shape[0] - 1, n_random_points
+        ).round().long()
+        # Deduplicate if rounding collapses indices; fill from neighbors if needed.
+        pick = torch.unique(pick)
+        if pick.numel() < n_random_points:
+            need = n_random_points - pick.numel()
+            all_idx = torch.arange(near_sorted.shape[0])
+            mask = torch.ones(near_sorted.shape[0], dtype=torch.bool)
+            mask[pick] = False
+            extra = all_idx[mask][:need]
+            pick = torch.sort(torch.cat([pick, extra]))[0]
+    centers = near_sorted[pick]
+    # Force exact shared x1 so model conditioners differ only in x2.
+    centers = centers.clone()
+    centers[:, 0] = x1_fixed
 
     fig, axes = plt.subplots(
         n_random_points, 3, figsize=(15, 3.2 * n_random_points), squeeze=False
@@ -130,7 +167,7 @@ def _plot_conditional_slices_model_vs_data(
             ax_emp.set_title(
                 "empirical samples x' | x in bin\n"
                 f"n={xp_slice.shape[0]}, "
-                f"x=({float(center[0]):.3f}, {float(center[1]):.3f})"
+                f"x1={float(center[0]):.3f}, x2={float(center[1]):.3f}"
             )
             ax_emp.set_xlim(float(lo[0]), float(hi[0]))
             ax_emp.set_ylim(float(lo[1]), float(hi[1]))
@@ -151,7 +188,8 @@ def _plot_conditional_slices_model_vs_data(
             cf = ax_model.contourf(X.numpy(), Y.numpy(), model_pdf, levels=40, cmap=cmap)
             fig.colorbar(cf, ax=ax_model, fraction=0.046, pad=0.04)
             ax_model.set_title(
-                "model p(x'|x_i)\n"
+                "model p(x'|x1 fixed, x2)\n"
+                f"x2={float(center[1]):.3f}, "
                 f"bin_w=({float(2 * half_width[0]):.3f}, {float(2 * half_width[1]):.3f})"
             )
             ax_model.set_xlim(float(lo[0]), float(hi[0]))
@@ -187,7 +225,10 @@ def _plot_conditional_slices_model_vs_data(
             ax_kde = axes[row, 2]
             cf_kde = ax_kde.contourf(X.numpy(), Y.numpy(), kde_pdf, levels=40, cmap=cmap)
             fig.colorbar(cf_kde, ax=ax_kde, fraction=0.046, pad=0.04)
-            ax_kde.set_title("conditional KDE p(x'|x_i)")
+            ax_kde.set_title(
+                f"conditional KDE p(x'|x)\n"
+                f"x1={float(center[0]):.3f}, x2={float(center[1]):.3f}"
+            )
             ax_kde.set_xlim(float(lo[0]), float(hi[0]))
             ax_kde.set_ylim(float(lo[1]), float(hi[1]))
             ax_kde.set_aspect("equal")
@@ -318,15 +359,16 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 50
+    n_basis = 20
     sacrificial_index = 0
     embedding_dim = 4
-    k_alpha = 3
+    k_alpha = 5
     k_beta = 5
     trainable_beta = False
     B_order = 10
-    flow_hidden = 64
+    flow_hidden = 16
     flow_layers = 2
+    swap_alpha_beta = False
     #tran_params = {
     #    "n_epochs_per_group": [3, 5, 3],  # domain_tf+wrap, embedding+base_mlp, weights
     #    "iterations": 10,
@@ -344,18 +386,18 @@ if __name__ == "__main__":
     #}
     tran_params = {
         "n_epochs_per_group": [5],  # basis params, weights
-        "iterations": 100,
-        "lr_basis": 1e-4,
+        "iterations": 30,
+        "lr_basis": 2e-4,
         "lr_weights": 8e-2,
         "lr_wrap": 1e-3,
     }
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
-        "iterations": 30,
+        "iterations": 1,
         "lr_weights": 1e-2,
     }
 
-    batch_size = 128
+    batch_size = 256
     n_timesteps_prop = problem.n_timesteps
     ###
 
@@ -432,11 +474,11 @@ if __name__ == "__main__":
         masking,
         sacrificial_index,
         free_basis,
-        swap_alpha_beta=True,
+        swap_alpha_beta=swap_alpha_beta,
     ).to(device)
 
     g_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0
+        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=1e-3
     ).to(device)
     h0_coeffs = PositiveParameters.random_init(
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
@@ -444,7 +486,7 @@ if __name__ == "__main__":
 
     #B = _make_qs_B(n_basis, B_order, device)
     B_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=10.0).to(device)
+        shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=0.0).to(device)
     B = DenseMatrixFactorization(B_coeffs)
 
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
@@ -577,7 +619,10 @@ if __name__ == "__main__":
         min_points_per_slice=20,
         bin_width=0.4,
         random_seed=0,
-        title="VDP LBS: random conditional bins — empirical vs model vs KDE",
+        title=(
+            "VDP LBS: fixed x1, varied x2 conditional bins — "
+            "empirical vs model vs KDE"
+        ),
     )
     print(f"Saved conditional slice comparison to {cond_slice_out_path}")
 

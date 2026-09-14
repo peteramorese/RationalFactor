@@ -18,14 +18,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 
-from rational_factor.models.mutual_bases import LocalBSplineMutualBasis
+from rational_factor.models.masking_bases import LocalBSplineMutualBasis
 from rational_factor.models.structured_matrices import Banded
 
 
 SEED = 0
-N_BASIS = 20
-K_ALPHA = 3
-K_BETA = 7
+N_BASIS = 50
+K_ALPHA = 8
+K_BETA = 16
 N_GRID = 20_001
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "figures", "local_bspline")
 
@@ -80,6 +80,38 @@ def _plot(basis: LocalBSplineMutualBasis) -> None:
     fig.tight_layout()
     fig.savefig(os.path.join(OUT_DIR, "alpha_beta_basis.png"), dpi=150)
     plt.close(fig)
+
+    # One subplot per index: alpha_i and beta_i together (twin y-axes).
+    n_cols = 5
+    n_rows = (N_BASIS + n_cols - 1) // n_cols
+    fig2, axes2 = plt.subplots(
+        n_rows, n_cols, figsize=(3.2 * n_cols, 2.4 * n_rows), sharex=True
+    )
+    fig2.suptitle(
+        rf"Paired $\alpha_i$, $\beta_i$  ($n={N_BASIS}$, "
+        rf"$k_\alpha={K_ALPHA}$, $k_\beta={K_BETA}$)"
+    )
+    axes2_flat = axes2.ravel()
+    for i in range(N_BASIS):
+        ax = axes2_flat[i]
+        ax_b = ax.twinx()
+        ax.plot(y_np, a[:, i].numpy(), color="C0", lw=1.3, label=rf"$\alpha_{{{i}}}$")
+        ax_b.plot(y_np, b[:, i].numpy(), color="C1", lw=1.3, label=rf"$\beta_{{{i}}}$")
+        for x in basis.breakpoints:
+            ax.axvline(float(x), color="0.88", lw=0.6)
+        ax.set_title(rf"$i={i}$", fontsize=9)
+        ax.grid(alpha=0.25)
+        if i // n_cols == n_rows - 1:
+            ax.set_xlabel("y")
+        lines = ax.get_lines() + ax_b.get_lines()
+        #ax.legend(lines, [ln.get_label() for ln in lines], fontsize=7, loc="best")
+        ax.tick_params(axis="y", labelcolor="C0", labelsize=7)
+        ax_b.tick_params(axis="y", labelcolor="C1", labelsize=7)
+    for j in range(N_BASIS, len(axes2_flat)):
+        axes2_flat[j].set_visible(False)
+    fig2.tight_layout()
+    fig2.savefig(os.path.join(OUT_DIR, "alpha_beta_pairs.png"), dpi=300)
+    plt.close(fig2)
 
 
 def _check_biorthogonality(basis: LocalBSplineMutualBasis, y: torch.Tensor) -> None:
@@ -147,6 +179,8 @@ def main() -> None:
 
     y = torch.linspace(0, 1, N_GRID, dtype=torch.float64)
 
+    _plot(basis)
+
     print("--- default beta_theta = 0 ---")
     _check_biorthogonality(basis, y)
     _check_alpha_b_gram(basis, y)
@@ -157,10 +191,10 @@ def main() -> None:
     with torch.no_grad():
         basis_t.beta_theta.copy_(0.25 * torch.randn_like(basis_t.beta_theta))
     basis_t.rebuild_alpha_b_gram()
+
     _check_biorthogonality(basis_t, y)
     _check_alpha_b_gram(basis_t, y)
 
-    _plot(basis)
     print(f"wrote plots to {OUT_DIR}")
     print("done")
 

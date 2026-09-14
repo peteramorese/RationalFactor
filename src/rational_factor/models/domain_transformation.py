@@ -169,6 +169,8 @@ class ErfSeparableTF(DomainTF):
         sqrt_2 = torch.sqrt(inputs.new_tensor(2.0))
         u = (inputs - loc) / (scale * sqrt_2)
         z = 0.5 * (1.0 + torch.special.erf(u))
+        # Keep outputs strictly inside (0, 1) for downstream unit-box maps (e.g. bounded RQS).
+        z = z.clamp(self.numerical_tolerance, 1.0 - self.numerical_tolerance)
         ladj = (-torch.log(scale) - 0.5 * torch.log(inputs.new_tensor(2.0 * torch.pi)) - u ** 2).sum(dim=-1)
         return z, ladj
 
@@ -259,6 +261,35 @@ class MaskedAffineNFTF(DomainTF):
         return self.T.inverse(inputs, context=context)
 
 
+class _ClampInputsTransform(Transform):
+    """Clamp inputs into a closed interval; log-det contribution is zero.
+
+    Absorbs floating-point drift before bounded spline layers that raise
+    ``InputOutsideDomain`` when inputs leave ``[left, right]``.
+    """
+
+    def __init__(self, left: float = 0.0, right: float = 1.0, eps: float = 0.0):
+        super().__init__()
+        if not left < right:
+            raise ValueError(f"Need left < right, got left={left}, right={right}")
+        if eps < 0:
+            raise ValueError(f"eps must be non-negative, got {eps}")
+        if 2.0 * eps >= right - left:
+            raise ValueError(f"eps={eps} too large for interval [{left}, {right}]")
+        self.left = float(left + eps)
+        self.right = float(right - eps)
+
+    def forward(self, inputs, context=None):
+        outputs = inputs.clamp(self.left, self.right)
+        ladj = inputs.new_zeros(inputs.shape[0])
+        return outputs, ladj
+
+    def inverse(self, inputs, context=None):
+        outputs = inputs.clamp(self.left, self.right)
+        ladj = inputs.new_zeros(inputs.shape[0])
+        return outputs, ladj
+
+
 class MaskedRQSNFTF(DomainTF):
     def __init__(
         self,
@@ -270,12 +301,24 @@ class MaskedRQSNFTF(DomainTF):
         tails: str | None = "linear",
         tail_bound: float = 3.0,
         context_features: int | None = None,
+        domain_eps: float = 0.0,
     ):
         super().__init__(dim, context_features=context_features)
+        self.tails = tails
+        self.tail_bound = float(tail_bound)
+        self.domain_eps = float(domain_eps)
+        # Bounded RQS (tails=None) is only defined on the unit interval.
+        self._bounded_domain = tails is None
 
         transforms = []
         for _ in range(n_layers):
             transforms.append(RandomPermutation(features=dim))
+            if self._bounded_domain:
+                # Clamp before each bounded RQS so cascade drift cannot raise
+                # nflows.InputOutsideDomain.
+                transforms.append(
+                    _ClampInputsTransform(0.0, 1.0, eps=domain_eps)
+                )
             transforms.append(
                 MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
                     features=dim,
@@ -299,6 +342,13 @@ class MaskedRQSNFTF(DomainTF):
             for p in self.parameters():
                 p.requires_grad_(False)
 
+    def _clamp_unit_box(self, inputs: torch.Tensor) -> torch.Tensor:
+        if not self._bounded_domain:
+            return inputs
+        lo = self.domain_eps
+        hi = 1.0 - self.domain_eps
+        return inputs.clamp(lo, hi)
+
     @classmethod
     def copy_from_trainable(cls, other: "MaskedRQSNFTF"):
         new_module = copy.deepcopy(other)
@@ -308,11 +358,15 @@ class MaskedRQSNFTF(DomainTF):
 
     def forward(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
         assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
-        return self.T(inputs, context=context)
+        inputs = self._clamp_unit_box(inputs)
+        outputs, ladj = self.T(inputs, context=context)
+        return self._clamp_unit_box(outputs), ladj
 
     def inverse(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
         assert inputs.shape[1] == self.dim, "inputs must have shape (n_data, dim)"
-        return self.T.inverse(inputs, context=context)
+        inputs = self._clamp_unit_box(inputs)
+        outputs, ladj = self.T.inverse(inputs, context=context)
+        return self._clamp_unit_box(outputs), ladj
 
 
 class MLP(torch.nn.Module):
