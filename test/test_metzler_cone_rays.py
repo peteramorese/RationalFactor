@@ -23,8 +23,8 @@ from rational_factor.tools.metzler_cone_rays import metzler_cone_rays
 
 
 SEED = 0
-M_SIZE = 16
-K = 4
+M_SIZE = 1000
+K = 20
 FEAS_TOL = 1e-6
 # Algorithm uses sampled constraints; for small m cover all columns.
 N_COLS = M_SIZE

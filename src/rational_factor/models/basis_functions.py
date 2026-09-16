@@ -4,12 +4,6 @@ import torch
 from abc import abstractmethod
 from numpy.polynomial.legendre import leggauss
 
-from nflows.distributions.normal import StandardNormal
-from nflows.flows.base import Flow
-from nflows.transforms.base import CompositeTransform
-from nflows.transforms.permutations import ReversePermutation
-from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
-
 from .parameters import Parameters, FixedParameters, TrainableParameters, PositiveParameters
 from .gram import BetaGram, GaussianGram
 from .structured_matrices import Banded, DenseMatrix
@@ -874,55 +868,3 @@ class BSpline1DBasis(Basis, NonnegativeBasis):
             .mul_diag_left(self.coeffs())
             .mul_diag_right(other.coeffs())
         )
-
-
-class NFBasis(Basis, NonnegativeBasis):
-    def __init__(
-        self,
-        dim: int,
-        n_basis: int,
-        n_layers: int = 5,
-        hidden_features: int = 128,
-        embedding_dim: int = 16,
-    ):
-        super().__init__(dim=dim, n_basis=n_basis, params=[])
-
-        self.embedding_dim = embedding_dim
-        self.index_embedding = torch.nn.Embedding(num_embeddings=n_basis, embedding_dim=embedding_dim)
-
-        transforms = []
-        for _ in range(n_layers):
-            transforms.append(ReversePermutation(features=dim))
-            transforms.append(MaskedAffineAutoregressiveTransform(
-                features=dim,
-                hiddenfeatures=hidden_features,
-                context_features=embedding_dim,
-                num_blocks=2,
-                use_residual_blocks=True,
-                random_mask=False,
-                activation=torch.tanh,
-                dropout_probability=0.0,
-                use_batch_norm=False,
-            ))
-
-        transform = CompositeTransform(transforms)
-        base_dist = StandardNormal(shape=[dim])
-        self.flow = Flow(transform, base_dist)
-
-        torch.nn.init.normal_(self.index_embedding.weight, mean=0.0, std=0.05)
-
-        self.register_buffer("indices", torch.arange(n_basis))
-    
-    def forward(self, y: torch.Tensor):
-        index_embeddings = self.index_embedding(self.indices)
-        return torch.exp(self.flow.log_prob(y, context=index_embeddings))
-
-    def normalized(self):
-        return True
-
-    def dtype_device(self):
-        return self.index_embedding.weight.dtype, self.index_embedding.weight.device
-
-    def Omega1(self):
-        dtype, device = self.dtype_device()
-        return torch.ones(self.n_basis_functions(), dtype=dtype, device=device)

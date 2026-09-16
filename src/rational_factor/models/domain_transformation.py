@@ -5,6 +5,8 @@ from nflows.transforms.base import Transform, CompositeTransform
 from nflows.transforms.permutations import RandomPermutation
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform, MaskedPiecewiseRationalQuadraticAutoregressiveTransform
 
+from rational_factor.models.mlp import MLP  # noqa: F401 — re-export
+
 
 class DomainTF(Transform):
     """Domain transform with nflows ``Transform`` API (``context`` optional).
@@ -367,37 +369,6 @@ class MaskedRQSNFTF(DomainTF):
         inputs = self._clamp_unit_box(inputs)
         outputs, ladj = self.T.inverse(inputs, context=context)
         return self._clamp_unit_box(outputs), ladj
-
-
-class MLP(torch.nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        hidden_features: int = 128,
-        num_hidden_layers: int = 2,
-        activation=torch.nn.Tanh,
-        zero_init_last: bool = True,
-    ):
-        super().__init__()
-
-        layers = []
-        last = in_features
-        for _ in range(num_hidden_layers):
-            layers.append(torch.nn.Linear(last, hidden_features))
-            layers.append(activation())
-            last = hidden_features
-
-        layers.append(torch.nn.Linear(last, out_features))
-        self.net = torch.nn.Sequential(*layers)
-
-        if zero_init_last:
-            final = self.net[-1]
-            torch.nn.init.zeros_(final.weight)
-            torch.nn.init.zeros_(final.bias)
-
-    def forward(self, x):
-        return self.net(x)
 
 
 class AdditiveCouplingTransform(Transform):
