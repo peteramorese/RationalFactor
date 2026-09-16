@@ -8,11 +8,9 @@ import torch
 
 from normalizing_flow.base_distributions import (
     SeparableBeta,
-    bspline_basis_mass,
-    eval_open_bsplines,
-    open_uniform_knots,
     sample_normalized_bsplines,
 )
+from rational_factor.models.basis_functions import BSpline1DBasis
 from rational_factor.models.density_model import ConditionalDensityModel
 
 
@@ -276,8 +274,8 @@ class ConditionalBSpline1D(ConditionalDensityModel):
         self.eps = eps
         self.mlp = mlp
 
-        knots = open_uniform_knots(n_basis, degree)
-        mass = bspline_basis_mass(knots, degree)
+        knots = BSpline1DBasis.open_uniform_knots(n_basis, degree)
+        mass = BSpline1DBasis.basis_mass(knots, degree)
         self.register_buffer("knots", knots)
         self.register_buffer("mass", mass)
         self.register_buffer("log_mass", mass.clamp_min(torch.finfo(mass.dtype).tiny).log())
@@ -302,7 +300,7 @@ class ConditionalBSpline1D(ConditionalDensityModel):
         )
 
     def eval_basis(self, t: torch.Tensor) -> torch.Tensor:
-        return eval_open_bsplines(
+        return BSpline1DBasis.eval_basis(
             t.to(dtype=self.knots.dtype, device=self.knots.device),
             self.knots,
             self.degree,

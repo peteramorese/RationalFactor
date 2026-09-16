@@ -2,6 +2,7 @@ import math
 
 import torch
 from abc import abstractmethod
+from numpy.polynomial.legendre import leggauss
 
 from nflows.distributions.normal import StandardNormal
 from nflows.flows.base import Flow
@@ -11,7 +12,7 @@ from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 
 from .parameters import Parameters, FixedParameters, TrainableParameters, PositiveParameters
 from .gram import BetaGram, GaussianGram
-from .structured_matrices import DenseMatrix
+from .structured_matrices import Banded, DenseMatrix
 
 
 class Basis:
@@ -656,6 +657,222 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
             mean_params=mu[:, dims, :],
             std_params=std[:, dims, :],
             coeffs=self.coeffs(),
+        )
+
+
+class BSpline1DBasis(Basis, NonnegativeBasis):
+    """Open-uniform B-splines on ``[0, 1]`` with ``n_cells`` equal spans.
+
+    There are ``n_basis = n_cells + degree`` cardinal B-splines of degree
+    ``degree``. Each interior basis is supported on ``degree + 1`` cells, so the
+    Gram ``G_ij = ∫ N_i N_j`` is banded with half-bandwidth ``degree``.
+    """
+
+    def __init__(
+        self,
+        n_cells: int,
+        degree: int = 3,
+        batch_size: int = 1,
+        coeffs: Parameters = None,
+        *,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | None = None,
+    ):
+        if degree < 0:
+            raise ValueError("degree must be nonnegative")
+        if n_cells < 1:
+            raise ValueError("n_cells must be at least 1")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+
+        n_basis = n_cells + degree
+        self._degree = int(degree)
+        self._n_cells = int(n_cells)
+        self._n_basis = n_basis  # needed by _cell_gram before Basis.__init__
+        self._knots = self.open_uniform_knots(n_basis, degree, dtype=dtype, device=device)
+        self._breaks = torch.linspace(0.0, 1.0, n_cells + 1, dtype=dtype, device=device)
+        self._mass = self.basis_mass(self._knots, degree)
+        self._gram = self._pack_banded(self._cell_gram())
+
+        super().__init__(dim=1, batch_size=batch_size, n_basis=n_basis, params=(), coeffs=coeffs)
+
+    # ------------------------------------------------------------------
+    # Knot / evaluation primitives (shared with BSpline1D densities)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def open_uniform_knots(
+        n_basis: int,
+        degree: int,
+        *,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """Open-uniform knot vector on ``[0, 1]`` with ``n_basis`` degree-``degree`` B-splines."""
+        if degree < 0:
+            raise ValueError("degree must be nonnegative")
+        if n_basis < degree + 1:
+            raise ValueError("n_basis must be at least degree + 1")
+        n_spans = n_basis - degree
+        breaks = torch.linspace(0.0, 1.0, n_spans + 1, dtype=dtype, device=device)
+        return torch.cat(
+            [
+                torch.zeros(degree + 1, dtype=dtype, device=device),
+                breaks[1:-1],
+                torch.ones(degree + 1, dtype=dtype, device=device),
+            ]
+        )
+
+    @staticmethod
+    def basis_mass(knots: torch.Tensor, degree: int) -> torch.Tensor:
+        """Exact integrals ``∫ N_{i,p}`` via ``(t_{i+p+1} - t_i) / (p + 1)``."""
+        n_basis = knots.numel() - degree - 1
+        return (knots[degree + 1 : degree + 1 + n_basis] - knots[:n_basis]) / (degree + 1.0)
+
+    @staticmethod
+    def eval_basis(
+        x: torch.Tensor,
+        knots: torch.Tensor,
+        degree: int,
+        n_basis: int,
+    ) -> torch.Tensor:
+        """Cox–de Boor evaluation of every open-uniform B-spline at ``x``.
+
+        ``x`` has shape ``(n,)``. Returns ``(n, n_basis)``, nonnegative and
+        summing to 1 (partition of unity). Built without in-place writes so
+        gradients w.r.t. ``x`` are well-defined.
+        """
+        x = x.reshape(-1).clamp(0.0, 1.0)
+        t = knots
+        p = degree
+        n = n_basis - 1
+
+        span = torch.searchsorted(t, x, right=True) - 1
+        span = torch.where(x >= t[n + 1], torch.full_like(span, n), span)
+        span = span.clamp(p, n)
+
+        N_curr = torch.ones(x.shape[0], 1, dtype=x.dtype, device=x.device)
+        eps = torch.finfo(x.dtype).eps
+        for j in range(1, p + 1):
+            ks = torch.arange(1, j + 1, device=x.device)
+            left = x.unsqueeze(1) - t[span.unsqueeze(1) + 1 - ks]
+            right = t[span.unsqueeze(1) + ks] - x.unsqueeze(1)
+            cols: list[torch.Tensor] = []
+            saved = torch.zeros_like(x)
+            for r in range(j):
+                den = right[:, r] + left[:, j - 1 - r]
+                tmp = torch.where(den.abs() > eps, N_curr[:, r] / den, torch.zeros_like(den))
+                cols.append(saved + right[:, r] * tmp)
+                saved = left[:, j - 1 - r] * tmp
+            cols.append(saved)
+            N_curr = torch.stack(cols, dim=1)
+
+        idx = span.unsqueeze(1) - p + torch.arange(p + 1, device=x.device)
+        return x.new_zeros(x.shape[0], n_basis).scatter(1, idx, N_curr)
+
+    # ------------------------------------------------------------------
+    # Properties / evaluation
+    # ------------------------------------------------------------------
+
+    @property
+    def degree(self) -> int:
+        return self._degree
+
+    @property
+    def bandwidth(self) -> int:
+        """Half-bandwidth of the Gram matrix (equal to ``degree``)."""
+        return self._degree
+
+    @property
+    def n_cells(self) -> int:
+        return self._n_cells
+
+    @property
+    def knots(self) -> torch.Tensor:
+        return self._knots
+
+    @property
+    def breakpoints(self) -> torch.Tensor:
+        return self._breaks
+
+    @property
+    def mass(self) -> torch.Tensor:
+        return self._mass
+
+    def dtype_device(self):
+        return self._knots.dtype, self._knots.device
+
+    def eval(self, y: torch.Tensor) -> torch.Tensor:
+        """Evaluate all B-splines. ``y`` is ``(n,)`` or ``(n, 1)``; returns ``(n, n_basis)``."""
+        y = torch.as_tensor(y, dtype=self._knots.dtype, device=self._knots.device)
+        return self.eval_basis(y.reshape(-1), self._knots, self._degree, self._n_basis)
+
+    def __call__(self, y: torch.Tensor) -> torch.Tensor:
+        vals = self.eval(y)  # (n, n_basis)
+        n = vals.shape[0]
+        b = self.batch_size()
+        assert b == n or b == 1, (
+            f"y batch {n} must match parameter batch {b} (or parameter batch must be 1)"
+        )
+        return vals * self.coeffs()
+
+    def _cell_gram(self, lo: float | torch.Tensor = 0.0, hi: float | torch.Tensor = 1.0) -> torch.Tensor:
+        """Dense ``∫_{[lo,hi]} N_i N_j`` via cellwise Gauss–Legendre (exact for degree ``2p``)."""
+        p = self._degree
+        m = self._n_basis
+        dtype, device = self.dtype_device()
+        qx, qw = leggauss(p + 1)
+        qx = torch.as_tensor(qx, dtype=dtype, device=device)
+        qw = torch.as_tensor(qw, dtype=dtype, device=device)
+
+        lo_t = torch.as_tensor(lo, dtype=dtype, device=device).reshape(())
+        hi_t = torch.as_tensor(hi, dtype=dtype, device=device).reshape(())
+        left = torch.maximum(self._breaks[:-1], lo_t)
+        right = torch.minimum(self._breaks[1:], hi_t)
+        half = (0.5 * (right - left)).clamp(min=0.0)
+        mid = 0.5 * (right + left)
+        x = mid[:, None] + half[:, None] * qx[None, :]
+        N = self.eval_basis(x.reshape(-1), self._knots, p, m).reshape(self._n_cells, -1, m)
+        w = (half[:, None] * qw[None, :]).unsqueeze(-1)
+        G = torch.einsum("cqi,cqj->ij", N * w, N)
+        return 0.5 * (G + G.T)
+
+    def _pack_banded(self, G: torch.Tensor) -> Banded:
+        p, m = self._degree, self._n_basis
+        offsets = torch.arange(-p, p + 1, device=G.device)
+        data = G.new_zeros(2 * p + 1, m)
+        for r, off in enumerate(range(-p, p + 1)):
+            diag = G.diagonal(offset=-off)
+            if off >= 0:
+                data[r, : m - off] = diag
+            else:
+                data[r, -off:] = diag
+        return Banded(offsets, data)
+
+    def Omega2(
+        self,
+        other: "BSpline1DBasis",
+        lows: torch.Tensor = None,
+        highs: torch.Tensor = None,
+    ) -> Banded:
+        assert isinstance(other, BSpline1DBasis), "other must be BSpline1DBasis"
+        assert self._n_cells == other._n_cells and self._degree == other._degree, (
+            "BSpline1DBasis Omega2 requires matching n_cells and degree"
+        )
+        assert self.batch_size() == other.batch_size(), "batch sizes must match"
+
+        if lows is None and highs is None:
+            geom = self._gram
+        else:
+            lo = 0.0 if lows is None else lows
+            hi = 1.0 if highs is None else highs
+            geom = self._pack_banded(self._cell_gram(lo, hi))
+
+        data = geom.data.unsqueeze(0).expand(self._batch_size, -1, -1)
+        return (
+            Banded(geom.offsets, data)
+            .mul_diag_left(self.coeffs())
+            .mul_diag_right(other.coeffs())
         )
 
 

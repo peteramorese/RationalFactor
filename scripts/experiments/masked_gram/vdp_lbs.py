@@ -331,6 +331,166 @@ def _plot_separable_phi_psi_grid(
     plt.close(fig)
 
 
+def _plot_2d_values_grid(
+    vals: torch.Tensor,
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    out_path: Path,
+    *,
+    title: str,
+) -> None:
+    """Plot (n_pts, n_basis) values on the unit-square mesh as a subplot grid."""
+    while vals.ndim > 2 and vals.shape[0] == 1:
+        vals = vals.squeeze(0)
+    if vals.ndim != 2:
+        raise ValueError(
+            f"Expected values shape (n_grid*n_grid, n_basis), got {tuple(vals.shape)}"
+        )
+
+    n_grid = int(X.shape[0])
+    if X.shape != (n_grid, n_grid) or Y.shape != (n_grid, n_grid):
+        raise ValueError("X and Y must be square meshes of equal shape")
+    if vals.shape[0] != n_grid * n_grid:
+        raise ValueError(
+            f"values leading dim {vals.shape[0]} != n_grid*n_grid={n_grid * n_grid}"
+        )
+
+    vals_np = vals.detach().cpu().numpy().reshape(n_grid, n_grid, -1)
+    n_basis = vals_np.shape[-1]
+    x_np = X.detach().cpu().numpy()
+    y_np = Y.detach().cpu().numpy()
+
+    n_cols = max(1, ceil(sqrt(n_basis)))
+    n_rows = max(1, ceil(n_basis / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(1.6 * n_cols, 1.45 * n_rows),
+        squeeze=False,
+    )
+    if title:
+        fig.suptitle(title, y=1.01)
+
+    cmap = "viridis"
+    for i in range(n_basis):
+        r, c = divmod(i, n_cols)
+        ax = axes[r, c]
+        ax.contourf(x_np, y_np, vals_np[:, :, i], levels=40, cmap=cmap)
+        ax.set_title(str(i), fontsize=7, pad=1)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_aspect("equal")
+        ax.tick_params(labelsize=5)
+        if r < n_rows - 1:
+            ax.set_xticklabels([])
+        if c > 0:
+            ax.set_yticklabels([])
+
+    for j in range(n_basis, n_rows * n_cols):
+        r, c = divmod(j, n_cols)
+        axes[r, c].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _unit_square_mesh(
+    pair_basis,
+    *,
+    n_grid: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(X, Y, y_flat)`` on the unit square in the basis dtype/device."""
+    dtype, device = pair_basis.dtype_device()
+    lin = torch.linspace(0.0, 1.0, n_grid, device=device, dtype=dtype)
+    X, Y = torch.meshgrid(lin, lin, indexing="xy")
+    y = torch.stack([X.reshape(-1), Y.reshape(-1)], dim=1)
+    return X, Y, y
+
+
+def _plot_2d_pair_member_grid(
+    pair_basis,
+    out_path: Path,
+    *,
+    index: int,
+    title: str,
+    n_grid: int = 64,
+) -> None:
+    """Plot every 2D phi (index=0) or psi (index=1) basis on a square subplot grid.
+
+    Domain is the unit square (post-wrap coordinates). Each subplot is a filled
+    contour of one basis function; unused cells are hidden.
+    """
+    if index not in (0, 1):
+        raise ValueError(f"index must be 0 (phi) or 1 (psi), got {index}")
+
+    dim = pair_basis.dim()
+    if dim != 2:
+        raise ValueError(
+            f"_plot_2d_pair_member_grid expects a 2D pair basis, got dim={dim}"
+        )
+
+    X, Y, y = _unit_square_mesh(pair_basis, n_grid=n_grid)
+    with torch.no_grad():
+        if isinstance(pair_basis, torch.nn.Module):
+            torch.nn.Module.eval(pair_basis)
+        vals = pair_basis.eval(y, index).detach().cpu()
+
+    _plot_2d_values_grid(vals, X, Y, out_path, title=title)
+
+
+def _plot_positive_beta_term_grids(
+    pos_basis: PositiveMaskedGramMutualBasis,
+    product_out: Path,
+    b_term_out: Path,
+    *,
+    n_grid: int = 64,
+    product_title: str = "",
+    b_term_title: str = "",
+) -> None:
+    """Plot the two PositiveMaskedGramMutualBasis beta terms on separate figures.
+
+    Beta decomposes as
+
+        β = (β_mask ∘ β_free) + u_b · b
+
+    with ``b = relu(-β_mask)`` depending only on the sacrificial coordinate.
+    Both terms are rendered on the unit square for comparison with full psi.
+    """
+    if pos_basis.dim() != 2:
+        raise ValueError(
+            f"_plot_positive_beta_term_grids expects a 2D basis, got dim={pos_basis.dim()}"
+        )
+
+    X, Y, y = _unit_square_mesh(pos_basis, n_grid=n_grid)
+    with torch.no_grad():
+        if isinstance(pos_basis, torch.nn.Module):
+            torch.nn.Module.eval(pos_basis)
+        x_l, x_rest = pos_basis._split_coords(y)
+        u_b = pos_basis._free_supremum(1)
+        product = (
+            pos_basis.masking_basis.eval(x_l, 1) * pos_basis._free_eval(x_rest, 1)
+        ).detach().cpu()
+        b_term = (pos_basis.masking_basis.eval_b(x_l) * u_b).detach().cpu()
+
+    _plot_2d_values_grid(
+        product,
+        X,
+        Y,
+        product_out,
+        title=product_title
+        or "VDP LBS: beta term (i) — β_mask ∘ β_free by index",
+    )
+    _plot_2d_values_grid(
+        b_term,
+        X,
+        Y,
+        b_term_out,
+        title=b_term_title
+        or "VDP LBS: beta term (ii) — u_b · b by index",
+    )
+
+
 def _make_qs_B(n_basis: int, order: int, device: torch.device) -> QuasiseparableFactorization:
     """Order-``order`` quasiseparable ``B = L D U`` with nonnegative factors.
 
@@ -359,24 +519,26 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 20
+    n_basis = 50
     sacrificial_index = 0
-    embedding_dim = 4
+    embedding_dim = 8
     k_alpha = 5
     k_beta = 5
     trainable_beta = False
     B_order = 10
-    flow_hidden = 16
-    flow_layers = 2
+    tf_flow_hidden = 16
+    tf_flow_layers = 2
+    index_flow_hidden = 16
+    index_flow_layers = 3
     swap_alpha_beta = False
-    #tran_params = {
-    #    "n_epochs_per_group": [3, 5, 3],  # domain_tf+wrap, embedding+base_mlp, weights
-    #    "iterations": 10,
-    #    "lr_domain_tf": 1e-3,
-    #    "lr_base": 1e-2,
-    #    "lr_weights": 5e-2,
-    #    "lr_wrap": 1e-3,
-    #}
+    tran_params = {
+        "n_epochs_per_group": [10, 3, 3],  # domain_tf+wrap, embedding+base_mlp, weights
+        "iterations": 10,
+        "lr_domain_tf": 1e-3,
+        "lr_base": 5e-3,
+        "lr_weights": 5e-2,
+        "lr_wrap": 1e-3,
+    }
     #tran_params = {
     #    "n_epochs_per_group": [5, 5],  # basis params, weights
     #    "iterations": 100,
@@ -384,13 +546,13 @@ if __name__ == "__main__":
     #    "lr_weights": 5e-2,
     #    "lr_wrap": 1e-3,
     #}
-    tran_params = {
-        "n_epochs_per_group": [5],  # basis params, weights
-        "iterations": 30,
-        "lr_basis": 2e-4,
-        "lr_weights": 8e-2,
-        "lr_wrap": 1e-3,
-    }
+    #tran_params = {
+    #    "n_epochs_per_group": [5],  # basis params, weights
+    #    "iterations": 10,
+    #    "lr_basis": 2e-4,
+    #    "lr_weights": 8e-2,
+    #    "lr_wrap": 1e-3,
+    #}
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
         "iterations": 1,
@@ -433,39 +595,40 @@ if __name__ == "__main__":
     domain_tf = MaskedRQSNFTF(
         dim=rest_dim,
         context_features=embedding_dim,
-        n_layers=flow_layers,
-        hidden_features=flow_hidden,
+        n_layers=tf_flow_layers,
+        hidden_features=tf_flow_hidden,
         tails=None,  # free coords are already on the unit box after Erf wrap
         num_bins=4
     ).to(device)
 
-    b_spline_params = 15
-    base_mlp = MLP(
-        in_features=embedding_dim,
-        out_features=b_spline_params,
-        hidden_features=flow_hidden,
-        zero_init_last=False,
-    ).to(device)
-    base = ConditionalBSpline1D(
-        dim=rest_dim,
-        conditioner_dim=embedding_dim,
-        n_basis=b_spline_params,
-        mlp=base_mlp,
-        degree=3,
-    ).to(device)
-    #bernstein_deg = 50
+    #b_spline_params = 15
     #base_mlp = MLP(
     #    in_features=embedding_dim,
-    #    out_features=bernstein_deg + 1,
+    #    out_features=b_spline_params,
     #    hidden_features=flow_hidden,
     #    zero_init_last=False,
     #).to(device)
-    #base = ConditionalBernstein1D(
+    #base = ConditionalBSpline1D(
     #    dim=rest_dim,
     #    conditioner_dim=embedding_dim,
-    #    degree=bernstein_deg,
+    #    n_basis=b_spline_params,
     #    mlp=base_mlp,
+    #    degree=3,
     #).to(device)
+    bernstein_deg = 100
+    base_mlp = MLP(
+        in_features=embedding_dim,
+        out_features=bernstein_deg + 1,
+        hidden_features=index_flow_hidden,
+        num_hidden_layers=index_flow_layers,
+        zero_init_last=False,
+    ).to(device)
+    base = ConditionalBernstein1D(
+        dim=rest_dim,
+        conditioner_dim=embedding_dim,
+        degree=bernstein_deg,
+        mlp=base_mlp,
+    ).to(device)
 
     free_basis = NormalizedProductPairBasis(base, domain_tf, embedding).to(device)
 
@@ -499,18 +662,18 @@ if __name__ == "__main__":
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     optimizers = {
-        #"domain_tf": torch.optim.Adam(
-        #    [
-        #        {"params": domain_tf.parameters(), "lr": tran_params["lr_domain_tf"]},
-        #        {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
-        #    ]
-        #),
-        #"base": torch.optim.Adam(
-        #    [
-        #        {"params": embedding.parameters(), "lr": tran_params["lr_base"]},
-        #        {"params": base_mlp.parameters(), "lr": tran_params["lr_base"]},
-        #    ]
-        #),
+        "base": torch.optim.Adam(
+            [
+                {"params": embedding.parameters(), "lr": tran_params["lr_base"]},
+                {"params": base_mlp.parameters(), "lr": tran_params["lr_base"]},
+            ]
+        ),
+        "domain_tf": torch.optim.Adam(
+            [
+                {"params": domain_tf.parameters(), "lr": tran_params["lr_domain_tf"]},
+                {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
+            ]
+        ),
 
         #"basis": torch.optim.Adam(
         #    [
@@ -518,17 +681,17 @@ if __name__ == "__main__":
         #        #{"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
         #    ]
         #),
-        #"weights": torch.optim.Adam(
-        #    param_group_iter((g_coeffs, B_coeffs)),
-        #    lr=tran_params["lr_weights"],
-        #),
-
-        "all": torch.optim.Adam(
-            [
-                {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
-                {"params": param_group_iter((g_coeffs, B_coeffs)), "lr": tran_params["lr_weights"]},
-            ]
+        "weights": torch.optim.Adam(
+            param_group_iter((g_coeffs, B_coeffs)),
+            lr=tran_params["lr_weights"],
         ),
+
+        #"all": torch.optim.Adam(
+        #    [
+        #        {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
+        #        {"params": param_group_iter((g_coeffs, B_coeffs)), "lr": tran_params["lr_weights"]},
+        #    ]
+        #),
     }
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(
@@ -602,6 +765,41 @@ if __name__ == "__main__":
         title="VDP LBS: free basis (rest dim) — phi / psi by index",
     )
     print(f"Saved free basis grid to {free_basis_out}")
+
+    mutual_phi_out = output_dir / "mutual_basis_phi_2d.png"
+    _plot_2d_pair_member_grid(
+        phi_psi_mutual,
+        mutual_phi_out,
+        index=0,
+        title="VDP LBS: 2D mutual phi basis by index",
+    )
+    print(f"Saved 2D mutual phi grid to {mutual_phi_out}")
+
+    mutual_psi_out = output_dir / "mutual_basis_psi_2d.png"
+    _plot_2d_pair_member_grid(
+        phi_psi_mutual,
+        mutual_psi_out,
+        index=1,
+        title="VDP LBS: 2D mutual psi basis by index",
+    )
+    print(f"Saved 2D mutual psi grid to {mutual_psi_out}")
+
+    psi_product_out = output_dir / "mutual_basis_psi_product_2d.png"
+    psi_b_term_out = output_dir / "mutual_basis_psi_b_term_2d.png"
+    _plot_positive_beta_term_grids(
+        phi_psi_mutual,
+        psi_product_out,
+        psi_b_term_out,
+        product_title=(
+            "VDP LBS: psi term (i) — β_mask ∘ β_free by index"
+        ),
+        b_term_title=(
+            "VDP LBS: psi term (ii) — u_b · b by index "
+            "(depends only on sacrificial coord)"
+        ),
+    )
+    print(f"Saved psi product-term grid to {psi_product_out}")
+    print(f"Saved psi b-term grid to {psi_b_term_out}")
 
     box_lows = tuple(problem.plot_bounds_low.tolist())
     box_highs = tuple(problem.plot_bounds_high.tolist())

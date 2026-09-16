@@ -803,10 +803,6 @@ class FixedDegreeBSplineMutualBasis(MutualPairBasis, torch.nn.Module):
 
         return (torch.as_tensor(lower, dtype=dtype, device=device), torch.as_tensor(upper, dtype=dtype, device=device))
 
-    # ===================================================================
-    # Bounds
-    # ===================================================================
-
     @staticmethod
     def _scale_interval(lower: torch.Tensor, upper: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         a = scale * lower
