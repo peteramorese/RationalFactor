@@ -344,6 +344,69 @@ def _plot_2d_values_grid(
     plt.close(fig)
 
 
+def _plot_metzler_cone_mlp_entries(
+    mc_mlp: MetzlerConeMLP,
+    out_path: Path,
+    *,
+    n_grid: int = 256,
+    title: str = "",
+) -> None:
+    """Plot every entry of ``M(z) = mc_mlp(z)`` vs 1D input ``z ∈ [0, 1]``.
+
+    Produces an ``m × m`` subplot grid: row ``i``, column ``j`` shows
+    ``M(z)_{ij}`` as a function of the free (rest) coordinate.
+    """
+    if mc_mlp.in_features() != 1:
+        raise ValueError(
+            f"_plot_metzler_cone_mlp_entries expects 1D input, got in_features={mc_mlp.in_features()}"
+        )
+
+    m = mc_mlp.out_features()
+    dtype, device = mc_mlp.K.dtype, mc_mlp.K.device
+    z = torch.linspace(0.0, 1.0, n_grid, device=device, dtype=dtype).unsqueeze(-1)
+
+    with torch.no_grad():
+        mc_mlp.eval()
+        M = mc_mlp(z).to_dense()  # (n_grid, m, m)
+    if M.shape != (n_grid, m, m):
+        raise ValueError(f"expected mc_mlp output shape {(n_grid, m, m)}, got {tuple(M.shape)}")
+
+    M_np = M.detach().cpu().numpy()
+    z_np = z.squeeze(-1).detach().cpu().numpy()
+
+    fig, axes = plt.subplots(
+        m,
+        m,
+        figsize=(1.15 * m, 1.05 * m),
+        sharex=True,
+        squeeze=False,
+    )
+    if title:
+        fig.suptitle(title, y=1.01)
+
+    for i in range(m):
+        for j in range(m):
+            ax = axes[i, j]
+            ax.plot(z_np, M_np[:, i, j], color="C0", lw=0.9)
+            ax.axhline(0.0, color="0.6", lw=0.4, zorder=0)
+            ax.set_xlim(0.0, 1.0)
+            ax.tick_params(labelsize=4, length=2)
+            if i == 0:
+                ax.set_title(f"j={j}", fontsize=6, pad=1)
+            if j == 0:
+                ax.set_ylabel(f"i={i}", fontsize=6)
+            if i < m - 1:
+                ax.set_xticklabels([])
+            else:
+                ax.set_xlabel("z", fontsize=5)
+            if j > 0:
+                ax.set_yticklabels([])
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _unit_square_mesh(
     pair_basis,
     *,
@@ -393,20 +456,20 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 15
+    n_basis = 5
     sacrificial_index = 0
     embedding_dim = 8
     bspline_degree = 3
-    n_rays = 5
+    n_rays = 15
     tf_flow_hidden = 16
     tf_flow_layers = 2
     mc_mlp_hidden = 64
     mc_mlp_layers = 2
     tran_params = {
-        "n_epochs_per_group": [10, 3, 3, 3],  # wrap, product, mc_mlp, weights
-        "iterations": 10,
-        "lr_product": 5e-3,
-        "lr_mc_mlp": 5e-3,
+        "n_epochs_per_group": [10, 3],  # wrap + product +mc_mlp, weights
+        "iterations": 5,
+        "lr_product": 1e-3,
+        "lr_mc_mlp": 1e-3,
         "lr_weights": 5e-2,
         "lr_wrap": 1e-3,
     }
@@ -471,6 +534,8 @@ if __name__ == "__main__":
     K = ray_finder.find(n_rays, ray_type="dense")
     K = DenseMatrix(K.to_dense().to(device=device, dtype=gram_dense.dtype))
     print(f"Ray matrix K shape: {tuple(K.shape)}")
+    print(f"Ray matrix K: {K.to_dense()}")
+    input("Press Enter to continue...")
 
     mc_mlp = MetzlerConeMLP(
         in_features=rest_dim,
@@ -478,6 +543,9 @@ if __name__ == "__main__":
         hidden_features=mc_mlp_hidden,
         num_hidden_layers=mc_mlp_layers,
         zero_init_last=True,
+        coeff_scale=1.0,
+        max_coeff=5.0,
+        bias_init=0.0,
     ).to(device)
 
     # Product basis on free coords (rest_dim=1): unit-box conditional RQ-NSF + index embeddings.
@@ -525,17 +593,13 @@ if __name__ == "__main__":
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
     optimizers = {
-        "wrap": torch.optim.Adam(
-            [{"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]}]
-        ),
-        "product": torch.optim.Adam(
+        "basis": torch.optim.Adam(
             [
+                {"params": mc_mlp.parameters(), "lr": tran_params["lr_mc_mlp"]},
+                {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
                 {"params": embedding.parameters(), "lr": tran_params["lr_product"]},
                 {"params": product_model.parameters(), "lr": tran_params["lr_product"]},
             ]
-        ),
-        "mc_mlp": torch.optim.Adam(
-            [{"params": mc_mlp.parameters(), "lr": tran_params["lr_mc_mlp"]}]
         ),
         "weights": torch.optim.Adam(
             param_group_iter((g_coeffs, B_coeffs)),
@@ -597,6 +661,14 @@ if __name__ == "__main__":
 
     output_dir = Path("figures/metzler/vdp")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    mc_mlp_out = output_dir / "metzler_cone_mlp_entries.png"
+    _plot_metzler_cone_mlp_entries(
+        mc_mlp,
+        mc_mlp_out,
+        title="VDP Metzler: trained mc_mlp(z) entries M(z)_{ij} vs free coord z",
+    )
+    print(f"Saved MetzlerConeMLP entry grid to {mc_mlp_out}")
 
     mutual_phi_out = output_dir / "mutual_basis_phi_2d.png"
     _plot_2d_pair_member_grid(

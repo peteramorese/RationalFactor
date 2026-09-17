@@ -56,6 +56,11 @@ class MetzlerConeMLP(MLP):
         Batched cone generators of shape ``(k, m, m)``, typically from
         ``MetzlerConeRayFinder.find`` (``Diagonal``, ``Banded``, or
         ``DenseMatrix``). Rays live on the leading batch axis.
+    coeff_scale :
+        Multiplies the softplus ray weights. Default ``1`` so unit-Frobenius
+        rays produce ``M`` entries on the same order as the rays themselves.
+    max_coeff :
+        Optional per-ray softplus cap after scaling (safety for ``expm``).
 
     The base MLP produces ``k`` logits; ``forward`` returns
 
@@ -74,6 +79,9 @@ class MetzlerConeMLP(MLP):
         num_hidden_layers: int = 2,
         activation=torch.nn.Tanh,
         zero_init_last: bool = True,
+        coeff_scale: float = 1.0,
+        max_coeff: float | None = 0.25,
+        bias_init: float = -1.0,
     ):
         if isinstance(K, torch.Tensor):
             K = DenseMatrix(K)
@@ -83,19 +91,33 @@ class MetzlerConeMLP(MLP):
             raise ValueError(
                 f"K must have shape (k, m, m), got {tuple(K.shape)}"
             )
+        if coeff_scale <= 0:
+            raise ValueError("coeff_scale must be positive")
+        if max_coeff is not None and max_coeff <= 0:
+            raise ValueError("max_coeff must be positive when set")
 
         k, m, _ = K.shape
+        # Skip parent zero-init; last layer is set below.
         super().__init__(
             in_features=in_features,
             out_features=k,
             hidden_features=hidden_features,
             num_hidden_layers=num_hidden_layers,
             activation=activation,
-            zero_init_last=zero_init_last,
+            zero_init_last=False,
         )
         self._m = m
         self._n_rays = k
+        self.coeff_scale = float(coeff_scale)
+        self.max_coeff = None if max_coeff is None else float(max_coeff)
         self._register_K(K)
+
+        if zero_init_last:
+            final = self.net[-1]
+            torch.nn.init.zeros_(final.weight)
+            # softplus(-1) ≈ 0.31 with σ(-1)≈0.27 — O(1) coeffs with usable
+            # gradients, then capped by max_coeff so expm(M) stays stable.
+            torch.nn.init.constant_(final.bias, float(bias_init))
 
     def _register_K(self, K: Matrix) -> None:
         if isinstance(K, Diagonal):
@@ -128,6 +150,7 @@ class MetzlerConeMLP(MLP):
         return self._n_rays
 
     def forward(self, x: torch.Tensor) -> Matrix:
-        c = torch.nn.functional.softplus(super().forward(x))
+        c = self.coeff_scale * torch.nn.functional.softplus(super().forward(x))
+        if self.max_coeff is not None:
+            c = c.clamp(max=self.max_coeff)
         return self.K.batch_linear_combine(c)
-    

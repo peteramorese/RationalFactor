@@ -736,7 +736,8 @@ class BSpline1DBasis(Basis, NonnegativeBasis):
         summing to 1 (partition of unity). Built without in-place writes so
         gradients w.r.t. ``x`` are well-defined.
         """
-        x = x.reshape(-1).clamp(0.0, 1.0)
+        x = x.reshape(-1)
+        x = torch.nan_to_num(x, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         t = knots
         p = degree
         n = n_basis - 1
@@ -762,6 +763,7 @@ class BSpline1DBasis(Basis, NonnegativeBasis):
             N_curr = torch.stack(cols, dim=1)
 
         idx = span.unsqueeze(1) - p + torch.arange(p + 1, device=x.device)
+        idx = idx.clamp(0, n_basis - 1)
         return x.new_zeros(x.shape[0], n_basis).scatter(1, idx, N_curr)
 
     # ------------------------------------------------------------------

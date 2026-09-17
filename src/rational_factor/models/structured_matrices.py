@@ -41,6 +41,42 @@ class Matrix(ABC):
         """``Mᵀ @ x``."""
         return self.T.matvec(x)
 
+    def inverse(self) -> Matrix:
+        """Return ``M^{-1}`` as a :class:`Matrix`.
+
+        Default densifies and inverts. Prefer :meth:`inverse_matvec` when only
+        applying the inverse to vectors; structured subclasses may keep a
+        compact representation of the inverse.
+        """
+        n, m = self.shape[-2], self.shape[-1]
+        if n != m:
+            raise ValueError(
+                f"inverse requires a square matrix, got shape {tuple(self.shape)}"
+            )
+        return DenseMatrix(torch.linalg.inv(self.to_dense()))
+
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        """Solve ``A y = x`` for ``y`` (same ``x`` shapes as :meth:`matvec`).
+
+        Default uses a dense linear solve and avoids forming ``A^{-1}``
+        explicitly. Structured subclasses override this for cheaper solves.
+        """
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        n = self.shape[-1]
+        if self.shape[-2] != n:
+            raise ValueError(
+                f"inverse_matvec requires a square matrix, got shape {tuple(self.shape)}"
+            )
+        A = self.to_dense()
+        batch_ndim = A.dim() - 2
+        if x.dim() >= batch_ndim + 2 and x.shape[-2] == n:
+            return torch.linalg.solve(A, x)
+        if x.shape[-1] == n:
+            return torch.linalg.solve(A, x)
+        raise ValueError(
+            f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
+        )
+
     def diag(self) -> torch.Tensor:
         """Main-diagonal vector ``(..., min(n, m))``."""
         return self.to_dense().diagonal(dim1=-2, dim2=-1)
@@ -170,6 +206,30 @@ class DenseMatrix(Matrix):
             f"x must have shape (..., {n_in}) or (..., {n_in}, k), got {tuple(x.shape)}"
         )
 
+    def inverse(self) -> DenseMatrix:
+        n, m = self._values.shape[-2], self._values.shape[-1]
+        if n != m:
+            raise ValueError(
+                f"inverse requires a square matrix, got shape {tuple(self.shape)}"
+            )
+        return DenseMatrix(torch.linalg.inv(self._values))
+
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        n = self._values.shape[-1]
+        if self._values.shape[-2] != n:
+            raise ValueError(
+                f"inverse_matvec requires a square matrix, got shape {tuple(self.shape)}"
+            )
+        batch_ndim = self._values.dim() - 2
+        if x.dim() >= batch_ndim + 2 and x.shape[-2] == n:
+            return torch.linalg.solve(self._values, x)
+        if x.shape[-1] == n:
+            return torch.linalg.solve(self._values, x)
+        raise ValueError(
+            f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
+        )
+
     def mul_diag_left(self, a: torch.Tensor) -> DenseMatrix:
         a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
         return DenseMatrix(a.unsqueeze(-1) * self._values)
@@ -274,6 +334,9 @@ class Identity(Matrix):
     def inverse(self) -> "Identity":
         return Identity(self.n, self._batch_shape, self._dtype, self._device)
 
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        return x.to(dtype=self._dtype, device=self._device)
+
 
 class Diagonal(Matrix):
     def __init__(self, d: torch.Tensor):
@@ -354,6 +417,94 @@ class Diagonal(Matrix):
 
     def matvec(self, x: torch.Tensor) -> torch.Tensor:
         return self.d * x
+
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        n = self.n
+        batch_ndim = self.d.dim() - 1
+        if x.dim() >= batch_ndim + 2 and x.shape[-2] == n:
+            return x / self.d.unsqueeze(-1)
+        if x.shape[-1] == n:
+            return x / self.d
+        raise ValueError(
+            f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
+        )
+
+
+def _banded_half_bandwidths(offsets: torch.Tensor) -> tuple[int, int]:
+    """LAPACK ``(kl, ku)``: subdiagonals (``row-col > 0``), superdiagonals (``row-col < 0``)."""
+    offs = offsets.tolist()
+    if not offs:
+        return 0, 0
+    return max(0, max(offs)), max(0, -min(offs))
+
+
+def _pack_banded_ab(offsets: torch.Tensor, data: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    """Pack diagonal storage into LAPACK-style band form ``(..., kl+ku+1, n)``.
+
+    Entry ``A[..., i, j]`` with ``i - j = off`` lives at ``ab[..., ku + off, j]``.
+    """
+    kl, ku = _banded_half_bandwidths(offsets)
+    n = data.shape[-1]
+    ab = data.new_zeros(data.shape[:-2] + (kl + ku + 1, n))
+    for r, off in enumerate(offsets.tolist()):
+        off = int(off)
+        if off > kl or off < -ku:
+            continue
+        if off >= 0:
+            cols = torch.arange(0, n - off, device=data.device)
+        else:
+            cols = torch.arange(-off, n, device=data.device)
+        ab[..., ku + off, cols] = data[..., r, cols]
+    return ab, kl, ku
+
+
+def _solve_banded_ab(
+    ab: torch.Tensor,
+    kl: int,
+    ku: int,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    """Solve a banded system stored in ``ab`` via Gaussian elimination (no pivoting).
+
+    Complexity is ``O(n · kl · ku)`` per batch element. Suitable when ``A`` admits
+    an LU factorization without pivoting (e.g. diagonally dominant / SPD).
+    """
+    ab = ab.clone()
+    x = b.clone()
+    n = ab.shape[-1]
+    multi_rhs = x.dim() == ab.dim() and x.shape[-2] == n
+
+    for j in range(n - 1):
+        piv = ab[..., ku, j]
+        for i in range(1, min(kl, n - 1 - j) + 1):
+            mult = ab[..., ku + i, j] / piv
+            ab[..., ku + i, j] = mult
+            for c in range(1, min(ku, n - 1 - j) + 1):
+                ab[..., ku + i - c, j + c] = (
+                    ab[..., ku + i - c, j + c] - mult * ab[..., ku - c, j + c]
+                )
+            if multi_rhs:
+                x[..., j + i, :] = x[..., j + i, :] - mult.unsqueeze(-1) * x[..., j, :]
+            else:
+                x[..., j + i] = x[..., j + i] - mult * x[..., j]
+
+    for j in range(n - 1, -1, -1):
+        if multi_rhs:
+            s = x[..., j, :].clone()
+        else:
+            s = x[..., j].clone()
+        for c in range(1, min(ku, n - 1 - j) + 1):
+            if multi_rhs:
+                s = s - ab[..., ku - c, j + c].unsqueeze(-1) * x[..., j + c, :]
+            else:
+                s = s - ab[..., ku - c, j + c] * x[..., j + c]
+        diag = ab[..., ku, j]
+        if multi_rhs:
+            x[..., j, :] = s / diag.unsqueeze(-1)
+        else:
+            x[..., j] = s / diag
+    return x
 
 
 class Banded(Matrix):
@@ -540,6 +691,27 @@ class Banded(Matrix):
                 out.index_add_(-1, rows, src)
         return out
 
+    def inverse(self) -> DenseMatrix:
+        """Dense inverse; inversion does not preserve band structure."""
+        return DenseMatrix(torch.linalg.inv(self.to_dense()))
+
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        """Solve ``A y = x`` in ``O(n · kl · ku)`` via banded LU (no pivoting).
+
+        ``x`` has shape ``(..., n)`` or ``(..., n, k)``. Prefer this over
+        :meth:`inverse` when only matrix–vector products with ``A^{-1}`` are needed.
+        """
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        n = self.n
+        batch_ndim = len(self.batch_shape)
+        multi_rhs = x.dim() >= batch_ndim + 2 and x.shape[-2] == n
+        if not multi_rhs and x.shape[-1] != n:
+            raise ValueError(
+                f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
+            )
+        ab, kl, ku = _pack_banded_ab(self.offsets, self.data)
+        return _solve_banded_ab(ab, kl, ku, x)
+
 
 class Rank1PlusDiagonal(Matrix):
     """Batched rank-1-plus-diagonal matrix ``M = diag(d) + u vᵀ``.
@@ -696,6 +868,10 @@ class Rank1PlusDiagonal(Matrix):
         alpha = 1.0 + (self.v * u_scaled).sum(dim=-1)
         u_inv = -u_scaled / alpha.unsqueeze(-1)
         return Rank1PlusDiagonal(u_inv, v_scaled, d_inv)
+
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        """Solve ``M y = x`` in ``O(n)`` via Sherman–Morrison (no dense inverse)."""
+        return self.inverse().matvec(x)
 
     def matvec(self, x: torch.Tensor) -> torch.Tensor:
         """Compute ``M @ x`` in ``O(n)`` time (per batch / RHS).
@@ -977,6 +1153,10 @@ class Semiseparable(Matrix):
     def solve(self, x: torch.Tensor) -> torch.Tensor:
         """Solve ``M y = x`` (unit triangular, ``O(k n)``)."""
         return self._apply(x, solve=True)
+
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        """``M^{-1} x``; alias of :meth:`solve` for the unit-triangular structure."""
+        return self.solve(x)
 
     def _apply(self, x: torch.Tensor, *, solve: bool) -> torch.Tensor:
         x = torch.as_tensor(x, dtype=self.p.dtype, device=self.p.device)

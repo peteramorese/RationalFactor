@@ -88,13 +88,13 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
     def _eval_basis(self, basis: Basis, x: torch.Tensor) -> torch.Tensor:
         return basis(x)
 
-    def _A(self, M: Matrix, z: torch.Tensor) -> Matrix:
+    def _A(self, X: Matrix, z: torch.Tensor) -> Matrix:
         n = self._eval_basis(self._product_basis, z)
-        return M.expm().mul_diag_left(n)
+        return X.expm().mul_diag_left(n)
 
-    def _B(self, M: Matrix) -> Matrix:
-        return M.T.scale(-1.0).expm()
-
+    def _B(self, X: Matrix) -> Matrix:
+        return X.T.scale(-1.0).expm()
+    
     def eval(self, y: torch.Tensor | None = None, index: int | None = None):
         if y is None:
             return torch.nn.Module.eval(self)
@@ -102,16 +102,29 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
             raise ValueError("index must be 0, 1, or None")
 
         y0, z = self._split_coords(y)
-        M = self._mc_mlp(z)
+        X = self._mc_mlp(z)
+
+        def _alpha():
+            A = self._A(X, z)
+            assert (A.to_dense() >= 0).all(), "A must be non-negative"
+            return self._A(X, z).matvec(self._eval_basis(self.nom_alpha_basis, y0))
+
+        def _beta():
+            # beta_perp = G^{-1} beta(y0)
+            beta_perp = self._G.inverse_matvec(self._eval_basis(self.nom_beta_basis, y0))
+
+            # beta_pre = B(z) beta_perp(x0)
+            beta_pre = self._B(X).matvec(beta_perp)
+
+            # beta = G beta_pre
+            return self._G.matvec(beta_pre)
 
         if index == 0:
-            return self._A(M, z).matvec(self._eval_basis(self.nom_alpha_basis, y0))
+            return _alpha()
         if index == 1:
-            return self._B(M).matvec(self._eval_basis(self.nom_beta_basis, y0))
+            return _beta()
 
-        alpha = self._A(M, z).matvec(self._eval_basis(self.nom_alpha_basis, y0))
-        beta = self._B(M).matvec(self._eval_basis(self.nom_beta_basis, y0))
-        return torch.stack([alpha, beta], dim=1)
+        return torch.stack([_alpha(), _beta()], dim=1)
 
     def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
         if lows is not None or highs is not None:
