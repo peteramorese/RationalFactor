@@ -11,16 +11,14 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
 
     With sacrificial coordinate ``y_s`` and free coordinates ``z = y_{\neq s}``,
 
-        b(z) = \exp(\mathrm{mc\_mlp}(z)),
-        a(z) = \exp(\log n(z) - \mathrm{mc\_mlp}(z)) = n(z) / b(z),
+        C(z) = \exp(M(z)), \qquad M(z) = \mathrm{mc\_mlp}(z),
+        A(z) = \mathrm{diag}(n(z))\, C(z),
+        B(z) = C(z)^{-T} = \exp(-M(z)^T),
 
     where ``n(z)`` is the product basis. Then
 
-        \alpha(y) = a(z) \circ \mathrm{nom\_alpha}(y_s),
-        \beta(y) = G\,\mathrm{diag}(b(z))\,G^{-1}\,\mathrm{nom\_beta}(y_s),
-
-    with ``G = \Omega_2(\mathrm{nom\_alpha}, \mathrm{nom\_beta})^\top``. The beta
-    map applies ``G^{-1}`` via linear solves, not an explicit inverse.
+        \alpha(y) = A(z)\,\mathrm{nom\_alpha}(y_s),
+        \beta(y) = B(z)\,\mathrm{nom\_beta}(y_s).
     """
 
     def __init__(
@@ -30,7 +28,6 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
         mc_mlp: MetzlerConeMLP,
         product_basis: Basis,
         sacrificial_index: int = 0,
-        eps: float = 1e-12,
     ):
         assert nom_alpha_basis.dim() == 1, "nom_alpha_basis must be 1D"
         assert nom_beta_basis.dim() == 1, "nom_beta_basis must be 1D"
@@ -48,7 +45,7 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
             "mc_mlp input dim must match product_basis.dim()"
         )
         assert mc_mlp.out_features() == n_basis, (
-            "mc_mlp output dim must match n_basis"
+            "mc_mlp matrix size must match n_basis"
         )
 
         total_dim = product_basis.dim() + 1
@@ -71,7 +68,6 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
         self._product_basis = product_basis
         self._mc_mlp = mc_mlp
         self.sacrificial_index = sacrificial_index
-        self.eps = eps
         self._G: Matrix = nom_alpha_basis.Omega2(nom_beta_basis).T
 
     def dtype_device(self):
@@ -92,35 +88,12 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
     def _eval_basis(self, basis: Basis, x: torch.Tensor) -> torch.Tensor:
         return basis(x)
 
-    def _solve_G(self, rhs: torch.Tensor) -> torch.Tensor:
-        """Solve ``G x = rhs`` along the last axis without forming ``G^{-1}``."""
-        G = self._G
-        if hasattr(G, "inverse_matvec"):
-            return G.inverse_matvec(rhs)
-        if hasattr(G, "solve"):
-            return G.solve(rhs)
-        A = G.to_dense()
-        while A.dim() > rhs.dim():
-            A = A.squeeze(0)
-        return torch.linalg.solve(A, rhs.unsqueeze(-1)).squeeze(-1)
-
-    def _matvec_G(self, x: torch.Tensor) -> torch.Tensor:
-        G = self._G
-        try:
-            return G.matvec(x)
-        except ValueError:
-            A = G.to_dense()
-            while A.dim() > x.dim():
-                A = A.squeeze(0)
-            return (A @ x.unsqueeze(-1)).squeeze(-1)
-
-    def _ab(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(a(z), b(z))`` with shape ``(n_data, n_basis)``."""
+    def _A(self, M: Matrix, z: torch.Tensor) -> Matrix:
         n = self._eval_basis(self._product_basis, z)
-        log_b = self._mc_mlp(z)
-        b = torch.exp(log_b)
-        a = torch.exp(torch.log(n.clamp_min(self.eps)) - log_b)
-        return a, b
+        return M.expm().mul_diag_left(n)
+
+    def _B(self, M: Matrix) -> Matrix:
+        return M.T.scale(-1.0).expm()
 
     def eval(self, y: torch.Tensor | None = None, index: int | None = None):
         if y is None:
@@ -129,18 +102,15 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
             raise ValueError("index must be 0, 1, or None")
 
         y0, z = self._split_coords(y)
-        a, b = self._ab(z)
+        M = self._mc_mlp(z)
 
         if index == 0:
-            return a * self._eval_basis(self.nom_alpha_basis, y0)
-
-        nom_beta = self._eval_basis(self.nom_beta_basis, y0)
-        # beta = G diag(b) G^{-1} nom_beta
-        beta = self._matvec_G(b * self._solve_G(nom_beta))
+            return self._A(M, z).matvec(self._eval_basis(self.nom_alpha_basis, y0))
         if index == 1:
-            return beta
+            return self._B(M).matvec(self._eval_basis(self.nom_beta_basis, y0))
 
-        alpha = a * self._eval_basis(self.nom_alpha_basis, y0)
+        alpha = self._A(M, z).matvec(self._eval_basis(self.nom_alpha_basis, y0))
+        beta = self._B(M).matvec(self._eval_basis(self.nom_beta_basis, y0))
         return torch.stack([alpha, beta], dim=1)
 
     def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:

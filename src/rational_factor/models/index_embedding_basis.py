@@ -4,7 +4,7 @@ from .density_model import ConditionalDensityModel
 from .parameters import Parameters
 
 
-class NormalziedIndexEmbeddingBasis(torch.nn.Module, Basis, NonnegativeBasis):
+class NormalizedIndexEmbeddingBasis(torch.nn.Module, Basis, NonnegativeBasis):
     """Basis of conditional densities indexed by learned embeddings.
 
     Each basis function is ``φ_i(y) = p(y | e_i)``, where ``p`` is a shared
@@ -42,7 +42,9 @@ class NormalziedIndexEmbeddingBasis(torch.nn.Module, Basis, NonnegativeBasis):
         torch.nn.Module.__init__(self)
         self.model = model
         self.index_embedding = embedding
-        self.owner = self
+        # Bypass Module.__setattr__: assigning self as a child submodule
+        # makes .to() / .parameters() recurse infinitely.
+        object.__setattr__(self, "owner", self)
         Basis.__init__(
             self,
             dim=model.dim,
@@ -86,3 +88,7 @@ class NormalziedIndexEmbeddingBasis(torch.nn.Module, Basis, NonnegativeBasis):
             raise NotImplementedError("Restricted-domain moments are not implemented")
         dtype, device = self.dtype_device()
         return torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
+
+
+# Backward-compatible misspelling.
+NormalziedIndexEmbeddingBasis = NormalizedIndexEmbeddingBasis

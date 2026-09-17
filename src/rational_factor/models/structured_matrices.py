@@ -71,6 +71,36 @@ class Matrix(ABC):
         s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         return DenseMatrix(self.to_dense() * s)
 
+    def batch_linear_combine(self, weights: torch.Tensor) -> Matrix:
+        """Weighted sum along the leading batch axis.
+
+        ``self`` has shape ``(k, n, m)``. ``weights`` has shape ``(..., k)``.
+        Returns a matrix of shape ``(..., n, m)``, always with at least one
+        leading batch axis (``weights`` of shape ``(k,)`` yields batch size 1).
+
+        The default path densifies; structured subclasses override this to keep
+        their storage format and use batched torch ops on the factors only.
+        """
+        weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
+        k = self.shape[0]
+        if weights.shape[-1] != k:
+            raise ValueError(
+                f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
+            )
+        values = self.to_dense()
+        if values.dim() != 3:
+            raise ValueError(
+                f"batch_linear_combine expects a single leading batch axis, "
+                f"got matrix shape {tuple(self.shape)}"
+            )
+        out = torch.einsum("...k,kij->...ij", weights, values)
+        if out.dim() == 2:
+            out = out.unsqueeze(0)
+        return DenseMatrix(out)
+
+    def expm(self) -> Matrix:
+        return DenseMatrix(torch.matrix_exp(self.to_dense()))
+
     def __matmul__(self, other: torch.Tensor) -> torch.Tensor:
         return self.matvec(other)
 
@@ -151,6 +181,22 @@ class DenseMatrix(Matrix):
     def scale(self, s: torch.Tensor | float) -> DenseMatrix:
         s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         return DenseMatrix(self._values * s)
+
+    def batch_linear_combine(self, weights: torch.Tensor) -> DenseMatrix:
+        weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
+        k = self._values.shape[0]
+        if self._values.dim() != 3:
+            raise ValueError(
+                f"batch_linear_combine expects shape (k, n, m), got {tuple(self._values.shape)}"
+            )
+        if weights.shape[-1] != k:
+            raise ValueError(
+                f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
+            )
+        out = torch.einsum("...k,kij->...ij", weights, self._values)
+        if out.dim() == 2:
+            out = out.unsqueeze(0)
+        return DenseMatrix(out)
 
 
 def as_matrix(obj: torch.Tensor | Matrix) -> Matrix:
@@ -272,6 +318,22 @@ class Diagonal(Matrix):
         s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         return Diagonal(self.d * s)
 
+    def batch_linear_combine(self, weights: torch.Tensor) -> Diagonal:
+        weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
+        if self.d.dim() != 2:
+            raise ValueError(
+                f"batch_linear_combine expects diagonal shape (k, n), got {tuple(self.d.shape)}"
+            )
+        k = self.d.shape[0]
+        if weights.shape[-1] != k:
+            raise ValueError(
+                f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
+            )
+        out = torch.einsum("...k,kn->...n", weights, self.d)
+        if out.dim() == 1:
+            out = out.unsqueeze(0)
+        return Diagonal(out)
+
     def mul_diag_left(self, a: torch.Tensor) -> Diagonal:
         a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
         return Diagonal(a * self.d)
@@ -392,6 +454,23 @@ class Banded(Matrix):
     def scale(self, s: torch.Tensor | float) -> Banded:
         s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         return Banded(self.offsets, self.data * s)
+
+    def batch_linear_combine(self, weights: torch.Tensor) -> Banded:
+        weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
+        if self.data.dim() != 3:
+            raise ValueError(
+                f"batch_linear_combine expects banded data shape (k, n_diag, n), "
+                f"got {tuple(self.data.shape)}"
+            )
+        k = self.data.shape[0]
+        if weights.shape[-1] != k:
+            raise ValueError(
+                f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
+            )
+        out = torch.einsum("...k,kdm->...dm", weights, self.data)
+        if out.dim() == 2:
+            out = out.unsqueeze(0)
+        return Banded(self.offsets, out)
 
     def mul_diag_left(self, a: torch.Tensor) -> Banded:
         """Left-multiply by ``diag(a)``: ``(diag(a) A)[i, j] = a[i] A[i, j]``."""

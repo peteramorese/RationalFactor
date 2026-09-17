@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import torch
 
-from rational_factor.models.structured_matrices import Matrix
+from rational_factor.models.structured_matrices import (
+    Banded,
+    DenseMatrix,
+    Diagonal,
+    Matrix,
+)
 
 
 class MLP(torch.nn.Module):
@@ -43,15 +48,22 @@ class MLP(torch.nn.Module):
 
 
 class MetzlerConeMLP(MLP):
-    """MLP constrained to a Metzler cone via nonnegative ray coefficients.
+    """MLP that outputs a nonnegative combination of Metzler cone ray matrices.
 
     Parameters
     ----------
     K :
-        Cone generator matrix of shape ``(m, k)``, typically the
-        ``DenseMatrix`` returned by ``metzler_cone_rays``. The base MLP
-        produces ``k`` logits; the module output is
-        ``K @ softplus(mlp(x))`` with shape ``(..., m)``.
+        Batched cone generators of shape ``(k, m, m)``, typically from
+        ``MetzlerConeRayFinder.find`` (``Diagonal``, ``Banded``, or
+        ``DenseMatrix``). Rays live on the leading batch axis.
+
+    The base MLP produces ``k`` logits; ``forward`` returns
+
+        ``sum_i softplus(mlp(x))_i · K_i``
+
+    as a :class:`~rational_factor.models.structured_matrices.Matrix` whose
+    structure matches ``K`` (batch size 1 when ``x`` is unbatched, otherwise
+    one matrix per leading data batch element).
     """
 
     def __init__(
@@ -63,12 +75,16 @@ class MetzlerConeMLP(MLP):
         activation=torch.nn.Tanh,
         zero_init_last: bool = True,
     ):
-        K_dense = K.to_dense() if isinstance(K, Matrix) else torch.as_tensor(K)
-        if K_dense.dim() != 2:
+        if isinstance(K, torch.Tensor):
+            K = DenseMatrix(K)
+        if not isinstance(K, Matrix):
+            raise TypeError(f"K must be a Matrix or Tensor, got {type(K)!r}")
+        if len(K.shape) != 3 or K.shape[-1] != K.shape[-2]:
             raise ValueError(
-                f"K must have shape (m, k), got {tuple(K_dense.shape)}"
+                f"K must have shape (k, m, m), got {tuple(K.shape)}"
             )
-        m, k = K_dense.shape
+
+        k, m, _ = K.shape
         super().__init__(
             in_features=in_features,
             out_features=k,
@@ -77,15 +93,41 @@ class MetzlerConeMLP(MLP):
             activation=activation,
             zero_init_last=zero_init_last,
         )
-        self.register_buffer("K", K_dense.detach().clone())
-        self.out_dim = m
+        self._m = m
+        self._n_rays = k
+        self._register_K(K)
+
+    def _register_K(self, K: Matrix) -> None:
+        if isinstance(K, Diagonal):
+            self._K_kind = "diagonal"
+            self.register_buffer("_K_storage", K.d.detach().clone())
+        elif isinstance(K, Banded):
+            self._K_kind = "banded"
+            self.register_buffer("_K_storage", K.data.detach().clone())
+            self.register_buffer("_K_offsets", K.offsets.detach().clone())
+        else:
+            self._K_kind = "dense"
+            self.register_buffer("_K_storage", K.to_dense().detach().clone())
+
+    @property
+    def K(self) -> Matrix:
+        if self._K_kind == "diagonal":
+            return Diagonal(self._K_storage)
+        if self._K_kind == "banded":
+            return Banded(self._K_offsets, self._K_storage)
+        return DenseMatrix(self._K_storage)
 
     def in_features(self):
         return self.net[0].in_features
 
     def out_features(self):
-        return self.K.shape[0]
+        """Matrix size ``m`` (each ray is ``m × m``)."""
+        return self._m
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def n_rays(self) -> int:
+        return self._n_rays
+
+    def forward(self, x: torch.Tensor) -> Matrix:
         c = torch.nn.functional.softplus(super().forward(x))
-        return torch.einsum("mk,...k->...m", self.K, c)
+        return self.K.batch_linear_combine(c)
+    
