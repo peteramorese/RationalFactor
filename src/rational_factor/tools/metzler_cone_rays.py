@@ -1,163 +1,261 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
-import torch
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+import torch
 from scipy.optimize import linprog
 
-from rational_factor.models.structured_matrices import Banded, DenseMatrix, Matrix
+from rational_factor.models.structured_matrices import Banded, Diagonal, DenseMatrix, Matrix
 
 
-def metzler_cone_rays(
-    gram: Matrix,
-    k: int,
-    *,
-    transpose: bool = True,
-    n_constraint_cols: int = 32,
-    n_verify_cols: int = 128,
-    candidate_factor: int = 6,
-    cut_rounds: int = 3,
-    max_new_cols: int = 16,
-    feasibility_tol: float = 1e-8,
-    independence_tol: float = 1e-5,
-    seed: int = 0,
-) -> Matrix:
+RayType = Literal["diagonal", "dense", "banded"]
+
+
+class MetzlerConeRayFinder:
     """
-    Find k diverse feasible directions r satisfying approximately
+    Find diverse rays X satisfying
 
-        M diag(r) M^{-1}  is Metzler,
+        X Metzler,
+        M X^T M^{-1} Metzler,
 
     where M = gram.T if transpose=True, else gram.
 
-    Returns:
-        DenseMatrix R of shape (m, k), so v(z) = R @ c(z), c(z) >= 0.
+    Returns a Matrix with batch size k:
 
-    Notes:
-        - The free lineality direction 1 is removed; add gamma(z) * 1 separately.
-        - For Banded input and fixed sample counts, storage is O(m).
-        - Feasibility is enforced on sampled/cutting-plane columns, not all m^2
-          inequalities. Increase n_verify_cols / cut_rounds for a tighter cone.
+        diagonal -> Diagonal:    (k, m, m), storage (k, m)
+        dense    -> DenseMatrix: (k, m, m), storage (k, m, m)
+        banded   -> Banded:      (k, m, m), storage (k, 2*bw+1, m)
     """
-    if k <= 0:
-        raise ValueError("k must be positive")
 
-    rng = np.random.default_rng(seed)
+    def __init__(
+        self,
+        gram: Matrix,
+        *,
+        transpose: bool = True,
+        n_constraint_cols: int = 32,
+        n_verify_cols: int = 128,
+        candidate_factor: int = 10,
+        cut_rounds: int = 3,
+        max_new_cols: int = 16,
+        feasibility_tol: float = 1e-8,
+        cosine_tol: float = 1e-6,
+        seed: int = 0,
+    ):
+        self.gram = gram
+        self.M = gram.T if transpose else gram
 
-    M = gram.T if transpose else gram
-    n = M.shape[-1]
+        if len(self.M.shape) != 2 or self.M.shape[-2] != self.M.shape[-1]:
+            raise ValueError("gram must be a non-batched square matrix")
 
-    if M.shape[-2] != n:
-        raise ValueError("gram must be square")
-    if len(M.shape) != 2:
-        raise ValueError("batched matrices are not supported by this offline routine")
-    if k >= n:
-        raise ValueError("use k < m; the all-ones lineality direction is handled separately")
+        self.m = self.M.shape[-1]
+        self.n_constraint_cols = n_constraint_cols
+        self.n_verify_cols = n_verify_cols
+        self.candidate_factor = candidate_factor
+        self.cut_rounds = cut_rounds
+        self.max_new_cols = max_new_cols
+        self.feasibility_tol = feasibility_tol
+        self.cosine_tol = cosine_tol
+        self.seed = seed
+
+        self.A = self._to_scipy(self.M)
+        self._lu = None
+        self._exact_cache = {}
 
     # ------------------------------------------------------------------
-    # Convert M to a SciPy sparse matrix without densifying Banded.
+    # Public
     # ------------------------------------------------------------------
-    if isinstance(M, Banded):
-        rows, cols, vals = [], [], []
 
-        offsets = M.offsets.detach().cpu().numpy()
-        data = M.data.detach().cpu().numpy()
+    def find(
+        self,
+        k: int,
+        ray_type: RayType = "diagonal",
+        *,
+        bandwidth: int | None = None,
+    ) -> Matrix:
+        if k <= 0:
+            raise ValueError("k must be positive")
 
-        for d, off in enumerate(offsets):
-            off = int(off)
+        rng = np.random.default_rng(self.seed)
 
-            if off >= 0:
-                c = np.arange(0, n - off)
-            else:
-                c = np.arange(-off, n)
+        if ray_type == "diagonal":
+            return self._find_diagonal(k, rng)
 
-            r = c + off
+        if ray_type == "dense":
+            return self._find_dense(k, rng)
 
-            rows.append(r)
-            cols.append(c)
-            vals.append(data[d, c])
+        if ray_type == "banded":
+            if bandwidth is None:
+                raise ValueError("bandwidth is required for banded rays")
+            if not 0 <= bandwidth < self.m:
+                raise ValueError(
+                    f"bandwidth must satisfy 0 <= bandwidth < {self.m}"
+                )
+            return self._find_banded(k, bandwidth, rng)
 
-        rows = np.concatenate(rows)
-        cols = np.concatenate(cols)
-        vals = np.concatenate(vals)
+        raise ValueError(f"unknown ray_type={ray_type!r}")
 
-        A = sp.csc_matrix((vals, (rows, cols)), shape=(n, n))
+    __call__ = find
 
-    elif isinstance(M, DenseMatrix):
-        A = sp.csc_matrix(
-            M.to_dense().detach().cpu().double().numpy()
+    # ------------------------------------------------------------------
+    # Matrix conversion
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_scipy(M: Matrix) -> sp.csc_matrix:
+        if isinstance(M, Banded):
+            n = M.shape[-1]
+            offsets = M.offsets.detach().cpu().numpy()
+            data = M.data.detach().cpu().double().numpy()
+
+            rows, cols, vals = [], [], []
+            for d, off in enumerate(offsets):
+                off = int(off)
+                c = (
+                    np.arange(n - off)
+                    if off >= 0
+                    else np.arange(-off, n)
+                )
+                rows.append(c + off)
+                cols.append(c)
+                vals.append(data[d, c])
+
+            return sp.csc_matrix(
+                (
+                    np.concatenate(vals),
+                    (np.concatenate(rows), np.concatenate(cols)),
+                ),
+                shape=(n, n),
+                dtype=np.float64,
+            )
+
+        return sp.csc_matrix(
+            M.to_dense().detach().cpu().double().numpy(),
+            dtype=np.float64,
         )
 
-    else:
-        # A generic Matrix has matvec but no solve(), so there is no
-        # structure-preserving way to apply M^{-1}.
-        A = sp.csc_matrix(
-            M.to_dense().detach().cpu().double().numpy()
-        )
-
-    A = A.astype(np.float64)
-
-    # One sparse LU factorization reused for every inverse-column query.
-    lu = spla.splu(A)
+    @property
+    def lu(self):
+        if self._lu is None:
+            self._lu = spla.splu(self.A)
+        return self._lu
 
     # ------------------------------------------------------------------
-    # G^{-1} columns needed for selected constraints.
+    # Cosine-diverse subset selection
     # ------------------------------------------------------------------
-    def inverse_columns(js: np.ndarray) -> np.ndarray:
-        E = np.zeros((n, len(js)), dtype=np.float64)
+
+    def _select_diverse(
+        self,
+        rays: list[np.ndarray],
+        k: int,
+    ) -> list[np.ndarray]:
+        """
+        Greedy max-min angular diversity.
+
+        At each step choose the candidate minimizing
+
+            max_{s in selected} cos(candidate, s).
+
+        Since cone rays are equivalent only under positive scaling,
+        ordinary cosine similarity (not |cosine|) is used.
+        """
+        if len(rays) < k:
+            raise RuntimeError(
+                f"Only found {len(rays)} candidates; requested {k}."
+            )
+
+        V = np.stack([r.ravel() for r in rays])
+        norms = np.linalg.norm(V, axis=1)
+
+        valid = norms > 1e-12
+        V = V[valid]
+        rays = [r for r, keep in zip(rays, valid) if keep]
+        V /= np.linalg.norm(V, axis=1, keepdims=True)
+
+        # Pairwise cosine similarities.
+        S = np.clip(V @ V.T, -1.0, 1.0)
+
+        # Deduplicate nearly identical rays.
+        keep = []
+        for i in range(len(rays)):
+            if not keep or np.max(S[i, keep]) < 1.0 - self.cosine_tol:
+                keep.append(i)
+
+        V = V[keep]
+        rays = [rays[i] for i in keep]
+        S = np.clip(V @ V.T, -1.0, 1.0)
+
+        if len(rays) < k:
+            raise RuntimeError(
+                f"Only found {len(rays)} distinct rays; requested {k}. "
+                "Increase candidate_factor."
+            )
+
+        if k == 1:
+            # Most isolated ray in the candidate population.
+            if len(rays) == 1:
+                return rays
+
+            T = S.copy()
+            np.fill_diagonal(T, -np.inf)
+            return [rays[int(np.argmin(T.max(axis=1)))]]
+
+        # Start with globally least-similar pair.
+        T = S.copy()
+        np.fill_diagonal(T, np.inf)
+        i, j = np.unravel_index(np.argmin(T), T.shape)
+
+        selected = [int(i), int(j)]
+        available = np.ones(len(rays), dtype=bool)
+        available[selected] = False
+
+        # Similarity to closest already-selected ray.
+        max_similarity = S[:, selected].max(axis=1)
+
+        while len(selected) < k:
+            candidates = np.flatnonzero(available)
+            best = candidates[np.argmin(max_similarity[candidates])]
+
+            selected.append(int(best))
+            available[best] = False
+
+            max_similarity = np.maximum(
+                max_similarity,
+                S[:, best],
+            )
+
+        return [rays[i] for i in selected]
+
+    # ==================================================================
+    # Diagonal: existing sampled/cutting-plane algorithm
+    # ==================================================================
+
+    def _inverse_columns(self, js: np.ndarray) -> np.ndarray:
+        E = np.zeros((self.m, len(js)))
         E[js, np.arange(len(js))] = 1.0
-        return lu.solve(E)  # shape (n, len(js))
+        return self.lu.solve(E)
 
-    # ------------------------------------------------------------------
-    # Build H such that H @ r >= 0 represents all off-diagonal entries
-    # from the selected columns of M diag(r) M^{-1}.
-    #
-    # For column j:
-    #   x_j = M^{-1} e_j
-    #   Q[:, j] = M diag(x_j) r
-    # so H_j = M diag(x_j).
-    # ------------------------------------------------------------------
-    def build_constraints(js: np.ndarray) -> sp.csr_matrix:
-        X = inverse_columns(js)
+    def _diagonal_constraints(self, js: np.ndarray) -> sp.csr_matrix:
+        inv = self._inverse_columns(js)
         blocks = []
 
         for t, j in enumerate(js):
-            H = A @ sp.diags(X[:, t], format="csc")
-
-            # Remove the diagonal constraint Q[j, j].
-            if j == 0:
-                H = H[1:, :]
-            elif j == n - 1:
-                H = H[:-1, :]
-            else:
-                H = sp.vstack(
-                    [H[:j, :], H[j + 1:, :]],
-                    format="csr",
-                )
-
-            blocks.append(H)
+            H = self.A @ sp.diags(inv[:, t], format="csc")
+            blocks.append(H[np.arange(self.m) != j])
 
         return sp.vstack(blocks, format="csr")
 
-    # ------------------------------------------------------------------
-    # Random LP probes.
-    #
-    # The cone contains span{1}, so impose 1^T r = 0 and recover the
-    # unrestricted gamma(z) * 1 term separately.
-    #
-    # Box bounds make the homogeneous LP bounded.
-    # ------------------------------------------------------------------
-    def solve_candidates(
+    def _diagonal_candidates(
+        self,
         H: sp.csr_matrix,
         count: int,
+        rng: np.random.Generator,
     ) -> list[np.ndarray]:
-        rays = []
-
-        A_ub = -H
-        b_ub = np.zeros(H.shape[0])
-
+        n = self.m
         A_eq = sp.csr_matrix(np.ones((1, n)))
-        b_eq = np.zeros(1)
+        rays = []
 
         for _ in range(count):
             q = rng.standard_normal(n)
@@ -165,207 +263,342 @@ def metzler_cone_rays(
 
             res = linprog(
                 c=-q,
-                A_ub=A_ub,
-                b_ub=b_ub,
+                A_ub=-H,
+                b_ub=np.zeros(H.shape[0]),
                 A_eq=A_eq,
-                b_eq=b_eq,
+                b_eq=np.zeros(1),
                 bounds=[(-1.0, 1.0)] * n,
                 method="highs",
             )
 
-            if not res.success:
-                continue
-
-            r = res.x
-            norm = np.linalg.norm(r)
-
-            if norm > 1e-10:
-                rays.append(r / norm)
+            if res.success:
+                r = res.x - res.x.mean()
+                norm = np.linalg.norm(r)
+                if norm > 1e-10:
+                    rays.append(r / norm)
 
         return rays
 
-    # ------------------------------------------------------------------
-    # Evaluate candidate rays on additional columns and return:
-    #   minimum off-diagonal value,
-    #   worst offending column.
-    # ------------------------------------------------------------------
-    def verify(
+    def _verify_diagonal(
+        self,
         rays: list[np.ndarray],
         js: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         if not rays:
             return np.empty(0), np.empty(0, dtype=int)
 
-        X = inverse_columns(js)
-
+        inv = self._inverse_columns(js)
         mins = np.full(len(rays), np.inf)
-        worst_cols = np.full(len(rays), -1, dtype=int)
+        worst = np.full(len(rays), -1, dtype=int)
 
         for r_idx, r in enumerate(rays):
-            # For all sampled columns simultaneously:
-            #
-            #   Q[:, js] = A @ (diag(r) X)
-            Y = A @ (r[:, None] * X)
+            Y = self.A @ (r[:, None] * inv)
 
             for t, j in enumerate(js):
-                col = Y[:, t]
-
-                # Exclude diagonal element.
-                if j == 0:
-                    vmin = col[1:].min()
-                elif j == n - 1:
-                    vmin = col[:-1].min()
-                else:
-                    vmin = min(col[:j].min(), col[j + 1:].min())
-
+                vmin = Y[np.arange(self.m) != j, t].min()
                 if vmin < mins[r_idx]:
                     mins[r_idx] = vmin
-                    worst_cols[r_idx] = j
+                    worst[r_idx] = j
 
-        return mins, worst_cols
+        return mins, worst
 
-    # ------------------------------------------------------------------
-    # Initial constraint columns: random + boundaries.
-    # ------------------------------------------------------------------
-    n0 = min(n, max(2, n_constraint_cols))
+    def _find_diagonal(
+        self,
+        k: int,
+        rng: np.random.Generator,
+    ) -> Diagonal:
+        n = self.m
+        if k >= n:
+            raise ValueError(
+                "For diagonal rays use k < m; identity lineality is separate."
+            )
 
-    constraint_cols = set(
-        rng.choice(n, size=n0, replace=False).tolist()
-    )
-    constraint_cols.add(0)
-    constraint_cols.add(n - 1)
+        n0 = min(n, max(2, self.n_constraint_cols))
+        cols = set(rng.choice(n, n0, replace=False).tolist())
+        cols.update((0, n - 1))
 
-    candidate_count = max(candidate_factor * k, k + 4)
+        count = max(self.candidate_factor * k, k + 4)
+        rays: list[np.ndarray] = []
 
-    rays: list[np.ndarray] = []
+        for _ in range(self.cut_rounds):
+            H = self._diagonal_constraints(
+                np.array(sorted(cols), dtype=int)
+            )
+            rays = self._diagonal_candidates(H, count, rng)
 
-    # ------------------------------------------------------------------
-    # Cutting-plane rounds.
-    # ------------------------------------------------------------------
-    for _ in range(cut_rounds):
-        cols = np.array(sorted(constraint_cols), dtype=int)
-        H = build_constraints(cols)
-
-        rays = solve_candidates(H, candidate_count)
-
-        if not rays:
-            continue
-
-        remaining = np.array(
-            [j for j in range(n) if j not in constraint_cols],
-            dtype=int,
-        )
-
-        if len(remaining) == 0:
-            break
-
-        nv = min(n_verify_cols, len(remaining))
-        verify_cols = rng.choice(remaining, size=nv, replace=False)
-
-        mins, worst = verify(rays, verify_cols)
-
-        bad = np.where(mins < -feasibility_tol)[0]
-
-        if len(bad) == 0:
-            break
-
-        # Add the most frequently / severely violated columns.
-        order = bad[np.argsort(mins[bad])]
-        new_cols = []
-
-        for idx in order:
-            j = int(worst[idx])
-            if j >= 0 and j not in constraint_cols:
-                new_cols.append(j)
-
-            if len(new_cols) >= max_new_cols:
+            remaining = np.array(
+                [j for j in range(n) if j not in cols],
+                dtype=int,
+            )
+            if not rays or not len(remaining):
                 break
 
-        if not new_cols:
-            break
+            verify_cols = rng.choice(
+                remaining,
+                min(self.n_verify_cols, len(remaining)),
+                replace=False,
+            )
+            mins, worst = self._verify_diagonal(rays, verify_cols)
+            bad = np.where(mins < -self.feasibility_tol)[0]
 
-        constraint_cols.update(new_cols)
+            if not len(bad):
+                break
 
-    if not rays:
-        raise RuntimeError("Could not find any nontrivial feasible cone directions")
+            new_cols = []
+            for idx in bad[np.argsort(mins[bad])]:
+                j = int(worst[idx])
+                if j >= 0 and j not in cols:
+                    new_cols.append(j)
+                if len(new_cols) >= self.max_new_cols:
+                    break
 
-    # ------------------------------------------------------------------
-    # Final sampled feasibility filter.
-    # ------------------------------------------------------------------
-    nv = min(n_verify_cols, n)
-    verify_cols = rng.choice(n, size=nv, replace=False)
+            if not new_cols:
+                break
 
-    mins, _ = verify(rays, verify_cols)
+            cols.update(new_cols)
 
-    feasible = [
-        r for r, mn in zip(rays, mins)
-        if mn >= -feasibility_tol
-    ]
+        if not rays:
+            raise RuntimeError("Could not find any diagonal cone rays")
 
-    if len(feasible) < k:
-        # Keep least-violating candidates too; this is deliberately an
-        # approximate offline dictionary search.
-        order = np.argsort(mins)[::-1]
-        feasible = [rays[i] for i in order[:max(k, len(feasible))]]
+        verify_cols = rng.choice(
+            n,
+            min(self.n_verify_cols, n),
+            replace=False,
+        )
+        mins, _ = self._verify_diagonal(rays, verify_cols)
 
-    # ------------------------------------------------------------------
-    # Greedy maximum-residual selection.
-    #
-    # This maximizes novelty relative to the span of already selected
-    # rays and strongly favors linear independence.
-    # ------------------------------------------------------------------
-    C = np.stack(feasible, axis=1)  # (n, n_candidates)
+        feasible = [
+            r for r, mn in zip(rays, mins)
+            if mn >= -self.feasibility_tol
+        ]
 
-    selected: list[np.ndarray] = []
-    Qbasis = np.empty((n, 0), dtype=np.float64)
+        if len(feasible) < k:
+            order = np.argsort(mins)[::-1]
+            feasible = [rays[i] for i in order[:max(k, len(feasible))]]
 
-    available = list(range(C.shape[1]))
+        selected = self._select_diverse(feasible, k)
 
-    while available and len(selected) < k:
-        if Qbasis.shape[1] == 0:
-            # First ray: arbitrary feasible candidate.
-            best = available[0]
-            score = 1.0
-        else:
-            best = None
-            score = -np.inf
-
-            for j in available:
-                r = C[:, j]
-                residual = r - Qbasis @ (Qbasis.T @ r)
-                s = np.linalg.norm(residual)
-
-                if s > score:
-                    score = s
-                    best = j
-
-        if best is None or score < independence_tol:
-            break
-
-        r = C[:, best]
-
-        # Numerically remove lineality once more.
-        r = r - r.mean()
-        r /= np.linalg.norm(r)
-
-        selected.append(r)
-        available.remove(best)
-
-        Qbasis, _ = np.linalg.qr(np.stack(selected, axis=1))
-
-    if len(selected) < k:
-        raise RuntimeError(
-            f"Only found {len(selected)} sufficiently independent rays; "
-            f"requested k={k}. Increase candidate_factor / constraint samples, "
-            f"or reduce k."
+        return Diagonal(
+            torch.as_tensor(
+                np.stack(selected),          # (k, m)
+                dtype=self.gram.dtype,
+                device=self.gram.device,
+            )
         )
 
-    R = np.stack(selected[:k], axis=1)
+    # ==================================================================
+    # Exact dense / banded LP
+    # ==================================================================
 
-    out = torch.as_tensor(
-        R,
-        dtype=gram.dtype,
-        device=gram.device,
-    )
+    def _support(
+        self,
+        bandwidth: int | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Valid (row, col) locations of Z = X^T, ordered column-major.
+        bandwidth=None gives dense support.
+        """
+        n = self.m
 
-    return DenseMatrix(out)
+        if bandwidth is None:
+            cols = np.repeat(np.arange(n), n)
+            rows = np.tile(np.arange(n), n)
+            return rows, cols
+
+        rows, cols = [], []
+        for j in range(n):
+            i = np.arange(
+                max(0, j - bandwidth),
+                min(n, j + bandwidth + 1),
+            )
+            rows.append(i)
+            cols.append(np.full(len(i), j))
+
+        return np.concatenate(rows), np.concatenate(cols)
+
+    def _exact_lp(
+        self,
+        bandwidth: int | None,
+    ):
+        """
+        Variables:
+
+            z = valid entries of Z = X^T
+            y = vec(Y)
+
+        Constraints:
+
+            Y M = M Z
+            Z, Y Metzler
+            tr(Z) = 0
+        """
+        if bandwidth in self._exact_cache:
+            return self._exact_cache[bandwidth]
+
+        n = self.m
+        n2 = n * n
+        rows, cols = self._support(bandwidth)
+        p = len(rows)
+
+        # vec(Z) = E z
+        flat = rows + n * cols
+        E = sp.csc_matrix(
+            (np.ones(p), (flat, np.arange(p))),
+            shape=(n2, p),
+        )
+
+        I = sp.eye(n, format="csc")
+
+        # vec(YM - MZ) = 0.
+        dynamics = sp.hstack(
+            [
+                -(sp.kron(I, self.A, format="csr") @ E),
+                sp.kron(self.A.T, I, format="csr"),
+            ],
+            format="csr",
+        )
+
+        # Remove scalar-I lineality.
+        diag_idx = np.flatnonzero(rows == cols)
+        trace = sp.csr_matrix(
+            (
+                np.ones(len(diag_idx)),
+                (
+                    np.zeros(len(diag_idx), dtype=int),
+                    diag_idx,
+                ),
+            ),
+            shape=(1, p + n2),
+        )
+
+        A_eq = sp.vstack([dynamics, trace], format="csr")
+        b_eq = np.zeros(n2 + 1)
+
+        z_bounds = [
+            (-1.0, 1.0) if i == j else (0.0, 1.0)
+            for i, j in zip(rows, cols)
+        ]
+
+        y_bounds = [
+            (-1.0, 1.0) if i == j else (0.0, 1.0)
+            for j in range(n)
+            for i in range(n)
+        ]
+
+        result = (A_eq, b_eq, z_bounds + y_bounds, rows, cols)
+        self._exact_cache[bandwidth] = result
+        return result
+
+    def _exact_candidates(
+        self,
+        k: int,
+        bandwidth: int | None,
+        rng: np.random.Generator,
+    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
+        A_eq, b_eq, bounds, rows, cols = self._exact_lp(bandwidth)
+
+        p = len(rows)
+        n2 = self.m * self.m
+        count = max(self.candidate_factor * k, k + 4)
+
+        rays = []
+
+        for _ in range(count):
+            # Probe both representations to expose different cone faces.
+            c = -rng.standard_normal(p + n2)
+
+            res = linprog(
+                c=c,
+                A_eq=A_eq,
+                b_eq=b_eq,
+                bounds=bounds,
+                method="highs",
+            )
+
+            if not res.success:
+                continue
+
+            z = res.x[:p]
+            norm = np.linalg.norm(z)
+
+            if norm > 1e-10:
+                rays.append(z / norm)
+
+        if not rays:
+            raise RuntimeError("Could not find any nontrivial cone rays")
+
+        return rays, rows, cols
+
+    # ------------------------------------------------------------------
+    # Dense
+    # ------------------------------------------------------------------
+
+    def _find_dense(
+        self,
+        k: int,
+        rng: np.random.Generator,
+    ) -> DenseMatrix:
+        rays, _, _ = self._exact_candidates(k, None, rng)
+        rays = self._select_diverse(rays, k)
+
+        # Dense support is column-major vec(Z), where Z = X^T.
+        X = np.stack([
+            z.reshape((self.m, self.m), order="F").T
+            for z in rays
+        ])
+
+        return DenseMatrix(
+            torch.as_tensor(
+                X,
+                dtype=self.gram.dtype,
+                device=self.gram.device,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Banded
+    # ------------------------------------------------------------------
+
+    def _find_banded(
+        self,
+        k: int,
+        bandwidth: int,
+        rng: np.random.Generator,
+    ) -> Banded:
+        rays, rows, cols = self._exact_candidates(k, bandwidth, rng)
+        rays = self._select_diverse(rays, k)
+
+        offsets = np.arange(-bandwidth, bandwidth + 1)
+        offset_to_idx = {
+            int(off): i for i, off in enumerate(offsets)
+        }
+
+        # Banded stores:
+        #     data[r, j] = X[j + offset[r], j]
+        #
+        # LP variable z_q = Z[i,j] = X[j,i].
+        data = np.zeros(
+            (k, len(offsets), self.m),
+            dtype=np.float64,
+        )
+
+        for batch, z in enumerate(rays):
+            for q, (i, j) in enumerate(zip(rows, cols)):
+                x_offset = int(j - i)
+                x_col = int(i)
+                data[batch, offset_to_idx[x_offset], x_col] = z[q]
+
+        data = torch.as_tensor(
+            data,
+            dtype=self.gram.dtype,
+            device=self.gram.device,
+        )
+
+        return Banded(
+            torch.as_tensor(
+                offsets,
+                dtype=torch.long,
+                device=self.gram.device,
+            ),
+            data,
+        )
