@@ -9,7 +9,7 @@ For every returned matrix ray X_i and random nonnegative combination
 verifies
 
     X is Metzler,
-    M X^T M^{-1} is Metzler,
+    -M X^T M^{-1} is Metzler,
 
 where M = gram.T if transpose=True, otherwise gram.
 
@@ -107,9 +107,9 @@ def _min_offdiag(A: np.ndarray) -> float:
 
 def _transform(M: np.ndarray, X: np.ndarray) -> np.ndarray:
     """
-    Q = M X^T M^{-1}, computed without explicitly forming M^{-1}.
+    Q = -M X^T M^{-1}, computed without explicitly forming M^{-1}.
     """
-    A = M @ X.T
+    A = -(M @ X.T)
 
     # Q M = A  ->  M^T Q^T = A^T
     return np.linalg.solve(M.T, A.T).T
@@ -145,14 +145,14 @@ def _assert_feasible(
 
     ymin = _assert_metzler(
         Y,
-        label=f"{label}: M X^T M^-1",
+        label=f"{label}: -M X^T M^-1",
     )
 
-    # Verify the similarity equation independently.
-    residual = np.max(np.abs(Y @ M - M @ X.T))
+    # Verify the dual similarity equation independently: Y M = -M X^T.
+    residual = np.max(np.abs(Y @ M + M @ X.T))
 
     assert residual < 1e-7, (
-        f"{label}: Y M != M X^T, "
+        f"{label}: Y M != -M X^T, "
         f"max residual={residual:.3e}"
     )
 

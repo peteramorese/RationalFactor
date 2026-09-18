@@ -19,7 +19,7 @@ class MetzlerConeRayFinder:
     Find diverse rays X satisfying
 
         X Metzler,
-        M X^T M^{-1} Metzler,
+        -M X^T M^{-1} Metzler,
 
     where M = gram.T if transpose=True, else gram.
 
@@ -238,11 +238,18 @@ class MetzlerConeRayFinder:
         return self.lu.solve(E)
 
     def _diagonal_constraints(self, js: np.ndarray) -> sp.csr_matrix:
+        """Linear forms for off-diagonals of ``Y = -M diag(r) M^{-1}``.
+
+        Column ``j`` of ``M diag(r) M^{-1}`` is ``A @ (r ⊙ M^{-1} e_j)``, so
+        the off-diagonal rows of ``-A @ diag(M^{-1} e_j)`` are the Metzler
+        inequalities for the dual condition.
+        """
         inv = self._inverse_columns(js)
         blocks = []
 
         for t, j in enumerate(js):
-            H = self.A @ sp.diags(inv[:, t], format="csc")
+            # Off-diag of -M diag(r) M^{-1} >= 0  <=>  H r >= 0 with H = -A diag(inv).
+            H = -(self.A @ sp.diags(inv[:, t], format="csc"))
             blocks.append(H[np.arange(self.m) != j])
 
         return sp.vstack(blocks, format="csr")
@@ -284,6 +291,7 @@ class MetzlerConeRayFinder:
         rays: list[np.ndarray],
         js: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Check off-diagonals of ``Y = -M diag(r) M^{-1}`` for sampled columns."""
         if not rays:
             return np.empty(0), np.empty(0, dtype=int)
 
@@ -292,7 +300,8 @@ class MetzlerConeRayFinder:
         worst = np.full(len(rays), -1, dtype=int)
 
         for r_idx, r in enumerate(rays):
-            Y = self.A @ (r[:, None] * inv)
+            # Y = -M diag(r) M^{-1}; columns over the sampled M^{-1} e_j.
+            Y = -(self.A @ (r[:, None] * inv))
 
             for t, j in enumerate(js):
                 vmin = Y[np.arange(self.m) != j, t].min()
@@ -428,7 +437,7 @@ class MetzlerConeRayFinder:
 
         Constraints:
 
-            Y M = M Z
+            Y M = -M Z   (i.e. Y = -M X^T M^{-1})
             Z, Y Metzler
             tr(Z) = 0
         """
@@ -449,10 +458,11 @@ class MetzlerConeRayFinder:
 
         I = sp.eye(n, format="csc")
 
-        # vec(YM - MZ) = 0.
+        # vec(YM + MZ) = 0  <=>  Y M = -M Z.
+        # vec(YM) = (M^T ⊗ I) y,  vec(MZ) = (I ⊗ M) vec(Z).
         dynamics = sp.hstack(
             [
-                -(sp.kron(I, self.A, format="csr") @ E),
+                sp.kron(I, self.A, format="csr") @ E,
                 sp.kron(self.A.T, I, format="csr"),
             ],
             format="csr",

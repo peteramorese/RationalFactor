@@ -456,11 +456,11 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 5
+    n_basis = 30
     sacrificial_index = 0
     embedding_dim = 8
-    bspline_degree = 3
-    n_rays = 15
+    bspline_degree = 20
+    n_rays = 3
     tf_flow_hidden = 16
     tf_flow_layers = 2
     mc_mlp_hidden = 64

@@ -106,10 +106,15 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
 
         def _alpha():
             A = self._A(X, z)
+            b4_basis = self._eval_basis(self.nom_alpha_basis, y0)
             assert (A.to_dense() >= 0).all(), "A must be non-negative"
+            assert (b4_basis >= 0).all(), "b4_basis must be non-negative"
             return self._A(X, z).matvec(self._eval_basis(self.nom_alpha_basis, y0))
 
         def _beta():
+            b4_basis = self._eval_basis(self.nom_beta_basis, y0)
+            assert (b4_basis >= 0).all(), "b4_basis must be non-negative"
+
             # beta_perp = G^{-1} beta(y0)
             beta_perp = self._G.inverse_matvec(self._eval_basis(self.nom_beta_basis, y0))
 
@@ -120,9 +125,13 @@ class PreorthogonalMutualBasis(torch.nn.Module, MutualPairBasis):
             return self._G.matvec(beta_pre)
 
         if index == 0:
+            alpha = _alpha()
+            assert (alpha >= 0).all(), "alpha must be non-negative"
             return _alpha()
         if index == 1:
-            return _beta()
+            beta = _beta()
+            assert (beta >= 0).all(), "beta must be non-negative"
+            return beta
 
         return torch.stack([_alpha(), _beta()], dim=1)
 
