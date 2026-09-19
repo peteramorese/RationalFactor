@@ -8,601 +8,512 @@ import scipy.sparse as sp
 import torch
 from scipy.optimize import linprog
 
-from rational_factor.models.structured_matrices import DenseMatrix
+try:
+    from rational_factor.models.structured_matrices import DenseMatrix
+except ModuleNotFoundError:  # standalone fallback
+    class DenseMatrix:
+        def __init__(self, data):
+            self.data = data
+
+        @property
+        def shape(self):
+            return self.data.shape
+
+        @property
+        def dtype(self):
+            return self.data.dtype
+
+        @property
+        def device(self):
+            return self.data.device
+
+        def to_dense(self):
+            return self.data
+
+        @property
+        def T(self):
+            return DenseMatrix(self.data.transpose(-1, -2))
 
 
-CertificateMode = Literal["auto", "full", "neighbors"]
+SupportMode = Literal["auto", "full", "neighbors"]
 
 
 @dataclass(frozen=True)
-class _VariableLayout:
+class PairedMetzlerConeRays:
+    r"""Batch of paired Metzler generator rays.
+
+    For every batch index k,
+
+        R[k] M + M T[k]^T = 0,
+
+    and R[k], T[k] are Metzler.  Therefore every nonnegative combination
+
+        R(z) = sum_k a_k(z) R[k],
+        T(z) = sum_k a_k(z) T[k],       a_k(z) >= 0,
+
+    is again feasible.  If A0,B0 >= 0 and A0 G B0^T = M, then
+
+        A(z) = exp(R(z)) A0,
+        B(z) = exp(T(z)) B0
+
+    are nonnegative and satisfy A(z) G B(z)^T = M exactly.
+
+    ``C`` is the r x r active-subspace witness used internally:
+
+        R L = L C,
+        T F = -F C^T,
+
+    for an internal rank factorization M = L F^T.
+    """
+
+    R: DenseMatrix
+    T: DenseMatrix
+    C: torch.Tensor
+    singular_values: torch.Tensor
+    factor_residual: float
+
+    def __len__(self) -> int:
+        return int(self.C.shape[0])
+
+
+@dataclass(frozen=True)
+class _Layout:
     c: slice
-    r_diag: slice
-    r_off: slice
-    t_diag: slice
-    t_off: slice
-    abs_c: slice
+    r: slice
+    t: slice
     n_vars: int
 
 
-class LowRankMetzlerConeRayFinder:
-    r"""
-    Find diverse reduced generator rays C in R^{r x r} with Metzler
-    certificates R,T satisfying
-
-        R U       = U C,
-        T U_tilde = U_tilde D(C),
-
-    where
-
-        D(C) = -H^T C^T H^{-T}.
-
-    If R and T are Metzler and U,U_tilde are entrywise nonnegative, then
-
-        U exp(C)             = exp(R) U       >= 0,
-        U_tilde exp(D(C))    = exp(T) U_tilde >= 0.
-
-    Thus these C rays can be combined with arbitrary nonnegative neural
-    coefficients while preserving positivity exactly.
+class RankDeficientGramConeRayFinder:
+    r"""Find diverse paired Metzler rays preserving a singular Gram target.
 
     Parameters
     ----------
-    U:
-        Nonnegative array/tensor of shape (m, r), full column rank.
-    U_tilde:
-        Nonnegative array/tensor of shape (m, r), full column rank.
-    H:
-        Invertible reduced Gram/coupling matrix of shape (r, r). IMPORTANT:
-        pass H itself, not H.T. The paired generator is constructed as
+    M:
+        Fixed target Gram matrix of shape ``(m, m)`` and numerical rank
+        ``rank``.
+    rank:
+        Intended rank r of M, with 1 <= r < m.
+    m:
+        Ambient matrix dimension.  Passed explicitly to make dimension
+        mismatches fail early; it must agree with M.shape.
 
-            D(C) = -H.T @ C.T @ inv(H).T.
+    Feasible generator pairs satisfy
 
-    certificate_mode:
-        ``"full"`` uses every off-diagonal entry of R and T as a certificate
-        variable. This is exact but uses O(m^2) LP variables.
+        R M + M T^T = 0,
+        R Metzler,
+        T Metzler.
 
-        ``"neighbors"`` restricts each row of R/T to a fixed set of
-        off-diagonal neighbors. Any ray returned is still rigorously feasible;
-        this only under-approximates the full cone and reduces the certificate
-        variables to O(m * certificate_neighbors).
+    Rather than impose the m x m matrix equality directly, the implementation
+    computes a compact SVD factorization
 
-        ``"auto"`` uses full certificates for m <= max_full_m and neighbor
-        certificates otherwise.
-    certificate_neighbors:
-        Number of off-diagonal row neighbors used in ``"neighbors"`` mode.
-        Neighbors are selected by cosine similarity between rows of U (and
-        separately U_tilde). Set >= m-1 to recover full support.
-    remove_identity:
-        Add tr(C)=0 while searching so the trivial scaling line C=c I_r does
-        not dominate the random LPs. The identity direction can be added back
-        separately at runtime if desired.
+        M = L F^T,    L,F in R^{m x r},
 
-    Notes
-    -----
-    The projected cone in C-space is polyhedral, but explicit extreme-ray
-    enumeration is generally unattractive here because the natural Metzler
-    certificate formulation contains R/T variables whose count can scale with
-    m. Instead this class probes the compact L1 slice of the cone with many
-    random LP objectives and returns a cosine-diverse subset of C directions.
+    and introduces an auxiliary active generator C in R^{r x r}:
+
+        R L = L C,
+        T F = -F C^T.
+
+    These equations are equivalent to R M + M T^T = 0 when L and F have full
+    column rank.  They reduce the equality count from O(m^2) to O(m r).
+
+    ``support_mode='full'`` searches the exact dense paired cone.  For large m,
+    ``'neighbors'`` restricts each row of R/T to a fixed number of off-diagonal
+    neighbors, yielding a rigorous inner approximation with O(m * neighbors)
+    variables. ``'auto'`` chooses full support for m <= max_full_m.
+
+    The trivial reciprocal scaling line
+
+        (R,T,C) = (gamma I, -gamma I, gamma I)
+
+    is removed during discovery with tr(C)=0.  Gram-null directions with C=0
+    are *not* removed; those are precisely useful rank-deficiency freedoms.
     """
 
     def __init__(
         self,
-        U: np.ndarray | torch.Tensor,
-        U_tilde: np.ndarray | torch.Tensor,
-        H: np.ndarray | torch.Tensor,
+        M: np.ndarray | torch.Tensor | DenseMatrix,
+        rank: int,
+        m: int,
         *,
-        certificate_mode: CertificateMode = "auto",
-        certificate_neighbors: int = 32,
-        max_full_m: int = 128,
-        candidate_factor: int = 12,
+        support_mode: SupportMode = "auto",
+        n_neighbors: int = 32,
+        max_full_m: int = 96,
+        candidate_factor: int = 16,
         feasibility_tol: float = 1e-8,
+        rank_tol: float = 1e-9,
+        factor_tol: float = 1e-8,
         cosine_tol: float = 1e-6,
-        rank_tol: float = 1e-10,
         seed: int = 0,
-        remove_identity: bool = True,
+        remove_scalar_lineality: bool = True,
     ):
-        self._torch_ref = self._pick_torch_reference(U, U_tilde, H)
+        self._torch_ref = self._pick_torch_reference(M)
+        self.M = self._to_numpy(M)
+        self.m = int(m)
+        self.rank = int(rank)
 
-        self.U = self._to_numpy(U)
-        self.U_tilde = self._to_numpy(U_tilde)
-        self.H = self._to_numpy(H)
-
-        if self.U.ndim != 2:
-            raise ValueError("U must have shape (m, r)")
-        if self.U_tilde.shape != self.U.shape:
+        if self.M.ndim != 2 or self.M.shape != (self.m, self.m):
             raise ValueError(
-                "U_tilde must have the same shape as U; got "
-                f"{self.U_tilde.shape} and {self.U.shape}"
+                f"M must have shape ({self.m}, {self.m}); got {self.M.shape}"
             )
-
-        self.m, self.r = self.U.shape
-        if self.H.shape != (self.r, self.r):
-            raise ValueError(
-                f"H must have shape ({self.r}, {self.r}); got {self.H.shape}"
-            )
-
-        if np.min(self.U) < -feasibility_tol:
-            raise ValueError("U must be entrywise nonnegative")
-        if np.min(self.U_tilde) < -feasibility_tol:
-            raise ValueError("U_tilde must be entrywise nonnegative")
-
-        if np.linalg.matrix_rank(self.U, tol=rank_tol) != self.r:
-            raise ValueError("U must have full column rank")
-        if np.linalg.matrix_rank(self.U_tilde, tol=rank_tol) != self.r:
-            raise ValueError("U_tilde must have full column rank")
-        if np.linalg.matrix_rank(self.H, tol=rank_tol) != self.r:
-            raise ValueError("H must be invertible")
-
-        if certificate_mode not in ("auto", "full", "neighbors"):
-            raise ValueError(
-                "certificate_mode must be 'auto', 'full', or 'neighbors'"
-            )
-        if certificate_neighbors <= 0:
-            raise ValueError("certificate_neighbors must be positive")
-        if max_full_m <= 0:
-            raise ValueError("max_full_m must be positive")
+        if not 1 <= self.rank < self.m:
+            raise ValueError("rank must satisfy 1 <= rank < m")
         if candidate_factor <= 0:
             raise ValueError("candidate_factor must be positive")
+        if n_neighbors <= 0:
+            raise ValueError("n_neighbors must be positive")
+        if support_mode not in ("auto", "full", "neighbors"):
+            raise ValueError("support_mode must be 'auto', 'full', or 'neighbors'")
 
-        if certificate_mode == "auto":
-            certificate_mode = "full" if self.m <= max_full_m else "neighbors"
+        self.feasibility_tol = float(feasibility_tol)
+        self.rank_tol = float(rank_tol)
+        self.factor_tol = float(factor_tol)
+        self.cosine_tol = float(cosine_tol)
+        self.candidate_factor = int(candidate_factor)
+        self.seed = int(seed)
+        self.remove_scalar_lineality = bool(remove_scalar_lineality)
 
-        self.certificate_mode = certificate_mode
-        self.certificate_neighbors = min(certificate_neighbors, max(0, self.m - 1))
-        self.max_full_m = max_full_m
-        self.candidate_factor = candidate_factor
-        self.feasibility_tol = feasibility_tol
-        self.cosine_tol = cosine_tol
-        self.rank_tol = rank_tol
-        self.seed = seed
-        self.remove_identity = remove_identity
+        # Compact rank-r factorization M = L F^T from the SVD.
+        U, s, Vh = np.linalg.svd(self.M, full_matrices=False)
+        if s[0] <= 0:
+            raise ValueError("M must be nonzero")
 
-        # H^{-T}; H itself is the input, not H^T.
-        self.H_inv_T = np.linalg.inv(self.H).T
+        threshold = self.rank_tol * s[0]
+        numerical_rank = int(np.sum(s > threshold))
+        if numerical_rank != self.rank:
+            raise ValueError(
+                f"declared rank={self.rank}, but numerical rank={numerical_rank} "
+                f"using tolerance {self.rank_tol:g} * sigma_max"
+            )
 
-        # Linear map vec(D) = L_D vec(C), using row-major vectorization.
-        self._D_map = self._build_D_map()
+        self.singular_values = s[: self.rank].copy()
+        root_s = np.sqrt(self.singular_values)
+        self.L = U[:, : self.rank] * root_s[None, :]
+        self.F = Vh[: self.rank, :].T * root_s[None, :]
 
-        self._r_pairs = self._certificate_pairs(self.U)
-        self._t_pairs = self._certificate_pairs(self.U_tilde)
+        reconstructed = self.L @ self.F.T
+        denom = max(np.linalg.norm(self.M), 1.0)
+        self.factor_residual = float(np.linalg.norm(reconstructed - self.M) / denom)
+        if self.factor_residual > self.factor_tol:
+            raise ValueError(
+                "rank-r factorization does not reconstruct M accurately: "
+                f"relative residual={self.factor_residual:.3e}"
+            )
 
+        if support_mode == "auto":
+            support_mode = "full" if self.m <= max_full_m else "neighbors"
+        self.support_mode = support_mode
+        self.n_neighbors = min(int(n_neighbors), max(0, self.m - 1))
+        self.max_full_m = int(max_full_m)
+
+        self._r_rows, self._r_cols = self._support_pairs(self.L)
+        self._t_rows, self._t_cols = self._support_pairs(self.F)
         self._layout = self._build_layout()
         self._A_eq, self._b_eq = self._build_equalities()
-        self._A_ub, self._b_ub = self._build_l1_slice()
         self._bounds = self._build_bounds()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def find(self, k: int) -> DenseMatrix:
-        """Return ``k`` cosine-diverse feasible C rays as a batched DenseMatrix."""
+    def find(self, k: int) -> PairedMetzlerConeRays:
         if k <= 0:
             raise ValueError("k must be positive")
 
         rng = np.random.default_rng(self.seed)
-        count = max(self.candidate_factor * k, k + 8)
-        candidates: list[np.ndarray] = []
+        count = max(self.candidate_factor * k, k + 12)
+        candidates: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
         for _ in range(count):
-            q = rng.standard_normal((self.r, self.r))
-            if self.remove_identity:
-                q -= (np.trace(q) / self.r) * np.eye(self.r)
+            objective = rng.standard_normal(self._layout.n_vars)
 
-            objective = np.zeros(self._layout.n_vars, dtype=np.float64)
-            objective[self._layout.c] = -q.ravel(order="C")
+            # Do not let arbitrary diagonal offsets dominate every objective.
+            # The variables remain in the LP; this only balances the probing.
+            objective /= max(np.linalg.norm(objective), 1e-12)
 
             res = linprog(
-                c=objective,
-                A_ub=self._A_ub,
-                b_ub=self._b_ub,
+                c=-objective,
                 A_eq=self._A_eq,
                 b_eq=self._b_eq,
                 bounds=self._bounds,
                 method="highs",
             )
-
             if not res.success:
                 continue
 
-            C = res.x[self._layout.c].reshape((self.r, self.r), order="C")
-            norm = np.linalg.norm(C)
-            if norm <= 1e-10:
+            C = res.x[self._layout.c].reshape(
+                (self.rank, self.rank), order="C"
+            )
+            R = self._unpack_supported(
+                res.x[self._layout.r], self._r_rows, self._r_cols
+            )
+            T = self._unpack_supported(
+                res.x[self._layout.t], self._t_rows, self._t_cols
+            )
+
+            pair_norm = np.sqrt(np.sum(R * R) + np.sum(T * T))
+            if pair_norm <= 1e-10:
                 continue
 
-            # Positive rescaling preserves cone feasibility.
-            candidates.append(C / norm)
+            R /= pair_norm
+            T /= pair_norm
+            C /= pair_norm
+
+            if self._direct_residual(R, T) > 50.0 * self.feasibility_tol:
+                continue
+            if self._min_offdiag(R) < -self.feasibility_tol:
+                continue
+            if self._min_offdiag(T) < -self.feasibility_tol:
+                continue
+
+            candidates.append((R, T, C))
 
         if not candidates:
             raise RuntimeError(
-                "Could not find a nontrivial reduced cone direction. "
-                "If using neighbor certificates, increase certificate_neighbors "
-                "or switch to certificate_mode='full'."
+                "Could not find a nontrivial paired Metzler direction. "
+                "If using neighbor support, increase n_neighbors or use "
+                "support_mode='full'."
             )
 
         selected = self._select_diverse(candidates, k)
-        rays = np.stack(selected)
 
-        return DenseMatrix(
-            torch.as_tensor(
-                rays,
-                dtype=self._torch_dtype,
-                device=self._torch_device,
-            )
+        R_batch = np.stack([x[0] for x in selected])
+        T_batch = np.stack([x[1] for x in selected])
+        C_batch = np.stack([x[2] for x in selected])
+
+        dtype, device = self._torch_dtype_device()
+        return PairedMetzlerConeRays(
+            R=DenseMatrix(torch.as_tensor(R_batch, dtype=dtype, device=device)),
+            T=DenseMatrix(torch.as_tensor(T_batch, dtype=dtype, device=device)),
+            C=torch.as_tensor(C_batch, dtype=dtype, device=device),
+            singular_values=torch.as_tensor(
+                self.singular_values, dtype=dtype, device=device
+            ),
+            factor_residual=self.factor_residual,
         )
 
     __call__ = find
 
-    def paired_generator(self, C: np.ndarray | torch.Tensor):
-        """
-        Compute D(C) = -H^T C^T H^{-T} using the same backend as ``C``.
-        """
-        if torch.is_tensor(C):
-            H = torch.as_tensor(self.H, dtype=C.dtype, device=C.device)
-            H_inv_T = torch.as_tensor(self.H_inv_T, dtype=C.dtype, device=C.device)
-            return -H.T @ C.T @ H_inv_T
-
-        C_np = np.asarray(C, dtype=np.float64)
-        return -self.H.T @ C_np.T @ self.H_inv_T
-
-    @property
-    def certificate_support_sizes(self) -> tuple[int, int]:
-        """Number of allowed off-diagonal entries in R and T."""
-        return len(self._r_pairs), len(self._t_pairs)
-
     # ------------------------------------------------------------------
-    # Input conversion
+    # LP construction
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _pick_torch_reference(*xs):
-        for x in xs:
-            if torch.is_tensor(x):
-                return x
-        return None
-
-    @staticmethod
-    def _to_numpy(x) -> np.ndarray:
-        if torch.is_tensor(x):
-            return x.detach().cpu().double().numpy()
-        return np.asarray(x, dtype=np.float64)
-
-    @property
-    def _torch_dtype(self):
-        if self._torch_ref is None:
-            return torch.float64
-        return self._torch_ref.dtype
-
-    @property
-    def _torch_device(self):
-        if self._torch_ref is None:
-            return torch.device("cpu")
-        return self._torch_ref.device
-
-    # ------------------------------------------------------------------
-    # D(C) linear map
-    # ------------------------------------------------------------------
-
-    def _build_D_map(self) -> np.ndarray:
-        """
-        Return L_D with row-major vectorization:
-
-            vec_C(D(C)) = L_D @ vec_C(C),
-            D(C) = -H^T C^T H^{-T}.
-
-        r is intentionally small, so building this map by basis evaluation is
-        simple and avoids Kronecker/vectorization convention mistakes.
-        """
-        n = self.r * self.r
-        L = np.empty((n, n), dtype=np.float64)
-
-        for p in range(n):
-            C = np.zeros((self.r, self.r), dtype=np.float64)
-            C.ravel(order="C")[p] = 1.0
-            D = -self.H.T @ C.T @ self.H_inv_T
-            L[:, p] = D.ravel(order="C")
-
-        return L
-
-    # ------------------------------------------------------------------
-    # Sparse/full Metzler certificate support
-    # ------------------------------------------------------------------
-
-    def _certificate_pairs(self, U: np.ndarray) -> np.ndarray:
-        """
-        Return allowed directed off-diagonal pairs (i,j) for a Metzler
-        certificate. A returned pair means R[i,j] (or T[i,j]) is a nonnegative
-        LP variable.
-
-        In full mode all i != j are included. In neighbor mode each row keeps
-        the most cosine-similar row directions. Restricting support cannot
-        invalidate a returned ray: it only searches a smaller certified cone.
-        """
+    def _support_pairs(self, embedding: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         m = self.m
-        if m <= 1:
-            return np.empty((0, 2), dtype=np.int64)
+        if self.support_mode == "full" or self.n_neighbors >= m - 1:
+            rows = np.repeat(np.arange(m), m)
+            cols = np.tile(np.arange(m), m)
+            return rows.astype(int), cols.astype(int)
 
-        if self.certificate_mode == "full" or self.certificate_neighbors >= m - 1:
-            rows = np.repeat(np.arange(m), m - 1)
-            cols = np.concatenate(
-                [np.concatenate((np.arange(i), np.arange(i + 1, m))) for i in range(m)]
-            )
-            return np.column_stack((rows, cols)).astype(np.int64, copy=False)
+        # Keep the diagonal plus rows whose embedding vectors have the largest
+        # absolute cosine similarity.  This is a safe inner approximation: any
+        # solution remains an exact Metzler certificate/generator.
+        norms = np.linalg.norm(embedding, axis=1, keepdims=True)
+        normalized = embedding / np.maximum(norms, 1e-15)
+        similarity = np.abs(normalized @ normalized.T)
+        np.fill_diagonal(similarity, -np.inf)
 
-        k = self.certificate_neighbors
-        norms = np.linalg.norm(U, axis=1)
-        if np.any(norms <= self.rank_tol):
-            raise ValueError("U/U_tilde cannot contain zero rows in neighbor mode")
-        V = U / norms[:, None]
-
-        pairs = np.empty((m * k, 2), dtype=np.int64)
-        pos = 0
-
-        # O(m^2 r) work but only O(m r) storage. This is offline. If m becomes
-        # enormous, replace this block with an ANN/kNN implementation.
+        rows: list[int] = []
+        cols: list[int] = []
         for i in range(m):
-            similarity = V @ V[i]
-            similarity[i] = -np.inf
-            js = np.argpartition(similarity, -k)[-k:]
-            # Stable ordering is useful for reproducibility/debugging.
-            js = js[np.argsort(similarity[js])[::-1]]
-            pairs[pos:pos + k, 0] = i
-            pairs[pos:pos + k, 1] = js
-            pos += k
+            rows.append(i)
+            cols.append(i)
+            nbr = np.argpartition(
+                similarity[i], -self.n_neighbors
+            )[-self.n_neighbors :]
+            for j in np.sort(nbr):
+                rows.append(i)
+                cols.append(int(j))
+        return np.asarray(rows, dtype=int), np.asarray(cols, dtype=int)
 
-        return pairs
-
-    def _build_layout(self) -> _VariableLayout:
-        n_c = self.r * self.r
-        n_roff = len(self._r_pairs)
-        n_toff = len(self._t_pairs)
-
-        start = 0
-        c = slice(start, start + n_c)
-        start = c.stop
-        r_diag = slice(start, start + self.m)
-        start = r_diag.stop
-        r_off = slice(start, start + n_roff)
-        start = r_off.stop
-        t_diag = slice(start, start + self.m)
-        start = t_diag.stop
-        t_off = slice(start, start + n_toff)
-        start = t_off.stop
-        abs_c = slice(start, start + n_c)
-        start = abs_c.stop
-
-        return _VariableLayout(c, r_diag, r_off, t_diag, t_off, abs_c, start)
-
-    # ------------------------------------------------------------------
-    # Equality constraints: R U = U C and T U_tilde = U_tilde D(C)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _group_pairs_by_row(pairs: np.ndarray, m: int):
-        groups: list[list[tuple[int, int]]] = [[] for _ in range(m)]
-        for local_idx, (i, j) in enumerate(pairs):
-            groups[int(i)].append((int(j), local_idx))
-        return groups
+    def _build_layout(self) -> _Layout:
+        r2 = self.rank * self.rank
+        p_r = len(self._r_rows)
+        p_t = len(self._t_rows)
+        c = slice(0, r2)
+        r = slice(c.stop, c.stop + p_r)
+        t = slice(r.stop, r.stop + p_t)
+        return _Layout(c=c, r=r, t=t, n_vars=t.stop)
 
     def _build_equalities(self) -> tuple[sp.csr_matrix, np.ndarray]:
-        m, r = self.m, self.r
-        layout = self._layout
-        n_main = 2 * m * r
-        n_trace = 1 if self.remove_identity else 0
-        n_rows = n_main + n_trace
-
-        eq_rows: list[int] = []
-        eq_cols: list[int] = []
-        eq_vals: list[float] = []
-
-        r_groups = self._group_pairs_by_row(self._r_pairs, m)
-        t_groups = self._group_pairs_by_row(self._t_pairs, m)
-
-        # --------------------------------------------------------------
-        # R U = U C
-        # --------------------------------------------------------------
-        for i in range(m):
-            for a in range(r):
-                row = i * r + a
-
-                # (R U)_{i,a}: diagonal certificate entry.
-                val = self.U[i, a]
-                if val != 0.0:
-                    eq_rows.append(row)
-                    eq_cols.append(layout.r_diag.start + i)
-                    eq_vals.append(val)
-
-                # (R U)_{i,a}: supported nonnegative off-diagonals.
-                for j, local_idx in r_groups[i]:
-                    val = self.U[j, a]
-                    if val != 0.0:
-                        eq_rows.append(row)
-                        eq_cols.append(layout.r_off.start + local_idx)
-                        eq_vals.append(val)
-
-                # -(U C)_{i,a} = -sum_b U[i,b] C[b,a].
-                for b in range(r):
-                    val = -self.U[i, b]
-                    if val != 0.0:
-                        eq_rows.append(row)
-                        eq_cols.append(layout.c.start + b * r + a)
-                        eq_vals.append(val)
-
-        # --------------------------------------------------------------
-        # T U_tilde = U_tilde D(C)
-        # --------------------------------------------------------------
-        # D_map reshaped as D[b,a] coefficients over vec(C).
-        D_coeff = self._D_map.reshape((r, r, r * r), order="C")
-        second_base = m * r
-
-        for i in range(m):
-            # coefficients[a,p] = coefficient of C_p in (U_tilde D)_{i,a}
-            coeff = np.einsum("b,bap->ap", self.U_tilde[i], D_coeff)
-
-            for a in range(r):
-                row = second_base + i * r + a
-
-                val = self.U_tilde[i, a]
-                if val != 0.0:
-                    eq_rows.append(row)
-                    eq_cols.append(layout.t_diag.start + i)
-                    eq_vals.append(val)
-
-                for j, local_idx in t_groups[i]:
-                    val = self.U_tilde[j, a]
-                    if val != 0.0:
-                        eq_rows.append(row)
-                        eq_cols.append(layout.t_off.start + local_idx)
-                        eq_vals.append(val)
-
-                nz = np.flatnonzero(np.abs(coeff[a]) > 0.0)
-                for p in nz:
-                    eq_rows.append(row)
-                    eq_cols.append(layout.c.start + int(p))
-                    eq_vals.append(-float(coeff[a, p]))
-
-        # Remove the trivial C = c I_r lineality while discovering mixing rays.
-        if self.remove_identity:
-            row = n_main
-            for a in range(r):
-                eq_rows.append(row)
-                eq_cols.append(layout.c.start + a * r + a)
-                eq_vals.append(1.0)
-
-        A_eq = sp.csr_matrix(
-            (eq_vals, (eq_rows, eq_cols)),
-            shape=(n_rows, layout.n_vars),
-            dtype=np.float64,
-        )
-        b_eq = np.zeros(n_rows, dtype=np.float64)
-        return A_eq, b_eq
-
-    # ------------------------------------------------------------------
-    # Compact L1 slice in C-space
-    # ------------------------------------------------------------------
-
-    def _build_l1_slice(self) -> tuple[sp.csr_matrix, np.ndarray]:
-        """
-        Enforce |C_p| <= s_p and sum_p s_p <= 1. This makes random linear
-        objectives bounded without imposing artificial bounds on R/T witnesses.
-        """
-        n = self.r * self.r
-        layout = self._layout
-
+        """Build R L = L C and T F = -F C^T, plus tr(C)=0."""
+        m, r = self.m, self.rank
+        n_eq = 2 * m * r + (1 if self.remove_scalar_lineality else 0)
         rows: list[int] = []
         cols: list[int] = []
         vals: list[float] = []
 
-        # C_p - s_p <= 0.
-        for p in range(n):
-            rows.extend((p, p))
-            cols.extend((layout.c.start + p, layout.abs_c.start + p))
-            vals.extend((1.0, -1.0))
+        # Fast lookup for all supported entries in each row.
+        r_by_row: list[list[tuple[int, int]]] = [[] for _ in range(m)]
+        for q, (i, j) in enumerate(zip(self._r_rows, self._r_cols)):
+            r_by_row[int(i)].append((q, int(j)))
 
-        # -C_p - s_p <= 0.
-        offset = n
-        for p in range(n):
-            rows.extend((offset + p, offset + p))
-            cols.extend((layout.c.start + p, layout.abs_c.start + p))
-            vals.extend((-1.0, -1.0))
+        t_by_row: list[list[tuple[int, int]]] = [[] for _ in range(m)]
+        for q, (i, j) in enumerate(zip(self._t_rows, self._t_cols)):
+            t_by_row[int(i)].append((q, int(j)))
 
-        # sum s_p <= 1.
-        sum_row = 2 * n
-        for p in range(n):
-            rows.append(sum_row)
-            cols.append(layout.abs_c.start + p)
-            vals.append(1.0)
+        eq = 0
+        # R L - L C = 0.
+        for i in range(m):
+            for a in range(r):
+                for q, j in r_by_row[i]:
+                    v = self.L[j, a]
+                    if v != 0.0:
+                        rows.append(eq)
+                        cols.append(self._layout.r.start + q)
+                        vals.append(float(v))
+                for b in range(r):
+                    v = -self.L[i, b]
+                    if v != 0.0:
+                        c_idx = b * r + a  # C[b,a], row-major
+                        rows.append(eq)
+                        cols.append(self._layout.c.start + c_idx)
+                        vals.append(float(v))
+                eq += 1
 
-        A_ub = sp.csr_matrix(
-            (vals, (rows, cols)),
-            shape=(2 * n + 1, layout.n_vars),
-            dtype=np.float64,
+        # T F + F C^T = 0.
+        for i in range(m):
+            for a in range(r):
+                for q, j in t_by_row[i]:
+                    v = self.F[j, a]
+                    if v != 0.0:
+                        rows.append(eq)
+                        cols.append(self._layout.t.start + q)
+                        vals.append(float(v))
+                for b in range(r):
+                    v = self.F[i, b]
+                    if v != 0.0:
+                        c_idx = a * r + b  # C[a,b] from C^T[b,a]
+                        rows.append(eq)
+                        cols.append(self._layout.c.start + c_idx)
+                        vals.append(float(v))
+                eq += 1
+
+        if self.remove_scalar_lineality:
+            for a in range(r):
+                c_idx = a * r + a
+                rows.append(eq)
+                cols.append(self._layout.c.start + c_idx)
+                vals.append(1.0)
+            eq += 1
+
+        assert eq == n_eq
+        A_eq = sp.csr_matrix(
+            (vals, (rows, cols)), shape=(n_eq, self._layout.n_vars)
         )
-        b_ub = np.zeros(2 * n + 1, dtype=np.float64)
-        b_ub[-1] = 1.0
-        return A_ub, b_ub
+        return A_eq, np.zeros(n_eq, dtype=np.float64)
 
-    def _build_bounds(self):
-        layout = self._layout
-        bounds: list[tuple[float | None, float | None]] = [
-            (None, None)
-        ] * layout.n_vars
+    def _build_bounds(self) -> list[tuple[float, float]]:
+        bounds: list[tuple[float, float]] = []
 
-        # Off-diagonal entries of the Metzler certificates are nonnegative.
-        for p in range(layout.r_off.start, layout.r_off.stop):
-            bounds[p] = (0.0, None)
-        for p in range(layout.t_off.start, layout.t_off.stop):
-            bounds[p] = (0.0, None)
+        # Active generator C is signed.
+        bounds.extend([(-1.0, 1.0)] * (self.rank * self.rank))
 
-        # L1 auxiliary variables are nonnegative.
-        for p in range(layout.abs_c.start, layout.abs_c.stop):
-            bounds[p] = (0.0, None)
-
-        # C and certificate diagonals are free.
+        # R and T are Metzler: diagonal signed, off-diagonal nonnegative.
+        for i, j in zip(self._r_rows, self._r_cols):
+            bounds.append((-1.0, 1.0) if i == j else (0.0, 1.0))
+        for i, j in zip(self._t_rows, self._t_cols):
+            bounds.append((-1.0, 1.0) if i == j else (0.0, 1.0))
         return bounds
 
     # ------------------------------------------------------------------
-    # Diversity selection in C-space
+    # Verification / diversity
     # ------------------------------------------------------------------
+
+    def _unpack_supported(
+        self, values: np.ndarray, rows: np.ndarray, cols: np.ndarray
+    ) -> np.ndarray:
+        A = np.zeros((self.m, self.m), dtype=np.float64)
+        A[rows, cols] = values
+        return A
+
+    def _direct_residual(self, R: np.ndarray, T: np.ndarray) -> float:
+        E = R @ self.M + self.M @ T.T
+        scale = max(np.linalg.norm(self.M), 1.0)
+        return float(np.linalg.norm(E) / scale)
+
+    @staticmethod
+    def _min_offdiag(A: np.ndarray) -> float:
+        if A.shape[0] <= 1:
+            return np.inf
+        mask = ~np.eye(A.shape[0], dtype=bool)
+        return float(A[mask].min())
 
     def _select_diverse(
         self,
-        rays: list[np.ndarray],
+        rays: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
         k: int,
-    ) -> list[np.ndarray]:
-        if len(rays) < k:
-            raise RuntimeError(
-                f"Only found {len(rays)} candidates; requested {k}. "
-                "Increase candidate_factor or certificate_neighbors."
-            )
-
-        V = np.stack([C.ravel() for C in rays])
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        # Runtime geometry is the pair (R,T), so select diversity in that space.
+        V = np.stack(
+            [np.concatenate([R.ravel(), T.ravel()]) for R, T, _ in rays]
+        )
         norms = np.linalg.norm(V, axis=1)
         valid = norms > 1e-12
         V = V[valid]
-        rays = [C for C, keep in zip(rays, valid) if keep]
+        rays = [ray for ray, keep in zip(rays, valid) if keep]
         V /= np.linalg.norm(V, axis=1, keepdims=True)
 
         S = np.clip(V @ V.T, -1.0, 1.0)
-
-        # Deduplicate positive-scaled copies of the same cone ray.
         keep: list[int] = []
         for i in range(len(rays)):
             if not keep or np.max(S[i, keep]) < 1.0 - self.cosine_tol:
                 keep.append(i)
 
-        V = V[keep]
         rays = [rays[i] for i in keep]
+        V = V[keep]
         S = np.clip(V @ V.T, -1.0, 1.0)
 
         if len(rays) < k:
             raise RuntimeError(
-                f"Only found {len(rays)} distinct candidates; requested {k}. "
-                "Increase candidate_factor or certificate_neighbors."
+                f"Only found {len(rays)} distinct paired directions; requested {k}. "
+                "Increase candidate_factor or use fuller support."
             )
-
         if k == 1:
             if len(rays) == 1:
                 return rays
-            T = S.copy()
-            np.fill_diagonal(T, -np.inf)
-            return [rays[int(np.argmin(T.max(axis=1)))]]
+            Tsim = S.copy()
+            np.fill_diagonal(Tsim, -np.inf)
+            return [rays[int(np.argmin(Tsim.max(axis=1)))]]
 
-        T = S.copy()
-        np.fill_diagonal(T, np.inf)
-        i, j = np.unravel_index(np.argmin(T), T.shape)
-
+        Tsim = S.copy()
+        np.fill_diagonal(Tsim, np.inf)
+        i, j = np.unravel_index(np.argmin(Tsim), Tsim.shape)
         selected = [int(i), int(j)]
         available = np.ones(len(rays), dtype=bool)
         available[selected] = False
         max_similarity = S[:, selected].max(axis=1)
 
         while len(selected) < k:
-            candidates = np.flatnonzero(available)
-            best = candidates[np.argmin(max_similarity[candidates])]
+            cand = np.flatnonzero(available)
+            best = cand[np.argmin(max_similarity[cand])]
             selected.append(int(best))
             available[best] = False
             max_similarity = np.maximum(max_similarity, S[:, best])
 
         return [rays[i] for i in selected]
+
+    # ------------------------------------------------------------------
+    # Conversion helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pick_torch_reference(M):
+        if isinstance(M, DenseMatrix):
+            return M.to_dense()
+        if torch.is_tensor(M):
+            return M
+        return None
+
+    @staticmethod
+    def _to_numpy(M) -> np.ndarray:
+        if isinstance(M, DenseMatrix):
+            M = M.to_dense()
+        if torch.is_tensor(M):
+            return M.detach().cpu().double().numpy()
+        return np.asarray(M, dtype=np.float64)
+
+    def _torch_dtype_device(self):
+        if self._torch_ref is None:
+            return torch.float64, torch.device("cpu")
+        return self._torch_ref.dtype, self._torch_ref.device

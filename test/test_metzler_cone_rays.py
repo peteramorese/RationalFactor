@@ -1,551 +1,208 @@
-"""
-Integration / regression checks for LowRankMetzlerConeRayFinder.
+"""Regression test for RankDeficientGramConeRayFinder.
 
-The realistic fixture does the following:
+The fixture builds
 
-1. Builds a dense, strictly positive Gram matrix G from normalized Bernstein
-   basis functions on [0, 1].
-2. Draws independent strictly positive low-rank factors
+    phi = A(z) alpha,
+    psi = B(z) beta,
 
-       U, V, U_tilde, V_tilde in R_+^{m x r}.
+with a fixed rank-r target Gram
 
-3. Forms the reduced coupling
+    M = A0 G B0^T.
 
-       H = V.T @ G @ V_tilde.
+A0 and B0 are random positive rank-r matrices and G is the exact Gram of a
+positive Bernstein basis.  The test then verifies that the direct paired cone
+finder produces genuinely nontrivial Metzler generator pairs (R,T) satisfying
 
-4. Runs the reduced cone finder for C in R^{r x r}, where
+    R M + M T^T = 0.
 
-       D(C) = -H.T @ C.T @ H^{-T},
+It additionally checks random nonnegative combinations and the finite-time
+identities
 
-   and independently verifies Metzler certificates
+    A(z) = exp(R(z)) A0 >= 0,
+    B(z) = exp(T(z)) B0 >= 0,
+    A(z) G B(z)^T = M.
 
-       R @ U       = U @ C,
-       T @ U_tilde = U_tilde @ D(C).
+Run standalone:
 
-5. Verifies the actual model consequences:
+    python test_rank_deficient_gram_cone.py
 
-       U exp(C) >= 0,
-       U_tilde exp(D) >= 0,
-
-   and
-
-       A G B.T = U H U_tilde.T,
-
-   where
-
-       A = U exp(C) V.T,
-       B = U_tilde exp(D) V_tilde.T.
-
-Important diagnostic:
----------------------
-For generic independent positive U, U_tilde, V, V_tilde, the trace-free
-certified cone may contain no nontrivial direction at all; the always-feasible
-scalar lineality C = gamma I can be the entire discovered cone.  The realistic
-random fixture therefore *strictly* tests the scalar cone and then probes the
-trace-free cone, reporting whether nontrivial directions were found rather
-than assuming that random factors must admit them.
-
-A small identity-coupling regression fixture is also included so the test
-strictly exercises discovery of a nontrivial trace-free ray.
-
-Run from the repository root with, e.g.
-
-    PYTHONPATH=src python test/test_low_rank_metzler_cone_rays.py
+or in the project after placing the finder under rational_factor/tools.
 """
 
 from __future__ import annotations
 
+from math import comb
+
 import numpy as np
 import torch
 from scipy.linalg import expm
-from scipy.optimize import linprog
-from scipy.special import betaln, gammaln
 
-from rational_factor.tools.metzler_cone_rays import LowRankMetzlerConeRayFinder
+from rational_factor.tools.metzler_cone_rays import RankDeficientGramConeRayFinder
 
 
-SEED = 0
-FEAS_TOL = 2e-8
-GRAM_TOL = 2e-8
-CERT_TOL = 2e-8
+SEED = 7
+M_DIM = 10
+RANK = 3
+N_RAYS = 8
 N_COMBOS = 24
-
-# Realistic random low-rank fixture.
-M = 10
-RANK = 10
-NONTRIVIAL_K = 10
-
-# Random LP probing.  The full certificate mode is intentional at this small m
-# so the test checks the exact lifted cone rather than a sparse inner cone.
-CANDIDATE_FACTOR = 50
-
-
-# ============================================================================
-# Positive Gram / low-rank fixture generation
-# ============================================================================
+TOL = 2e-7
 
 
 def _bernstein_gram(m: int) -> np.ndarray:
-    """Gram of normalized degree-(m-1) Bernstein basis functions on [0,1].
-
-    For B_i^n(x) = C(n,i) x^i (1-x)^(n-i),
-
-        integral B_i^n B_j^n dx
-        = C(n,i) C(n,j) Beta(i+j+1, 2n-i-j+1).
-
-    The diagonal normalization simply rescales each positive basis function to
-    unit L2 norm.  The result is dense, symmetric positive definite, and
-    strictly entrywise positive.
-    """
-    if m <= 0:
-        raise ValueError("m must be positive")
-
+    """Exact Gram of degree-(m-1) Bernstein basis on [0,1]."""
     n = m - 1
-    i = np.arange(m, dtype=np.float64)[:, None]
-    j = np.arange(m, dtype=np.float64)[None, :]
-
-    log_choose_i = (
-        gammaln(n + 1.0)
-        - gammaln(i + 1.0)
-        - gammaln(n - i + 1.0)
-    )
-    log_choose_j = (
-        gammaln(n + 1.0)
-        - gammaln(j + 1.0)
-        - gammaln(n - j + 1.0)
-    )
-
-    log_g = (
-        log_choose_i
-        + log_choose_j
-        + betaln(i + j + 1.0, 2.0 * n - i - j + 1.0)
-    )
-    G = np.exp(log_g)
-
-    scale = np.sqrt(np.diag(G))
-    G = G / (scale[:, None] * scale[None, :])
-
-    assert np.min(G) > 0.0
-    print("G rank:", np.linalg.matrix_rank(G), " m: ", m)
-    assert np.linalg.matrix_rank(G) == m
+    G = np.empty((m, m), dtype=np.float64)
+    for i in range(m):
+        for j in range(m):
+            G[i, j] = (
+                comb(n, i)
+                * comb(n, j)
+                / ((2 * n + 1) * comb(2 * n, i + j))
+            )
     return G
 
 
-def _random_positive_factor(
-    m: int,
-    r: int,
-    rng: np.random.Generator,
-    *,
-    concentration: float = 0.6,
-    floor: float = 0.03,
+def _random_positive_rank_r(
+    m: int, r: int, rng: np.random.Generator
 ) -> np.ndarray:
-    """Draw a strictly positive, row-normalized m x r full-rank matrix."""
-    for _ in range(100):
-        X = rng.gamma(concentration, 1.0, size=(m, r)) + floor
-        X /= X.sum(axis=1, keepdims=True)
-        if np.linalg.matrix_rank(X) == r:
-            return X
-    raise RuntimeError("Could not sample a full-column-rank positive factor")
-
-
-def _random_fixture(
-    m: int,
-    r: int,
-    seed: int,
-    *,
-    max_h_condition: float = 1e5,
-):
-    rng = np.random.default_rng(seed)
-    G = _bernstein_gram(m)
-
-    U = _random_positive_factor(m, r, rng)
-    U_tilde = _random_positive_factor(m, r, rng)
-
-    # H can be ill-conditioned if two random positive column spaces align too
-    # closely.  Since these factors are an offline design choice, simply reject
-    # such draws rather than making the cone test numerically meaningless.
-    for _ in range(200):
-        V = _random_positive_factor(m, r, rng)
-        V_tilde = _random_positive_factor(m, r, rng)
-        H = V.T @ G @ V_tilde
-        if (
-            np.linalg.matrix_rank(H) == r
-            and np.linalg.cond(H) <= max_h_condition
-        ):
-            break
-    else:
-        raise RuntimeError("Could not sample a well-conditioned invertible H")
-
-    local_gram = U @ H @ U_tilde.T
-    assert np.linalg.matrix_rank(local_gram, tol=1e-9) == r
-
-    return G, U, V, U_tilde, V_tilde, H, local_gram
-
-
-# ============================================================================
-# Independent certificate / model verification
-# ============================================================================
-
-
-def _paired_generator(H: np.ndarray, C: np.ndarray) -> np.ndarray:
-    """D(C) = -H^T C^T H^{-T}, without explicitly forming H^{-T}."""
-    # Right-multiplication by H^{-T}: X H^{-T} = solve(H^{-1} X^T)^T.
-    # At these small r values explicit inverse would also be harmless, but the
-    # solve makes the orientation unambiguous.
-    left = -H.T @ C.T
-    return np.linalg.solve(H, left.T).T
-
-
-def _solve_metzler_certificate(
-    U: np.ndarray,
-    C: np.ndarray,
-) -> np.ndarray | None:
-    """Independently solve R U = U C with R Metzler.
-
-    This intentionally does not use any private matrices from the ray finder,
-    so it catches vectorization/orientation mistakes in the implementation.
-    """
-    m, r = U.shape
-    n_vars = m * m
-
-    rows = []
-    rhs = (U @ C).reshape(-1)
-
-    for i in range(m):
-        for a in range(r):
-            row = np.zeros(n_vars, dtype=np.float64)
-            for j in range(m):
-                row[i * m + j] = U[j, a]
-            rows.append(row)
-
-    bounds = []
-    for i in range(m):
-        for j in range(m):
-            bounds.append((None, None) if i == j else (0.0, None))
-
-    res = linprog(
-        c=np.zeros(n_vars, dtype=np.float64),
-        A_eq=np.asarray(rows),
-        b_eq=rhs,
-        bounds=bounds,
-        method="highs",
-    )
-
-    if not res.success:
-        return None
-    return res.x.reshape((m, m))
+    """Random strictly-positive m x m matrix of exact rank r."""
+    U = rng.lognormal(mean=0.0, sigma=0.65, size=(m, r))
+    V = rng.lognormal(mean=0.0, sigma=0.65, size=(m, r))
+    U /= np.linalg.norm(U, axis=0, keepdims=True)
+    V /= np.linalg.norm(V, axis=0, keepdims=True)
+    A = U @ V.T
+    assert np.min(A) > 0.0
+    assert np.linalg.matrix_rank(A, tol=1e-10) == r
+    return A
 
 
 def _min_offdiag(A: np.ndarray) -> float:
-    B = A.copy()
-    np.fill_diagonal(B, np.inf)
-    return float(B.min())
+    mask = ~np.eye(A.shape[0], dtype=bool)
+    return float(A[mask].min())
 
 
-def _assert_ray_feasible(
-    *,
-    G: np.ndarray,
-    U: np.ndarray,
-    V: np.ndarray,
-    U_tilde: np.ndarray,
-    V_tilde: np.ndarray,
-    H: np.ndarray,
-    local_gram: np.ndarray,
-    C: np.ndarray,
-    label: str,
-) -> tuple[float, float]:
-    r = C.shape[0]
-    assert C.shape == (r, r)
-
-    D = _paired_generator(H, C)
-
-    # ------------------------------------------------------------------
-    # Independent Metzler witnesses.
-    # ------------------------------------------------------------------
-    R_cert = _solve_metzler_certificate(U, C)
-    assert R_cert is not None, f"{label}: no R Metzler certificate"
-
-    T_cert = _solve_metzler_certificate(U_tilde, D)
-    assert T_cert is not None, f"{label}: no T Metzler certificate"
-
-    r_min = _min_offdiag(R_cert)
-    t_min = _min_offdiag(T_cert)
-    assert r_min >= -CERT_TOL, f"{label}: R offdiag min={r_min:.3e}"
-    assert t_min >= -CERT_TOL, f"{label}: T offdiag min={t_min:.3e}"
-
-    r_resid = np.max(np.abs(R_cert @ U - U @ C))
-    t_resid = np.max(np.abs(T_cert @ U_tilde - U_tilde @ D))
-    assert r_resid <= CERT_TOL, f"{label}: RU-UC residual={r_resid:.3e}"
-    assert t_resid <= CERT_TOL, f"{label}: TU~-U~D residual={t_resid:.3e}"
-
-    # ------------------------------------------------------------------
-    # Exponential positivity.
-    # ------------------------------------------------------------------
-    exp_C = expm(C)
-    exp_D = expm(D)
-
-    U_exp_C = U @ exp_C
-    Ut_exp_D = U_tilde @ exp_D
-
-    assert U_exp_C.min() >= -FEAS_TOL, (
-        f"{label}: min(U exp(C))={U_exp_C.min():.3e}"
+def _pair_cosines(R: np.ndarray, T: np.ndarray) -> np.ndarray:
+    V = np.concatenate(
+        [R.reshape(R.shape[0], -1), T.reshape(T.shape[0], -1)], axis=1
     )
-    assert Ut_exp_D.min() >= -FEAS_TOL, (
-        f"{label}: min(U_tilde exp(D))={Ut_exp_D.min():.3e}"
-    )
-
-    # ------------------------------------------------------------------
-    # Reduced and full Gram cancellation.
-    # ------------------------------------------------------------------
-    reduced = exp_C @ H @ exp_D.T
-    reduced_err = np.max(np.abs(reduced - H))
-    assert reduced_err <= GRAM_TOL, (
-        f"{label}: exp(C) H exp(D)^T != H, err={reduced_err:.3e}"
-    )
-
-    A = U_exp_C @ V.T
-    B = Ut_exp_D @ V_tilde.T
-
-    assert A.min() >= -FEAS_TOL, f"{label}: A min={A.min():.3e}"
-    assert B.min() >= -FEAS_TOL, f"{label}: B min={B.min():.3e}"
-
-    gram = A @ G @ B.T
-    gram_err = np.max(np.abs(gram - local_gram))
-    assert gram_err <= GRAM_TOL, (
-        f"{label}: A G B^T != U H U_tilde^T, err={gram_err:.3e}"
-    )
-
-    return r_min, t_min
-
-
-def _cosine_matrix(C: np.ndarray) -> np.ndarray:
-    V = C.reshape(C.shape[0], -1)
     V /= np.linalg.norm(V, axis=1, keepdims=True)
     return np.clip(V @ V.T, -1.0, 1.0)
 
 
-# ============================================================================
-# Realistic random-positive test
-# ============================================================================
+def _check_pair(M: np.ndarray, R: np.ndarray, T: np.ndarray, label: str) -> None:
+    assert _min_offdiag(R) >= -TOL, f"{label}: R is not Metzler"
+    assert _min_offdiag(T) >= -TOL, f"{label}: T is not Metzler"
 
-
-def _check_random_positive_fixture() -> None:
-    G, U, V, U_tilde, V_tilde, H, local_gram = _random_fixture(
-        M,
-        RANK,
-        SEED,
-    )
-
-    print(
-        "Random positive fixture: "
-        f"m={M}, r={RANK}, "
-        f"cond(G)={np.linalg.cond(G):.3e}, "
-        f"cond(H)={np.linalg.cond(H):.3e}, "
-        f"rank(local gram)={np.linalg.matrix_rank(local_gram)}"
-    )
-
-    # ------------------------------------------------------------------
-    # The scalar lineality C = gamma I is always feasible.  Keep identity
-    # lineality enabled here so a generic random fixture gives a strict smoke
-    # test rather than failing merely because its trace-free cone is trivial.
-    # ------------------------------------------------------------------
-    finder = LowRankMetzlerConeRayFinder(
-        torch.as_tensor(U, dtype=torch.float64),
-        torch.as_tensor(U_tilde, dtype=torch.float64),
-        torch.as_tensor(H, dtype=torch.float64),
-        certificate_mode="full",
-        candidate_factor=CANDIDATE_FACTOR,
-        feasibility_tol=1e-9,
-        cosine_tol=1e-7,
-        seed=SEED,
-        remove_identity=False,
-    )
-
-    rays = finder.find(1)
-    C = rays.to_dense().detach().cpu().double().numpy()
-
-    assert C.shape == (1, RANK, RANK)
-    assert np.linalg.norm(C[0]) > 1e-10
-
-    ray_r_min, ray_t_min = _assert_ray_feasible(
-        G=G,
-        U=U,
-        V=V,
-        U_tilde=U_tilde,
-        V_tilde=V_tilde,
-        H=H,
-        local_gram=local_gram,
-        C=C[0],
-        label="random scalar-cone ray",
-    )
-
-    # Random positive multiples plus arbitrary identity lineality.  The latter
-    # is useful because it tests D(C + gamma I) = D(C) - gamma I as well.
-    rng = np.random.default_rng(SEED + 100)
-    combo_r_min = np.inf
-    combo_t_min = np.inf
-
-    for t in range(N_COMBOS):
-        coeff = rng.uniform(0.0, 3.0)
-        gamma = rng.uniform(-2.0, 2.0)
-        C_combo = coeff * C[0] + gamma * np.eye(RANK)
-
-        r_min, t_min = _assert_ray_feasible(
-            G=G,
-            U=U,
-            V=V,
-            U_tilde=U_tilde,
-            V_tilde=V_tilde,
-            H=H,
-            local_gram=local_gram,
-            C=C_combo,
-            label=f"random combo[{t}]",
-        )
-        combo_r_min = min(combo_r_min, r_min)
-        combo_t_min = min(combo_t_min, t_min)
-
-    print(
-        "  scalar cone ok: "
-        f"R_offdiag_min={ray_r_min:.3e}, "
-        f"T_offdiag_min={ray_t_min:.3e}, "
-        f"combo_R_min={combo_r_min:.3e}, "
-        f"combo_T_min={combo_t_min:.3e}"
-    )
-
-    # ------------------------------------------------------------------
-    # Probe the actually interesting trace-free cone.  Do not assume generic
-    # independent positive factors admit one: empirically they often do not.
-    # If rays are found, verify them and their nonnegative combinations fully.
-    # ------------------------------------------------------------------
-    nontrivial_finder = LowRankMetzlerConeRayFinder(
-        U,
-        U_tilde,
-        H,
-        certificate_mode="full",
-        candidate_factor=CANDIDATE_FACTOR,
-        feasibility_tol=1e-9,
-        cosine_tol=1e-7,
-        seed=SEED + 1,
-        remove_identity=True,
-    )
-
-    try:
-        nontrivial = nontrivial_finder.find(NONTRIVIAL_K)
-    except RuntimeError as exc:
-        print(
-            "  trace-free cone diagnostic: no set of "
-            f"{NONTRIVIAL_K} nontrivial rays found for this independent "
-            f"random fixture ({exc})."
-        )
-        return
-
-    Cn = nontrivial.to_dense().detach().cpu().double().numpy()
-    assert Cn.shape == (NONTRIVIAL_K, RANK, RANK)
-    assert np.max(np.abs(np.trace(Cn, axis1=1, axis2=2))) < 1e-6
-
-    cosine = _cosine_matrix(Cn)
-    pair = cosine[~np.eye(NONTRIVIAL_K, dtype=bool)]
-
-    for i, Ci in enumerate(Cn):
-        _assert_ray_feasible(
-            G=G,
-            U=U,
-            V=V,
-            U_tilde=U_tilde,
-            V_tilde=V_tilde,
-            H=H,
-            local_gram=local_gram,
-            C=Ci,
-            label=f"random trace-free ray[{i}]",
-        )
-
-    for t in range(N_COMBOS):
-        coeff = rng.random(NONTRIVIAL_K)
-        C_combo = np.tensordot(coeff, Cn, axes=(0, 0))
-        _assert_ray_feasible(
-            G=G,
-            U=U,
-            V=V,
-            U_tilde=U_tilde,
-            V_tilde=V_tilde,
-            H=H,
-            local_gram=local_gram,
-            C=C_combo,
-            label=f"random trace-free combo[{t}]",
-        )
-
-    print(
-        "  trace-free cone found: "
-        f"k={NONTRIVIAL_K}, pairwise cosine "
-        f"range=[{pair.min():.3f}, {pair.max():.3f}]"
-    )
-
-
-# ============================================================================
-# Small known-nontrivial solver regression
-# ============================================================================
-
-
-def _check_known_nontrivial_fixture() -> None:
-    """Strictly exercise discovery of multiple trace-free rays.
-
-    U = U_tilde = I and H = I is not intended as a realistic model fixture.
-    It is a solver regression where the cone is known analytically:
-
-        C Metzler and -C^T Metzler
-
-    forces C to be diagonal, while tr(C)=0 leaves an (r-1)-dimensional
-    nontrivial subspace.
-    """
-    r = 4
-    U = np.eye(r)
-    U_tilde = np.eye(r)
-    H = np.eye(r)
-
-    finder = LowRankMetzlerConeRayFinder(
-        U,
-        U_tilde,
-        H,
-        certificate_mode="full",
-        candidate_factor=30,
-        seed=SEED + 1000,
-        remove_identity=True,
-    )
-
-    rays = finder.find(1).to_dense().detach().cpu().double().numpy()
-    assert rays.shape == (1, r, r)
-
-    for i, C in enumerate(rays):
-        assert abs(np.trace(C)) < 1e-7
-        off = C.copy()
-        np.fill_diagonal(off, 0.0)
-        assert np.max(np.abs(off)) < 1e-7
-
-        D = _paired_generator(H, C)
-        R_cert = _solve_metzler_certificate(U, C)
-        T_cert = _solve_metzler_certificate(U_tilde, D)
-        assert R_cert is not None, f"known ray[{i}] missing R certificate"
-        assert T_cert is not None, f"known ray[{i}] missing T certificate"
-
-    print(
-        "Known nontrivial fixture: "
-        "found and verified a nonzero trace-free diagonal direction."
-    )
-
-
-# ============================================================================
-# Driver
-# ============================================================================
+    residual = np.linalg.norm(R @ M + M @ T.T) / max(np.linalg.norm(M), 1.0)
+    assert residual < TOL, f"{label}: Gram generator residual={residual:.3e}"
 
 
 def main() -> None:
+    rng = np.random.default_rng(SEED)
     torch.manual_seed(SEED)
-    np.set_printoptions(precision=4, suppress=True)
 
-    _check_random_positive_fixture()
-    _check_known_nontrivial_fixture()
+    G = _bernstein_gram(M_DIM)
+    assert np.min(G) > 0.0
+    assert np.linalg.matrix_rank(G, tol=1e-12) == M_DIM
 
-    print("All LowRankMetzlerConeRayFinder checks passed.")
+    A0 = _random_positive_rank_r(M_DIM, RANK, rng)
+    B0 = _random_positive_rank_r(M_DIM, RANK, rng)
+    M = A0 @ G @ B0.T
+
+    s = np.linalg.svd(M, compute_uv=False)
+    numerical_rank = np.linalg.matrix_rank(M, tol=1e-9 * s[0])
+    assert numerical_rank == RANK
+
+    print(
+        f"fixture: m={M_DIM}, rank={RANK}, "
+        f"sigma[:r]={np.array2string(s[:RANK], precision=3)}, "
+        f"sigma[r]={s[RANK]:.3e}"
+    )
+
+    finder = RankDeficientGramConeRayFinder(
+        torch.as_tensor(M, dtype=torch.float64),
+        rank=RANK,
+        m=M_DIM,
+        support_mode="full",
+        candidate_factor=24,
+        seed=SEED,
+        feasibility_tol=1e-9,
+        rank_tol=1e-9,
+    )
+    rays = finder.find(N_RAYS)
+
+    R = rays.R.to_dense().detach().cpu().numpy()
+    T = rays.T.to_dense().detach().cpu().numpy()
+    C = rays.C.detach().cpu().numpy()
+
+    assert R.shape == (N_RAYS, M_DIM, M_DIM)
+    assert T.shape == (N_RAYS, M_DIM, M_DIM)
+    assert C.shape == (N_RAYS, RANK, RANK)
+
+    # tr(C)=0 removes only the reciprocal scalar lineality.  C=0 rays are
+    # allowed and correspond to pure Gram-null dynamics.
+    assert np.max(np.abs(np.trace(C, axis1=1, axis2=2))) < 5e-7
+
+    offdiag_energy = []
+    for k in range(N_RAYS):
+        _check_pair(M, R[k], T[k], f"ray[{k}]")
+        Roff = R[k].copy()
+        Toff = T[k].copy()
+        np.fill_diagonal(Roff, 0.0)
+        np.fill_diagonal(Toff, 0.0)
+        offdiag_energy.append(np.linalg.norm(Roff) + np.linalg.norm(Toff))
+
+    assert max(offdiag_energy) > 1e-3, "cone contains only diagonal directions"
+
+    # The returned set should span several genuinely different paired directions.
+    pair_flat = np.concatenate(
+        [R.reshape(N_RAYS, -1), T.reshape(N_RAYS, -1)], axis=1
+    )
+    span_rank = int(np.linalg.matrix_rank(pair_flat, tol=1e-8))
+    assert span_rank >= min(4, N_RAYS), f"paired cone span rank only {span_rank}"
+
+    cosine = _pair_cosines(R, T)
+    mask = ~np.eye(N_RAYS, dtype=bool)
+    max_cosine = float(cosine[mask].max())
+    assert max_cosine < 1.0 - 1e-6
+
+    # Random nonnegative combinations remain feasible and preserve the finite
+    # Gram exactly under exponentiation.
+    worst_generator_residual = 0.0
+    worst_finite_gram_residual = 0.0
+    worst_A_min = np.inf
+    worst_B_min = np.inf
+
+    for q in range(N_COMBOS):
+        coeff = rng.uniform(0.0, 0.35, size=N_RAYS)
+        Rc = np.tensordot(coeff, R, axes=(0, 0))
+        Tc = np.tensordot(coeff, T, axes=(0, 0))
+        _check_pair(M, Rc, Tc, f"combo[{q}]")
+
+        gen_res = np.linalg.norm(Rc @ M + M @ Tc.T) / max(np.linalg.norm(M), 1.0)
+        worst_generator_residual = max(worst_generator_residual, gen_res)
+
+        A = expm(Rc) @ A0
+        B = expm(Tc) @ B0
+        worst_A_min = min(worst_A_min, float(A.min()))
+        worst_B_min = min(worst_B_min, float(B.min()))
+        assert A.min() >= -TOL
+        assert B.min() >= -TOL
+
+        M_new = A @ G @ B.T
+        gram_res = np.linalg.norm(M_new - M) / max(np.linalg.norm(M), 1.0)
+        worst_finite_gram_residual = max(worst_finite_gram_residual, gram_res)
+        assert gram_res < 5e-7, f"combo[{q}]: finite Gram residual={gram_res:.3e}"
+
+    print(
+        "  found nontrivial paired cone: "
+        f"rays={N_RAYS}, span_rank={span_rank}, "
+        f"max_cos={max_cosine:.4f}, "
+        f"max_generator_residual={worst_generator_residual:.3e}, "
+        f"max_finite_gram_residual={worst_finite_gram_residual:.3e}, "
+        f"min(A)={worst_A_min:.3e}, min(B)={worst_B_min:.3e}"
+    )
+    print("All RankDeficientGramConeRayFinder checks passed.")
 
 
 if __name__ == "__main__":

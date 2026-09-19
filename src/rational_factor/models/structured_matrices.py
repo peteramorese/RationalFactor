@@ -1,4 +1,4 @@
-"""Structured matrix approximators: banded, rank-1-plus-diagonal, and quasiseparable."""
+"""Structured matrix approximators: banded, low-rank, rank-1-plus-diagonal, and quasiseparable."""
 
 from __future__ import annotations
 
@@ -107,32 +107,32 @@ class Matrix(ABC):
         s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         return DenseMatrix(self.to_dense() * s)
 
-    def batch_linear_combine(self, weights: torch.Tensor) -> Matrix:
-        """Weighted sum along the leading batch axis.
+    def batch_linear_combine(
+        self, weights: torch.Tensor, *, batch_dim: int = 0
+    ) -> Matrix:
+        """Weighted sum along one batch axis.
 
-        ``self`` has shape ``(k, n, m)``. ``weights`` has shape ``(..., k)``.
-        Returns a matrix of shape ``(..., n, m)``, always with at least one
-        leading batch axis (``weights`` of shape ``(k,)`` yields batch size 1).
+        ``self`` has shape ``(..., k, ..., n, m)`` with ``k`` at ``batch_dim``
+        (any batch axis; the last two dims are the matrix). ``weights`` has shape
+        ``(..., k)``. Returns a matrix of shape
+        ``(weights_batch..., remaining_batch..., n, m)``, always with at least
+        one leading batch axis (``weights`` of shape ``(k,)`` and no remaining
+        batch axes yields batch size 1).
 
         The default path densifies; structured subclasses override this to keep
         their storage format and use batched torch ops on the factors only.
         """
         weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
-        k = self.shape[0]
+        dim = _normalize_matrix_batch_dim(self.shape, batch_dim)
+        k = self.shape[dim]
         if weights.shape[-1] != k:
             raise ValueError(
                 f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
             )
-        values = self.to_dense()
-        if values.dim() != 3:
-            raise ValueError(
-                f"batch_linear_combine expects a single leading batch axis, "
-                f"got matrix shape {tuple(self.shape)}"
-            )
-        out = torch.einsum("...k,kij->...ij", weights, values)
-        if out.dim() == 2:
-            out = out.unsqueeze(0)
-        return DenseMatrix(out)
+        values = self.to_dense().movedim(dim, 0)
+        out = torch.tensordot(weights, values, dims=1)
+        return DenseMatrix(_ensure_leading_batch(out, trailing=2))
+
 
     def expm(self) -> Matrix:
         return DenseMatrix(torch.matrix_exp(self.to_dense()))
@@ -242,21 +242,19 @@ class DenseMatrix(Matrix):
         s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         return DenseMatrix(self._values * s)
 
-    def batch_linear_combine(self, weights: torch.Tensor) -> DenseMatrix:
+    def batch_linear_combine(
+        self, weights: torch.Tensor, *, batch_dim: int = 0
+    ) -> DenseMatrix:
         weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
-        k = self._values.shape[0]
-        if self._values.dim() != 3:
-            raise ValueError(
-                f"batch_linear_combine expects shape (k, n, m), got {tuple(self._values.shape)}"
-            )
+        dim = _normalize_matrix_batch_dim(self.shape, batch_dim)
+        k = self._values.shape[dim]
         if weights.shape[-1] != k:
             raise ValueError(
                 f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
             )
-        out = torch.einsum("...k,kij->...ij", weights, self._values)
-        if out.dim() == 2:
-            out = out.unsqueeze(0)
-        return DenseMatrix(out)
+        out = torch.tensordot(weights, self._values.movedim(dim, 0), dims=1)
+        return DenseMatrix(_ensure_leading_batch(out, trailing=2))
+
 
 
 def as_matrix(obj: torch.Tensor | Matrix) -> Matrix:
@@ -264,6 +262,29 @@ def as_matrix(obj: torch.Tensor | Matrix) -> Matrix:
     if isinstance(obj, Matrix):
         return obj
     return DenseMatrix(obj)
+
+
+def _normalize_matrix_batch_dim(shape: torch.Size, batch_dim: int) -> int:
+    """Resolve ``batch_dim`` against a matrix shape ``(..., n, m)``."""
+    ndim = len(shape)
+    if ndim < 3:
+        raise ValueError(
+            f"batch_linear_combine requires at least one batch axis, got shape {tuple(shape)}"
+        )
+    dim = batch_dim + ndim if batch_dim < 0 else batch_dim
+    if not (0 <= dim < ndim - 2):
+        raise ValueError(
+            f"batch_dim must index a batch axis of shape {tuple(shape)}, got {batch_dim}"
+        )
+    return dim
+
+
+def _ensure_leading_batch(out: torch.Tensor, *, trailing: int) -> torch.Tensor:
+    """Keep at least one leading batch axis when a reduction removes all of them."""
+    if out.dim() == trailing:
+        out = out.unsqueeze(0)
+    return out
+
 
 
 class Identity(Matrix):
@@ -381,21 +402,19 @@ class Diagonal(Matrix):
         s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         return Diagonal(self.d * s)
 
-    def batch_linear_combine(self, weights: torch.Tensor) -> Diagonal:
+    def batch_linear_combine(
+        self, weights: torch.Tensor, *, batch_dim: int = 0
+    ) -> Diagonal:
         weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
-        if self.d.dim() != 2:
-            raise ValueError(
-                f"batch_linear_combine expects diagonal shape (k, n), got {tuple(self.d.shape)}"
-            )
-        k = self.d.shape[0]
+        dim = _normalize_matrix_batch_dim(self.shape, batch_dim)
+        k = self.d.shape[dim]
         if weights.shape[-1] != k:
             raise ValueError(
                 f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
             )
-        out = torch.einsum("...k,kn->...n", weights, self.d)
-        if out.dim() == 1:
-            out = out.unsqueeze(0)
-        return Diagonal(out)
+        out = torch.tensordot(weights, self.d.movedim(dim, 0), dims=1)
+        return Diagonal(_ensure_leading_batch(out, trailing=1))
+
 
     def mul_diag_left(self, a: torch.Tensor) -> Diagonal:
         a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
@@ -606,22 +625,19 @@ class Banded(Matrix):
         s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         return Banded(self.offsets, self.data * s)
 
-    def batch_linear_combine(self, weights: torch.Tensor) -> Banded:
+    def batch_linear_combine(
+        self, weights: torch.Tensor, *, batch_dim: int = 0
+    ) -> Banded:
         weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
-        if self.data.dim() != 3:
-            raise ValueError(
-                f"batch_linear_combine expects banded data shape (k, n_diag, n), "
-                f"got {tuple(self.data.shape)}"
-            )
-        k = self.data.shape[0]
+        dim = _normalize_matrix_batch_dim(self.shape, batch_dim)
+        k = self.data.shape[dim]
         if weights.shape[-1] != k:
             raise ValueError(
                 f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
             )
-        out = torch.einsum("...k,kdm->...dm", weights, self.data)
-        if out.dim() == 2:
-            out = out.unsqueeze(0)
-        return Banded(self.offsets, out)
+        out = torch.tensordot(weights, self.data.movedim(dim, 0), dims=1)
+        return Banded(self.offsets, _ensure_leading_batch(out, trailing=2))
+
 
     def mul_diag_left(self, a: torch.Tensor) -> Banded:
         """Left-multiply by ``diag(a)``: ``(diag(a) A)[i, j] = a[i] A[i, j]``."""
@@ -711,6 +727,233 @@ class Banded(Matrix):
             )
         ab, kl, ku = _pack_banded_ab(self.offsets, self.data)
         return _solve_banded_ab(ab, kl, ku, x)
+
+
+class LowRankFactorization(Matrix):
+    """Batched low-rank matrix ``M = U Vᵀ``.
+
+    - ``U``: ``(..., n, r)`` left factor
+    - ``V``: ``(..., m, r)`` right factor
+
+    Storage is ``O((n + m) r)``. Matrix–vector products use
+    ``M x = U (Vᵀ x)`` and cost ``O((n + m) r)`` per RHS, never forming the
+    dense ``n × m`` matrix.
+    """
+
+    def __init__(self, U: torch.Tensor, V: torch.Tensor):
+        U = torch.as_tensor(U)
+        V = torch.as_tensor(V)
+        if U.dim() < 2 or V.dim() < 2:
+            raise ValueError(
+                f"U and V must have shape (..., n, r) and (..., m, r), "
+                f"got {tuple(U.shape)} and {tuple(V.shape)}"
+            )
+        if U.shape[-1] != V.shape[-1]:
+            raise ValueError(
+                f"U and V must share rank r as trailing size, got "
+                f"U.shape[-1]={U.shape[-1]} and V.shape[-1]={V.shape[-1]}"
+            )
+        if U.shape[:-2] != V.shape[:-2]:
+            raise ValueError(
+                f"U and V must share batch shape, got {tuple(U.shape[:-2])} and "
+                f"{tuple(V.shape[:-2])}"
+            )
+        if U.dtype != V.dtype:
+            raise ValueError("U and V must share the same dtype")
+        if U.device != V.device:
+            raise ValueError("U and V must share the same device")
+        self.U = U
+        self.V = V
+
+    @property
+    def n(self) -> int:
+        """Number of rows."""
+        return self.U.shape[-2]
+
+    @property
+    def m(self) -> int:
+        """Number of columns."""
+        return self.V.shape[-2]
+
+    @property
+    def r(self) -> int:
+        """Factor rank (inner dimension)."""
+        return self.U.shape[-1]
+
+    @property
+    def batch_shape(self) -> torch.Size:
+        return self.U.shape[:-2]
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.batch_shape + torch.Size([self.n, self.m])
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.U.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.U.device
+
+    @property
+    def T(self) -> "LowRankFactorization":
+        """Transpose: ``(U Vᵀ)ᵀ = V Uᵀ``."""
+        return LowRankFactorization(self.V, self.U)
+
+    def to(self, *args, **kwargs) -> "LowRankFactorization":
+        return LowRankFactorization(
+            self.U.to(*args, **kwargs),
+            self.V.to(*args, **kwargs),
+        )
+
+    def to_dense(self) -> torch.Tensor:
+        """Materialize ``U Vᵀ`` as a dense ``(..., n, m)`` tensor."""
+        return self.U @ self.V.transpose(-2, -1)
+
+    def diag(self) -> torch.Tensor:
+        """Main diagonal ``(..., min(n, m))`` without forming the dense matrix."""
+        k = min(self.n, self.m)
+        return (self.U[..., :k, :] * self.V[..., :k, :]).sum(dim=-1)
+
+    def sum(self) -> torch.Tensor:
+        """Sum of all entries: ``1ᵀ U Vᵀ 1 = (Uᵀ 1) · (Vᵀ 1)``."""
+        return (self.U.sum(dim=-2) * self.V.sum(dim=-2)).sum()
+
+    def scale(self, s: torch.Tensor | float) -> "LowRankFactorization":
+        s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
+        return LowRankFactorization(self.U * s, self.V)
+
+    def _prepare_row_diag(self, a: torch.Tensor, size: int, name: str) -> torch.Tensor:
+        a = torch.as_tensor(a, dtype=self.dtype, device=self.device)
+        if a.shape[-1] != size:
+            raise ValueError(
+                f"{name} must have trailing size {size}, got shape {tuple(a.shape)}"
+            )
+        try:
+            torch.broadcast_shapes(a.shape[:-1], self.batch_shape)
+        except RuntimeError as e:
+            raise ValueError(
+                f"{name} shape {tuple(a.shape)} is not broadcastable with "
+                f"batch shape {tuple(self.batch_shape)}"
+            ) from e
+        return a
+
+    def mul_diag_left(self, a: torch.Tensor) -> "LowRankFactorization":
+        """Left-multiply by ``diag(a)``: ``diag(a) U Vᵀ = (a ⊙ rows of U) Vᵀ``."""
+        a = self._prepare_row_diag(a, self.n, "left diagonal")
+        return LowRankFactorization(a.unsqueeze(-1) * self.U, self.V)
+
+    def mul_diag_right(self, a: torch.Tensor) -> "LowRankFactorization":
+        """Right-multiply by ``diag(a)``: ``U Vᵀ diag(a) = U (a ⊙ rows of V)ᵀ``."""
+        a = self._prepare_row_diag(a, self.m, "right diagonal")
+        return LowRankFactorization(self.U, a.unsqueeze(-1) * self.V)
+
+    def mul_diag(self, a: torch.Tensor, *, side: str = "left") -> "LowRankFactorization":
+        if side == "left":
+            return self.mul_diag_left(a)
+        if side == "right":
+            return self.mul_diag_right(a)
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+    def batch_linear_combine(
+        self, weights: torch.Tensor, *, batch_dim: int = 0
+    ) -> "LowRankFactorization":
+        """Weighted sum along one batch axis, keeping low-rank form.
+
+        Combines factors at ``batch_dim`` into a single factorization of rank
+        ``k r`` by concatenating the scaled factors.
+        """
+        weights = torch.as_tensor(weights, dtype=self.dtype, device=self.device)
+        dim = _normalize_matrix_batch_dim(self.shape, batch_dim)
+        k = self.U.shape[dim]
+        if weights.shape[-1] != k:
+            raise ValueError(
+                f"weights trailing size must be k={k}, got {tuple(weights.shape)}"
+            )
+
+        U_m = self.U.movedim(dim, 0)  # (k, *batch_rest, n, r)
+        V_m = self.V.movedim(dim, 0)  # (k, *batch_rest, m, r)
+        # Broadcast weights over the moved factors: (..., k, *batch_rest, n, r)
+        expand = (1,) * (U_m.dim() - 1)
+        U_scaled = U_m * weights.view(weights.shape + expand)
+        V_exp = V_m.expand(weights.shape[:-1] + V_m.shape)
+        # (..., k, *batch_rest, n, r) -> (..., *batch_rest, n, k, r) -> flatten rank
+        k_axis = weights.dim() - 1
+        U_out = U_scaled.moveaxis(k_axis, -2).contiguous().flatten(-2, -1)
+        V_out = V_exp.moveaxis(k_axis, -2).contiguous().flatten(-2, -1)
+        U_out = _ensure_leading_batch(U_out, trailing=2)
+        V_out = _ensure_leading_batch(V_out, trailing=2)
+        return LowRankFactorization(U_out, V_out)
+
+
+    def inverse(self) -> "LowRankFactorization":
+        """Inverse when square and full factor rank: ``(U Vᵀ)^{-1} = V^{-T} U^{-T}``.
+
+        Requires ``n = m = r``. Rank-deficient factorizations are singular.
+        """
+        n, m, r = self.n, self.m, self.r
+        if n != m:
+            raise ValueError(
+                f"inverse requires a square matrix, got shape {tuple(self.shape)}"
+            )
+        if r != n:
+            raise ValueError(
+                f"low-rank inverse requires full factor rank r=n={n}, got r={r}"
+            )
+        U_inv = torch.linalg.inv(self.U)
+        V_inv = torch.linalg.inv(self.V)
+        return LowRankFactorization(
+            V_inv.transpose(-2, -1),
+            U_inv.transpose(-2, -1),
+        )
+
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        """Solve ``U Vᵀ y = x`` when square and ``r = n``.
+
+        Uses ``y = V^{-T} U^{-1} x`` without forming the inverse explicitly.
+        """
+        n, m, r = self.n, self.m, self.r
+        if n != m:
+            raise ValueError(
+                f"inverse_matvec requires a square matrix, got shape {tuple(self.shape)}"
+            )
+        if r != n:
+            raise ValueError(
+                f"low-rank inverse_matvec requires full factor rank r=n={n}, got r={r}"
+            )
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        batch_ndim = self.U.dim() - 2
+        VT = self.V.transpose(-2, -1)
+        if x.dim() >= batch_ndim + 2 and x.shape[-2] == n:
+            z = torch.linalg.solve(self.U, x)
+            return torch.linalg.solve(VT, z)
+        if x.shape[-1] == n:
+            z = torch.linalg.solve(self.U, x.unsqueeze(-1)).squeeze(-1)
+            return torch.linalg.solve(VT, z.unsqueeze(-1)).squeeze(-1)
+        raise ValueError(
+            f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
+        )
+
+    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute ``M @ x = U (Vᵀ x)`` in ``O((n + m) r)`` time.
+
+        Args:
+            x: ``(..., m)`` or ``(..., m, k)``. Leading dims broadcast with
+                ``batch_shape``.
+        """
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        m = self.m
+        batch_ndim = self.U.dim() - 2
+        if x.dim() >= batch_ndim + 2 and x.shape[-2] == m:
+            # Vᵀ x: (..., r, k), then U @ that: (..., n, k)
+            return self.U @ (self.V.transpose(-2, -1) @ x)
+        if x.shape[-1] == m:
+            # Vᵀ x: (..., r), then U @ that: (..., n)
+            return (self.U @ (self.V.transpose(-2, -1) @ x.unsqueeze(-1))).squeeze(-1)
+        raise ValueError(
+            f"x must have shape (..., {m}) or (..., {m}, k), got {tuple(x.shape)}"
+        )
 
 
 class Rank1PlusDiagonal(Matrix):

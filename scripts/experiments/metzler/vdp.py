@@ -2,64 +2,233 @@ from pathlib import Path
 from math import ceil, sqrt
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import BSpline1DBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.density_model import ConditionalDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF, MaskedRQSNFTF
+from rational_factor.models.domain_transformation import ErfSeparableTF
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
-from rational_factor.models.index_embedding_basis import NormalizedIndexEmbeddingBasis
-from rational_factor.models.mlp import MetzlerConeMLP
-from rational_factor.models.preorthogonal_basis import PreorthogonalMutualBasis
+from rational_factor.models.kde import GaussianKDE
+from rational_factor.models.mlp import PairedMaskedMetzlerConeMLP
 from rational_factor.models.parameters import (
     PositiveParameters,
     DenseMatrixFactorization,
     param_group_iter,
 )
+from rational_factor.models.autoregressive_basis import AutoregressiveMetzlerConeMutualBasis
 from rational_factor.models.structured_matrices import DenseMatrix
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
-from rational_factor.tools.metzler_cone_rays import MetzlerConeRayFinder
+from rational_factor.tools.metzler_cone_rays import RankDeficientGramConeRayFinder
 from rational_factor.tools.visualization import plot_belief
-from rational_factor.models.kde import GaussianKDE
 import rational_factor.models.loss as loss
 import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 
 
-class ConditionalRQSNF(ConditionalDensityModel):
-    """Conditional RQ-NSF density on ``[0, 1]^d`` (``tails=None``) with Uniform base.
+def _random_nonneg_rank_r(
+    m: int,
+    r: int,
+    rng: np.random.Generator,
+    *,
+    near_diag: bool = True,
+) -> np.ndarray:
+    """Strictly nonnegative ``m × m`` matrix of exact rank ``r``.
 
-    With Uniform base density 1, ``log p(x | c) = log |det DT(x | c)|``.
+    Factors are lognormal. When ``near_diag`` is set, each factor column is
+    softly localized around a diagonal center so entries decay away from the
+    band (while staying strictly positive).
     """
+    U = rng.lognormal(mean=0.0, sigma=0.65, size=(m, r))
+    V = rng.lognormal(mean=0.0, sigma=0.65, size=(m, r))
+    if near_diag:
+        rows = np.arange(m, dtype=np.float64)[:, None]
+        centers = np.linspace(0.0, m - 1.0, r)[None, :]
+        width = max(m / r, 1.5)
+        w = 0.15 + 0.85 * np.exp(-0.5 * ((rows - centers) / width) ** 2)
+        U = U * w
+        V = V * w
+    U /= np.linalg.norm(U, axis=0, keepdims=True)
+    V /= np.linalg.norm(V, axis=0, keepdims=True)
+    A = U @ V.T
+    assert A.min() > 0.0
+    assert np.linalg.matrix_rank(A, tol=1e-10) == r
+    return A
 
-    def __init__(
-        self,
-        dim: int,
-        conditioner_dim: int,
-        n_layers: int = 2,
-        hidden_features: int = 16,
-        num_bins: int = 4,
-    ):
-        super().__init__(dim=dim, conditioner_dim=conditioner_dim)
-        self.transform = MaskedRQSNFTF(
-            dim=dim,
-            context_features=conditioner_dim,
-            n_layers=n_layers,
-            hidden_features=hidden_features,
-            tails=None,
-            num_bins=num_bins,
+
+def _uniform_nonneg_rank_r(
+    m: int,
+    r: int,
+    rng: np.random.Generator,
+    *,
+    low: float = 0.1,
+    high: float = 1.0,
+) -> np.ndarray:
+    """Strictly nonnegative ``m × m`` matrix of exact rank ``r`` via uniform factors.
+
+    Draws ``U, V ∼ Unif[low, high]^{m × r}`` (column-normalized), returns ``U Vᵀ``.
+    No near-diagonal localization — denser / more spatially uniform than the
+    lognormal sampler.
+    """
+    if not (0.0 < low < high):
+        raise ValueError(f"need 0 < low < high, got low={low}, high={high}")
+    U = rng.uniform(low, high, size=(m, r))
+    V = rng.uniform(low, high, size=(m, r))
+    U /= np.linalg.norm(U, axis=0, keepdims=True)
+    V /= np.linalg.norm(V, axis=0, keepdims=True)
+    A = U @ V.T
+    assert A.min() > 0.0
+    assert np.linalg.matrix_rank(A, tol=1e-10) == r
+    return A
+
+
+def _sample_A0_B0(
+    m: int,
+    r: int,
+    d: int,
+    rng: np.random.Generator,
+    *,
+    method: str = "uniform",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample ``(A0, B0)`` each of shape ``(d, m, m)`` with the given method."""
+    if method == "uniform":
+        draw = lambda: _uniform_nonneg_rank_r(m, r, rng)
+    elif method == "lognormal_near_diag":
+        draw = lambda: _random_nonneg_rank_r(m, r, rng, near_diag=True)
+    elif method == "lognormal":
+        draw = lambda: _random_nonneg_rank_r(m, r, rng, near_diag=False)
+    else:
+        raise ValueError(
+            f"unknown A0/B0 sampler {method!r}; expected "
+            "'uniform', 'lognormal_near_diag', or 'lognormal'"
         )
+    A0 = np.stack([draw() for _ in range(d)], axis=0)
+    B0 = np.stack([draw() for _ in range(d)], axis=0)
+    return A0, B0
 
-    def log_density(self, x: torch.Tensor, *, conditioner: torch.Tensor, **contexts):
-        _, ladj = self.transform.forward(x, context=conditioner)
-        return self._clip_log_density(ladj)
 
-    def dtype_device(self):
-        p = next(self.parameters())
-        return p.dtype, p.device
+def _build_paired_ray_banks(
+    A0: torch.Tensor,
+    B0: torch.Tensor,
+    G: torch.Tensor,
+    *,
+    rank: int,
+    n_rays: int,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """For each slot ``ℓ``, find paired Metzler rays of ``Γ_ℓ = A0_ℓ G B0_ℓᵀ``.
+
+    Returns ``(R_bank, T_bank)`` each of shape ``(d, n_rays, m, m)``.
+    """
+    d, m, _ = A0.shape
+    G_np = G.detach().cpu().numpy()
+    A0_np = A0.detach().cpu().numpy()
+    B0_np = B0.detach().cpu().numpy()
+
+    R_list = []
+    T_list = []
+    for ell in range(d):
+        gamma = A0_np[ell] @ G_np @ B0_np[ell].T
+        s = np.linalg.svd(gamma, compute_uv=False)
+        num_rank = int(np.linalg.matrix_rank(gamma, tol=1e-9 * s[0]))
+        if num_rank != rank:
+            raise RuntimeError(
+                f"Gamma[{ell}] has numerical rank {num_rank}, expected {rank}"
+            )
+        print(
+            f"  slot {ell}: finding {n_rays} paired rays for Gamma "
+            f"shape {(m, m)}, rank={rank}, "
+            f"sigma[:r]={np.array2string(s[:rank], precision=3)} ..."
+        )
+        finder = RankDeficientGramConeRayFinder(
+            torch.as_tensor(gamma, dtype=torch.float64),
+            rank=rank,
+            m=m,
+            support_mode="auto",
+            candidate_factor=32,
+            seed=seed + 17 * ell,
+        )
+        paired = finder.find(n_rays)
+        R_list.append(paired.R.to_dense().detach())
+        T_list.append(paired.T.to_dense().detach())
+        print(f"  slot {ell}: got R/T shape {tuple(R_list[-1].shape)}")
+
+    R_bank = torch.stack(R_list, dim=0)
+    T_bank = torch.stack(T_list, dim=0)
+    return R_bank, T_bank
+
+
+def _plot_cone_ray_heatmaps(
+    bank: torch.Tensor | np.ndarray,
+    out_path: Path,
+    *,
+    slot: int,
+    name: str,
+    max_rays: int = 16,
+    title: str = "",
+) -> None:
+    """Color heatmaps of ``expm`` of cone-ray matrices for one slot.
+
+    ``bank`` has shape ``(d, k, m, m)`` or ``(k, m, m)``. Shows up to
+    ``max_rays`` rays as ``exp(M_i)`` in a grid with a shared color scale
+    (``vmin=0``) so diversity of the exponentials is easy to compare.
+    """
+    if isinstance(bank, torch.Tensor):
+        mats = bank.detach().cpu()
+    else:
+        mats = torch.as_tensor(bank)
+    if mats.ndim == 4:
+        mats = mats[slot]
+    if mats.ndim != 3:
+        raise ValueError(f"expected (k,m,m) or (d,k,m,m), got {tuple(mats.shape)}")
+
+    k = mats.shape[0]
+    n_show = min(int(max_rays), k)
+    # Batched matrix exp: (n_show, m, m)
+    exps = torch.matrix_exp(mats[:n_show].to(dtype=torch.float64)).numpy()
+
+    n_cols = max(1, ceil(sqrt(n_show)))
+    n_rows = max(1, ceil(n_show / n_cols))
+    vmax = float(np.max(exps))
+    if vmax < 1e-12:
+        vmax = 1.0
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(2.0 * n_cols, 1.85 * n_rows),
+        squeeze=False,
+    )
+    if title:
+        fig.suptitle(title, y=1.01)
+
+    cmap = "viridis"
+    im = None
+    for idx in range(n_show):
+        r, c = divmod(idx, n_cols)
+        ax = axes[r, c]
+        im = ax.imshow(
+            exps[idx],
+            cmap=cmap,
+            vmin=0.0,
+            vmax=vmax,
+            interpolation="nearest",
+            aspect="equal",
+        )
+        ax.set_title(f"exp({name}[{idx}])", fontsize=7, pad=2)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    for idx in range(n_show, n_rows * n_cols):
+        r, c = divmod(idx, n_cols)
+        axes[r, c].set_visible(False)
+
+    if im is not None:
+        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _plot_conditional_slices_model_vs_data(
@@ -116,14 +285,11 @@ def _plot_conditional_slices_model_vs_data(
     rng.manual_seed(random_seed)
     half_width = torch.full((2,), 0.5 * float(bin_width), dtype=xk_cpu.dtype)
 
-    # Shared x1, varied x2: pick a random reference x1, then take points near that
-    # x1 whose x2 values span the local support (so rows compare x2 dependence).
     ref_idx = int(torch.randint(0, n_data, (1,), generator=rng).item())
-    x1_fixed = 0.0 #float(xk_cpu[ref_idx, 0])
+    x1_fixed = 0.0
     near_x1 = (xk_cpu[:, 0] - x1_fixed).abs() <= half_width[0]
     near_pts = xk_cpu[near_x1]
     if near_pts.shape[0] < n_random_points:
-        # Fall back to all points ordered by x2 if the x1 strip is too thin.
         near_pts = xk_cpu
         x1_fixed = float(near_pts[ref_idx, 0])
     order = torch.argsort(near_pts[:, 1])
@@ -134,7 +300,6 @@ def _plot_conditional_slices_model_vs_data(
         pick = torch.linspace(
             0, near_sorted.shape[0] - 1, n_random_points
         ).round().long()
-        # Deduplicate if rounding collapses indices; fill from neighbors if needed.
         pick = torch.unique(pick)
         if pick.numel() < n_random_points:
             need = n_random_points - pick.numel()
@@ -144,7 +309,6 @@ def _plot_conditional_slices_model_vs_data(
             extra = all_idx[mask][:need]
             pick = torch.sort(torch.cat([pick, extra]))[0]
     centers = near_sorted[pick]
-    # Force exact shared x1 so model conditioners differ only in x2.
     centers = centers.clone()
     centers[:, 0] = x1_fixed
 
@@ -234,7 +398,6 @@ def _plot_conditional_slices_model_vs_data(
                     rasterized=True,
                 )
 
-            # Conditional KDE at fixed x_i: w(x) ∝ N(x_i, h_x^2), then mix N(x'_k, h_xp^2).
             diff_x = xk_dev - center_dev.unsqueeze(0)
             w_x = torch.exp(-0.5 * diff_x.square().sum(dim=1) / (bw_x * bw_x))
             w_sum = w_x.sum().clamp_min(eps)
@@ -344,66 +507,91 @@ def _plot_2d_values_grid(
     plt.close(fig)
 
 
-def _plot_metzler_cone_mlp_entries(
-    mc_mlp: MetzlerConeMLP,
+def _plot_masked_metzler_slot_entries(
+    get_M,
     out_path: Path,
     *,
-    n_grid: int = 256,
+    slot: int,
+    n_slots: int,
+    n_grid: int = 128,
+    n_show: int = 9,
     title: str = "",
+    dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
 ) -> None:
-    """Plot every entry of ``M(z) = mc_mlp(z)`` vs 1D input ``z ∈ [0, 1]``.
+    """Plot a few entries of ``M_slot(x)`` vs its free coordinate on ``[0, 1]``.
 
-    Produces an ``m × m`` subplot grid: row ``i``, column ``j`` shows
-    ``M(z)_{ij}`` as a function of the free (rest) coordinate.
+    ``get_M(x)`` maps ``(n_grid, d)`` inputs to a dense ``(n_grid, d, m, m)``
+    tensor (or Matrix of that shape). Slot ``ℓ`` depends on ``x_<ℓ``.
+
+    Instead of a full ``m × m`` grid, shows ``n_show`` entries on an evenly
+    spaced index subgrid (default 9 → up to a 3×3 layout).
     """
-    if mc_mlp.in_features() != 1:
-        raise ValueError(
-            f"_plot_metzler_cone_mlp_entries expects 1D input, got in_features={mc_mlp.in_features()}"
-        )
+    d = n_slots
+    if not (0 <= slot < d):
+        raise ValueError(f"slot must be in [0, {d}), got {slot}")
+    if n_show < 1:
+        raise ValueError(f"n_show must be positive, got {n_show}")
 
-    m = mc_mlp.out_features()
-    dtype, device = mc_mlp.K.dtype, mc_mlp.K.device
-    z = torch.linspace(0.0, 1.0, n_grid, device=device, dtype=dtype).unsqueeze(-1)
+    if dtype is None:
+        dtype = torch.float32
+    if device is None:
+        device = torch.device("cpu")
+
+    t = torch.linspace(0.0, 1.0, n_grid, device=device, dtype=dtype)
+    x = torch.zeros(n_grid, d, device=device, dtype=dtype)
+    if slot == 0:
+        xlabel = "(constant)"
+    else:
+        if slot >= 2:
+            x[:, : slot - 1] = 0.5
+        x[:, slot - 1] = t
+        xlabel = f"x_{slot - 1}"
 
     with torch.no_grad():
-        mc_mlp.eval()
-        M = mc_mlp(z).to_dense()  # (n_grid, m, m)
-    if M.shape != (n_grid, m, m):
-        raise ValueError(f"expected mc_mlp output shape {(n_grid, m, m)}, got {tuple(M.shape)}")
+        M = get_M(x)
+        if hasattr(M, "to_dense"):
+            M = M.to_dense()
+        M = M[:, slot]  # (n_grid, m, m)
 
-    M_np = M.detach().cpu().numpy()
-    z_np = z.squeeze(-1).detach().cpu().numpy()
+    m = M.shape[-1]
+    n_side = max(1, ceil(sqrt(n_show)))
+    idx = torch.linspace(0, m - 1, n_side).round().long().unique().tolist()
+    pairs = [(int(i), int(j)) for i in idx for j in idx][:n_show]
 
+    n_cols = min(n_side, len(pairs))
+    n_rows = max(1, ceil(len(pairs) / n_cols))
     fig, axes = plt.subplots(
-        m,
-        m,
-        figsize=(1.15 * m, 1.05 * m),
+        n_rows,
+        n_cols,
+        figsize=(2.4 * n_cols, 2.1 * n_rows),
         sharex=True,
         squeeze=False,
     )
     if title:
         fig.suptitle(title, y=1.01)
 
-    for i in range(m):
-        for j in range(m):
-            ax = axes[i, j]
-            ax.plot(z_np, M_np[:, i, j], color="C0", lw=0.9)
-            ax.axhline(0.0, color="0.6", lw=0.4, zorder=0)
-            ax.set_xlim(0.0, 1.0)
-            ax.tick_params(labelsize=4, length=2)
-            if i == 0:
-                ax.set_title(f"j={j}", fontsize=6, pad=1)
-            if j == 0:
-                ax.set_ylabel(f"i={i}", fontsize=6)
-            if i < m - 1:
-                ax.set_xticklabels([])
-            else:
-                ax.set_xlabel("z", fontsize=5)
-            if j > 0:
-                ax.set_yticklabels([])
+    M_np = M.detach().cpu().numpy()
+    t_np = t.detach().cpu().numpy()
+    for p, (i, j) in enumerate(pairs):
+        r, c = divmod(p, n_cols)
+        ax = axes[r, c]
+        ax.plot(t_np, M_np[:, i, j], color="C0", lw=1.0)
+        ax.axhline(0.0, color="0.6", lw=0.4, zorder=0)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_title(f"({i},{j})", fontsize=8, pad=2)
+        ax.tick_params(labelsize=6)
+        if r < n_rows - 1:
+            ax.set_xticklabels([])
+        else:
+            ax.set_xlabel(xlabel, fontsize=7)
+
+    for p in range(len(pairs), n_rows * n_cols):
+        r, c = divmod(p, n_cols)
+        axes[r, c].set_visible(False)
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -428,11 +616,7 @@ def _plot_2d_pair_member_grid(
     title: str,
     n_grid: int = 64,
 ) -> None:
-    """Plot every 2D phi (index=0) or psi (index=1) basis on a square subplot grid.
-
-    Domain is the unit square (post-wrap coordinates). Each subplot is a filled
-    contour of one basis function; unused cells are hidden.
-    """
+    """Plot every 2D phi (index=0) or psi (index=1) basis on a square subplot grid."""
     if index not in (0, 1):
         raise ValueError(f"index must be 0 (phi) or 1 (psi), got {index}")
 
@@ -456,32 +640,40 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 30
-    sacrificial_index = 0
-    embedding_dim = 8
-    bspline_degree = 20
-    n_rays = 3
-    tf_flow_hidden = 16
-    tf_flow_layers = 2
+    n_basis = 10
+    bspline_degree = 5
+    n_rays = 20
+    ray_seed = 0
+    a0_b0_sampler = "uniform"  # "uniform" | "lognormal_near_diag" | "lognormal"
+    # Finder returns unit-Frobenius (R,T) pairs; scale so exp(R) leaves near-I.
+    # Same factor on R and T preserves R M + M Tᵀ = 0. Keep MLP coeffs O(1)
+    # once rays are pre-scaled (otherwise expm can explode).
+    mc_ray_scale = 25.0
     mc_mlp_hidden = 64
     mc_mlp_layers = 2
+    # c = coeff_scale * softplus(base) * softplus(Δ(x)); base sets magnitude,
+    # Δ carries x_<ℓ dependence (high last-layer gain, zero last-layer bias).
+    mc_coeff_scale = 2.0
+    mc_max_coeff = None  # do not clip away x-dependence
+    mc_bias_init = 1.0  # softplus(1)≈1.3 base magnitude per ray
     tran_params = {
-        "n_epochs_per_group": [10, 3],  # wrap + product +mc_mlp, weights
-        "iterations": 5,
-        "lr_product": 1e-3,
-        "lr_mc_mlp": 1e-3,
+        "n_epochs_per_group": [3, 3],  # wrap + mc_mlps, weights
+        "iterations": 20,
+        "lr_mc_mlp": 3e-3,
         "lr_weights": 5e-2,
         "lr_wrap": 1e-3,
     }
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
-        "iterations": 1,
+        "iterations": 10,
         "lr_weights": 1e-2,
     }
 
     batch_size = 256
     n_timesteps_prop = problem.n_timesteps
+
     ###
+
 
     device = torch.device("cuda" if use_gpu else "cpu")
     print("Using GPU: ", use_gpu)
@@ -492,83 +684,106 @@ if __name__ == "__main__":
     if dim != 2:
         raise ValueError(f"VDP script expects a 2D system, got dim={dim}")
 
+    m = n_basis
+    d = dim
+    rank = max(1, ceil(m ** (1.0 / d)))
+
     x0 = problem.train_initial_state_data()
     x_k, x_kp1 = problem.train_state_transition_data()
     traj_data = problem.test_data()
 
-    x0_dataloader = DataLoader(TensorDataset(x0), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    xp_dataloader = DataLoader(TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    x0_dataloader = DataLoader(
+        TensorDataset(x0), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
+    )
+    xp_dataloader = DataLoader(
+        TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
+    )
 
-    rest_dim = dim - 1
+    if rank >= m:
+        raise ValueError(f"rank={rank} must satisfy 1 <= rank < m={m}")
+    print(f"n_basis={m}, dim={d}, rank=ceil(m^(1/d))={rank}, n_rays={n_rays}")
+
     n_cells = n_basis - bspline_degree
     if n_cells < 1:
         raise ValueError(f"n_basis={n_basis} too small for degree={bspline_degree}")
 
-    # Nominal 1D B-spline bases on the sacrificial coordinate (unit interval after Erf wrap).
     nom_alpha_basis = BSpline1DBasis(
         n_cells=n_cells,
         degree=bspline_degree,
         device=device,
     )
-    nom_beta_basis = BSpline1DBasis(
-        n_cells=n_cells,
-        degree=bspline_degree,
-        device=device,
-    )
+    nom_beta_basis = nom_alpha_basis
     assert nom_alpha_basis.n_basis_functions() == n_basis
-    assert nom_beta_basis.n_basis_functions() == n_basis
 
-    # Dense Metzler cone rays for gram G = Omega2(nom_alpha, nom_beta)^T (finder uses transpose=True).
-    gram = nom_alpha_basis.Omega2(nom_beta_basis)
-    gram_dense = gram.to_dense()
-    if gram_dense.dim() == 3:
-        gram_dense = gram_dense.squeeze(0)
-    print(f"Computing {n_rays} dense Metzler cone rays for gram shape {tuple(gram_dense.shape)} ...")
-    ray_finder = MetzlerConeRayFinder(
-        DenseMatrix(gram_dense.detach().cpu()),
-        transpose=True,
-        n_constraint_cols=min(64, n_basis),
-        n_verify_cols=min(128, n_basis),
-        seed=0,
+    G = nom_alpha_basis.Omega2(nom_beta_basis).to_dense()
+    if G.dim() == 3:
+        G = G.squeeze(0)
+    G = G.detach().cpu().double()
+    print(f"Nominal Gram G shape {tuple(G.shape)}")
+
+    rng = np.random.default_rng(ray_seed)
+    A0_np, B0_np = _sample_A0_B0(m, rank, d, rng, method=a0_b0_sampler)
+    A0 = torch.as_tensor(A0_np, dtype=torch.float64)
+    B0 = torch.as_tensor(B0_np, dtype=torch.float64)
+    print(
+        f"A0/B0 sampler={a0_b0_sampler!r}, shape {tuple(A0.shape)}, "
+        f"min(A0)={float(A0.min()):.3e}, mean(A0)={float(A0.mean()):.3e}"
     )
-    K = ray_finder.find(n_rays, ray_type="dense")
-    K = DenseMatrix(K.to_dense().to(device=device, dtype=gram_dense.dtype))
-    print(f"Ray matrix K shape: {tuple(K.shape)}")
-    print(f"Ray matrix K: {K.to_dense()}")
-    input("Press Enter to continue...")
+    print("Computing paired Metzler cone rays per Gamma_l ...")
+    R_bank, T_bank = _build_paired_ray_banks(
+        A0, B0, G, rank=rank, n_rays=n_rays, seed=ray_seed
+    )
+    R_bank = R_bank * mc_ray_scale
+    T_bank = T_bank * mc_ray_scale
+    print(
+        f"Scaled ray banks by mc_ray_scale={mc_ray_scale}: "
+        f"||R||_F mean={R_bank.reshape(R_bank.shape[0], R_bank.shape[1], -1).norm(dim=-1).mean():.3f}"
+    )
 
-    mc_mlp = MetzlerConeMLP(
-        in_features=rest_dim,
-        K=K,
+    output_dir = Path("figures/metzler/vdp")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    max_rays_plot = min(16, n_rays)
+    for name, bank in (("R", R_bank), ("T", T_bank)):
+        for slot in range(d):
+            out = output_dir / f"cone_rays_{name}_slot{slot}_expm_heatmaps.png"
+            _plot_cone_ray_heatmaps(
+                bank,
+                out,
+                slot=slot,
+                name=name,
+                max_rays=max_rays_plot,
+                title=(
+                    f"VDP Metzler: exp({name}) cone rays slot {slot} "
+                    f"(scale={mc_ray_scale}, first {max_rays_plot}/{n_rays})"
+                ),
+            )
+            print(f"Saved {name} slot-{slot} expm ray heatmaps to {out}")
+    
+    input("...")
+
+    dtype_model = torch.float32
+    A0 = A0.to(device=device, dtype=dtype_model)
+    B0 = B0.to(device=device, dtype=dtype_model)
+    R_bank = R_bank.to(device=device, dtype=dtype_model)
+    T_bank = T_bank.to(device=device, dtype=dtype_model)
+
+    paired_mc_mlp = PairedMaskedMetzlerConeMLP(
+        R=DenseMatrix(R_bank),
+        T=DenseMatrix(T_bank),
         hidden_features=mc_mlp_hidden,
         num_hidden_layers=mc_mlp_layers,
-        zero_init_last=True,
-        coeff_scale=1.0,
-        max_coeff=5.0,
-        bias_init=0.0,
+        zero_init_last=False,
+        coeff_scale=mc_coeff_scale,
+        max_coeff=mc_max_coeff,
+        bias_init=mc_bias_init,
     ).to(device)
 
-    # Product basis on free coords (rest_dim=1): unit-box conditional RQ-NSF + index embeddings.
-    embedding = torch.nn.Embedding(n_basis, embedding_dim).to(device)
-    product_model = ConditionalRQSNF(
-        dim=rest_dim,
-        conditioner_dim=embedding_dim,
-        n_layers=tf_flow_layers,
-        hidden_features=tf_flow_hidden,
-        num_bins=4,
-    ).to(device)
-    product_basis = NormalizedIndexEmbeddingBasis(
-        product_model,
-        n_basis=n_basis,
-        embedding=embedding,
-    ).to(device)
-
-    phi_psi_mutual = PreorthogonalMutualBasis(
+    phi_psi_mutual = AutoregressiveMetzlerConeMutualBasis(
         nom_alpha_basis,
         nom_beta_basis,
-        mc_mlp,
-        product_basis,
-        sacrificial_index=sacrificial_index,
+        A0,
+        B0,
+        paired_mc_mlp,
     ).to(device)
 
     g_coeffs = PositiveParameters.random_init(
@@ -579,7 +794,10 @@ if __name__ == "__main__":
     ).to(device)
 
     B_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=0.0
+        shape=(1, n_basis, n_basis),
+        mean=torch.tensor([1.0]),
+        std=torch.tensor([1.0]),
+        epsilon=0.0,
     ).to(device)
     B = DenseMatrixFactorization(B_coeffs)
 
@@ -595,10 +813,8 @@ if __name__ == "__main__":
     optimizers = {
         "basis": torch.optim.Adam(
             [
-                {"params": mc_mlp.parameters(), "lr": tran_params["lr_mc_mlp"]},
+                {"params": paired_mc_mlp.parameters(), "lr": tran_params["lr_mc_mlp"]},
                 {"params": wrap_tf.parameters(), "lr": tran_params["lr_wrap"]},
-                {"params": embedding.parameters(), "lr": tran_params["lr_product"]},
-                {"params": product_model.parameters(), "lr": tran_params["lr_product"]},
             ]
         ),
         "weights": torch.optim.Adam(
@@ -620,7 +836,6 @@ if __name__ == "__main__":
     )
     print("Done! \n")
 
-    # Freeze the shared pair, g coeffs, and wrap; reuse psi for h0
     for p in phi_psi_mutual.parameters():
         p.requires_grad_(False)
     g_coeffs.set_requires_grad(False)
@@ -651,8 +866,14 @@ if __name__ == "__main__":
     )
     print("Done! \n")
 
-    print(f"Transition model loss: {best_loss_tran:.4f}, training time: {training_time_tran:.2f} seconds")
-    print(f"Initial model loss: {best_loss_init:.4f}, training time: {training_time_init:.2f} seconds")
+    print(
+        f"Transition model loss: {best_loss_tran:.4f}, "
+        f"training time: {training_time_tran:.2f} seconds"
+    )
+    print(
+        f"Initial model loss: {best_loss_init:.4f}, "
+        f"training time: {training_time_init:.2f} seconds"
+    )
 
     analysis_device = device
     init_model = init_model.to(analysis_device).eval()
@@ -662,13 +883,34 @@ if __name__ == "__main__":
     output_dir = Path("figures/metzler/vdp")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mc_mlp_out = output_dir / "metzler_cone_mlp_entries.png"
-    _plot_metzler_cone_mlp_entries(
-        mc_mlp,
-        mc_mlp_out,
-        title="VDP Metzler: trained mc_mlp(z) entries M(z)_{ij} vs free coord z",
-    )
-    print(f"Saved MetzlerConeMLP entry grid to {mc_mlp_out}")
+    # Active slot for d=2 is ℓ=1 (ℓ=0 is excluded from the product).
+    paired_mc_mlp.eval()
+    dtype_plot, device_plot = paired_mc_mlp.R.dtype, paired_mc_mlp.R.device
+
+    def _R_of(x):
+        return paired_mc_mlp(x)[0]
+
+    def _T_of(x):
+        return paired_mc_mlp(x)[1]
+
+    for name, get_M in (("R", _R_of), ("T", _T_of)):
+        for slot in range(d):
+            out = output_dir / f"metzler_cone_mlp_{name}_slot{slot}_entries.png"
+            _plot_masked_metzler_slot_entries(
+                get_M,
+                out,
+                slot=slot,
+                n_slots=d,
+                n_show=9,
+                n_grid=128,
+                title=(
+                    f"VDP Metzler: paired {name} slot {slot} "
+                    f"(9 of {n_basis}×{n_basis} entries) vs free coord"
+                ),
+                dtype=dtype_plot,
+                device=device_plot,
+            )
+            print(f"Saved {name} slot-{slot} entry subsample to {out}")
 
     mutual_phi_out = output_dir / "mutual_basis_phi_2d.png"
     _plot_2d_pair_member_grid(
