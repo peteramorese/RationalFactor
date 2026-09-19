@@ -1,592 +1,551 @@
 """
-Checks that MetzlerConeRayFinder returns feasible, diverse Metzler directions
-for diagonal, dense, and banded ray types.
+Integration / regression checks for LowRankMetzlerConeRayFinder.
 
-For every returned matrix ray X_i and random nonnegative combination
+The realistic fixture does the following:
 
-    X = sum_i c_i X_i,   c_i >= 0,
+1. Builds a dense, strictly positive Gram matrix G from normalized Bernstein
+   basis functions on [0, 1].
+2. Draws independent strictly positive low-rank factors
 
-verifies
+       U, V, U_tilde, V_tilde in R_+^{m x r}.
 
-    X is Metzler,
-    -M X^T M^{-1} is Metzler,
+3. Forms the reduced coupling
 
-where M = gram.T if transpose=True, otherwise gram.
+       H = V.T @ G @ V_tilde.
 
-Also checks:
-  - correct structured return type / batch shape,
-  - removal of the scalar-identity lineality direction,
-  - cosine diversity of returned rays,
-  - requested support structure for diagonal / banded rays,
-  - feasibility after adding gamma * I.
+4. Runs the reduced cone finder for C in R^{r x r}, where
 
-The diagonal algorithm is tested at large m. Dense and banded rays use an exact
-LP with O(m^2) auxiliary variables, so they are intentionally tested at much
-smaller m.
+       D(C) = -H.T @ C.T @ H^{-T},
 
-Run:
-  PYTHONPATH=src python test/test_metzler_cone_rays.py
+   and independently verifies Metzler certificates
+
+       R @ U       = U @ C,
+       T @ U_tilde = U_tilde @ D(C).
+
+5. Verifies the actual model consequences:
+
+       U exp(C) >= 0,
+       U_tilde exp(D) >= 0,
+
+   and
+
+       A G B.T = U H U_tilde.T,
+
+   where
+
+       A = U exp(C) V.T,
+       B = U_tilde exp(D) V_tilde.T.
+
+Important diagnostic:
+---------------------
+For generic independent positive U, U_tilde, V, V_tilde, the trace-free
+certified cone may contain no nontrivial direction at all; the always-feasible
+scalar lineality C = gamma I can be the entire discovered cone.  The realistic
+random fixture therefore *strictly* tests the scalar cone and then probes the
+trace-free cone, reporting whether nontrivial directions were found rather
+than assuming that random factors must admit them.
+
+A small identity-coupling regression fixture is also included so the test
+strictly exercises discovery of a nontrivial trace-free ray.
+
+Run from the repository root with, e.g.
+
+    PYTHONPATH=src python test/test_low_rank_metzler_cone_rays.py
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch
+from scipy.linalg import expm
+from scipy.optimize import linprog
+from scipy.special import betaln, gammaln
 
-from rational_factor.models.structured_matrices import (
-    Banded,
-    DenseMatrix,
-    Diagonal,
-)
-from rational_factor.tools.metzler_cone_rays import MetzlerConeRayFinder
+from rational_factor.tools.metzler_cone_rays import LowRankMetzlerConeRayFinder
 
 
 SEED = 0
-FEAS_TOL = 1e-6
-N_COMBOS = 32
+FEAS_TOL = 2e-8
+GRAM_TOL = 2e-8
+CERT_TOL = 2e-8
+N_COMBOS = 24
 
-# Sampled diagonal algorithm can still be tested large.
-DIAG_M = 100
-DIAG_K = 20
+# Realistic random low-rank fixture.
+M = 10
+RANK = 10
+NONTRIVIAL_K = 10
 
-# Exact dense/banded LPs scale quadratically in matrix dimension.
-EXACT_M = 12
-EXACT_K = 4
-BANDED_BW = 2
-
-# Returned rays should not contain near-duplicates.
-MAX_COSINE = 1.0 - 1e-6
-
-
-# ======================================================================
-# Gram fixtures
-# ======================================================================
-
-def _eye_gram(n: int) -> DenseMatrix:
-    return DenseMatrix(torch.eye(n, dtype=torch.float64))
+# Random LP probing.  The full certificate mode is intentional at this small m
+# so the test checks the exact lifted cone rather than a sparse inner cone.
+CANDIDATE_FACTOR = 50
 
 
-def _lower_bidiagonal(n: int, sub: float = -0.35) -> DenseMatrix:
-    M = torch.eye(n, dtype=torch.float64)
-    idx = torch.arange(1, n)
-    M[idx, idx - 1] = sub
-    return DenseMatrix(M)
+# ============================================================================
+# Positive Gram / low-rank fixture generation
+# ============================================================================
 
 
-def _banded_bidiagonal(n: int, sub: float = -0.4) -> Banded:
-    # Banded convention:
-    # data[r, j] = A[j + offset[r], j].
-    #
-    # Therefore offset +1 is the lower/subdiagonal.
-    data = torch.zeros(2, n, dtype=torch.float64)
-    data[0] = 1.0
-    data[1, :-1] = sub
+def _bernstein_gram(m: int) -> np.ndarray:
+    """Gram of normalized degree-(m-1) Bernstein basis functions on [0,1].
 
-    return Banded(
-        torch.tensor([0, 1], dtype=torch.long),
-        data,
+    For B_i^n(x) = C(n,i) x^i (1-x)^(n-i),
+
+        integral B_i^n B_j^n dx
+        = C(n,i) C(n,j) Beta(i+j+1, 2n-i-j+1).
+
+    The diagonal normalization simply rescales each positive basis function to
+    unit L2 norm.  The result is dense, symmetric positive definite, and
+    strictly entrywise positive.
+    """
+    if m <= 0:
+        raise ValueError("m must be positive")
+
+    n = m - 1
+    i = np.arange(m, dtype=np.float64)[:, None]
+    j = np.arange(m, dtype=np.float64)[None, :]
+
+    log_choose_i = (
+        gammaln(n + 1.0)
+        - gammaln(i + 1.0)
+        - gammaln(n - i + 1.0)
+    )
+    log_choose_j = (
+        gammaln(n + 1.0)
+        - gammaln(j + 1.0)
+        - gammaln(n - j + 1.0)
     )
 
+    log_g = (
+        log_choose_i
+        + log_choose_j
+        + betaln(i + j + 1.0, 2.0 * n - i - j + 1.0)
+    )
+    G = np.exp(log_g)
 
-def _lower_triangular(n: int, fill: float = -0.05) -> DenseMatrix:
-    M = torch.eye(n, dtype=torch.float64)
-    i, j = torch.tril_indices(n, n, offset=-1)
-    M[i, j] = fill
-    return DenseMatrix(M)
+    scale = np.sqrt(np.diag(G))
+    G = G / (scale[:, None] * scale[None, :])
+
+    assert np.min(G) > 0.0
+    print("G rank:", np.linalg.matrix_rank(G), " m: ", m)
+    assert np.linalg.matrix_rank(G) == m
+    return G
 
 
-# ======================================================================
-# Verification helpers
-# ======================================================================
+def _random_positive_factor(
+    m: int,
+    r: int,
+    rng: np.random.Generator,
+    *,
+    concentration: float = 0.6,
+    floor: float = 0.03,
+) -> np.ndarray:
+    """Draw a strictly positive, row-normalized m x r full-rank matrix."""
+    for _ in range(100):
+        X = rng.gamma(concentration, 1.0, size=(m, r)) + floor
+        X /= X.sum(axis=1, keepdims=True)
+        if np.linalg.matrix_rank(X) == r:
+            return X
+    raise RuntimeError("Could not sample a full-column-rank positive factor")
+
+
+def _random_fixture(
+    m: int,
+    r: int,
+    seed: int,
+    *,
+    max_h_condition: float = 1e5,
+):
+    rng = np.random.default_rng(seed)
+    G = _bernstein_gram(m)
+
+    U = _random_positive_factor(m, r, rng)
+    U_tilde = _random_positive_factor(m, r, rng)
+
+    # H can be ill-conditioned if two random positive column spaces align too
+    # closely.  Since these factors are an offline design choice, simply reject
+    # such draws rather than making the cone test numerically meaningless.
+    for _ in range(200):
+        V = _random_positive_factor(m, r, rng)
+        V_tilde = _random_positive_factor(m, r, rng)
+        H = V.T @ G @ V_tilde
+        if (
+            np.linalg.matrix_rank(H) == r
+            and np.linalg.cond(H) <= max_h_condition
+        ):
+            break
+    else:
+        raise RuntimeError("Could not sample a well-conditioned invertible H")
+
+    local_gram = U @ H @ U_tilde.T
+    assert np.linalg.matrix_rank(local_gram, tol=1e-9) == r
+
+    return G, U, V, U_tilde, V_tilde, H, local_gram
+
+
+# ============================================================================
+# Independent certificate / model verification
+# ============================================================================
+
+
+def _paired_generator(H: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """D(C) = -H^T C^T H^{-T}, without explicitly forming H^{-T}."""
+    # Right-multiplication by H^{-T}: X H^{-T} = solve(H^{-1} X^T)^T.
+    # At these small r values explicit inverse would also be harmless, but the
+    # solve makes the orientation unambiguous.
+    left = -H.T @ C.T
+    return np.linalg.solve(H, left.T).T
+
+
+def _solve_metzler_certificate(
+    U: np.ndarray,
+    C: np.ndarray,
+) -> np.ndarray | None:
+    """Independently solve R U = U C with R Metzler.
+
+    This intentionally does not use any private matrices from the ray finder,
+    so it catches vectorization/orientation mistakes in the implementation.
+    """
+    m, r = U.shape
+    n_vars = m * m
+
+    rows = []
+    rhs = (U @ C).reshape(-1)
+
+    for i in range(m):
+        for a in range(r):
+            row = np.zeros(n_vars, dtype=np.float64)
+            for j in range(m):
+                row[i * m + j] = U[j, a]
+            rows.append(row)
+
+    bounds = []
+    for i in range(m):
+        for j in range(m):
+            bounds.append((None, None) if i == j else (0.0, None))
+
+    res = linprog(
+        c=np.zeros(n_vars, dtype=np.float64),
+        A_eq=np.asarray(rows),
+        b_eq=rhs,
+        bounds=bounds,
+        method="highs",
+    )
+
+    if not res.success:
+        return None
+    return res.x.reshape((m, m))
+
 
 def _min_offdiag(A: np.ndarray) -> float:
-    off = A.copy()
-    np.fill_diagonal(off, np.inf)
-    return float(off.min())
+    B = A.copy()
+    np.fill_diagonal(B, np.inf)
+    return float(B.min())
 
 
-def _transform(M: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """
-    Q = -M X^T M^{-1}, computed without explicitly forming M^{-1}.
-    """
-    A = -(M @ X.T)
-
-    # Q M = A  ->  M^T Q^T = A^T
-    return np.linalg.solve(M.T, A.T).T
-
-
-def _assert_metzler(
-    A: np.ndarray,
+def _assert_ray_feasible(
     *,
-    label: str,
-    tol: float = FEAS_TOL,
-) -> float:
-    vmin = _min_offdiag(A)
-
-    assert vmin >= -tol, (
-        f"{label}: min off-diag={vmin:.3e} < -{tol}"
-    )
-
-    return vmin
-
-
-def _assert_feasible(
-    M: np.ndarray,
-    X: np.ndarray,
-    *,
+    G: np.ndarray,
+    U: np.ndarray,
+    V: np.ndarray,
+    U_tilde: np.ndarray,
+    V_tilde: np.ndarray,
+    H: np.ndarray,
+    local_gram: np.ndarray,
+    C: np.ndarray,
     label: str,
 ) -> tuple[float, float]:
-    xmin = _assert_metzler(
-        X,
-        label=f"{label}: X",
+    r = C.shape[0]
+    assert C.shape == (r, r)
+
+    D = _paired_generator(H, C)
+
+    # ------------------------------------------------------------------
+    # Independent Metzler witnesses.
+    # ------------------------------------------------------------------
+    R_cert = _solve_metzler_certificate(U, C)
+    assert R_cert is not None, f"{label}: no R Metzler certificate"
+
+    T_cert = _solve_metzler_certificate(U_tilde, D)
+    assert T_cert is not None, f"{label}: no T Metzler certificate"
+
+    r_min = _min_offdiag(R_cert)
+    t_min = _min_offdiag(T_cert)
+    assert r_min >= -CERT_TOL, f"{label}: R offdiag min={r_min:.3e}"
+    assert t_min >= -CERT_TOL, f"{label}: T offdiag min={t_min:.3e}"
+
+    r_resid = np.max(np.abs(R_cert @ U - U @ C))
+    t_resid = np.max(np.abs(T_cert @ U_tilde - U_tilde @ D))
+    assert r_resid <= CERT_TOL, f"{label}: RU-UC residual={r_resid:.3e}"
+    assert t_resid <= CERT_TOL, f"{label}: TU~-U~D residual={t_resid:.3e}"
+
+    # ------------------------------------------------------------------
+    # Exponential positivity.
+    # ------------------------------------------------------------------
+    exp_C = expm(C)
+    exp_D = expm(D)
+
+    U_exp_C = U @ exp_C
+    Ut_exp_D = U_tilde @ exp_D
+
+    assert U_exp_C.min() >= -FEAS_TOL, (
+        f"{label}: min(U exp(C))={U_exp_C.min():.3e}"
+    )
+    assert Ut_exp_D.min() >= -FEAS_TOL, (
+        f"{label}: min(U_tilde exp(D))={Ut_exp_D.min():.3e}"
     )
 
-    Y = _transform(M, X)
-
-    ymin = _assert_metzler(
-        Y,
-        label=f"{label}: -M X^T M^-1",
+    # ------------------------------------------------------------------
+    # Reduced and full Gram cancellation.
+    # ------------------------------------------------------------------
+    reduced = exp_C @ H @ exp_D.T
+    reduced_err = np.max(np.abs(reduced - H))
+    assert reduced_err <= GRAM_TOL, (
+        f"{label}: exp(C) H exp(D)^T != H, err={reduced_err:.3e}"
     )
 
-    # Verify the dual similarity equation independently: Y M = -M X^T.
-    residual = np.max(np.abs(Y @ M + M @ X.T))
+    A = U_exp_C @ V.T
+    B = Ut_exp_D @ V_tilde.T
 
-    assert residual < 1e-7, (
-        f"{label}: Y M != -M X^T, "
-        f"max residual={residual:.3e}"
+    assert A.min() >= -FEAS_TOL, f"{label}: A min={A.min():.3e}"
+    assert B.min() >= -FEAS_TOL, f"{label}: B min={B.min():.3e}"
+
+    gram = A @ G @ B.T
+    gram_err = np.max(np.abs(gram - local_gram))
+    assert gram_err <= GRAM_TOL, (
+        f"{label}: A G B^T != U H U_tilde^T, err={gram_err:.3e}"
     )
 
-    return xmin, ymin
+    return r_min, t_min
 
 
-def _cosine_matrix(X: np.ndarray) -> np.ndarray:
-    """Pairwise Frobenius cosine similarity of (k,m,m) rays."""
-    V = X.reshape(X.shape[0], -1)
+def _cosine_matrix(C: np.ndarray) -> np.ndarray:
+    V = C.reshape(C.shape[0], -1)
     V /= np.linalg.norm(V, axis=1, keepdims=True)
     return np.clip(V @ V.T, -1.0, 1.0)
 
 
-# ======================================================================
-# Main generalized checker
-# ======================================================================
+# ============================================================================
+# Realistic random-positive test
+# ============================================================================
 
-def _check_rays(
-    gram: DenseMatrix | Banded,
-    *,
-    ray_type: str,
-    k: int,
-    transpose: bool = True,
-    bandwidth: int | None = None,
-    seed: int = SEED,
-) -> None:
-    m = gram.shape[-1]
 
-    finder = MetzlerConeRayFinder(
-        gram,
-        transpose=transpose,
-
-        # For the sampled diagonal method, cover every column.
-        n_constraint_cols=m,
-        n_verify_cols=m,
-        candidate_factor=10,
-        cut_rounds=4,
-        max_new_cols=m,
-
-        feasibility_tol=FEAS_TOL,
-        cosine_tol=1e-7,
-        seed=seed,
+def _check_random_positive_fixture() -> None:
+    G, U, V, U_tilde, V_tilde, H, local_gram = _random_fixture(
+        M,
+        RANK,
+        SEED,
     )
-
-    kwargs = {}
-    if ray_type == "banded":
-        kwargs["bandwidth"] = bandwidth
-
-    rays = finder.find(
-        k,
-        ray_type=ray_type,
-        **kwargs,
-    )
-
-    # ------------------------------------------------------------------
-    # Structured return type
-    # ------------------------------------------------------------------
-
-    expected_type = {
-        "diagonal": Diagonal,
-        "dense": DenseMatrix,
-        "banded": Banded,
-    }[ray_type]
-
-    assert isinstance(rays, expected_type), (
-        f"{ray_type}: expected {expected_type.__name__}, "
-        f"got {type(rays).__name__}"
-    )
-
-    assert rays.shape == torch.Size((k, m, m)), (
-        f"{ray_type}: expected {(k, m, m)}, got {tuple(rays.shape)}"
-    )
-
-    if ray_type == "diagonal":
-        assert rays.d.shape == (k, m)
-
-    elif ray_type == "banded":
-        assert bandwidth is not None
-        assert rays.data.shape == (
-            k,
-            2 * bandwidth + 1,
-            m,
-        )
-
-        expected_offsets = torch.arange(
-            -bandwidth,
-            bandwidth + 1,
-            device=rays.offsets.device,
-        )
-
-        assert torch.equal(rays.offsets, expected_offsets)
-
-    # Dense only for verification.
-    X = rays.to_dense().detach().cpu().double().numpy()
-
-    # ------------------------------------------------------------------
-    # Nonzero / lineality
-    # ------------------------------------------------------------------
-
-    norms = np.linalg.norm(X.reshape(k, -1), axis=1)
-
-    assert np.all(norms > 1e-10), (
-        f"{ray_type}: zero ray found: norms={norms}"
-    )
-
-    # Scalar identity lineality has been removed.
-    traces = np.trace(X, axis1=-2, axis2=-1)
-
-    assert np.all(np.abs(traces) < 1e-6), (
-        f"{ray_type}: rays not trace-zero: "
-        f"max |trace|={np.abs(traces).max():.3e}"
-    )
-
-    # ------------------------------------------------------------------
-    # Representation-specific structure
-    # ------------------------------------------------------------------
-
-    if ray_type == "diagonal":
-        off = X.copy()
-
-        for i in range(k):
-            np.fill_diagonal(off[i], 0.0)
-
-        assert np.max(np.abs(off)) < 1e-12, (
-            "diagonal ray contains non-diagonal entries"
-        )
-
-    elif ray_type == "banded":
-        assert bandwidth is not None
-
-        row = np.arange(m)[:, None]
-        col = np.arange(m)[None, :]
-        outside = np.abs(row - col) > bandwidth
-
-        assert np.max(np.abs(X[:, outside])) < 1e-12, (
-            f"banded rays contain entries outside bandwidth={bandwidth}"
-        )
-
-    # ------------------------------------------------------------------
-    # M used by the finder
-    # ------------------------------------------------------------------
-
-    M_torch = (
-        gram.T.to_dense()
-        if transpose
-        else gram.to_dense()
-    )
-
-    M = M_torch.detach().cpu().double().numpy()
-
-    # ------------------------------------------------------------------
-    # Individual rays
-    # ------------------------------------------------------------------
-
-    ray_x_mins = []
-    ray_y_mins = []
-
-    for i in range(k):
-        xmin, ymin = _assert_feasible(
-            M,
-            X[i],
-            label=f"{ray_type} ray[{i}]",
-        )
-
-        ray_x_mins.append(xmin)
-        ray_y_mins.append(ymin)
-
-    # ------------------------------------------------------------------
-    # Nonnegative combinations
-    # ------------------------------------------------------------------
-
-    rng = np.random.default_rng(seed + 17)
-
-    combo_x_mins = []
-    combo_y_mins = []
-
-    for t in range(N_COMBOS):
-        if t < k:
-            # Single ray.
-            c = np.zeros(k)
-            c[t] = 1.0
-
-        elif t < 2 * k:
-            # Sparse two-ray combination.
-            c = np.zeros(k)
-
-            i = t - k
-            j = (i + 1) % k
-
-            c[i] = rng.uniform(0.1, 2.0)
-            c[j] = rng.uniform(0.1, 2.0)
-
-        else:
-            # Dense positive combination.
-            c = rng.random(k)
-
-        Xc = np.tensordot(c, X, axes=(0, 0))
-
-        xmin, ymin = _assert_feasible(
-            M,
-            Xc,
-            label=f"{ray_type} combo[{t}] c={np.round(c, 3)}",
-        )
-
-        combo_x_mins.append(xmin)
-        combo_y_mins.append(ymin)
-
-    # ------------------------------------------------------------------
-    # Identity lineality direction
-    # ------------------------------------------------------------------
-
-    I = np.eye(m)
-
-    for t in range(8):
-        c = rng.random(k)
-
-        # Lineality really is unrestricted, so test both signs.
-        gamma = rng.uniform(-2.0, 2.0)
-
-        Xc = (
-            np.tensordot(c, X, axes=(0, 0))
-            + gamma * I
-        )
-
-        _assert_feasible(
-            M,
-            Xc,
-            label=f"{ray_type} combo+I[{t}]",
-        )
-
-    # ------------------------------------------------------------------
-    # Cosine diversity
-    # ------------------------------------------------------------------
-
-    cosine = _cosine_matrix(X)
-
-    offdiag_mask = ~np.eye(k, dtype=bool)
-    pair_cosines = cosine[offdiag_mask]
-
-    max_cos = float(pair_cosines.max())
-    min_cos = float(pair_cosines.min())
-
-    assert max_cos < MAX_COSINE, (
-        f"{ray_type}: near-duplicate rays: "
-        f"max pairwise cosine={max_cos:.9f}"
-    )
-
-    # SVD/rank are still useful diagnostics, but cosine selection does
-    # not mathematically guarantee linear independence.
-    V = X.reshape(k, -1).T
-    s = np.linalg.svd(V, compute_uv=False)
-    rank = int(np.linalg.matrix_rank(V, tol=1e-8))
 
     print(
-        f"  ok  type={ray_type:<8} "
-        f"shape={tuple(rays.shape)}  "
-        f"X_min={min(ray_x_mins):.3e}  "
-        f"Y_min={min(ray_y_mins):.3e}  "
-        f"combo_X_min={min(combo_x_mins):.3e}  "
-        f"combo_Y_min={min(combo_y_mins):.3e}  "
-        f"cos=[{min_cos:.3f}, {max_cos:.3f}]  "
-        f"rank={rank}/{k}  "
-        f"sv={np.array2string(s, precision=3)}"
+        "Random positive fixture: "
+        f"m={M}, r={RANK}, "
+        f"cond(G)={np.linalg.cond(G):.3e}, "
+        f"cond(H)={np.linalg.cond(H):.3e}, "
+        f"rank(local gram)={np.linalg.matrix_rank(local_gram)}"
+    )
+
+    # ------------------------------------------------------------------
+    # The scalar lineality C = gamma I is always feasible.  Keep identity
+    # lineality enabled here so a generic random fixture gives a strict smoke
+    # test rather than failing merely because its trace-free cone is trivial.
+    # ------------------------------------------------------------------
+    finder = LowRankMetzlerConeRayFinder(
+        torch.as_tensor(U, dtype=torch.float64),
+        torch.as_tensor(U_tilde, dtype=torch.float64),
+        torch.as_tensor(H, dtype=torch.float64),
+        certificate_mode="full",
+        candidate_factor=CANDIDATE_FACTOR,
+        feasibility_tol=1e-9,
+        cosine_tol=1e-7,
+        seed=SEED,
+        remove_identity=False,
+    )
+
+    rays = finder.find(1)
+    C = rays.to_dense().detach().cpu().double().numpy()
+
+    assert C.shape == (1, RANK, RANK)
+    assert np.linalg.norm(C[0]) > 1e-10
+
+    ray_r_min, ray_t_min = _assert_ray_feasible(
+        G=G,
+        U=U,
+        V=V,
+        U_tilde=U_tilde,
+        V_tilde=V_tilde,
+        H=H,
+        local_gram=local_gram,
+        C=C[0],
+        label="random scalar-cone ray",
+    )
+
+    # Random positive multiples plus arbitrary identity lineality.  The latter
+    # is useful because it tests D(C + gamma I) = D(C) - gamma I as well.
+    rng = np.random.default_rng(SEED + 100)
+    combo_r_min = np.inf
+    combo_t_min = np.inf
+
+    for t in range(N_COMBOS):
+        coeff = rng.uniform(0.0, 3.0)
+        gamma = rng.uniform(-2.0, 2.0)
+        C_combo = coeff * C[0] + gamma * np.eye(RANK)
+
+        r_min, t_min = _assert_ray_feasible(
+            G=G,
+            U=U,
+            V=V,
+            U_tilde=U_tilde,
+            V_tilde=V_tilde,
+            H=H,
+            local_gram=local_gram,
+            C=C_combo,
+            label=f"random combo[{t}]",
+        )
+        combo_r_min = min(combo_r_min, r_min)
+        combo_t_min = min(combo_t_min, t_min)
+
+    print(
+        "  scalar cone ok: "
+        f"R_offdiag_min={ray_r_min:.3e}, "
+        f"T_offdiag_min={ray_t_min:.3e}, "
+        f"combo_R_min={combo_r_min:.3e}, "
+        f"combo_T_min={combo_t_min:.3e}"
+    )
+
+    # ------------------------------------------------------------------
+    # Probe the actually interesting trace-free cone.  Do not assume generic
+    # independent positive factors admit one: empirically they often do not.
+    # If rays are found, verify them and their nonnegative combinations fully.
+    # ------------------------------------------------------------------
+    nontrivial_finder = LowRankMetzlerConeRayFinder(
+        U,
+        U_tilde,
+        H,
+        certificate_mode="full",
+        candidate_factor=CANDIDATE_FACTOR,
+        feasibility_tol=1e-9,
+        cosine_tol=1e-7,
+        seed=SEED + 1,
+        remove_identity=True,
+    )
+
+    try:
+        nontrivial = nontrivial_finder.find(NONTRIVIAL_K)
+    except RuntimeError as exc:
+        print(
+            "  trace-free cone diagnostic: no set of "
+            f"{NONTRIVIAL_K} nontrivial rays found for this independent "
+            f"random fixture ({exc})."
+        )
+        return
+
+    Cn = nontrivial.to_dense().detach().cpu().double().numpy()
+    assert Cn.shape == (NONTRIVIAL_K, RANK, RANK)
+    assert np.max(np.abs(np.trace(Cn, axis1=1, axis2=2))) < 1e-6
+
+    cosine = _cosine_matrix(Cn)
+    pair = cosine[~np.eye(NONTRIVIAL_K, dtype=bool)]
+
+    for i, Ci in enumerate(Cn):
+        _assert_ray_feasible(
+            G=G,
+            U=U,
+            V=V,
+            U_tilde=U_tilde,
+            V_tilde=V_tilde,
+            H=H,
+            local_gram=local_gram,
+            C=Ci,
+            label=f"random trace-free ray[{i}]",
+        )
+
+    for t in range(N_COMBOS):
+        coeff = rng.random(NONTRIVIAL_K)
+        C_combo = np.tensordot(coeff, Cn, axes=(0, 0))
+        _assert_ray_feasible(
+            G=G,
+            U=U,
+            V=V,
+            U_tilde=U_tilde,
+            V_tilde=V_tilde,
+            H=H,
+            local_gram=local_gram,
+            C=C_combo,
+            label=f"random trace-free combo[{t}]",
+        )
+
+    print(
+        "  trace-free cone found: "
+        f"k={NONTRIVIAL_K}, pairwise cosine "
+        f"range=[{pair.min():.3f}, {pair.max():.3f}]"
     )
 
 
-# ======================================================================
-# API checks
-# ======================================================================
-
-def _check_banded_api() -> None:
-    gram = _eye_gram(6)
-    finder = MetzlerConeRayFinder(gram)
-
-    try:
-        finder.find(2, ray_type="banded")
-    except ValueError as exc:
-        assert "bandwidth is required" in str(exc)
-    else:
-        raise AssertionError(
-            "banded ray type should require bandwidth"
-        )
-
-    for bw in (-1, 6):
-        try:
-            finder.find(
-                2,
-                ray_type="banded",
-                bandwidth=bw,
-            )
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(
-                f"invalid bandwidth={bw} should raise ValueError"
-            )
+# ============================================================================
+# Small known-nontrivial solver regression
+# ============================================================================
 
 
-# ======================================================================
-# Test driver
-# ======================================================================
+def _check_known_nontrivial_fixture() -> None:
+    """Strictly exercise discovery of multiple trace-free rays.
+
+    U = U_tilde = I and H = I is not intended as a realistic model fixture.
+    It is a solver regression where the cone is known analytically:
+
+        C Metzler and -C^T Metzler
+
+    forces C to be diagonal, while tr(C)=0 leaves an (r-1)-dimensional
+    nontrivial subspace.
+    """
+    r = 4
+    U = np.eye(r)
+    U_tilde = np.eye(r)
+    H = np.eye(r)
+
+    finder = LowRankMetzlerConeRayFinder(
+        U,
+        U_tilde,
+        H,
+        certificate_mode="full",
+        candidate_factor=30,
+        seed=SEED + 1000,
+        remove_identity=True,
+    )
+
+    rays = finder.find(1).to_dense().detach().cpu().double().numpy()
+    assert rays.shape == (1, r, r)
+
+    for i, C in enumerate(rays):
+        assert abs(np.trace(C)) < 1e-7
+        off = C.copy()
+        np.fill_diagonal(off, 0.0)
+        assert np.max(np.abs(off)) < 1e-7
+
+        D = _paired_generator(H, C)
+        R_cert = _solve_metzler_certificate(U, C)
+        T_cert = _solve_metzler_certificate(U_tilde, D)
+        assert R_cert is not None, f"known ray[{i}] missing R certificate"
+        assert T_cert is not None, f"known ray[{i}] missing T certificate"
+
+    print(
+        "Known nontrivial fixture: "
+        "found and verified a nonzero trace-free diagonal direction."
+    )
+
+
+# ============================================================================
+# Driver
+# ============================================================================
+
 
 def main() -> None:
     torch.manual_seed(SEED)
+    np.set_printoptions(precision=4, suppress=True)
 
-    # ------------------------------------------------------------------
-    # Diagonal: preserve the old large-m test coverage.
-    # ------------------------------------------------------------------
+    _check_random_positive_fixture()
+    _check_known_nontrivial_fixture()
 
-    print(
-        f"Diagonal rays / identity, "
-        f"m={DIAG_M}, k={DIAG_K}"
-    )
-    _check_rays(
-        _eye_gram(DIAG_M),
-        ray_type="diagonal",
-        k=DIAG_K,
-    )
-
-    print(
-        f"Diagonal rays / dense lower bidiagonal, "
-        f"m={DIAG_M}, k={DIAG_K}"
-    )
-    G = _lower_bidiagonal(DIAG_M)
-
-    _check_rays(
-        G,
-        ray_type="diagonal",
-        k=DIAG_K,
-        transpose=True,
-    )
-
-    _check_rays(
-        G,
-        ray_type="diagonal",
-        k=DIAG_K,
-        transpose=False,
-        seed=SEED + 1,
-    )
-
-    print(
-        f"Diagonal rays / banded lower bidiagonal, "
-        f"m={DIAG_M}, k={DIAG_K}"
-    )
-    _check_rays(
-        _banded_bidiagonal(DIAG_M),
-        ray_type="diagonal",
-        k=DIAG_K,
-        transpose=True,
-        seed=SEED + 2,
-    )
-
-    # ------------------------------------------------------------------
-    # Dense exact LP.
-    # ------------------------------------------------------------------
-
-    print(
-        f"Dense rays / identity, "
-        f"m={EXACT_M}, k={EXACT_K}"
-    )
-    _check_rays(
-        _eye_gram(EXACT_M),
-        ray_type="dense",
-        k=EXACT_K,
-        seed=SEED + 10,
-    )
-
-    print(
-        f"Dense rays / lower bidiagonal, "
-        f"m={EXACT_M}, k={EXACT_K}"
-    )
-    G = _lower_bidiagonal(EXACT_M)
-
-    _check_rays(
-        G,
-        ray_type="dense",
-        k=EXACT_K,
-        transpose=True,
-        seed=SEED + 11,
-    )
-
-    _check_rays(
-        G,
-        ray_type="dense",
-        k=EXACT_K,
-        transpose=False,
-        seed=SEED + 12,
-    )
-
-    # ------------------------------------------------------------------
-    # Banded exact LP.
-    # ------------------------------------------------------------------
-
-    print(
-        f"Banded rays / identity, "
-        f"m={EXACT_M}, k={EXACT_K}, bw={BANDED_BW}"
-    )
-    _check_rays(
-        _eye_gram(EXACT_M),
-        ray_type="banded",
-        bandwidth=BANDED_BW,
-        k=EXACT_K,
-        seed=SEED + 20,
-    )
-
-    print(
-        f"Banded rays / dense lower bidiagonal, "
-        f"m={EXACT_M}, k={EXACT_K}, bw={BANDED_BW}"
-    )
-    _check_rays(
-        _lower_bidiagonal(EXACT_M),
-        ray_type="banded",
-        bandwidth=BANDED_BW,
-        k=EXACT_K,
-        transpose=True,
-        seed=SEED + 21,
-    )
-
-    print(
-        f"Banded rays / banded lower bidiagonal, "
-        f"m={EXACT_M}, k={EXACT_K}, bw={BANDED_BW}"
-    )
-    _check_rays(
-        _banded_bidiagonal(EXACT_M),
-        ray_type="banded",
-        bandwidth=BANDED_BW,
-        k=EXACT_K,
-        transpose=True,
-        seed=SEED + 22,
-    )
-
-    _check_banded_api()
-
-    print("All MetzlerConeRayFinder checks passed.")
+    print("All LowRankMetzlerConeRayFinder checks passed.")
 
 
 if __name__ == "__main__":
