@@ -1,9 +1,4 @@
 import torch
-from copy import deepcopy
-import itertools
-from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
-
-#### Base Classes ####
 
 class DensityModel(torch.nn.Module):
     def __init__(self, features: int, batch_shape: tuple[int, ...] | int = 1):

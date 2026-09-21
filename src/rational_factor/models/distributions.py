@@ -288,50 +288,6 @@ class Bernstein1D(DensityModel):
         )
 
 
-# Backward-compatible aliases for the primitives owned by BSpline1DBasis.
-open_uniform_knots = BSpline1DBasis.open_uniform_knots
-bspline_basis_mass = BSpline1DBasis.basis_mass
-eval_open_bsplines = BSpline1DBasis.eval_basis
-
-
-def sample_normalized_bsplines(
-    idx: torch.Tensor,
-    knots: torch.Tensor,
-    degree: int,
-    n_basis: int,
-    *,
-    dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Draw from ``N_{idx,p} / μ_{idx}`` by rejection (accept with probability ``N``)."""
-    if dtype is None:
-        dtype = knots.dtype
-    p = degree
-    lo = knots[idx]
-    hi = knots[idx + p + 1]
-    n = idx.shape[0]
-    out = torch.empty(n, device=idx.device, dtype=dtype)
-    pending = torch.ones(n, dtype=torch.bool, device=idx.device)
-    for _ in range(64):
-        if not pending.any():
-            break
-        n_pend = int(pending.sum().item())
-        u = lo[pending] + (hi[pending] - lo[pending]) * torch.rand(
-            n_pend, device=idx.device, dtype=dtype
-        )
-        N = BSpline1DBasis.eval_basis(u, knots, degree, n_basis)
-        n_i = N.gather(1, idx[pending].unsqueeze(1)).squeeze(1)
-        ok = torch.rand(n_pend, device=idx.device, dtype=dtype) <= n_i
-        filled_idx = pending.nonzero(as_tuple=False).squeeze(-1)
-        out[filled_idx[ok]] = u[ok]
-        pending[filled_idx[ok]] = False
-    if pending.any():
-        u = lo[pending] + (hi[pending] - lo[pending]) * torch.rand(
-            int(pending.sum().item()), device=idx.device, dtype=dtype
-        )
-        out[pending] = u
-    return out
-
-
 class BSpline1D(DensityModel):
     """Open-uniform B-spline density on a sacrificial coordinate.
 
@@ -436,15 +392,48 @@ class BSpline1D(DensityModel):
         log_p = torch.logsumexp(log_alpha + log_N, dim=-1)
         return self._clip_log_density(log_p)
 
+    def sample_normalized_bsplines(
+        idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draw from ``N_{idx,p} / μ_{idx}`` by rejection (accept with probability ``N``)."""
+
+
+
     def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
         """Mixture of normalized B-splines; each component via rejection on its support."""
+        
+        def _sample_normalized_bsplines(idx: torch.Tensor) -> torch.Tensor:
+            p = self.degree
+            lo = self.knots[idx]
+            hi = self.knots[idx + p + 1]
+            n = idx.shape[0]
+            out = torch.empty(n, device=idx.device, dtype=self.logits.dtype)
+            pending = torch.ones(n, dtype=torch.bool, device=idx.device)
+            for _ in range(64):
+                if not pending.any():
+                    break
+                n_pend = int(pending.sum().item())
+                u = lo[pending] + (hi[pending] - lo[pending]) * torch.rand(
+                    n_pend, device=idx.device, dtype=self.logits.dtype
+                )
+                N = self.eval_basis(u)
+                n_i = N.gather(1, idx[pending].unsqueeze(1)).squeeze(1)
+                ok = torch.rand(n_pend, device=idx.device, dtype=self.logits.dtype) <= n_i
+                filled_idx = pending.nonzero(as_tuple=False).squeeze(-1)
+                out[filled_idx[ok]] = u[ok]
+                pending[filled_idx[ok]] = False
+            if pending.any():
+                u = lo[pending] + (hi[pending] - lo[pending]) * torch.rand(
+                    int(pending.sum().item()), device=idx.device, dtype=self.logits.dtype
+                )
+                out[pending] = u
+            return out
+
         weights = self.mixture_weights()
         flat_w = weights.reshape(-1, self.n_basis)
         idx = torch.multinomial(flat_w, n_samples, replacement=True).T
         idx_flat = idx.reshape(-1)
-        x_s_flat = sample_normalized_bsplines(
-            idx_flat, self.knots, self.degree, self.n_basis, dtype=self.logits.dtype
-        )
+        x_s_flat = _sample_normalized_bsplines(idx_flat)
         x_s = x_s_flat.reshape(n_samples, *self.batch_shape)
         samples = torch.rand(
             n_samples,
