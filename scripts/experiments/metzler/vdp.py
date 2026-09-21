@@ -514,24 +514,24 @@ def _plot_masked_metzler_slot_entries(
     slot: int,
     n_slots: int,
     n_grid: int = 128,
-    n_show: int = 9,
+    n_show: int | None = None,
     title: str = "",
     dtype: torch.dtype | None = None,
     device: torch.device | None = None,
 ) -> None:
-    """Plot a few entries of ``M_slot(x)`` vs its free coordinate on ``[0, 1]``.
+    """Plot entries of ``M_slot(x)`` vs its free coordinate on ``[0, 1]``.
 
     ``get_M(x)`` maps ``(n_grid, d)`` inputs to a dense ``(n_grid, d, m, m)``
     tensor (or Matrix of that shape). Slot ``ℓ`` depends on ``x_<ℓ``.
 
-    Instead of a full ``m × m`` grid, shows ``n_show`` entries on an evenly
-    spaced index subgrid (default 9 → up to a 3×3 layout).
+    If ``n_show`` is ``None``, plots the full ``m × m`` entry grid. Otherwise
+    shows ``n_show`` entries on an evenly spaced index subgrid.
     """
     d = n_slots
     if not (0 <= slot < d):
         raise ValueError(f"slot must be in [0, {d}), got {slot}")
-    if n_show < 1:
-        raise ValueError(f"n_show must be positive, got {n_show}")
+    if n_show is not None and n_show < 1:
+        raise ValueError(f"n_show must be positive or None, got {n_show}")
 
     if dtype is None:
         dtype = torch.float32
@@ -555,6 +555,42 @@ def _plot_masked_metzler_slot_entries(
         M = M[:, slot]  # (n_grid, m, m)
 
     m = M.shape[-1]
+    M_np = M.detach().cpu().numpy()
+    t_np = t.detach().cpu().numpy()
+
+    if n_show is None:
+        # Full m × m grid of every matrix entry.
+        fig, axes = plt.subplots(
+            m,
+            m,
+            figsize=(max(1.0, 0.85 * m), max(0.9, 0.78 * m)),
+            sharex=True,
+            squeeze=False,
+        )
+        if title:
+            fig.suptitle(title, y=1.01)
+        for i in range(m):
+            for j in range(m):
+                ax = axes[i, j]
+                ax.plot(t_np, M_np[:, i, j], color="C0", lw=0.8)
+                ax.axhline(0.0, color="0.6", lw=0.35, zorder=0)
+                ax.set_xlim(0.0, 1.0)
+                ax.tick_params(labelsize=4, length=1.5)
+                if i == 0:
+                    ax.set_title(f"j={j}", fontsize=5, pad=1)
+                if j == 0:
+                    ax.set_ylabel(f"i={i}", fontsize=5)
+                if i < m - 1:
+                    ax.set_xticklabels([])
+                else:
+                    ax.set_xlabel(xlabel, fontsize=5)
+                if j > 0:
+                    ax.set_yticklabels([])
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        return
+
     n_side = max(1, ceil(sqrt(n_show)))
     idx = torch.linspace(0, m - 1, n_side).round().long().unique().tolist()
     pairs = [(int(i), int(j)) for i in idx for j in idx][:n_show]
@@ -571,8 +607,6 @@ def _plot_masked_metzler_slot_entries(
     if title:
         fig.suptitle(title, y=1.01)
 
-    M_np = M.detach().cpu().numpy()
-    t_np = t.detach().cpu().numpy()
     for p, (i, j) in enumerate(pairs):
         r, c = divmod(p, n_cols)
         ax = axes[r, c]
@@ -642,7 +676,7 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     n_basis = 10
     bspline_degree = 5
-    n_rays = 20
+    n_rays = 100
     ray_seed = 0
     a0_b0_sampler = "uniform"  # "uniform" | "lognormal_near_diag" | "lognormal"
     # Finder returns unit-Frobenius (R,T) pairs; scale so exp(R) leaves near-I.
@@ -759,7 +793,7 @@ if __name__ == "__main__":
             )
             print(f"Saved {name} slot-{slot} expm ray heatmaps to {out}")
     
-    input("...")
+    #input("...")
 
     dtype_model = torch.float32
     A0 = A0.to(device=device, dtype=dtype_model)
@@ -901,16 +935,16 @@ if __name__ == "__main__":
                 out,
                 slot=slot,
                 n_slots=d,
-                n_show=9,
+                n_show=None,
                 n_grid=128,
                 title=(
                     f"VDP Metzler: paired {name} slot {slot} "
-                    f"(9 of {n_basis}×{n_basis} entries) vs free coord"
+                    f"(all {n_basis}×{n_basis} entries) vs free coord"
                 ),
                 dtype=dtype_plot,
                 device=device_plot,
             )
-            print(f"Saved {name} slot-{slot} entry subsample to {out}")
+            print(f"Saved {name} slot-{slot} full entry grid to {out}")
 
     mutual_phi_out = output_dir / "mutual_basis_phi_2d.png"
     _plot_2d_pair_member_grid(
