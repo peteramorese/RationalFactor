@@ -26,15 +26,15 @@ class ConditionalStandardNormalDensity(ConditionalDensityModel):
     The MLP maps the conditioner to a mean ``μ`` of shape ``(batch, dim)``.
     """
 
-    def __init__(self, dim: int, conditioner_dim: int, mlp: torch.nn.Module):
-        super().__init__(dim=dim, conditioner_dim=conditioner_dim)
+    def __init__(self, features: int, context_features: int, mlp: torch.nn.Module):
+        super().__init__(features=features, context_features=context_features)
         self.mlp = mlp
 
     def _mean(self, conditioner: torch.Tensor) -> torch.Tensor:
         mean = self.mlp(conditioner)
-        if mean.shape != (conditioner.shape[0], self.dim):
+        if mean.shape != (conditioner.shape[0], self.features):
             raise ValueError(
-                f"mlp output must have shape (batch, {self.dim}), got {tuple(mean.shape)}"
+                f"mlp output must have shape (batch, {self.features}), got {tuple(mean.shape)}"
             )
         return mean
 
@@ -44,7 +44,7 @@ class ConditionalStandardNormalDensity(ConditionalDensityModel):
 
     def log_density(self, x: torch.Tensor, *, conditioner: torch.Tensor, **contexts) -> torch.Tensor:
         mean = self._mean(conditioner)
-        log_z = -0.5 * self.dim * math.log(2.0 * math.pi)
+        log_z = -0.5 * self.features * math.log(2.0 * math.pi)
         return self._clip_log_density(log_z - 0.5 * ((x - mean) ** 2).sum(dim=-1))
 
     def sample(self, conditioner: torch.Tensor, **contexts) -> torch.Tensor:
@@ -57,7 +57,7 @@ class ConditionalStandardNormalDensity(ConditionalDensityModel):
         conditioner = _require_conditioner(conditioner)
         if conditioner.ndim == 1:
             conditioner = conditioner.unsqueeze(0)
-        bound = conditioner.new_tensor((2.0 * math.pi) ** (-0.5 * self.dim))
+        bound = conditioner.new_tensor((2.0 * math.pi) ** (-0.5 * self.features))
         return bound.expand(conditioner.shape[0])
 
 
@@ -70,16 +70,14 @@ class ConditionalSeparableBeta(ConditionalDensityModel):
     least ``min_concentration`` (default 1 keeps the density bounded).
     """
 
-    def __init__(
-        self,
-        dim: int,
-        conditioner_dim: int,
+    def __init__(self, features: int,
+        context_features: int,
         mlp: torch.nn.Module,
         n_basis: int = 1,
         min_concentration: float = 1.0,
         eps: float = 1e-6,
     ):
-        super().__init__(dim=dim, conditioner_dim=conditioner_dim)
+        super().__init__(features=features, context_features=context_features)
         if n_basis < 1:
             raise ValueError("n_basis must be at least 1")
         if min_concentration < 0:
@@ -87,7 +85,7 @@ class ConditionalSeparableBeta(ConditionalDensityModel):
         self.n_basis = n_basis
         self.min_concentration = min_concentration
         self.eps = eps
-        self.param_dim = 2 * n_basis * dim
+        self.param_dim = 2 * n_basis * features
         self.mlp = mlp
 
     def _raw_params(self, conditioner: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -96,14 +94,14 @@ class ConditionalSeparableBeta(ConditionalDensityModel):
             raise ValueError(
                 f"mlp output must have shape (batch, {self.param_dim}), got {tuple(raw.shape)}"
             )
-        half = self.n_basis * self.dim
+        half = self.n_basis * self.features
         raw_alpha = raw[:, :half]
         raw_beta = raw[:, half:]
         if self.n_basis == 1:
             return raw_alpha, raw_beta
         return (
-            raw_alpha.view(-1, self.n_basis, self.dim),
-            raw_beta.view(-1, self.n_basis, self.dim),
+            raw_alpha.view(-1, self.n_basis, self.features),
+            raw_beta.view(-1, self.n_basis, self.features),
         )
 
     def concentrations(self, conditioner: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -123,8 +121,8 @@ class ConditionalSeparableBeta(ConditionalDensityModel):
     def log_density(self, x: torch.Tensor, *, conditioner: torch.Tensor, **contexts) -> torch.Tensor:
         alpha, beta = self.concentrations(conditioner)
         x_c = x.clamp(self.eps, 1.0 - self.eps)
-        if x_c.ndim != 2 or x_c.shape[1] != self.dim:
-            raise ValueError(f"x must have shape (n_data, {self.dim}), got {tuple(x.shape)}")
+        if x_c.ndim != 2 or x_c.shape[1] != self.features:
+            raise ValueError(f"x must have shape (n_data, {self.features}), got {tuple(x.shape)}")
 
         if self.n_basis == 1:
             log_p = torch.distributions.Beta(alpha, beta).log_prob(x_c).sum(dim=-1)
@@ -164,20 +162,18 @@ class ConditionalBernstein1D(ConditionalDensityModel):
     with other coordinates independent Uniform[0, 1].
     """
 
-    def __init__(
-        self,
-        dim: int,
-        conditioner_dim: int,
+    def __init__(self, features: int,
+        context_features: int,
         degree: int,
         mlp: torch.nn.Module,
         sacrificial_index: int = 0,
         eps: float = 1e-6,
     ):
-        super().__init__(dim=dim, conditioner_dim=conditioner_dim)
+        super().__init__(features=features, context_features=context_features)
         if degree < 0:
             raise ValueError("degree must be nonnegative")
-        if not (0 <= sacrificial_index < dim):
-            raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
+        if not (0 <= sacrificial_index < features):
+            raise ValueError(f"sacrificial_index must be in [0, {features}), got {sacrificial_index}")
         self.degree = degree
         self.sacrificial_index = sacrificial_index
         self.eps = eps
@@ -209,7 +205,7 @@ class ConditionalBernstein1D(ConditionalDensityModel):
         return p.dtype, p.device
 
     def log_density(self, x: torch.Tensor, *, conditioner: torch.Tensor, **contexts) -> torch.Tensor:
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        assert x.shape[1] == self.features, "x must have shape (n_data, features)"
         x_s = x[:, self.sacrificial_index].clamp(self.eps, 1.0 - self.eps)
         k = torch.arange(self.degree + 1, device=x.device, dtype=x.dtype)
         log_b = (
@@ -230,7 +226,7 @@ class ConditionalBernstein1D(ConditionalDensityModel):
         beta = (self.degree - idx + 1).to(dtype=weights.dtype)
         x_s = torch.distributions.Beta(alpha, beta).sample()
         samples = torch.rand(
-            conditioner.shape[0], self.dim, device=conditioner.device, dtype=weights.dtype
+            conditioner.shape[0], self.features, device=conditioner.device, dtype=weights.dtype
         )
         samples[:, self.sacrificial_index] = x_s
         return samples
@@ -251,23 +247,21 @@ class ConditionalBSpline1D(ConditionalDensityModel):
     spline parameterization (zero logits → Uniform; local support → sharp bumps).
     """
 
-    def __init__(
-        self,
-        dim: int,
-        conditioner_dim: int,
+    def __init__(self, features: int,
+        context_features: int,
         n_basis: int,
         mlp: torch.nn.Module,
         degree: int = 3,
         sacrificial_index: int = 0,
         eps: float = 1e-6,
     ):
-        super().__init__(dim=dim, conditioner_dim=conditioner_dim)
+        super().__init__(features=features, context_features=context_features)
         if degree < 0:
             raise ValueError("degree must be nonnegative")
         if n_basis < degree + 1:
             raise ValueError("n_basis must be at least degree + 1")
-        if not (0 <= sacrificial_index < dim):
-            raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
+        if not (0 <= sacrificial_index < features):
+            raise ValueError(f"sacrificial_index must be in [0, {features}), got {sacrificial_index}")
         self.n_basis = n_basis
         self.degree = degree
         self.sacrificial_index = sacrificial_index
@@ -312,7 +306,7 @@ class ConditionalBSpline1D(ConditionalDensityModel):
         return p.dtype, p.device
 
     def log_density(self, x: torch.Tensor, *, conditioner: torch.Tensor, **contexts) -> torch.Tensor:
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        assert x.shape[1] == self.features, "x must have shape (n_data, features)"
         x_s = x[:, self.sacrificial_index].clamp(self.eps, 1.0 - self.eps)
         N = self.eval_basis(x_s)
         log_alpha = self.coefficients(conditioner).clamp_min(self.eps).log()
@@ -328,7 +322,7 @@ class ConditionalBSpline1D(ConditionalDensityModel):
             idx, self.knots, self.degree, self.n_basis, dtype=weights.dtype
         )
         samples = torch.rand(
-            conditioner.shape[0], self.dim, device=conditioner.device, dtype=weights.dtype
+            conditioner.shape[0], self.features, device=conditioner.device, dtype=weights.dtype
         )
         samples[:, self.sacrificial_index] = x_s
         return samples

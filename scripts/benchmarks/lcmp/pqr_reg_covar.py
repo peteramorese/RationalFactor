@@ -11,7 +11,7 @@ import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeDensityModel
 from rational_factor.models.density_model import LogisticSigmoid
-from rational_factor.models.domain_transformation import MaskedAffineNFTF, StackedTF, VolumePreservingNFTF
+from normalizing_flow.transforms import Transforms, StackedTransform
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
@@ -78,7 +78,7 @@ def main() -> None:
         loc = loc.to(device)
         scale = scale.to(device)
         base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
-        decorrupter = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
+        decorrupter = Transforms.make_transform("maf", dim=system.dim(), trainable=True, hidden_features=128, num_layers=5, permutation="random").to(device)
         decorrupter_density = CompositeDensityModel([decorrupter], base_distribution).to(device)
 
         optimizer = torch.optim.Adam(
@@ -103,7 +103,7 @@ def main() -> None:
             clip_grad_norm=5.0,
             restore_loss_threshold=50.0,
         )
-        decorrupter_trained = MaskedAffineNFTF.copy_from_trainable(decorrupter).to(device)
+        decorrupter_trained = Transforms.freeze(decorrupter).to(device)
 
         x_k_data_device = x_k_train.to(device)
         x_kp1_data_device = x_kp1_train.to(device)
@@ -118,9 +118,9 @@ def main() -> None:
         y_kp1_val, _ = decorrupter_trained(x_kp1_val_device)
         y0_val, _ = decorrupter_trained(x0_val_device)
 
-        mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
+        mover = Transforms.make_transform("volume_preserving", dim=system.dim(), trainable=True, hidden_features=256, num_layers=6).to(device)
         y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
-        mover_joint = StackedTF([mover, mover])
+        mover_joint = StackedTransform([mover, mover])
 
         z_joint_data = y_joint_data
         best_loss_tran = 0.0
@@ -168,7 +168,7 @@ def main() -> None:
 
             z_joint_data, _ = mover_joint(y_joint_data)
 
-        mover_trained = VolumePreservingNFTF.copy_from_trainable(mover).to(device)
+        mover_trained = Transforms.freeze(mover).to(device)
 
         weights = gmm_lf.w.get_coeffs()
         z_marginal = gmm_lf.marginal(marginal_dims=range(system.dim()))

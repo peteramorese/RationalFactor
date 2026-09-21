@@ -13,7 +13,7 @@ import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.density_model import LogisticSigmoid
-from rational_factor.models.domain_transformation import MaskedRQSNFTF, StackedTF, VolumePreservingNFTF
+from normalizing_flow.transforms import Transforms, StackedTransform
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
@@ -200,7 +200,7 @@ def main() -> None:
     loc = loc.to(device)
     scale = scale.to(device)
     base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
-    decorrupter = MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
+    decorrupter = Transforms.make_transform("nsf", dim=system.dim(), trainable=True, hidden_features=128, num_layers=5, permutation="random").to(device)
     decorrupter_density = CompositeDensityModel([decorrupter], base_distribution).to(device)
 
     print("Training NF decorrupter")
@@ -223,7 +223,7 @@ def main() -> None:
     )
     print("Done.\n")
 
-    decorrupter_trained = MaskedRQSNFTF.copy_from_trainable(decorrupter).to(device)
+    decorrupter_trained = Transforms.freeze(decorrupter).to(device)
 
     x_k_data = x_k_data.to(device)
     x_kp1_data = x_kp1_data.to(device)
@@ -234,8 +234,8 @@ def main() -> None:
 
     ######## TRAIN MOVER ########
     print("Training mover")
-    mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
-    mover_joint = StackedTF([mover, mover])
+    mover = Transforms.make_transform("volume_preserving", dim=system.dim(), trainable=True, hidden_features=128, num_layers=5).to(device)
+    mover_joint = StackedTransform([mover, mover])
 
     y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
     z_joint_data = y_joint_data
@@ -277,7 +277,7 @@ def main() -> None:
         print("Done.\n")
         z_joint_data, _ = mover_joint(y_joint_data)
 
-    mover_trained = VolumePreservingNFTF.copy_from_trainable(mover).to(device)
+    mover_trained = Transforms.freeze(mover).to(device)
 
     weights = gmm_lf.w.get_coeffs()
     z_marginal = gmm_lf.marginal(marginal_dims=range(system.dim()))

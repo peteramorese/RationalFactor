@@ -8,7 +8,7 @@ class BaseGaussianKDE(DensityModel):
     def __init__(self, data: torch.Tensor):
         assert data.ndim == 2, "data must have shape (n_samples, dim)"
         assert data.shape[0] >= 1, "data must contain at least one sample"
-        super().__init__(dim=data.shape[1])
+        super().__init__(features=data.shape[1])
         self.register_buffer("data", data.detach().clone())
         self._eps = torch.finfo(self.data.dtype).eps
 
@@ -30,7 +30,7 @@ class BaseGaussianKDE(DensityModel):
         return log_norm - 0.5 * sq_norm
 
     def log_density(self, x: torch.Tensor, **contexts: torch.Tensor):
-        assert x.ndim == 2 and x.shape[1] == self.dim, f"x must have shape (n_data, {self.dim})"
+        assert x.ndim == 2 and x.shape[1] == self.features, f"x must have shape (n_data, {self.features})"
         n = self.data.shape[0]
         h = self._kernel_bandwidths(dtype=x.dtype, device=x.device).clamp_min(self._eps)
         log_k = self._log_kernel(x=x, centers=self.data, kernel_bandwidths=h)
@@ -40,7 +40,7 @@ class BaseGaussianKDE(DensityModel):
         assert n_samples > 0, "n_samples must be positive"
         idx = torch.randint(low=0, high=self.data.shape[0], size=(n_samples,), device=self.data.device)
         h = self._kernel_bandwidths(dtype=self.data.dtype, device=self.data.device).clamp_min(self._eps)
-        noise = torch.randn(n_samples, self.dim, dtype=self.data.dtype, device=self.data.device)
+        noise = torch.randn(n_samples, self.features, dtype=self.data.dtype, device=self.data.device)
         return self.data[idx] + h[idx, None] * noise
 
     def marginal(self, marginal_dims: tuple[int, ...]):
@@ -182,7 +182,7 @@ class GaussianKDE(BaseGaussianKDE):
           else:                h <- h - lr * diff
         """
         assert validation_data.ndim == 2, "validation_data must have shape (n_samples, dim)"
-        assert validation_data.shape[1] == self.dim, f"validation_data must have shape (n_samples, {self.dim})"
+        assert validation_data.shape[1] == self.features, f"validation_data must have shape (n_samples, {self.features})"
         assert validation_data.shape[0] > 0, "validation_data must contain at least one sample"
         assert epochs > 0, "epochs must be positive"
         assert lr > 0, "lr must be positive"

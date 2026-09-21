@@ -51,8 +51,8 @@ class ParticleSet(DensityModel):
         """
         Standard Gaussian KDE with diagonal bandwidth.
         """
-        assert x.ndim == 2 and x.shape[1] == self.dim, \
-            f"x must have shape (n_data, {self.dim})"
+        assert x.ndim == 2 and x.shape[1] == self.features, \
+            f"x must have shape (n_data, {self.features})"
 
         particles = self.particles 
         n, d = particles.shape
@@ -141,8 +141,8 @@ class WeightedParticleSet(ParticleSet):
         Returns:
             log p(x): (m,)
         """
-        assert x.ndim == 2 and x.shape[1] == self.dim, \
-            f"x must have shape (n_data, {self.dim})"
+        assert x.ndim == 2 and x.shape[1] == self.features, \
+            f"x must have shape (n_data, {self.features})"
 
         particles = self.particles
         w = self.weights

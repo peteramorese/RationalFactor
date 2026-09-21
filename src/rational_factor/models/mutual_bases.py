@@ -11,7 +11,7 @@ from numpy.polynomial.legendre import leggauss
 from normalizing_flow.vp_flow import ConditionalUnitBoxVolumePreservingFlow
 from rational_factor.models.basis_functions import Basis, BetaBasis, GaussianBasis
 from rational_factor.models.density_model import ConditionalDensityModel
-from rational_factor.models.domain_transformation import DomainTF
+from nflows.transforms.base import Transform
 from rational_factor.models.parameters import Parameters, Order1QuasiseparableFactorization
 from rational_factor.models.structured_matrices import (
     Banded,
@@ -164,12 +164,12 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
         if base.dim() == 0 and flow is not None:
             raise ValueError("flow is not defined for 0-dimensional rest coordinates")
         if flow is not None:
-            if flow.dim != base.dim():
+            if flow.features != base.dim():
                 raise ValueError("flow and base must have the same dimension")
-            if embedding.embedding_dim != flow.conditioner_dim:
+            if embedding.embedding_dim != flow.context_features:
                 raise ValueError(
                     f"embedding dim {embedding.embedding_dim} must match "
-                    f"flow conditioner_dim {flow.conditioner_dim}"
+                    f"flow context_features {flow.context_features}"
                 )
 
         MutualPairBasis.__init__(self, base.dim(), 1, n_basis, (), coeffs)
@@ -218,7 +218,7 @@ class VolumePreservingPairBasis(torch.nn.Module, MutualPairBasis):
         n_data, m = y.shape[0], self._n_basis
         if self._dim == 0:
             return y.new_ones(n_data, m)
-        if self.flow is None or self.flow.dim == 1:
+        if self.flow is None or self.flow.features == 1:
             return self._eval_base(y)
         cond = self._index_conditioners(y.dtype, y.device)
         y_rep = y.unsqueeze(1).expand(-1, m, -1).reshape(n_data * m, self._dim)
@@ -316,7 +316,7 @@ class NormalizedProductPairBasis(torch.nn.Module, MutualPairBasis):
     def __init__(
         self,
         base_box_distribution: ConditionalDensityModel,
-        domain_transformation: DomainTF,
+        domain_transformation: Transform,
         embedding: torch.nn.Embedding,
         coeffs: tuple[Parameters | None, Parameters | None] | None = None,
     ):
@@ -324,15 +324,15 @@ class NormalizedProductPairBasis(torch.nn.Module, MutualPairBasis):
         n_basis = embedding.num_embeddings
         if n_basis < 1:
             raise ValueError("embedding must contain at least one index")
-        #if base_box_distribution.dim != domain_transformation.dim:
+        #if base_box_distribution.features != domain_transformation.dim:
         #    raise ValueError(
-        #        f"base dim {base_box_distribution.dim} must match "
+        #        f"base dim {base_box_distribution.features} must match "
         #        f"domain_transformation dim {domain_transformation.dim}"
         #    )
-        if embedding.embedding_dim != base_box_distribution.conditioner_dim:
+        if embedding.embedding_dim != base_box_distribution.context_features:
             raise ValueError(
                 f"embedding dim {embedding.embedding_dim} must match "
-                f"base conditioner_dim {base_box_distribution.conditioner_dim}"
+                f"base context_features {base_box_distribution.context_features}"
             )
         #if domain_transformation.context_features is None:
         #    raise ValueError(
@@ -348,7 +348,7 @@ class NormalizedProductPairBasis(torch.nn.Module, MutualPairBasis):
 
         MutualPairBasis.__init__(
             self,
-            base_box_distribution.dim,
+            base_box_distribution.features,
             1,
             n_basis,
             (),

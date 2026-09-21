@@ -90,17 +90,8 @@ def main() -> None:
             TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
         )
 
-        tran_nf = ConditionalNormalizingFlow(
-            dim=dim,
-            conditioner_dim=dim,
-            num_layers=num_layers,
-            hidden_features=hidden_features,
-        ).to(device)
-        init_nf = NormalizingFlow(
-            dim=dim,
-            num_layers=num_layers,
-            hidden_features=hidden_features,
-        ).to(device)
+        tran_nf = ConditionalNormalizingFlow(dim=dim, conditioner_dim=dim, transform="maf", num_layers=num_layers, hidden_features=hidden_features).to(device)
+        init_nf = NormalizingFlow(dim=dim, transform="maf", num_layers=num_layers, hidden_features=hidden_features).to(device)
 
         tran_nf, best_loss_tran, time_tran = train.train(
             tran_nf,

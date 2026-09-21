@@ -23,7 +23,7 @@ from rational_factor.models.basis_functions import (
     UnnormalizedBetaBasis,
 )
 from rational_factor.models.composite_model import CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF
+from normalizing_flow.transforms import ErfSeparableTransform
 from rational_factor.models.factor_forms import Linear2FF, LinearFF, QuadraticFF
 from rational_factor.tools.analysis import check_pdf_valid
 from rational_factor.tools.visualization import plot_belief
@@ -36,7 +36,7 @@ BASIS = "beta"
 
 # None => random choice from ("linear_ff", "linear2ff", "quadratic_ff", "composite_erf_linear_ff")
 #MODEL: str | None = None
-MODEL: str = "composite_erf_linear_ff"
+MODEL: str = "linear_ff"
 
 SEED = 0
 N_BASIS = 12
@@ -63,7 +63,7 @@ BETA_OFFSETS = (0.0, 0.0)
 BETA_MIN_CONCENTRATION = 1.0
 BETA_EPS = 1e-6
 
-# CompositeDensityModel(ErfSeparableTF, base density) is visualized in x-space on a finite
+# CompositeDensityModel(ErfSeparableTransform, base density) is visualized in x-space on a finite
 # window that captures essentially all of the transformed mass.
 ERF_LOC = 0.0
 ERF_SCALE = 1.0
@@ -203,7 +203,7 @@ def make_composite_erf_linear_ff(
     base_density = make_linear_ff("beta", d, n_basis, device, dtype)
     loc = torch.full((d,), ERF_LOC, device=device, dtype=dtype)
     scale = torch.full((d,), ERF_SCALE, device=device, dtype=dtype)
-    domain_tf = ErfSeparableTF(d, loc=loc, scale=scale, trainable=False)
+    domain_tf = ErfSeparableTransform(d, loc=loc, scale=scale, trainable=False)
     return CompositeDensityModel(domain_tf, base_density)
 
 

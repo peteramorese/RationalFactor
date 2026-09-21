@@ -11,7 +11,7 @@ import torch
 
 from normalizing_flow.vp_flow import ConditionalUnitBoxVolumePreservingFlow
 from rational_factor.models.basis_functions import BetaBasis
-from rational_factor.models.domain_transformation import MLP
+from rational_factor.models.mlp import MLP
 from rational_factor.models.mutual_bases import VolumePreservingPairBasis
 from rational_factor.models.parameters import PositiveParameters
 from rational_factor.tools.analysis import mc_integral_box
@@ -54,8 +54,8 @@ def main() -> None:
     )
 
     flow = ConditionalUnitBoxVolumePreservingFlow(
-        dim=DIM,
-        conditioner_dim=CONDITIONER_DIM,
+        features=DIM,
+        context_features=CONDITIONER_DIM,
         n_steps=4,
         hidden_features=16,
         num_hidden_layers=2,
@@ -137,7 +137,7 @@ def main() -> None:
         _beta_basis(1),
         MLP(in_features=1 + CONDITIONER_DIM, out_features=1, hidden_features=16, num_hidden_layers=2, zero_init_last=True),
         torch.nn.Embedding(N_BASIS, CONDITIONER_DIM),
-        ConditionalUnitBoxVolumePreservingFlow(dim=1, conditioner_dim=CONDITIONER_DIM, n_steps=8, zero_init=False),
+        ConditionalUnitBoxVolumePreservingFlow(features=1, context_features=CONDITIONER_DIM, n_steps=8, zero_init=False),
     )
     y1 = 0.05 + 0.9 * torch.rand(N_POINTS, 1)
     n1 = pair_1d.flow_density(y1)

@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import BSpline1DBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF
+from normalizing_flow.transforms import ErfSeparableTransform
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.mlp import PairedMaskedMetzlerConeMLP
@@ -838,7 +838,7 @@ if __name__ == "__main__":
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)
 
-    wrap_tf = ErfSeparableTF.from_data(x_k, trainable=True).to(device)
+    wrap_tf = ErfSeparableTransform.from_data(x_k, trainable=True).to(device)
     rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
@@ -873,7 +873,7 @@ if __name__ == "__main__":
     for p in phi_psi_mutual.parameters():
         p.requires_grad_(False)
     g_coeffs.set_requires_grad(False)
-    trained_wrap_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
+    trained_wrap_tf = ErfSeparableTransform.copy_from_trainable(wrap_tf).to(device)
 
     h0_basis = phi_psi_mutual.get_basis(1, coeffs=h0_coeffs)
     init_model = CompositeDensityModel(

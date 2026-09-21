@@ -31,14 +31,14 @@ class Filter(torch.nn.Module):
         super().__init__()
         if not callable(prop_and_upd_fn):
             raise TypeError("prop_and_upd_fn must be callable")
-        if transition_model.conditioner_dim != transition_model.dim:
+        if transition_model.context_features != transition_model.features:
             raise ValueError(
                 "transition_model must map previous state to current state "
-                "(conditioner_dim == dim)."
+                "(context_features == features)."
             )
-        if observation_model.conditioner_dim != transition_model.dim:
+        if observation_model.context_features != transition_model.features:
             raise ValueError(
-                "observation_model.conditioner_dim must match state dimension "
+                "observation_model.context_features must match state dimension "
                 "of transition_model."
             )
 
@@ -63,9 +63,9 @@ class Filter(torch.nn.Module):
             return_priors: if True, return (priors, posteriors). If False,
                 return posteriors only.
         """
-        if initial_belief.dim != self.transition_model.conditioner_dim:
+        if initial_belief.features != self.transition_model.context_features:
             raise ValueError(
-                "initial_belief.dim must match transition_model.conditioner_dim."
+                "initial_belief.features must match transition_model.context_features."
             )
         if not isinstance(observations, Sequence):
             raise TypeError("observations must be a sequence of tensors or None")

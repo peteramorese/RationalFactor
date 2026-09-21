@@ -12,7 +12,7 @@ import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeRFandR2FF
 from rational_factor.models.density_model import LogisticSigmoid
-from rational_factor.models.domain_transformation import MaskedAffineNFTF
+from normalizing_flow.transforms import Transforms
 from rational_factor.models.factor_forms import LinearFF, LinearRFandR2FF
 from rational_factor.models.filter import Filter
 from particle_filter.particle_set import WeightedParticleSet
@@ -183,7 +183,7 @@ def main() -> None:
         o_val_dataloader = DataLoader(o_val_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
         x_k_dataloader = DataLoader(x_k_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-        nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=8).to(device) if use_nftf else None
+        nftf = Transforms.make_transform("maf", dim=system.dim(), trainable=True, hidden_features=256, num_layers=8, permutation="random").to(device) if use_nftf else None
 
         if use_nftf and use_nftf_prefit:
             loc, scale = data_bounds(x_k_data, mode="center_lengths")
@@ -363,7 +363,7 @@ def main() -> None:
 
         init_model = init_model.to(device).eval()
         if use_nftf:
-            nftf_eval = MaskedAffineNFTF.copy_from_trainable(nftf).to(device).eval()
+            nftf_eval = Transforms.freeze(nftf).to(device).eval()
 
             def prop_and_upd_nf(initial_belief, transition_model, observation_model, observations):
                 latent_priors, latent_posteriors = propagate.propagate_and_update(

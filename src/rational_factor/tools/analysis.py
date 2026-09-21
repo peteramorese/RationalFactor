@@ -88,9 +88,9 @@ def avg_log_filter_score(
     state_dim = test_traj_data[0].shape[1]
     n_steps = len(test_traj_data) - 1
 
-    if initial_belief.dim != state_dim:
+    if initial_belief.features != state_dim:
         raise ValueError(
-            "initial_belief.dim must match state dimension in test_traj_data"
+            "initial_belief.features must match state dimension in test_traj_data"
         )
     if len(test_obs_data) != n_steps:
         raise ValueError(
@@ -183,9 +183,9 @@ def avg_log_likelihood_under_particle_belief_reference(
     state_dim = test_traj_data[0].shape[1]
     n_steps = len(test_traj_data) - 1
 
-    if initial_belief.dim != state_dim:
+    if initial_belief.features != state_dim:
         raise ValueError(
-            "initial_belief.dim must match state dimension in test_traj_data"
+            "initial_belief.features must match state dimension in test_traj_data"
         )
     if len(test_obs_data) != n_steps:
         raise ValueError(

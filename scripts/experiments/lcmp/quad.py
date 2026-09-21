@@ -12,7 +12,7 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import MaskedAffineNFTF, IdentityTF, VolumePreservingNFTF, StackedTF
+from normalizing_flow.transforms import Transforms, IdentityTransform, StackedTransform
 from rational_factor.models.density_model import LogisticSigmoid
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, LinearForm
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
@@ -71,7 +71,7 @@ def main() -> None:
     loc = loc.to(device)
     scale = scale.to(device)
     base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
-    decorrupter = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device)
+    decorrupter = Transforms.make_transform("maf", dim=system.dim(), trainable=True, hidden_features=128, num_layers=5, permutation="random").to(device)
     decorrupter_density = CompositeDensityModel([decorrupter], base_distribution).to(device)
 
     print("Training NF decorrupter")
@@ -91,7 +91,7 @@ def main() -> None:
     )
     print("Done.\n")
 
-    decorrupter_trained = MaskedAffineNFTF.copy_from_trainable(decorrupter).to(device)
+    decorrupter_trained = Transforms.freeze(decorrupter).to(device)
 
     x_k_data = x_k_data.to(device)
     x_kp1_data = x_kp1_data.to(device)
@@ -102,14 +102,14 @@ def main() -> None:
     
     ######## TRAIN MOVER ########
     print("Training mover")
-    mover = VolumePreservingNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
+    mover = Transforms.make_transform("volume_preserving", dim=system.dim(), trainable=True, hidden_features=256, num_layers=6).to(device)
     base_density_basis =  GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
     
     # Initialize base density to LF GMM
     y_joint_data = torch.cat([y_k_data, y_kp1_data], dim=1)
     #gmm_lf = train.fit_gaussian_lf_em(y_joint_data.to(torch.device("cpu")), n_components=n_basis, reg_covar=1e-3, max_iter=100)
     #mover_base_density = LinearForm()
-    mover_joint = StackedTF([mover, mover])
+    mover_joint = StackedTransform([mover, mover])
 
     # Train on the decorrupted x' marginal data
     z_joint_data = y_joint_data
@@ -149,7 +149,7 @@ def main() -> None:
 
         z_joint_data, _ = mover_joint(y_joint_data)
 
-    mover_trained = VolumePreservingNFTF.copy_from_trainable(mover).to(device)
+    mover_trained = Transforms.freeze(mover).to(device)
 
     weights = gmm_lf.w.get_coeffs()
     z_marginal = gmm_lf.marginal(marginal_dims=range(system.dim()))

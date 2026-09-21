@@ -11,7 +11,7 @@ import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.density_model import LogisticSigmoid
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel, CompositeRFandR2FF
-from rational_factor.models.domain_transformation import MaskedAffineNFTF
+from normalizing_flow.transforms import Transforms
 from rational_factor.tools.visualization import plot_belief, plot_particle_belief
 from rational_factor.tools.analysis import check_pdf_valid, avg_log_filter_score
 from rational_factor.tools.misc import data_bounds, train_test_split
@@ -306,7 +306,7 @@ if __name__ == "__main__":
     xp_val_dataloader = DataLoader(TensorDataset(x_kp1_val, x_k_val), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
     o_val_dataloader = DataLoader(TensorDataset(o_val, xo_val), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
 
-    nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=8).to(device)
+    nftf = Transforms.make_transform("maf", dim=system.dim(), trainable=True, hidden_features=256, num_layers=8, permutation="random").to(device)
 
     # Pre train the dtf
     if use_dtf:
@@ -458,7 +458,7 @@ if __name__ == "__main__":
 
     # Extract the individual models for filtering
     if use_dtf:
-        trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device).eval()
+        trained_nftf = Transforms.freeze(nftf).to(device).eval()
         tran_model = tran_obs_model.conditional_density_model.r2ff().to(device)
         obs_model = tran_obs_model.conditional_density_model.rf().to(device)
     else:

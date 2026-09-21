@@ -11,7 +11,7 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import MaskedAffineNFTF
+from normalizing_flow.transforms import Transforms
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
@@ -73,7 +73,7 @@ def main() -> None:
     psi0_basis = GaussianBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([0.0, 20.0], device=device), variance=30.0, min_std=1e-4).to(device)
 
     nftf = (
-        MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=6).to(device)
+        Transforms.make_transform("maf", dim=system.dim(), trainable=True, hidden_features=256, num_layers=6, permutation="random").to(device)
         if use_dtf
         else None
     )
@@ -116,7 +116,7 @@ def main() -> None:
     print("Done.\n")
     print("Valid: ", tran_model.valid())
 
-    trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
+    trained_nftf = Transforms.freeze(nftf).to(device) if use_dtf else None
 
     ######## TRAIN INITIAL ########
     if use_dtf:

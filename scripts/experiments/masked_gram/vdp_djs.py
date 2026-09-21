@@ -2,9 +2,10 @@ import torch
 from pathlib import Path
 from torch.utils.data import DataLoader, TensorDataset
 
-from normalizing_flow.normalizing_flow import ConditionalNSFNormalizingFlow
+from normalizing_flow.normalizing_flow import ConditionalNormalizingFlow
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF, MLP
+from normalizing_flow.transforms import ErfSeparableTransform
+from rational_factor.models.mlp import MLP
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.mutual_bases import (
     NFPairBasis,
@@ -91,13 +92,16 @@ if __name__ == "__main__":
     rest_dim = dim - 1
 
     # Create nf mutual basis
-    nf = ConditionalNSFNormalizingFlow(
-        dim=rest_dim,
-        conditioner_dim=embedding_dim,
-        num_layers=flow_layers,
-        hidden_features=flow_hidden,
+    nf = ConditionalNormalizingFlow(dim=rest_dim, conditioner_dim=embedding_dim, transform="nsf", num_layers=flow_layers, hidden_features=flow_hidden).to(device)
+    keep = [d for d in range(dim) if d != sacrificial_index]
+    _erf = ErfSeparableTransform.from_data(x_k, trainable=False)
+    _loc, _scale = _erf.loc_scale()
+    nf_wrapper = ErfSeparableTransform(
+        len(keep),
+        _loc[keep].detach().clone(),
+        _scale[keep].detach().clone(),
+        trainable=False,
     ).to(device)
-    nf_wrapper = ErfSeparableTF.from_data(x_k, trainable=True).marginal((d for d in range(dim) if d != sacrificial_index)).to(device)
     nf_wrapped = CompositeConditionalModel([nf_wrapper], nf).to(device)
 
     nf_embedding = torch.nn.Embedding(n_basis, embedding_dim).to(device)
@@ -133,7 +137,7 @@ if __name__ == "__main__":
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)
 
-    wrap_tf = ErfSeparableTF.from_data(x_k, trainable=True).to(device)
+    wrap_tf = ErfSeparableTransform.from_data(x_k, trainable=True).to(device)
     rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
@@ -170,7 +174,7 @@ if __name__ == "__main__":
     for p in phi_psi_mutual.parameters():
         p.requires_grad_(False)
     g_coeffs.set_requires_grad(False)
-    trained_wrap_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
+    trained_wrap_tf = ErfSeparableTransform.copy_from_trainable(wrap_tf).to(device)
 
     h0_basis = phi_psi_mutual.get_basis(1, coeffs=h0_coeffs)
     init_model = CompositeDensityModel(

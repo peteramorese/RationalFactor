@@ -6,16 +6,28 @@ from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 #### Base Classes ####
 
 class DensityModel(torch.nn.Module):
-    def __init__(self, dim : int):
+    def __init__(self, features: int, batch_shape: tuple[int, ...] | int = 1):
         super().__init__()
-        self.dim = dim
+        self.features = features
+        self.batch_shape = batch_shape
         self.min_log_density = -30
+        if isinstance(batch_shape, int):
+            batch_shape = (batch_shape,)
+        else:
+            batch_shape = tuple(batch_shape)
+        if any(s < 1 for s in batch_shape):
+            raise ValueError(f"batch_shape entries must be positive, got {batch_shape}")
+        self.batch_shape = batch_shape
+    
+    def _expand_data(self, x : torch.Tensor) -> torch.Tensor:
+        """``(n, d)`` → ``(n, *ones(batch_ndim), d)`` for broadcasting against batched params."""
+        return x.reshape(x.shape[0], *([1] * len(self.batch_shape)), x.shape[-1])
 
     def _clip_log_density(self, log_density : torch.Tensor):
         return torch.nan_to_num(log_density, nan=self.min_log_density, neginf=self.min_log_density)
     
     def forward(self, x : torch.Tensor, **contexts : torch.Tensor):
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
+        assert x.shape[1] == self.features, "x must have shape (n_data, features)"
         return torch.exp(self.log_density(x, **contexts))
 
     def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
@@ -37,11 +49,12 @@ class DensityModel(torch.nn.Module):
         raise NotImplementedError("supremum_bound not implemented")
 
 class ConditionalDensityModel(torch.nn.Module):
-    def __init__(self, dim : int, conditioner_dim : int):
+    def __init__(self, features : int, context_features : int, batch_shape: tuple[int, ...] = (1,)):
         super().__init__()
-        self.dim = dim
-        self.conditioner_dim = conditioner_dim
+        self.features = features
+        self.context_features = context_features
         self.min_log_density = -30
+        self.batch_shape = batch_shape
 
     def _clip_log_density(self, log_density : torch.Tensor):
         return torch.nan_to_num(log_density, nan=self.min_log_density, neginf=self.min_log_density)
@@ -50,8 +63,8 @@ class ConditionalDensityModel(torch.nn.Module):
         """
         Returns density of p(x | conditioner, contexts).
         """
-        assert x.shape[1] == self.dim, "x must have shape (n_data, dim)"
-        assert conditioner.shape[1] == self.conditioner_dim, "conditioner must have shape (n_data, conditioner_dim)"
+        assert x.shape[1] == self.features, "x must have shape (n_data, features)"
+        assert conditioner.shape[1] == self.context_features, "conditioner must have shape (n_data, context_features)"
         assert x.shape[0] == conditioner.shape[0], "x and conditioner must have the same number of data points"
         
         return torch.exp(self.log_density(x, conditioner=conditioner, **contexts))
@@ -64,7 +77,7 @@ class ConditionalDensityModel(torch.nn.Module):
     
     def sample(self, conditioner : torch.Tensor, **contexts : torch.Tensor):
         """
-        Returns (n_samples, dim) tensor of samples.
+        Returns (n_samples, features) tensor of samples.
         """
         raise NotImplementedError("sample not implemented")
     
@@ -77,50 +90,3 @@ class ConditionalDensityModel(torch.nn.Module):
         otherwise if conditoner is None, it returns the supremum across all possible conditioners.
         """
         raise NotImplementedError("supremum_bound not implemented")
-    
-
-###### Special Distributions ######
-class LogisticSigmoid(DensityModel):
-    def __init__(
-        self,
-        dim: int,
-        temperature: float = 0.1,
-        loc: torch.Tensor = None,
-        scale: torch.Tensor = None,
-    ):
-        super().__init__(dim)
-        assert temperature > 0.0, "temperature must be positive"
-        self.temperature = temperature
-
-        if loc is None:
-            loc = torch.full((dim,), 0.5)
-        if scale is None:
-            scale = torch.ones(dim)
-
-        assert torch.all(scale > 0), "scale must be positive"
-
-        self.register_buffer("loc", loc)
-        self.register_buffer("scale", scale)
-
-    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor):
-        tau = torch.as_tensor(self.temperature, dtype=x.dtype, device=x.device)
-
-        loc = self.loc.to(dtype=x.dtype, device=x.device)
-        scale = self.scale.to(dtype=x.dtype, device=x.device)
-
-        # map to unit-box coordinates
-        x_norm = (x - loc) / scale + 0.5
-
-        term1 = torch.nn.functional.softplus(-x_norm / tau)
-        term2 = torch.nn.functional.softplus(-(1.0 - x_norm) / tau)
-
-        # stable log(1 - exp(-1/tau))
-        log_inv_Z_1d = torch.log(-torch.expm1(-1.0 / tau))
-
-        log_p = (
-            self.dim * log_inv_Z_1d
-            - torch.log(scale).sum()
-            - (term1 + term2).sum(dim=-1)
-        )
-
-        return log_p

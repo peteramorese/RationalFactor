@@ -4,7 +4,7 @@ from rational_factor.systems.base import sample_io_pairs, sample_observation_pai
 from rational_factor.systems.problems import PARTIALLY_OBSERVABLE_PROBLEMS
 from rational_factor.models.basis_functions import UnnormalizedBetaBasis
 from rational_factor.models.factor_forms import LinearRF, LinearR2FF, Linear2FF, LinearFF, LinearRFF
-from rational_factor.models.domain_transformation import ErfSeparableTF
+from normalizing_flow.transforms import ErfSeparableTransform
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
@@ -82,7 +82,7 @@ if __name__ == "__main__":
     zeta_basis = UnnormalizedBetaBasis.random_init(system.observation_dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
 
     # Train a fake transition model to get a good wrap dtf and warm start the phi and psi basis functions
-    wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True).to(device)
+    wrap_tf = ErfSeparableTransform.from_data(x_k_data, trainable=True).to(device)
     warm_start_tran_model = CompositeConditionalModel([wrap_tf], LinearRFF(phi_basis, psi_basis)).to(device)
     optimizers = {
         "basis": torch.optim.Adam(
@@ -106,7 +106,7 @@ if __name__ == "__main__":
         use_best="mle")
     print("Done! \n")
 
-    trained_wrap_tf = ErfSeparableTF.copy_from_trainable(wrap_tf)
+    trained_wrap_tf = ErfSeparableTransform.copy_from_trainable(wrap_tf)
 
     # Create and train the observation model
     obs_model = CompositeConditionalModel([trained_wrap_tf], LinearRF(xi_basis, zeta_basis)).to(device)

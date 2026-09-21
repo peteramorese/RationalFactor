@@ -9,7 +9,7 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import MaskedAffineNFTF, MaskedRQSNFTF
+from normalizing_flow.transforms import Transforms
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
@@ -113,7 +113,7 @@ def main() -> None:
             min_std=1e-4,
         ).to(device)
 
-        nftf = MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device) if use_dtf else None
+        nftf = Transforms.make_transform("nsf", dim=system.dim(), trainable=True, hidden_features=128, num_layers=5, permutation="random").to(device) if use_dtf else None
 
         if use_dtf:
             tran_model = CompositeConditionalModel([nftf], LinearRFF(phi_basis, psi_basis)).to(device)
@@ -152,7 +152,7 @@ def main() -> None:
             use_best="val_mle",
         )
 
-        trained_nftf = MaskedRQSNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
+        trained_nftf = Transforms.freeze(nftf).to(device) if use_dtf else None
 
         if use_dtf:
             init_model = CompositeDensityModel(

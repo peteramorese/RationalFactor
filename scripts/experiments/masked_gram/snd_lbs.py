@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from normalizing_flow.normalizing_flow import ConditionalNormalizingFlow
 from normalizing_flow.vp_flow import ConditionalVolumePreservingFlow
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF, IdentityTF, StackedTF
+from normalizing_flow.transforms import ErfSeparableTransform, IdentityTransform, StackedTransform
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.mutual_bases import (
     LocalBSplineMutualBasis,
@@ -58,44 +58,44 @@ def _make_wrap_tf(
     dim: int,
     sacrificial_index: int,
     trainable: bool = True,
-) -> StackedTF | ErfSeparableTF:
+) -> StackedTransform | ErfSeparableTransform:
     """Erf on the sacrificial coordinate; identity on the free ``R^{d-1}`` coords."""
     if not (0 <= sacrificial_index < dim):
         raise ValueError(f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}")
 
     parts = []
     if sacrificial_index > 0:
-        parts.append(IdentityTF(sacrificial_index))
+        parts.append(IdentityTransform(sacrificial_index))
 
     x_s = x_data[:, sacrificial_index : sacrificial_index + 1]
-    parts.append(ErfSeparableTF.from_data(x_s, trainable=trainable))
+    parts.append(ErfSeparableTransform.from_data(x_s, trainable=trainable))
 
     n_after = dim - sacrificial_index - 1
     if n_after > 0:
-        parts.append(IdentityTF(n_after))
+        parts.append(IdentityTransform(n_after))
 
     if len(parts) == 1:
         return parts[0]
-    return StackedTF(parts)
+    return StackedTransform(parts)
 
 
-def _freeze_wrap_tf(wrap: StackedTF | ErfSeparableTF) -> StackedTF | ErfSeparableTF:
+def _freeze_wrap_tf(wrap: StackedTransform | ErfSeparableTransform) -> StackedTransform | ErfSeparableTransform:
     """Detach a trained wrap so initial-state / belief models stay fixed."""
-    if isinstance(wrap, ErfSeparableTF):
-        return ErfSeparableTF.copy_from_trainable(wrap)
+    if isinstance(wrap, ErfSeparableTransform):
+        return ErfSeparableTransform.copy_from_trainable(wrap)
 
     frozen = []
     for tf in wrap.tfs:
-        if isinstance(tf, ErfSeparableTF):
-            frozen.append(ErfSeparableTF.copy_from_trainable(tf))
-        elif isinstance(tf, IdentityTF):
-            frozen.append(IdentityTF(tf.dim))
+        if isinstance(tf, ErfSeparableTransform):
+            frozen.append(ErfSeparableTransform.copy_from_trainable(tf))
+        elif isinstance(tf, IdentityTransform):
+            frozen.append(IdentityTransform(tf.dim))
         else:
             part = copy.deepcopy(tf)
             for p in part.parameters():
                 p.requires_grad_(False)
             frozen.append(part)
-    return StackedTF(frozen)
+    return StackedTransform(frozen)
 
 
 def _make_free_basis(
@@ -115,12 +115,7 @@ def _make_free_basis(
         return None
 
     embedding = torch.nn.Embedding(n_basis, embedding_dim).to(device)
-    product = ConditionalNormalizingFlow(
-        dim=rest_dim,
-        conditioner_dim=embedding_dim,
-        num_layers=flow_layers,
-        hidden_features=flow_hidden,
-    ).to(device)
+    product = ConditionalNormalizingFlow(dim=rest_dim, conditioner_dim=embedding_dim, transform="maf", num_layers=flow_layers, hidden_features=flow_hidden).to(device)
 
     if rest_dim < 2:
         raise ValueError(

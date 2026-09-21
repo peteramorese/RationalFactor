@@ -13,7 +13,7 @@ import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianKernelBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.density_model import DensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF, MaskedRQSNFTF, IdentityTF
+from normalizing_flow.transforms import Transforms, ErfSeparableTransform, IdentityTransform
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.models.density_model import LogisticSigmoid
 from normalizing_flow.normalizing_flow import NormalizingFlow
@@ -304,9 +304,9 @@ def main() -> None:
     base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
     print("Base distribution loc: ", base_distribution.loc)
     print("Base distribution scale: ", base_distribution.scale)
-    dtf = MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=5).to(device)
+    dtf = Transforms.make_transform("nsf", dim=system.dim(), trainable=True, hidden_features=256, num_layers=5, permutation="random").to(device)
     decorrupter = CompositeDensityModel([dtf], base_distribution).to(device)
-    test_decorrupter = NormalizingFlow(system.dim(), num_layers=5, hidden_features=256).to(device)
+    test_decorrupter = NormalizingFlow(system.dim(), transform="maf", num_layers=5, hidden_features=256).to(device)
 
     ######## TRAIN LCM ########
 
@@ -370,7 +370,7 @@ def main() -> None:
     print("Done.\n")
     print(f"Initial model loss: {best_loss_init:.6f}, training time: {training_time_init:.2f}s")
 
-    #tran_model = CompositeConditionalModel([IdentityTF(system.dim())], lrff).to(device)
+    #tran_model = CompositeConditionalModel([IdentityTransform(system.dim())], lrff).to(device)
 
     ######### TRAIN INITIAL ########
     #if use_dtf:

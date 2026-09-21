@@ -10,7 +10,7 @@ from rational_factor.models.density_model import LogisticSigmoid
 import rational_factor.tools.propagate as propagate
 from rational_factor.tools.misc import data_bounds, train_test_split
 from rational_factor.tools.analysis import avg_log_likelihood
-from rational_factor.models.domain_transformation import MaskedAffineNFTF
+from normalizing_flow.transforms import Transforms
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 import matplotlib.pyplot as plt
@@ -80,7 +80,7 @@ if __name__ == "__main__":
     xp_val_dataloader = DataLoader(TensorDataset(x_kp1_val, x_k_val), batch_size=val_batch_size, shuffle=True, pin_memory=use_gpu)
 
     # Create separable domain transformation
-    nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=8).to(device) if use_dtf else None
+    nftf = Transforms.make_transform("maf", dim=system.dim(), trainable=True, hidden_features=256, num_layers=8, permutation="random").to(device) if use_dtf else None
 
     # Pre train the dtf
     if use_dtf:
@@ -153,7 +153,7 @@ if __name__ == "__main__":
     print("Valid: ", tran_model.valid())
 
     # Copy the domain transformation to fix it for training the initial state model
-    trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
+    trained_nftf = Transforms.freeze(nftf).to(device) if use_dtf else None
 
     if use_dtf:
         init_model = CompositeDensityModel([trained_nftf], LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis)).to(device)

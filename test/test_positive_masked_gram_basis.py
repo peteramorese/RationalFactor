@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 
 from rational_factor.models.basis_functions import BetaBasis
-from rational_factor.models.domain_transformation import MLP
+from rational_factor.models.mlp import MLP
 from rational_factor.models.mutual_bases import (
     LocalBSplineMutualBasis,
     MaskedGramMutualBasis,

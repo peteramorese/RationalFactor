@@ -14,7 +14,7 @@ def _square_ranges(x_range: tuple[float, float], y_range: tuple[float, float]) -
     return (x_mid - half_span, x_mid + half_span), (y_mid - half_span, y_mid + half_span)
 
 def plot_belief(ax: plt.Axes, belief : DensityModel, x_range: tuple[float, float], y_range: tuple[float, float], n_points: int = 100, contour_levels: int = 10, contourf_kwargs: dict = None):
-    assert belief.dim == 2, "Belief must be 2D"
+    assert belief.features == 2, "Belief must be 2D"
     dtype, device = belief.dtype_device()
 
     x_range, y_range = _square_ranges(x_range, y_range)

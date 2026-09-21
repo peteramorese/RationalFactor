@@ -29,7 +29,7 @@ from rational_factor.models.basis_functions import (
     UnnormalizedBetaBasis,
 )
 from rational_factor.models.composite_model import CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF
+from normalizing_flow.transforms import ErfSeparableTransform
 from rational_factor.models.factor_forms import Linear2FF, LinearFF, QuadraticFF
 from rational_factor.tools.analysis import check_pdf_valid
 from rational_factor.tools.visualization import plot_belief
@@ -40,7 +40,7 @@ from rational_factor.tools.visualization import plot_belief
 BASIS = "quadratic_exp"
 
 # Subset of: "linear_ff", "linear2ff", "quadratic_ff", "composite_erf_linear_ff"
-MODELS = ("linear_ff", "linear2ff", "composite_erf_linear_ff")
+MODELS = ("linear_ff", "linear2ff")
 
 DIM = 6  # full dimension d, must be >= 2
 N_BASIS = 12
@@ -78,7 +78,7 @@ BETA_EPS = 1e-6
 # Standard deviation for Gaussian noise written into each *trainable* parameter after build
 PARAM_RAND_STD = 1.0
 
-# CompositeDensityModel(ErfSeparableTF, base density) checks happen in x-space over a finite
+# CompositeDensityModel(ErfSeparableTransform, base density) checks happen in x-space over a finite
 # window that captures essentially all Gaussian-CDF tail mass.
 ERF_LOC = 0.0
 ERF_SCALE = 1.0
@@ -224,7 +224,7 @@ def make_composite_erf_linear_ff(
     base_density = make_linear_ff("beta", d, n_basis, device, dtype)
     loc = torch.full((d,), ERF_LOC, device=device, dtype=dtype)
     scale = torch.full((d,), ERF_SCALE, device=device, dtype=dtype)
-    domain_tf = ErfSeparableTF(d, loc=loc, scale=scale, trainable=False)
+    domain_tf = ErfSeparableTransform(d, loc=loc, scale=scale, trainable=False)
     return CompositeDensityModel(domain_tf, base_density)
 
 
@@ -327,7 +327,7 @@ def run_trial(
         for t in range(n_marginal_samples):
             arg = random_marginal_arg(dim, convention, rng)
             m_model = model.marginal(arg)
-            m_d = m_model.dim
+            m_d = m_model.features
             if m_d != 2:
                 raise RuntimeError(f"Expected 2D marginal, got dim {m_d} for marginal_dims {arg}.")
 

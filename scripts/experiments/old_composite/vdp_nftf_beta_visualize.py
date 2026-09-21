@@ -7,7 +7,7 @@ import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
 from rational_factor.tools.visualization import plot_belief
 from rational_factor.tools.analysis import avg_log_likelihood
-from rational_factor.models.domain_transformation import MaskedAffineNFTF, ErfSeparableTF
+from normalizing_flow.transforms import Transforms, ErfSeparableTransform
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 import matplotlib.pyplot as plt
@@ -72,9 +72,9 @@ if __name__ == "__main__":
     psi0_basis = UnnormalizedBetaBasis.random_init(system.dim(), n_basis=n_basis, offsets=torch.tensor([10.0, 10.0], device=device), variance=30.0, min_concentration=1.0).to(device)
 
     # Create separable domain transformation
-    wrap_tf = ErfSeparableTF.from_data(x_k_data, trainable=True)
+    wrap_tf = ErfSeparableTransform.from_data(x_k_data, trainable=True)
     
-    nftf = MaskedAffineNFTF(system.dim(), trainable=True, hidden_features=128, n_layers=5).to(device) if use_dtf else None
+    nftf = Transforms.make_transform("maf", dim=system.dim(), trainable=True, hidden_features=128, num_layers=5, permutation="random").to(device) if use_dtf else None
 
     # Create and train the transition model
     if use_dtf:
@@ -109,8 +109,8 @@ if __name__ == "__main__":
 
 
     # Copy the domain transformation to fix it for training the initial state model
-    trained_nftf = MaskedAffineNFTF.copy_from_trainable(nftf).to(device) if use_dtf else None
-    trained_domain_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
+    trained_nftf = Transforms.freeze(nftf).to(device) if use_dtf else None
+    trained_domain_tf = ErfSeparableTransform.copy_from_trainable(wrap_tf).to(device)
 
     #init_model = CompositeDensityModel(trained_domain_tf, QuadraticFF.from_rff(tran_model.conditional_density_model, psi0_basis))
     if use_dtf:

@@ -26,17 +26,17 @@ class NormalizedIndexEmbeddingBasis(torch.nn.Module, Basis, NonnegativeBasis):
         if n_basis < 1:
             raise ValueError("n_basis must be at least 1")
         if embedding is None:
-            embedding = torch.nn.Embedding(n_basis, model.conditioner_dim)
+            embedding = torch.nn.Embedding(n_basis, model.context_features)
             torch.nn.init.normal_(embedding.weight, mean=0.0, std=embedding_init_std)
         if embedding.num_embeddings != n_basis:
             raise ValueError(
                 f"embedding num_embeddings {embedding.num_embeddings} "
                 f"must match n_basis {n_basis}"
             )
-        if embedding.embedding_dim != model.conditioner_dim:
+        if embedding.embedding_dim != model.context_features:
             raise ValueError(
                 f"embedding dim {embedding.embedding_dim} must match "
-                f"model conditioner_dim {model.conditioner_dim}"
+                f"model context_features {model.context_features}"
             )
 
         torch.nn.Module.__init__(self)
@@ -47,7 +47,7 @@ class NormalizedIndexEmbeddingBasis(torch.nn.Module, Basis, NonnegativeBasis):
         object.__setattr__(self, "owner", self)
         Basis.__init__(
             self,
-            dim=model.dim,
+            dim=model.features,
             batch_size=1,
             n_basis=n_basis,
             params=(),

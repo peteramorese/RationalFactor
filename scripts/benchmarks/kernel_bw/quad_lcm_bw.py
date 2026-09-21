@@ -11,7 +11,7 @@ import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianKernelBasis
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from rational_factor.models.density_model import LogisticSigmoid
-from rational_factor.models.domain_transformation import MaskedRQSNFTF
+from normalizing_flow.transforms import Transforms
 from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.models.kde import GaussianKDE
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
@@ -70,7 +70,7 @@ def main() -> None:
         loc = loc.to(device)
         scale = scale.to(device)
         base_distribution = LogisticSigmoid(system.dim(), temperature=ls_temp, loc=loc, scale=scale)
-        dtf = MaskedRQSNFTF(system.dim(), trainable=True, hidden_features=256, n_layers=5).to(device)
+        dtf = Transforms.make_transform("nsf", dim=system.dim(), trainable=True, hidden_features=256, num_layers=5, permutation="random").to(device)
         decorrupter = CompositeDensityModel([dtf], base_distribution).to(device)
 
         optimizer = torch.optim.Adam(decorrupter.parameters(), lr=dtf_params["lr"], weight_decay=1e-3)
@@ -86,7 +86,7 @@ def main() -> None:
             restore_loss_threshold=50.0,
         )
 
-        dtf_trained = MaskedRQSNFTF.copy_from_trainable(dtf).to(device)
+        dtf_trained = Transforms.freeze(dtf).to(device)
 
         x_k_data_device = x_k_train.to(device)
         x_kp1_data_device = x_kp1_train.to(device)

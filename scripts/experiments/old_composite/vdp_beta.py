@@ -7,7 +7,7 @@ import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
 from rational_factor.tools.visualization import plot_belief
 from rational_factor.tools.analysis import mc_integral_box
-from rational_factor.models.domain_transformation import ErfSeparableTF
+from normalizing_flow.transforms import ErfSeparableTransform
 from rational_factor.models.composite_model import CompositeDensityModel, CompositeConditionalModel
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 import matplotlib.pyplot as plt
@@ -45,7 +45,7 @@ if __name__ == "__main__":
 
 
     # Create separable domain transformation
-    domain_tf = ErfSeparableTF.from_data(x_k, trainable=True)
+    domain_tf = ErfSeparableTransform.from_data(x_k, trainable=True)
     print("domain tf loc: ", domain_tf.params[:, 0])
     print("domain tf scale: ", torch.square(domain_tf.params[:, 1]))
 
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     print("domain tf scale: ", torch.square(domain_tf.params[:, 1]))
 
     # Copy the domain transformation to fix it for training the initial state model
-    trained_domain_tf = ErfSeparableTF.copy_from_trainable(domain_tf)
+    trained_domain_tf = ErfSeparableTransform.copy_from_trainable(domain_tf)
 
     init_model = CompositeDensityModel(trained_domain_tf, QuadraticFF.from_rff(tran_model.conditional_density_model, psi0_basis))
     #init_model = CompositeDensityModel(trained_domain_tf, LinearFF.from_rff(tran_model.conditional_density_model, psi0_basis))

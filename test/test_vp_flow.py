@@ -48,11 +48,11 @@ def _jacobian_logabsdet_single(
     x: torch.Tensor,
     conditioner: torch.Tensor,
 ) -> torch.Tensor:
-    assert x.shape == (1, flow.dim)
+    assert x.shape == (1, flow.features)
     x = x.detach().requires_grad_(True)
     z, _ = flow.transform(x, conditioner=conditioner)
     rows = []
-    for i in range(flow.dim):
+    for i in range(flow.features):
         (grad_i,) = torch.autograd.grad(z[0, i], x, retain_graph=True)
         rows.append(grad_i[0])
     J = torch.stack(rows, dim=0)
@@ -64,8 +64,8 @@ def _jacobian_logabsdet_single(
 def test_unit_box_conditional() -> None:
     g = torch.Generator().manual_seed(SEED)
     flow = ConditionalUnitBoxVolumePreservingFlow(
-        dim=DIM,
-        conditioner_dim=CONDITIONER_DIM,
+        features=DIM,
+        context_features=CONDITIONER_DIM,
         n_steps=24,
         hidden_features=32,
         num_hidden_layers=2,
@@ -122,7 +122,7 @@ def test_unit_box_conditional() -> None:
     assert max_logdet < LOGDET_TOL, f"discrete map is not volume-preserving: {max_logdet}"
 
     flow_1d = ConditionalUnitBoxVolumePreservingFlow(
-        dim=1, conditioner_dim=CONDITIONER_DIM, n_steps=8, zero_init=False
+        features=1, context_features=CONDITIONER_DIM, n_steps=8, zero_init=False
     )
     x1 = _random_interior(N_POINTS, 1, g)
     c1 = torch.randn(N_POINTS, CONDITIONER_DIM, generator=g)
@@ -132,8 +132,8 @@ def test_unit_box_conditional() -> None:
     print("1D flow is identity:      ok")
 
     ident = ConditionalUnitBoxVolumePreservingFlow(
-        dim=DIM,
-        conditioner_dim=CONDITIONER_DIM,
+        features=DIM,
+        context_features=CONDITIONER_DIM,
         n_steps=4,
         zero_init=True,
     )
@@ -159,7 +159,7 @@ def test_unit_box_conditional() -> None:
 def test_unit_box_unconditional() -> None:
     g = torch.Generator().manual_seed(SEED)
     flow = UnitBoxVolumePreservingFlow(
-        dim=DIM, n_steps=8, hidden_features=32, zero_init=False
+        features=DIM, n_steps=8, hidden_features=32, zero_init=False
     )
     x = _random_interior(N_POINTS, DIM, g)
     with torch.no_grad():
@@ -175,7 +175,7 @@ def test_unit_box_unconditional() -> None:
 
 def test_additive_vp() -> None:
     g = torch.Generator().manual_seed(SEED)
-    flow = VolumePreservingFlow(dim=DIM, num_layers=3, hidden_features=32)
+    flow = VolumePreservingFlow(features=DIM, num_layers=3, hidden_features=32)
     x = torch.randn(N_POINTS, DIM, generator=g)
     with torch.no_grad():
         z, ladj = flow.transform(x)
@@ -192,7 +192,7 @@ def test_additive_vp() -> None:
     print(f"additive VP log_p mean:   {log_p.mean().item():.3e}")
 
     cond = ConditionalVolumePreservingFlow(
-        dim=DIM, conditioner_dim=CONDITIONER_DIM, num_layers=3, hidden_features=32
+        features=DIM, context_features=CONDITIONER_DIM, num_layers=3, hidden_features=32
     )
     c = torch.randn(N_POINTS, CONDITIONER_DIM, generator=g)
     with torch.no_grad():

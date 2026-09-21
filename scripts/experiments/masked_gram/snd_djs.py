@@ -9,7 +9,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from normalizing_flow.normalizing_flow import ConditionalNormalizingFlow
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
-from rational_factor.models.domain_transformation import ErfSeparableTF, MLP
+from normalizing_flow.transforms import ErfSeparableTransform
+from rational_factor.models.mlp import MLP
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.mutual_bases import (
     DisjointSupport1DPWCBasis,
@@ -326,7 +327,7 @@ if __name__ == "__main__":
     g_basis = orth_pwc_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = orth_pwc_mutual.get_basis(1)
 
-    wrap_tf = ErfSeparableTF.from_data(x_k, trainable=True).to(device)
+    wrap_tf = ErfSeparableTransform.from_data(x_k, trainable=True).to(device)
     rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
@@ -384,7 +385,7 @@ if __name__ == "__main__":
     cell_widths.set_requires_grad(False)
     alpha_params.set_requires_grad(False)
     g_coeffs.set_requires_grad(False)
-    trained_wrap_tf = ErfSeparableTF.copy_from_trainable(wrap_tf).to(device)
+    trained_wrap_tf = ErfSeparableTransform.copy_from_trainable(wrap_tf).to(device)
 
     h0_basis = orth_pwc_mutual.get_basis(1, coeffs=h0_coeffs)
     init_model = CompositeDensityModel(
