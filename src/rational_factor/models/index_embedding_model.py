@@ -1,7 +1,89 @@
 import torch
+from nflows.transforms.base import Transform
+
 from .basis_functions import Basis, NonnegativeBasis
 from .density_model import ConditionalDensityModel
 from .parameters import Parameters
+
+
+class IndexEmbeddingTransform(torch.nn.Module):
+    """Map ``y`` through ``n_mappings`` contexts from an embedding table.
+
+    A standard transform returns ``(z, ladj)`` with ``z.shape == (n, d)`` and
+    ``ladj.shape == (n,)``. This module instead evaluates the same (possibly
+    conditional) transform under each index embedding ``e_i``, returning
+
+        z.shape    == (n_data, n_mappings, features)
+        ladj.shape == (n_data, n_mappings)
+
+    as if ``y`` were pushed through ``n_mappings`` distinct maps ``T(· | e_i)``.
+    """
+
+    def __init__(self, tf: Transform, embedding: torch.nn.Embedding):
+        super().__init__()
+        if embedding.num_embeddings < 1:
+            raise ValueError("embedding must contain at least one index")
+        ctx = getattr(tf, "context_features", None)
+        if ctx is not None and ctx != embedding.embedding_dim:
+            raise ValueError(
+                f"embedding dim {embedding.embedding_dim} must match "
+                f"transform context_features {ctx}"
+            )
+        self.tf = tf
+        self.embedding = embedding
+        self.n_mappings = embedding.num_embeddings
+        self.features = getattr(tf, "features", None)
+        self.context_features = embedding.embedding_dim
+
+    def _index_contexts(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        idx = torch.arange(self.n_mappings, device=device)
+        return self.embedding(idx).to(dtype=dtype)
+
+    def _expanded(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Flatten the Cartesian product of data points and index embeddings."""
+        n, m = inputs.shape[0], self.n_mappings
+        cond = self._index_contexts(inputs.dtype, inputs.device)
+        y_rep = inputs.unsqueeze(1).expand(-1, m, -1).reshape(n * m, -1)
+        c_rep = cond.unsqueeze(0).expand(n, -1, -1).reshape(n * m, -1)
+        return y_rep, c_rep
+
+    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if inputs.ndim != 2:
+            raise ValueError(
+                f"inputs must have shape (n_data, features), got {tuple(inputs.shape)}"
+            )
+        if self.features is not None and inputs.shape[1] != self.features:
+            raise ValueError(
+                f"inputs must have shape (n_data, {self.features}), "
+                f"got {tuple(inputs.shape)}"
+            )
+        n, m = inputs.shape[0], self.n_mappings
+        y_rep, c_rep = self._expanded(inputs)
+        z, ladj = self.tf.forward(y_rep, context=c_rep)
+        return z.reshape(n, m, -1), ladj.reshape(n, m)
+
+    def inverse(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if inputs.ndim != 3:
+            raise ValueError(
+                f"inputs must have shape (n_data, n_mappings, features), "
+                f"got {tuple(inputs.shape)}"
+            )
+        n, m, d = inputs.shape
+        if m != self.n_mappings:
+            raise ValueError(
+                f"inputs n_mappings {m} must match transform n_mappings "
+                f"{self.n_mappings}"
+            )
+        if self.features is not None and d != self.features:
+            raise ValueError(
+                f"inputs must have shape (n_data, {self.n_mappings}, {self.features}), "
+                f"got {tuple(inputs.shape)}"
+            )
+        cond = self._index_contexts(inputs.dtype, inputs.device)
+        z_rep = inputs.reshape(n * m, d)
+        c_rep = cond.unsqueeze(0).expand(n, -1, -1).reshape(n * m, -1)
+        y, ladj = self.tf.inverse(z_rep, context=c_rep)
+        return y.reshape(n, m, d), ladj.reshape(n, m)
 
 
 class NormalizedIndexEmbeddingBasis(torch.nn.Module, Basis, NonnegativeBasis):
@@ -88,7 +170,3 @@ class NormalizedIndexEmbeddingBasis(torch.nn.Module, Basis, NonnegativeBasis):
             raise NotImplementedError("Restricted-domain moments are not implemented")
         dtype, device = self.dtype_device()
         return torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
-
-
-# Backward-compatible misspelling.
-NormalziedIndexEmbeddingBasis = NormalizedIndexEmbeddingBasis

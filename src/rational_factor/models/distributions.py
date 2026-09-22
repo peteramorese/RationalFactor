@@ -98,7 +98,7 @@ class SeparableBeta(DensityModel):
         if x.ndim != 2 or x.shape[1] != self.features:
             raise ValueError(f"x must have shape (n_data, {self.features}), got {tuple(x.shape)}")
         alpha, beta = self.concentrations()
-        x_c = self._expand_data(x.clamp(self.eps, 1.0 - self.eps), len(self.batch_shape))
+        x_c = self._expand_data(x.clamp(self.eps, 1.0 - self.eps))
         log_p = torch.distributions.Beta(alpha, beta).log_prob(x_c).sum(dim=-1)
         return self._clip_log_density(log_p)
 
@@ -396,8 +396,6 @@ class BSpline1D(DensityModel):
         idx: torch.Tensor,
     ) -> torch.Tensor:
         """Draw from ``N_{idx,p} / μ_{idx}`` by rejection (accept with probability ``N``)."""
-
-
 
     def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
         """Mixture of normalized B-splines; each component via rejection on its support."""

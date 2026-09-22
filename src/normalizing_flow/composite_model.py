@@ -15,9 +15,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
-from nflows.transforms.base import CompositeTransform, Transform
+from nflows.transforms.base import Transform
 
-from normalizing_flow.base_distributions import StandardNormalDensity
 from normalizing_flow.transforms import Transforms
 from rational_factor.models.density_model import ConditionalDensityModel, DensityModel
 
@@ -31,7 +30,9 @@ class CompositeDensityModel(DensityModel):
         transform: str | Transform | Sequence[Transform] = "maf",
         **transform_kwargs,
     ):
-        super().__init__(features=base_density.features)
+        super().__init__(
+            features=base_density.features, batch_shape=base_density.batch_shape
+        )
         self.base_density = base_density
         self.transform = Transforms.make_transform(
             transform, features=base_density.features, **transform_kwargs
@@ -39,9 +40,10 @@ class CompositeDensityModel(DensityModel):
 
     def log_density(self, x: torch.Tensor, **contexts: torch.Tensor) -> torch.Tensor:
         z, ladj = self.transform(x)
-        return self._clip_log_density(
-            self.base_density.log_density(z, **contexts) + ladj
-        )
+        log_base = self.base_density.log_density(z, **contexts)
+        while ladj.ndim < log_base.ndim:
+            ladj = ladj.unsqueeze(-1)
+        return self._clip_log_density(log_base + ladj)
 
     def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
         z = self.base_density.sample(n_samples, **contexts)
@@ -120,6 +122,8 @@ class CompositeConditionalModel(ConditionalDensityModel):
             z = self.base_density.sample(conditioner, **contexts)
         else:
             z = self.base_density.sample(conditioner.shape[0], **contexts)
+            if z.ndim == 3 and z.shape[1] == 1:
+                z = z.squeeze(1)
 
         x, _ = self.transform.inverse(z, context=conditioner)
         if num_samples_per > 1:

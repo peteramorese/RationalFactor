@@ -25,7 +25,7 @@ from nflows.nn.nets import ResidualNet
 from nflows.transforms import CompositeTransform
 from nflows.transforms.coupling import AdditiveCouplingTransform
 
-from normalizing_flow.base_distributions import SeparableBeta, StandardNormalDensity
+from rational_factor.models.distributions import SeparableBeta, StandardNormalDensity
 from rational_factor.models.density_model import ConditionalDensityModel, DensityModel
 from normalizing_flow.transforms import HouseholderTransform
 from rational_factor.models.mlp import MLP

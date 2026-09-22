@@ -1,5 +1,5 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
-from rational_factor.models.composite_model import CompositeConditionalModel
+from normalizing_flow.composite_model import CompositeConditionalModel
 from rational_factor.models.parameters import FixedParameters
 from rational_factor.models.structured_matrices import Matrix
 import torch
