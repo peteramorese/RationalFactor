@@ -23,7 +23,7 @@ import rational_factor.tools.propagate as propagate
 
 from rational_factor.models.gram_preserving_basis import DeepGramPreservingBasis
 from rational_factor.models.index_embedding_model import IndexEmbeddingTransform
-from normalizing_flow.transforms import IdentityTransform
+from normalizing_flow.transforms import Transforms
 from rational_factor.models.space_splitter import LatentReflectionSpaceSplitter
 from rational_factor.models.mlp import MLP
 
@@ -37,9 +37,10 @@ if __name__ == "__main__":
     n_basis = 200
     n_hidden_features = 64
     n_hidden_layers = 5
-    n_gp_layers = 3
+    n_gp_layers = 5
+    embedding_dim = 2
     tran_params = {
-        "n_epochs_per_group": [3, 3],
+        "n_epochs_per_group": [5, 3],
         "iterations": 40,
         "lr_basis": 3e-3,
         "lr_weights": 5e-2,
@@ -62,12 +63,6 @@ if __name__ == "__main__":
 
     system = problem.system
     dim = system.dim()
-    if dim != 2:
-        raise ValueError(f"VDP script expects a 2D system, got dim={dim}")
-
-    m = n_basis
-    d = dim
-    rank = max(1, ceil(m ** (1.0 / d)))
 
     x0 = problem.train_initial_state_data()
     x_k, x_kp1 = problem.train_state_transition_data()
@@ -96,9 +91,11 @@ if __name__ == "__main__":
     phi_stds = PositiveParameters.from_values(
         torch.full((1, dim, n_basis), std_init, device=device)
     ).to(device)
+    psi_offset = 0.25 * torch.ones(dim, device=device)
+    psi_offset[1::2] = -0.25
     psi_means = TrainableParameters.from_values(
         means
-        + torch.tensor([0.3, -0.2], device=device).view(1, dim, 1)
+        + psi_offset.view(1, dim, 1)
         + mean_jitter * torch.randn_like(means)
     ).to(device)
     psi_stds = PositiveParameters.from_values(
@@ -107,9 +104,10 @@ if __name__ == "__main__":
     phi_basis = GaussianBasis(phi_means, phi_stds, coeffs=None)
     psi_basis = GaussianBasis(psi_means, psi_stds, coeffs=None)
 
-    embedding = torch.nn.Embedding(n_gp_layers, 1).to(device)
-    tf = IndexEmbeddingTransform(IdentityTransform(dim), embedding)
-    space_splitter = LatentReflectionSpaceSplitter(tf, reflection_axis=0).to(device)
+    embedding = torch.nn.Embedding(n_gp_layers, embedding_dim).to(device)
+    tf = Transforms.make_transform("maf", features=dim, context_features=embedding_dim).to(device)
+    idx_tf = IndexEmbeddingTransform(tf, embedding)
+    space_splitter = LatentReflectionSpaceSplitter(idx_tf, reflection_axis=0).to(device)
     deformer = MLP(
         in_features=dim,
         out_features=n_gp_layers,
@@ -117,6 +115,10 @@ if __name__ == "__main__":
         num_hidden_layers=n_hidden_layers,
         zero_init_last=True,
     ).to(device)
+    # sigmoid(0)=0.5 puts s midway in [L,U]; with large U that yields strong
+    # deformations at init and O(eps) negativity. Bias toward s≈L (near 0).
+    with torch.no_grad():
+        deformer.net[-1].bias.fill_(-4.0)
 
     phi_psi_mutual = DeepGramPreservingBasis(
         phi_basis,
@@ -124,6 +126,7 @@ if __name__ == "__main__":
         space_splitter,
         deformer,
         fixed_base_basis=False,
+        eps=1e-4,
     ).to(device)
 
     g_coeffs = PositiveParameters.random_init(
@@ -144,7 +147,8 @@ if __name__ == "__main__":
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)
 
-    tran_model = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    # cartpole default tolerance (1e-20) is too tight once basis values are O(1e-6).
+    tran_model = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=1e-10)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss

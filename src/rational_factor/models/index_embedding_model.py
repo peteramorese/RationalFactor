@@ -24,7 +24,7 @@ class IndexEmbeddingTransform(torch.nn.Module):
         if embedding.num_embeddings < 1:
             raise ValueError("embedding must contain at least one index")
         ctx = getattr(tf, "context_features", None)
-        if ctx is not None and ctx != embedding.embedding_dim:
+        if ctx != embedding.embedding_dim:
             raise ValueError(
                 f"embedding dim {embedding.embedding_dim} must match "
                 f"transform context_features {ctx}"

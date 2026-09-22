@@ -23,7 +23,7 @@ import rational_factor.tools.propagate as propagate
 
 from rational_factor.models.gram_preserving_basis import DeepGramPreservingBasis
 from rational_factor.models.index_embedding_model import IndexEmbeddingTransform
-from normalizing_flow.transforms import IdentityTransform
+from normalizing_flow.transforms import Transforms
 from rational_factor.models.space_splitter import LatentReflectionSpaceSplitter
 from rational_factor.models.mlp import MLP
 
@@ -355,24 +355,207 @@ def _plot_2d_pair_member_grid(
     )
 
 
+def _plot_sigmoid_deformer(
+    gp_basis: DeepGramPreservingBasis,
+    out_path: Path,
+    *,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    n_grid: int = 80,
+    title: str = "sigmoid(deformer(x)) — unconstrained σ per layer",
+) -> None:
+    """Heatmaps of each deformer channel after sigmoid (before L/U constraints)."""
+    X, Y, y = _state_space_mesh(
+        gp_basis, x_range=x_range, y_range=y_range, n_grid=n_grid
+    )
+    with torch.no_grad():
+        torch.nn.Module.eval(gp_basis)
+        sigma = torch.sigmoid(gp_basis._deformer(y)).detach().cpu()
+
+    n_layers = sigma.shape[-1]
+    x_np = X.detach().cpu().numpy()
+    y_np = Y.detach().cpu().numpy()
+    fig, axes = plt.subplots(
+        1, n_layers, figsize=(4.0 * n_layers, 3.6), squeeze=False
+    )
+    fig.suptitle(title, y=1.02)
+    for l in range(n_layers):
+        ax = axes[0, l]
+        z = sigma[:, l].reshape(n_grid, n_grid).numpy()
+        cf = ax.contourf(x_np, y_np, z, levels=40, cmap="coolwarm", vmin=0.0, vmax=1.0)
+        fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(f"σ_{l}(x)  [{z.min():.3f}, {z.max():.3f}]")
+        ax.set_xlim(x_range[0], x_range[1])
+        ax.set_ylim(y_range[0], y_range[1])
+        ax.set_aspect("equal")
+        ax.set_xlabel("x1")
+        if l == 0:
+            ax.set_ylabel("x2")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_set_indices(
+    gp_basis: DeepGramPreservingBasis,
+    out_path: Path,
+    *,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    n_grid: int = 120,
+    title: str = "space-splitter set index per layer",
+) -> None:
+    """Two-color map of set_index(y) plus continuous d_to_boundary with zero contour.
+
+    Also writes ``{out_path.stem}_d_to_boundary{out_path.suffix}`` so a collapsed
+    partition (boundary pushed outside the plot box) is visible.
+    """
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.patches import Patch
+
+    X, Y, y = _state_space_mesh(
+        gp_basis, x_range=x_range, y_range=y_range, n_grid=n_grid
+    )
+    with torch.no_grad():
+        torch.nn.Module.eval(gp_basis)
+        _, set_index, _, d_to_boundary = gp_basis._space_splitter.partner(y)
+        set_index = set_index.detach().cpu()
+        d_to_boundary = d_to_boundary.detach().cpu()
+
+    n_layers = set_index.shape[1]
+    x_np = X.detach().cpu().numpy()
+    y_np = Y.detach().cpu().numpy()
+    cmap = ListedColormap(["#4C78A8", "#F58518"])
+    norm = BoundaryNorm([-0.5, 0.5, 1.5], cmap.N)
+    fig, axes = plt.subplots(
+        1, n_layers, figsize=(4.0 * n_layers, 3.6), squeeze=False
+    )
+    fig.suptitle(title, y=1.02)
+    legend_handles = [
+        Patch(facecolor="#4C78A8", edgecolor="none", label="set 0 (z≥0)"),
+        Patch(facecolor="#F58518", edgecolor="none", label="set 1 (z<0)"),
+    ]
+    for l in range(n_layers):
+        ax = axes[0, l]
+        z = set_index[:, l].reshape(n_grid, n_grid).numpy()
+        d = d_to_boundary[:, l].reshape(n_grid, n_grid).numpy()
+        ax.pcolormesh(x_np, y_np, z, cmap=cmap, norm=norm, shading="auto")
+        # Zero contour of latent coordinate — empty if boundary left the box.
+        try:
+            ax.contour(
+                x_np, y_np, d, levels=[0.0], colors="k", linewidths=1.5
+            )
+        except Exception:
+            pass
+        frac1 = float((z == 1).mean())
+        ax.set_title(
+            f"layer {l}  (set1={frac1:.1%})\n"
+            f"d∈[{d.min():.2f},{d.max():.2f}]"
+        )
+        ax.set_xlim(x_range[0], x_range[1])
+        ax.set_ylim(y_range[0], y_range[1])
+        ax.set_aspect("equal")
+        ax.set_xlabel("x1")
+        if l == 0:
+            ax.set_ylabel("x2")
+        ax.legend(handles=legend_handles, loc="upper right", fontsize=8, framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # Continuous signed distance so a one-sided box is obvious.
+    d_path = out_path.with_name(f"{out_path.stem}_d_to_boundary{out_path.suffix}")
+    fig, axes = plt.subplots(
+        1, n_layers, figsize=(4.0 * n_layers, 3.6), squeeze=False
+    )
+    fig.suptitle("latent d_to_boundary = z[reflection_axis] (0 = split)", y=1.02)
+    for l in range(n_layers):
+        ax = axes[0, l]
+        d = d_to_boundary[:, l].reshape(n_grid, n_grid).numpy()
+        vmax = max(abs(float(d.min())), abs(float(d.max())), 1e-6)
+        cf = ax.contourf(
+            x_np, y_np, d, levels=40, cmap="coolwarm", vmin=-vmax, vmax=vmax
+        )
+        ax.contour(x_np, y_np, d, levels=[0.0], colors="k", linewidths=1.5)
+        fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(f"layer {l}  [{d.min():.2f}, {d.max():.2f}]")
+        ax.set_xlim(x_range[0], x_range[1])
+        ax.set_ylim(y_range[0], y_range[1])
+        ax.set_aspect("equal")
+        ax.set_xlabel("x1")
+        if l == 0:
+            ax.set_ylabel("x2")
+    fig.tight_layout()
+    fig.savefig(d_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved d_to_boundary map to {d_path}")
+
+
+def _plot_layerwise_alpha_beta(
+    gp_basis: DeepGramPreservingBasis,
+    out_dir: Path,
+    *,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    n_grid: int = 64,
+) -> None:
+    """Plot all α / β basis functions after 0, 1, …, n_layers reflections.
+
+    Uses ``_apply_layers(y, ℓ)`` only — no changes to the basis class.
+    """
+    X, Y, y = _state_space_mesh(
+        gp_basis, x_range=x_range, y_range=y_range, n_grid=n_grid
+    )
+    n_layers = gp_basis._n_layers
+    with torch.no_grad():
+        torch.nn.Module.eval(gp_basis)
+        for layer in range(n_layers + 1):
+            alpha, beta = gp_basis._apply_layers(y, layer)
+            alpha = alpha.detach().cpu()
+            beta = beta.detach().cpu()
+            tag = "base" if layer == 0 else f"after_layer_{layer}"
+            alpha_path = out_dir / f"alpha_{tag}.png"
+            beta_path = out_dir / f"beta_{tag}.png"
+            _plot_2d_values_grid(
+                alpha,
+                X,
+                Y,
+                alpha_path,
+                title=f"α (phi) — {tag}",
+                x_range=x_range,
+                y_range=y_range,
+            )
+            _plot_2d_values_grid(
+                beta,
+                X,
+                Y,
+                beta_path,
+                title=f"β (psi) — {tag}",
+                x_range=x_range,
+                y_range=y_range,
+            )
+            print(f"Saved layerwise α/β ({tag}) to {alpha_path.name}, {beta_path.name}")
+
+
 if __name__ == "__main__":
     problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 20
-    n_hidden_features = 32
-    n_hidden_layers = 2
+    n_basis = 100
+    n_hidden_features = 64
+    n_hidden_layers = 3
     n_gp_layers = 3
+    embedding_dim = 2
     tran_params = {
         "n_epochs_per_group": [3, 3],
-        "iterations": 40,
+        "iterations": 8,
         "lr_basis": 3e-3,
         "lr_weights": 5e-2,
     }
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
-        "iterations": 50,
+        "iterations": 20,
         "lr_weights": 1e-2,
     }
 
@@ -433,9 +616,15 @@ if __name__ == "__main__":
     phi_basis = GaussianBasis(phi_means, phi_stds, coeffs=None)
     psi_basis = GaussianBasis(psi_means, psi_stds, coeffs=None)
 
-    embedding = torch.nn.Embedding(n_gp_layers, 1).to(device)
-    tf = IndexEmbeddingTransform(IdentityTransform(dim), embedding)
-    space_splitter = LatentReflectionSpaceSplitter(tf, reflection_axis=0).to(device)
+    embedding = torch.nn.Embedding(n_gp_layers, embedding_dim).to(device)
+    tf = Transforms.make_transform(
+        "maf",
+        features=dim,
+        context_features=embedding_dim,
+        init_identity=True,
+    ).to(device)
+    idx_tf = IndexEmbeddingTransform(tf, embedding)
+    space_splitter = LatentReflectionSpaceSplitter(idx_tf, reflection_axis=0).to(device)
     deformer = MLP(
         in_features=dim,
         out_features=n_gp_layers,
@@ -474,12 +663,23 @@ if __name__ == "__main__":
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
+    # MAF splitter at full lr_basis quickly pushes z[axis]<0 on all data
+    # (set1→100%, boundary leaves the plot box). Keep it slow / near-identity.
+    splitter_params = list(phi_psi_mutual._space_splitter.parameters())
+    splitter_ids = {id(p) for p in splitter_params}
+    deformer_params = [
+        p for p in phi_psi_mutual.parameters() if id(p) not in splitter_ids
+    ]
     optimizers = {
         "basis": torch.optim.Adam(
             [
                 {
-                    "params": phi_psi_mutual.parameters(),
+                    "params": deformer_params,
                     "lr": tran_params["lr_basis"],
+                },
+                {
+                    "params": splitter_params,
+                    "lr": tran_params["lr_basis"] * 0.02,
                 },
                 {
                     "params": param_group_iter(
@@ -552,6 +752,33 @@ if __name__ == "__main__":
 
     output_dir = Path("figures/gram_preserving/vdp")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    deformer_out = output_dir / "sigmoid_deformer.png"
+    _plot_sigmoid_deformer(
+        phi_psi_mutual,
+        deformer_out,
+        x_range=plot_x_range,
+        y_range=plot_y_range,
+    )
+    print(f"Saved sigmoid deformer map to {deformer_out}")
+
+    set_idx_out = output_dir / "set_indices.png"
+    _plot_set_indices(
+        phi_psi_mutual,
+        set_idx_out,
+        x_range=plot_x_range,
+        y_range=plot_y_range,
+    )
+    print(f"Saved set-index map to {set_idx_out}")
+
+    layerwise_dir = output_dir / "layerwise"
+    layerwise_dir.mkdir(parents=True, exist_ok=True)
+    _plot_layerwise_alpha_beta(
+        phi_psi_mutual,
+        layerwise_dir,
+        x_range=plot_x_range,
+        y_range=plot_y_range,
+    )
 
     mutual_phi_out = output_dir / "mutual_basis_phi_2d.png"
     _plot_2d_pair_member_grid(

@@ -73,18 +73,23 @@ class DeepGramPreservingBasis(MutualPairBasis, torch.nn.Module):
         """Scalar deformer ``s ∈ [L, U]`` from positivity bounds at a set-0 point.
 
         ``L = max_j (-β_j / (J β_p,j))``, ``U = min_j α_p,j / α_j`` (with
-        ``α_j > 0``), and ``s = (U - L) σ + L`` with ``σ ∈ (0, 1)``.
+        ``α_j > eps``), and ``s = (U - L) σ + L`` with ``σ ∈ (eps, 1-eps)``.
+
+        Ratios with ``α_j ≤ eps`` are ignored so tiny denominators cannot inflate
+        ``U``; ``σ`` is clamped away from ``{0,1}`` for float safety.
         """
         eps = self._eps
         J = J.unsqueeze(-1)
         L = (-beta / (J * beta_p).clamp_min(eps)).amax(dim=-1)
         ratios_u = torch.where(
             alpha > eps,
-            alpha_p / alpha.clamp_min(eps),
+            alpha_p.clamp_min(0.0) / alpha.clamp_min(eps),
             torch.full_like(alpha, float("inf")),
         )
         U = ratios_u.amin(dim=-1)
         U = torch.where(torch.isfinite(U), torch.maximum(U, L), L)
+        # Keep s strictly inside [L, U] to limit float violations of positivity.
+        sigma = sigma.clamp(eps, 1.0 - eps)
         s = (U - L) * sigma + L
         if self._smooth_boundary:
             return s * d_to_boundary.unsqueeze(-1)
@@ -134,6 +139,9 @@ class DeepGramPreservingBasis(MutualPairBasis, torch.nn.Module):
             #   set 1: α' = α - s α(partner), β' = β
             alpha = torch.where(set0, alpha, alpha - s * alpha_p)
             beta = torch.where(set0, beta + J * s * beta_p, beta)
+            # Absorb O(eps) float violations so downstream log-density stays finite.
+            alpha = alpha.clamp_min(0.0)
+            beta = beta.clamp_min(0.0)
 
         return alpha, beta
 
