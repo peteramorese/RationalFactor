@@ -363,16 +363,16 @@ if __name__ == "__main__":
     n_basis = 20
     n_hidden_features = 32
     n_hidden_layers = 2
-    n_gp_layers = 5
+    n_gp_layers = 3
     tran_params = {
         "n_epochs_per_group": [3, 3],
-        "iterations": 20,
+        "iterations": 40,
         "lr_basis": 3e-3,
         "lr_weights": 5e-2,
     }
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
-        "iterations": 10,
+        "iterations": 50,
         "lr_weights": 1e-2,
     }
 

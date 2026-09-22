@@ -14,7 +14,7 @@ class DeepGramPreservingBasis(MutualPairBasis, torch.nn.Module):
         space_splitter: LatentReflectionSpaceSplitter,
         deformer: MLP,
         fixed_base_basis: bool = False,
-        smooth_boundary: bool = True,
+        smooth_boundary: bool = False,
         eps: float = 1e-8,
     ):
         torch.nn.Module.__init__(self)
@@ -44,6 +44,7 @@ class DeepGramPreservingBasis(MutualPairBasis, torch.nn.Module):
         self._n_layers = n_layers
         self._fixed_base_basis = fixed_base_basis
         self._base_gram = None
+        self._smooth_boundary = smooth_boundary
         self._eps = eps
 
         if fixed_base_basis:
