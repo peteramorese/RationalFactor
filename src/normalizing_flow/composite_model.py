@@ -63,10 +63,16 @@ class CompositeDensityModel(DensityModel):
 
 
 class CompositeConditionalModel(ConditionalDensityModel):
-    """Conditional density ``p(x|c) = p_base(T(x;c)|c) |det J_{T(·;c)}(x)|``.
+    """Conditional density ``p(x|c) = p_base(T(x;c)|c') |det J_{T(·;c)}(x)|``.
 
     ``base_density`` may be unconditional (ignores ``c``) or conditional.
     The transform always receives ``c`` as ``context``.
+
+    If ``transform_conditioner`` is True (e.g. a shared domain wrap into the
+    unit box), the conditioner is mapped with the same transform and the base
+    sees ``c' = T(c)`` instead of raw ``c``:
+
+        p(x|c) = p_base(T(x)|T(c)) |det J_T(x)|
     """
 
     def __init__(
@@ -74,6 +80,8 @@ class CompositeConditionalModel(ConditionalDensityModel):
         base_density: DensityModel | ConditionalDensityModel,
         context_features: int,
         transform: str | Transform | Sequence[Transform] = "maf",
+        *,
+        transform_conditioner: bool = False,
         **transform_kwargs,
     ):
         super().__init__(features=base_density.features, context_features=context_features)
@@ -84,6 +92,7 @@ class CompositeConditionalModel(ConditionalDensityModel):
                     f"context_features {context_features}"
                 )
         self.base_density = base_density
+        self.transform_conditioner = bool(transform_conditioner)
         self.transform = Transforms.make_transform(
             transform,
             features=base_density.features,
@@ -96,6 +105,8 @@ class CompositeConditionalModel(ConditionalDensityModel):
     ) -> torch.Tensor:
         z, ladj = self.transform(x, context=conditioner)
         if isinstance(self.base_density, ConditionalDensityModel):
+            if self.transform_conditioner:
+                conditioner, _ = self.transform(conditioner)
             log_base = self.base_density.log_density(
                 z, conditioner=conditioner, **contexts
             )
@@ -118,8 +129,14 @@ class CompositeConditionalModel(ConditionalDensityModel):
         if num_samples_per > 1:
             conditioner = conditioner.repeat_interleave(num_samples_per, dim=0)
 
+        base_conditioner = conditioner
+        if self.transform_conditioner and isinstance(
+            self.base_density, ConditionalDensityModel
+        ):
+            base_conditioner, _ = self.transform(conditioner)
+
         if isinstance(self.base_density, ConditionalDensityModel):
-            z = self.base_density.sample(conditioner, **contexts)
+            z = self.base_density.sample(base_conditioner, **contexts)
         else:
             z = self.base_density.sample(conditioner.shape[0], **contexts)
             if z.ndim == 3 and z.shape[1] == 1:

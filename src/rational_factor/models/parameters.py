@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 
 from rational_factor.models.structured_matrices import (
     DenseMatrix,
+    LowRankFactorization,
     Order1Quasiseparable,
     Quasiseparable,
     R1PDFactorization,
@@ -266,6 +267,24 @@ class DenseMatrixFactorization(Parameters):
     def is_module(self):
         return False
 
+class LowRankFactorizationParameters(Parameters):
+    """Wraps a ``(..., n, k, r)`` tensor parameter; ``()`` returns a ``LowRankFactorization``."""
+
+    def __init__(self, U: Parameters, V: Parameters):
+        self.U = U
+        self.V = V
+
+    def __call__(self) -> LowRankFactorization:
+        return LowRankFactorization(self.U(), self.V())
+
+    def is_trainable(self):
+        return self.U.is_trainable() and self.V.is_trainable()
+
+    def parameter_modules(self) -> list[torch.nn.Module]:
+        return [module for param in (self.U, self.V) for module in param.parameter_modules()]
+
+    def is_module(self):
+        return False
 
 class Order1Quasiseparable1Parameters(Parameters):
     """Trainable ``P = L D U``.
