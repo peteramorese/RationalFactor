@@ -37,11 +37,11 @@ if __name__ == "__main__":
     n_basis = 200
     n_hidden_features = 64
     n_hidden_layers = 5
-    n_gp_layers = 5
+    n_gp_layers = 3
     embedding_dim = 2
     tran_params = {
         "n_epochs_per_group": [5, 3],
-        "iterations": 40,
+        "iterations": 30,
         "lr_basis": 3e-3,
         "lr_weights": 5e-2,
     }
@@ -105,7 +105,7 @@ if __name__ == "__main__":
     psi_basis = GaussianBasis(psi_means, psi_stds, coeffs=None)
 
     embedding = torch.nn.Embedding(n_gp_layers, embedding_dim).to(device)
-    tf = Transforms.make_transform("maf", features=dim, context_features=embedding_dim).to(device)
+    tf = Transforms.make_transform("maf", features=dim, context_features=embedding_dim, init_identity=True).to(device)
     idx_tf = IndexEmbeddingTransform(tf, embedding)
     space_splitter = LatentReflectionSpaceSplitter(idx_tf, reflection_axis=0).to(device)
     deformer = MLP(
@@ -152,12 +152,22 @@ if __name__ == "__main__":
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
+
+    splitter_params = list(phi_psi_mutual._space_splitter.parameters())
+    splitter_ids = {id(p) for p in splitter_params}
+    deformer_params = [
+        p for p in phi_psi_mutual.parameters() if id(p) not in splitter_ids
+    ]
     optimizers = {
         "basis": torch.optim.Adam(
             [
                 {
-                    "params": phi_psi_mutual.parameters(),
+                    "params": deformer_params,
                     "lr": tran_params["lr_basis"],
+                },
+                {
+                    "params": splitter_params,
+                    "lr": tran_params["lr_basis"] * 0.02,
                 },
                 {
                     "params": param_group_iter(

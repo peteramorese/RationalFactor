@@ -12,7 +12,7 @@ from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.parameters import (
     PositiveParameters,
     LowRankFactorizationParameters,
-    DenseMatrixFactorization,
+    DenseMatrixParameters,
     param_group_iter,
 )
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
@@ -160,7 +160,7 @@ if __name__ == "__main__":
         std=torch.tensor([1.0]),
         epsilon=0.0,
     ).to(device)
-    B = DenseMatrixFactorization(B_coeffs)
+    B = DenseMatrixParameters(B_coeffs)
 
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)

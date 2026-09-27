@@ -14,7 +14,7 @@ from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.parameters import (
     PositiveParameters,
     LowRankFactorizationParameters,
-    DenseMatrixFactorization,
+    DenseMatrixParameters,
     param_group_iter,
 )
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
@@ -388,19 +388,128 @@ def _plot_2d_pair_member_grid(
     _plot_2d_values_grid(vals, X, Y, out_path, title=title)
 
 
+def _plot_matrix_entries_vs_x1_grid(
+    mat: torch.Tensor,
+    x1: torch.Tensor,
+    out_path: Path,
+    *,
+    title: str,
+    color: str = "C0",
+) -> None:
+    """Plot ``(n_x1, m, m)`` matrix entries as an ``m x m`` subplot grid vs x1."""
+    while mat.ndim > 3 and mat.shape[0] == 1:
+        mat = mat.squeeze(0)
+    if mat.ndim != 3 or mat.shape[1] != mat.shape[2]:
+        raise ValueError(
+            f"Expected mat shape (n_x1, m, m), got {tuple(mat.shape)}"
+        )
+    if x1.ndim != 1 or x1.shape[0] != mat.shape[0]:
+        raise ValueError(
+            f"x1 shape {tuple(x1.shape)} must be (n_x1,) matching mat={tuple(mat.shape)}"
+        )
+
+    n_x1, m, _ = mat.shape
+    x1_np = x1.detach().cpu().numpy()
+    mat_np = mat.detach().cpu().numpy()
+
+    fig, axes = plt.subplots(
+        m,
+        m,
+        figsize=(0.45 * m, 0.40 * m),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    if title:
+        fig.suptitle(title, y=1.01)
+
+    for i in range(m):
+        for j in range(m):
+            ax = axes[i, j]
+            ax.plot(x1_np, mat_np[:, i, j], color=color, lw=0.6)
+            ax.set_xlim(float(x1_np[0]), float(x1_np[-1]))
+            ax.tick_params(labelsize=3, length=1, pad=0.5)
+            if i < m - 1:
+                ax.set_xticklabels([])
+            if j > 0:
+                ax.set_yticklabels([])
+            if i == m - 1 and j == m // 2:
+                ax.set_xlabel("x1", fontsize=7)
+            if j == 0 and i == m // 2:
+                ax.set_ylabel("entry", fontsize=7)
+
+    fig.subplots_adjust(wspace=0.05, hspace=0.05)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_final_AB_entries_vs_x1(
+    pair_basis: AutoregressiveConeLayerBasis,
+    out_path_a: Path,
+    out_path_b: Path,
+    *,
+    slot: int = 1,
+    n_x1: int = 128,
+    title_a: str = "",
+    title_b: str = "",
+) -> None:
+    """Plot final cone-composed A,B matrix entries vs prefix coordinate x1.
+
+    Slot ``d=0`` has an empty prefix, so A0/B0 are constant.  Slot ``d=1``
+    (the non-constant factor for 2D) depends only on ``x1`` through the cone
+    layers.  Writes two ``m x m`` subplot grids (one entry per panel).
+    """
+    dim = pair_basis.dim()
+    if not (0 < slot < dim):
+        raise ValueError(
+            f"slot must be in 1..{dim - 1} (non-constant prefixes), got {slot}"
+        )
+    if not isinstance(pair_basis, AutoregressiveConeLayerBasis):
+        raise TypeError(
+            "_plot_final_AB_entries_vs_x1 expects AutoregressiveConeLayerBasis"
+        )
+
+    dtype, device = pair_basis.dtype_device()
+    x1 = torch.linspace(0.0, 1.0, n_x1, device=device, dtype=dtype)
+    y = torch.zeros(n_x1, dim, device=device, dtype=dtype)
+    y[:, 0] = x1
+
+    with torch.no_grad():
+        torch.nn.Module.eval(pair_basis)
+        XA, XB = pair_basis._slot_state(y, slot)
+        # A = L_A X_A, B = L_B X_B with L: (m, r), X: (n, r, m).
+        A = torch.einsum("ik,bkj->bij", pair_basis.L_A[slot], XA)
+        B = torch.einsum("ik,bkj->bij", pair_basis.L_B[slot], XB)
+
+    _plot_matrix_entries_vs_x1_grid(
+        A,
+        x1,
+        out_path_a,
+        title=title_a or f"A_{slot}(x1) entries",
+        color="C0",
+    )
+    _plot_matrix_entries_vs_x1_grid(
+        B,
+        x1,
+        out_path_b,
+        title=title_b or f"B_{slot}(x1) entries",
+        color="C1",
+    )
+
+
 if __name__ == "__main__":
     problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     ###
     use_gpu = torch.cuda.is_available()
     n_basis = 36
-    bspline_degree = 5
-    n_cone_layers = 10
+    bspline_degree = 3
+    n_cone_layers = 4
     n_hidden_features = 64
     tran_params = {
-        "n_epochs_per_group": [3, 3],  # wrap + cone layers, weights
-        "iterations": 20,
-        "lr_basis": 3e-3,
+        "n_epochs_per_group": [5, 5],  # wrap + cone layers, weights
+        "iterations": 10,
+        "lr_basis": 1e-3,
         "lr_weights": 5e-2,
         "lr_wrap": 1e-3,
     }
@@ -426,7 +535,7 @@ if __name__ == "__main__":
 
     m = n_basis
     d = dim
-    rank = max(1, ceil(m ** (1.0 / d)))
+    rank = max(1, ceil(m ** (1.0 / d))) 
 
     x0 = problem.train_initial_state_data()
     x_k, x_kp1 = problem.train_state_transition_data()
@@ -483,7 +592,7 @@ if __name__ == "__main__":
         std=torch.tensor([1.0]),
         epsilon=0.0,
     ).to(device)
-    B = DenseMatrixFactorization(B_coeffs)
+    B = DenseMatrixParameters(B_coeffs)
 
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
     psi_basis = phi_psi_mutual.get_basis(1)
@@ -603,6 +712,19 @@ if __name__ == "__main__":
         title="VDP cone-layer: 2D mutual psi basis by index",
     )
     print(f"Saved 2D mutual psi grid to {mutual_psi_out}")
+
+    a_vs_x1_out = output_dir / "A_final_layer_entries_vs_x1.png"
+    b_vs_x1_out = output_dir / "B_final_layer_entries_vs_x1.png"
+    _plot_final_AB_entries_vs_x1(
+        phi_psi_mutual,
+        a_vs_x1_out,
+        b_vs_x1_out,
+        slot=1,
+        title_a="VDP cone-layer: final A₁(x1) matrix entries",
+        title_b="VDP cone-layer: final B₁(x1) matrix entries",
+    )
+    print(f"Saved final A entries vs x1 to {a_vs_x1_out}")
+    print(f"Saved final B entries vs x1 to {b_vs_x1_out}")
 
     cond_slice_out_path = output_dir / "conditional_slices_model_vs_data.png"
     _plot_conditional_slices_model_vs_data(

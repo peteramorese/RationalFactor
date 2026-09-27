@@ -396,6 +396,120 @@ def _plot_sigmoid_deformer(
     plt.close(fig)
 
 
+def _lu_bounds(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    alpha_p: torch.Tensor,
+    beta_p: torch.Tensor,
+    J: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Same L, U construction as ``DeepGramPreservingBasis._constrained_s``."""
+    J = J.unsqueeze(-1)
+    L = (-beta / (J * beta_p).clamp_min(eps)).amax(dim=-1)
+    ratios_u = torch.where(
+        alpha > eps,
+        alpha_p.clamp_min(0.0) / alpha.clamp_min(eps),
+        torch.full_like(alpha, float("inf")),
+    )
+    U = ratios_u.amin(dim=-1)
+    U = torch.where(torch.isfinite(U), torch.maximum(U, L), L)
+    return L, U
+
+
+def _layerwise_LU(
+    gp_basis: DeepGramPreservingBasis, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(L, U)`` of shape ``(n_data, n_layers)`` at each reflection layer.
+
+    Uses the same branch as the applied ``s`` (set-0 vs set-1 / partner).
+    """
+    n_layers = gp_basis._n_layers
+    eps = gp_basis._eps
+    n = y.shape[0]
+    device, dtype = y.device, y.dtype
+    L_all = torch.empty(n, n_layers, device=device, dtype=dtype)
+    U_all = torch.empty(n, n_layers, device=device, dtype=dtype)
+
+    alpha = gp_basis._eval_base(gp_basis._base_phi, y)
+    beta = gp_basis._eval_base(gp_basis._base_psi, y)
+    y_partner, set_index, ladj, _ = gp_basis._space_splitter.partner(y)
+
+    for l in range(n_layers):
+        yp = y_partner[:, l, :]
+        alpha_p, beta_p = gp_basis._apply_layers(yp, l)
+        J = torch.exp(ladj[:, l])
+        si = set_index[:, l]
+
+        L_y, U_y = _lu_bounds(alpha, beta, alpha_p, beta_p, J, eps)
+        L_p, U_p = _lu_bounds(
+            alpha_p, beta_p, alpha, beta, torch.exp(-ladj[:, l]), eps
+        )
+        L_all[:, l] = torch.where(si == 0, L_y, L_p)
+        U_all[:, l] = torch.where(si == 0, U_y, U_p)
+
+        # Advance (α, β) like ``_apply_layers`` so later layers see the same state.
+        sig = torch.sigmoid(gp_basis._deformer(y))[:, l].clamp(eps, 1.0 - eps)
+        sig_p = torch.sigmoid(gp_basis._deformer(yp))[:, l].clamp(eps, 1.0 - eps)
+        s_y = (U_y - L_y) * sig + L_y
+        s_p = (U_p - L_p) * sig_p + L_p
+        s = torch.where(si == 0, s_y, s_p).unsqueeze(-1)
+        J2 = J.unsqueeze(-1)
+        set0 = (si == 0).unsqueeze(-1)
+        alpha = torch.where(set0, alpha, alpha - s * alpha_p).clamp_min(0.0)
+        beta = torch.where(set0, beta + J2 * s * beta_p, beta).clamp_min(0.0)
+
+    return L_all, U_all
+
+
+def _plot_deformer_interval_width(
+    gp_basis: DeepGramPreservingBasis,
+    out_path: Path,
+    *,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    n_grid: int = 80,
+    title: str = "deformer interval (L − U) per layer",
+) -> None:
+    """Heatmaps of ``L(x) − U(x)`` from the positivity bounds in ``_constrained_s``."""
+    X, Y, y = _state_space_mesh(
+        gp_basis, x_range=x_range, y_range=y_range, n_grid=n_grid
+    )
+    with torch.no_grad():
+        torch.nn.Module.eval(gp_basis)
+        L, U = _layerwise_LU(gp_basis, y)
+        width = (L - U).detach().cpu()
+
+    n_layers = width.shape[-1]
+    x_np = X.detach().cpu().numpy()
+    y_np = Y.detach().cpu().numpy()
+    fig, axes = plt.subplots(
+        1, n_layers, figsize=(4.0 * n_layers, 3.6), squeeze=False
+    )
+    fig.suptitle(title, y=1.02)
+    for l in range(n_layers):
+        ax = axes[0, l]
+        z = width[:, l].reshape(n_grid, n_grid).numpy()
+        # L≤U after the max(U,L) clamp, so L−U ≤ 0; center colormap at 0.
+        vmin = float(z.min())
+        vmax = float(z.max())
+        vabs = max(abs(vmin), abs(vmax), 1e-12)
+        cf = ax.contourf(
+            x_np, y_np, z, levels=40, cmap="coolwarm", vmin=-vabs, vmax=vabs
+        )
+        fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(f"(L−U)_{l}  [{z.min():.3g}, {z.max():.3g}]")
+        ax.set_xlim(x_range[0], x_range[1])
+        ax.set_ylim(y_range[0], y_range[1])
+        ax.set_aspect("equal")
+        ax.set_xlabel("x1")
+        if l == 0:
+            ax.set_ylabel("x2")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_set_indices(
     gp_basis: DeepGramPreservingBasis,
     out_path: Path,
@@ -542,14 +656,14 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 100
-    n_hidden_features = 64
+    n_basis = 30
+    n_hidden_features = 32
     n_hidden_layers = 3
     n_gp_layers = 3
     embedding_dim = 2
     tran_params = {
         "n_epochs_per_group": [3, 3],
-        "iterations": 8,
+        "iterations": 4,
         "lr_basis": 3e-3,
         "lr_weights": 5e-2,
     }
@@ -761,6 +875,15 @@ if __name__ == "__main__":
         y_range=plot_y_range,
     )
     print(f"Saved sigmoid deformer map to {deformer_out}")
+
+    interval_out = output_dir / "deformer_interval_LU.png"
+    _plot_deformer_interval_width(
+        phi_psi_mutual,
+        interval_out,
+        x_range=plot_x_range,
+        y_range=plot_y_range,
+    )
+    print(f"Saved deformer interval (L−U) map to {interval_out}")
 
     set_idx_out = output_dir / "set_indices.png"
     _plot_set_indices(

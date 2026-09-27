@@ -213,7 +213,7 @@ class AutoregressiveMetzlerConeMutualBasis(torch.nn.Module, MutualPairBasis):
 
 
 class _PrefixUpdateMLP(torch.nn.Module):
-    """MLP on x_<d producing an unconstrained C in R^{m x r} and one raw step."""
+    """MLP on x_<d producing C in R^{m x r} and r raw row-wise steps."""
 
     def __init__(
         self,
@@ -225,7 +225,7 @@ class _PrefixUpdateMLP(torch.nn.Module):
         super().__init__()
         self.m = m
         self.r = r
-        out_features = m * r + 1
+        out_features = m * r + r
 
         if in_features == 0:
             # Slot d=0 has an empty autoregressive context, so its update is constant.
@@ -250,8 +250,9 @@ class _PrefixUpdateMLP(torch.nn.Module):
             out = self.constant.unsqueeze(0).expand(prefix.shape[0], -1)
         else:
             out = self.net(prefix)
-        C = out[..., :-1].reshape(prefix.shape[0], self.m, self.r)
-        raw_s = out[..., -1]
+        split = self.m * self.r
+        C = out[..., :split].reshape(prefix.shape[0], self.m, self.r)
+        raw_s = out[..., split:]  # (batch, r)
         return C, raw_s
 
 
@@ -274,15 +275,17 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
 
         K_A = X_A G,
         Z   = P_null(K_A) C(x_<d),
-        X_B <- X_B + s(x_<d) Z^T,
+        X_B <- X_B + diag(s(x_<d)) Z^T,
 
     where
 
         P_null(K) C = C - K^T (K K^T)^{-1} K C.
 
     Therefore K_A Z = 0 and A G B^T is unchanged.  A updates are symmetric with
-    K_B = X_B G^T.  The scalar s >= 0 is bounded pointwise by the largest step
-    that keeps the *actual dense updated matrix* A or B entrywise nonnegative.
+    K_B = X_B G^T.  The vector s in R_+^r is bounded independently for each
+    latent row so that the updated right factor X remains entrywise nonnegative.
+    Since L is nonnegative, this is sufficient to keep A = L_A X_A and
+    B = L_B X_B entrywise nonnegative.
 
     The final autoregressive bases are
 
@@ -480,24 +483,30 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
         dY: torch.Tensor,
         raw_s: torch.Tensor,
     ) -> torch.Tensor:
-        r"""Return s >= 0 such that Y + s dY remains entrywise nonnegative.
+        r"""Return row-wise s >= 0 with Y + diag(s) dY >= 0.
 
-        The exact pointwise upper bound is
+        ``Y`` and ``dY`` have shape ``(batch, r, m)`` and ``raw_s`` has shape
+        ``(batch, r)``.  Each latent row k gets its own exact pointwise bound
 
-            s_max = min_{dY_ij < 0} Y_ij / (-dY_ij).
+            s_max[k] = min_{j: dY[k,j] < 0} Y[k,j] / (-dY[k,j]).
 
-        If dY has no negative entry, positivity imposes no upper bound and we
-        use softplus(raw_s).  Otherwise use a sigmoid fraction of the bound.
+        Thus one restrictive entry only limits its own latent row rather than
+        all r rows.  If a row of dY has no negative entry, positivity imposes
+        no upper bound on that row and we use softplus(raw_s[k]).
 
         ``s_max`` is detached and capped: backprop through the nondifferentiable
-        ``amin`` / reciprocal of near-zero ``dY`` yields NaNs, and an uncapped
-        bound makes a single tiny negative ``dY`` entry explode the step.
+        ``amin`` / reciprocal of near-zero ``dY`` can be numerically unstable,
+        and an uncapped bound can make a tiny negative entry yield a huge step.
         """
         neg = dY < 0
         # Floor away from 0 so barely-negative entries cannot explode s_max.
         denom = (-dY).clamp_min(1e-3)
-        ratios = torch.where(neg, Y.clamp_min(0.0) / denom, torch.full_like(dY, torch.inf))
-        s_max = ratios.amin(dim=(-2, -1))
+        ratios = torch.where(
+            neg,
+            Y.clamp_min(0.0) / denom,
+            torch.full_like(dY, torch.inf),
+        )
+        s_max = ratios.amin(dim=-1)  # (batch, r)
         has_bound = torch.isfinite(s_max)
         s_cap = (
             torch.nan_to_num(s_max, nan=0.0, posinf=0.0, neginf=0.0)
@@ -516,8 +525,6 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
         """Return pointwise X_A(x_<d), X_B(x_<d) for one coordinate slot."""
         n_data = y.shape[0]
         G = self._G
-        LA = self.L_A[d]                             # (m, r)
-        LB = self.L_B[d]                             # (m, r)
         XA = self.X_A0[d].unsqueeze(0).expand(n_data, -1, -1)  # (b, r, m)
         XB = self.X_B0[d].unsqueeze(0).expand(n_data, -1, -1)
         prefix = y[:, :d]
@@ -531,22 +538,20 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
                 Z = self._project_null(K, C)                     # (b, m, r)
                 dX = Z.transpose(-2, -1)                         # (b, r, m)
 
-                # Exact positivity bound on B = L_B X_B.
-                B = torch.einsum("ir,brj->bij", LB, XB)
-                dB = torch.einsum("ir,brj->bij", LB, dX)
-                s = self._bounded_positive_step(B, dB, raw_s)
-                XB = XB + s[:, None, None] * dX
+                # Row-wise positivity bound on the right factor X_B.
+                # X_B >= 0 and L_B >= 0 imply B = L_B X_B >= 0.
+                s = self._bounded_positive_step(XB, dX, raw_s)  # (b, r)
+                XB = XB + s.unsqueeze(-1) * dX
             else:
                 # A update. Z lies in ker(X_B G^T).
                 K = XB @ G.transpose(-2, -1)                    # (b, r, m)
                 Z = self._project_null(K, C)                     # (b, m, r)
                 dX = Z.transpose(-2, -1)                         # (b, r, m)
 
-                # Exact positivity bound on A = L_A X_A.
-                A = torch.einsum("ir,brj->bij", LA, XA)
-                dA = torch.einsum("ir,brj->bij", LA, dX)
-                s = self._bounded_positive_step(A, dA, raw_s)
-                XA = XA + s[:, None, None] * dX
+                # Row-wise positivity bound on the right factor X_A.
+                # X_A >= 0 and L_A >= 0 imply A = L_A X_A >= 0.
+                s = self._bounded_positive_step(XA, dX, raw_s)  # (b, r)
+                XA = XA + s.unsqueeze(-1) * dX
 
         return XA, XB
 

@@ -249,7 +249,7 @@ class R1PDFactorizationParameters(Parameters):
         return [module for param in params for module in param.parameter_modules()]
 
 
-class DenseMatrixFactorization(Parameters):
+class DenseMatrixParameters(Parameters):
     """Wraps a ``(..., n, m)`` tensor parameter; ``()`` returns a ``DenseMatrix``."""
 
     def __init__(self, values: Parameters):
