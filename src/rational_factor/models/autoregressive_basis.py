@@ -1,10 +1,9 @@
 import torch
 import torch.nn.functional as F
-from collections.abc import Sequence
 import math
 
 from rational_factor.models.basis_functions import Basis
-from rational_factor.models.mlp import PairedMaskedMetzlerConeMLP
+from rational_factor.models.mlp import MaskedInputMLP, PairedMaskedMetzlerConeMLP
 from rational_factor.models.mutual_bases import MutualPairBasis
 from rational_factor.models.parameters import LowRankFactorizationParameters
 from rational_factor.models.structured_matrices import DenseMatrix, Matrix, as_matrix, LowRankFactorization
@@ -212,50 +211,6 @@ class AutoregressiveMetzlerConeMutualBasis(torch.nn.Module, MutualPairBasis):
         return DenseMatrix(self._omega2)
 
 
-class _PrefixUpdateMLP(torch.nn.Module):
-    """MLP on x_<d producing C in R^{m x r} and r raw row-wise steps."""
-
-    def __init__(
-        self,
-        in_features: int,
-        m: int,
-        r: int,
-        hidden_features: Sequence[int],
-    ):
-        super().__init__()
-        self.m = m
-        self.r = r
-        out_features = m * r + r
-
-        if in_features == 0:
-            # Slot d=0 has an empty autoregressive context, so its update is constant.
-            self.constant = torch.nn.Parameter(torch.zeros(out_features))
-            self.net = None
-            return
-
-        widths = [in_features, *hidden_features, out_features]
-        layers: list[torch.nn.Module] = []
-        for i in range(len(widths) - 2):
-            layers += [torch.nn.Linear(widths[i], widths[i + 1]), torch.nn.SiLU()]
-        final = torch.nn.Linear(widths[-2], widths[-1])
-        # Start from the supplied A0/B0. The network learns residual cone moves.
-        torch.nn.init.zeros_(final.weight)
-        torch.nn.init.zeros_(final.bias)
-        layers.append(final)
-        self.net = torch.nn.Sequential(*layers)
-        self.register_parameter("constant", None)
-
-    def forward(self, prefix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.net is None:
-            out = self.constant.unsqueeze(0).expand(prefix.shape[0], -1)
-        else:
-            out = self.net(prefix)
-        split = self.m * self.r
-        C = out[..., :split].reshape(prefix.shape[0], self.m, self.r)
-        raw_s = out[..., split:]  # (batch, r)
-        return C, raw_s
-
-
 class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
     r"""Autoregressive mutual basis with alternating exact nullspace updates.
 
@@ -305,6 +260,10 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
       U/V factors so the starting A0/B0 stay entrywise nonnegative under
       optimization.  Positivity of updated factors is enforced by the bounded
       cone steps.
+    * Pass a single shared :class:`~rational_factor.models.mlp.MaskedInputMLP`
+      whose forward returns ``C`` of shape ``(batch, D, L, m, r)`` (and
+      matching ``raw_s``).  Parameters are shared across dimensions and cone
+      layers via triangular input masking.
     * Exact nullspace projection assumes K_A and K_B retain full row rank r.
       This is generic but can fail at a rank-degenerate parameter setting.
     """
@@ -315,8 +274,7 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
         nom_beta_basis: Basis,
         A0: LowRankFactorizationParameters,
         B0: LowRankFactorizationParameters,
-        n_layers: int,
-        hidden_features: int | Sequence[int] = (64, 64),
+        update_mlp: MaskedInputMLP,
         *,
         positivity_margin: float = 1e-6,
     ):
@@ -332,6 +290,10 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
             B0, LowRankFactorizationParameters
         ):
             raise TypeError("A0 and B0 must be LowRankFactorizationParameters instances")
+        if not isinstance(update_mlp, MaskedInputMLP):
+            raise TypeError(
+                f"update_mlp must be a MaskedInputMLP, got {type(update_mlp)!r}"
+            )
 
         A0_mat = A0()
         B0_mat = B0()
@@ -347,18 +309,19 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
             raise ValueError(
                 f"A0 and B0 must share factor rank, got {A0_mat.r} and {B0_mat.r}"
             )
-        if n_layers < 0:
-            raise ValueError("n_layers must be nonnegative")
         if not (0.0 <= positivity_margin < 1.0):
             raise ValueError("positivity_margin must lie in [0, 1)")
 
         D = A0_mat.batch_shape[0]
         r = A0_mat.r
-        expected_r = math.ceil(m ** (1.0 / D))
-        if r != expected_r:
+        if update_mlp.n_features != D:
             raise ValueError(
-                f"factor rank must be ceil(m**(1/D))={expected_r}, got r={r} "
-                f"for m={m}, D={D}"
+                f"update_mlp.n_features={update_mlp.n_features} must equal D={D}"
+            )
+        if update_mlp.m != m or update_mlp.r != r:
+            raise ValueError(
+                f"update_mlp (m, r)=({update_mlp.m}, {update_mlp.r}) must match "
+                f"basis (m, r)=({m}, {r})"
             )
 
         # A0 = U V^T = L X, so L=U and X=V^T; require nonnegative starting factors.
@@ -373,11 +336,6 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
                 "use PositiveParameters for U and V"
             )
 
-        if isinstance(hidden_features, int):
-            hidden_features = (hidden_features, hidden_features)
-        else:
-            hidden_features = tuple(hidden_features)
-
         torch.nn.Module.__init__(self)
         MutualPairBasis.__init__(
             self,
@@ -391,7 +349,8 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
         self.nom_beta_basis = nom_beta_basis
         self._A0 = A0
         self._B0 = B0
-        self.n_layers = n_layers
+        self.update_mlp = update_mlp
+        self.n_layers = update_mlp.n_layers
         self.rank = r
         self.positivity_margin = float(positivity_margin)
 
@@ -417,20 +376,6 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
         if torch.linalg.matrix_rank(G).item() != m:
             raise ValueError("nominal Gram G must be full rank")
         self.register_buffer("_G", G)
-
-        # One autoregressive update network per (layer, dimension).  Layer parity
-        # determines which side it updates: even -> B, odd -> A.
-        self.update_mlps = torch.nn.ModuleList(
-            [
-                torch.nn.ModuleList(
-                    [
-                        _PrefixUpdateMLP(d, m, r, hidden_features)
-                        for d in range(D)
-                    ]
-                )
-                for _ in range(n_layers)
-            ]
-        )
 
     @property
     def L_A(self) -> torch.Tensor:
@@ -477,60 +422,151 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
         coeff = torch.linalg.solve(KKT, KC)          # (batch, r, r)
         return C - K.transpose(-2, -1) @ coeff       # (batch, m, r)
 
+    #def _bounded_positive_step(
+    #    self,
+    #    Y: torch.Tensor,
+    #    dY: torch.Tensor,
+    #    raw_s: torch.Tensor,
+    #) -> torch.Tensor:
+    #    r"""Return row-wise s >= 0 with Y + diag(s) dY >= 0.
+
+    #    ``Y`` and ``dY`` have shape ``(batch, r, m)`` and ``raw_s`` has shape
+    #    ``(batch, r)``.  Each latent row k gets its own exact pointwise bound
+
+    #        s_max[k] = min_{j: dY[k,j] < 0} Y[k,j] / (-dY[k,j]).
+
+    #    Thus one restrictive entry only limits its own latent row rather than
+    #    all r rows.  If a row of dY has no negative entry, positivity imposes
+    #    no upper bound on that row and we use softplus(raw_s[k]).
+
+    #    ``s_max`` is detached and capped: backprop through the nondifferentiable
+    #    ``amin`` / reciprocal of near-zero ``dY`` can be numerically unstable,
+    #    and an uncapped bound can make a tiny negative entry yield a huge step.
+    #    """
+    #    neg = dY < 0
+    #    # Floor away from 0 so barely-negative entries cannot explode s_max.
+    #    denom = (-dY).clamp_min(1e-3)
+    #    ratios = torch.where(
+    #        neg,
+    #        Y.clamp_min(0.0) / denom,
+    #        torch.full_like(dY, torch.inf),
+    #    )
+    #    s_max = ratios.amin(dim=-1)  # (batch, r)
+    #    has_bound = torch.isfinite(s_max)
+    #    s_cap = (
+    #        torch.nan_to_num(s_max, nan=0.0, posinf=0.0, neginf=0.0)
+    #        .clamp(0.0, 10.0)
+    #        .detach()
+    #    )
+    #    bounded = (1.0 - self.positivity_margin) * s_cap * torch.sigmoid(raw_s)
+    #    unbounded = F.softplus(raw_s)
+    #    return torch.where(has_bound, bounded, unbounded)
+    
     def _bounded_positive_step(
         self,
         Y: torch.Tensor,
         dY: torch.Tensor,
         raw_s: torch.Tensor,
     ) -> torch.Tensor:
-        r"""Return row-wise s >= 0 with Y + diag(s) dY >= 0.
+        r"""Row-wise signed step preserving Y + diag(s) dY >= 0.
 
-        ``Y`` and ``dY`` have shape ``(batch, r, m)`` and ``raw_s`` has shape
-        ``(batch, r)``.  Each latent row k gets its own exact pointwise bound
+        Y, dY: (batch, r, m)
+        raw_s: (batch, r)
 
-            s_max[k] = min_{j: dY[k,j] < 0} Y[k,j] / (-dY[k,j]).
+        Exact feasible interval for each row:
 
-        Thus one restrictive entry only limits its own latent row rather than
-        all r rows.  If a row of dY has no negative entry, positivity imposes
-        no upper bound on that row and we use softplus(raw_s[k]).
+            s_min = max_{dY_j > 0} -Y_j / dY_j
+            s_max = min_{dY_j < 0}  Y_j / (-dY_j)
 
-        ``s_max`` is detached and capped: backprop through the nondifferentiable
-        ``amin`` / reciprocal of near-zero ``dY`` can be numerically unstable,
-        and an uncapped bound can make a tiny negative entry yield a huge step.
+        with s_min <= 0 <= s_max.
         """
+
+        pos = dY > 0
         neg = dY < 0
-        # Floor away from 0 so barely-negative entries cannot explode s_max.
-        denom = (-dY).clamp_min(1e-3)
-        ratios = torch.where(
+
+        # Safe denominators; masked entries do not participate in reductions.
+        pos_denom = torch.where(pos, dY, torch.ones_like(dY))
+        neg_denom = torch.where(neg, -dY, torch.ones_like(dY))
+
+        lower_candidates = torch.where(
+            pos,
+            -Y / pos_denom,
+            torch.full_like(dY, -torch.inf),
+        )
+        upper_candidates = torch.where(
             neg,
-            Y.clamp_min(0.0) / denom,
+            Y / neg_denom,
             torch.full_like(dY, torch.inf),
         )
-        s_max = ratios.amin(dim=-1)  # (batch, r)
-        has_bound = torch.isfinite(s_max)
-        s_cap = (
-            torch.nan_to_num(s_max, nan=0.0, posinf=0.0, neginf=0.0)
-            .clamp(0.0, 10.0)
-            .detach()
+
+        s_min = lower_candidates.amax(dim=-1)  # (batch, r)
+        s_max = upper_candidates.amin(dim=-1)  # (batch, r)
+
+        has_lower = torch.isfinite(s_min)
+        has_upper = torch.isfinite(s_max)
+
+        # Optional margin only on finite bounds.
+        margin = 1.0 - self.positivity_margin
+        s_min = torch.where(has_lower, margin * s_min, s_min)
+        s_max = torch.where(has_upper, margin * s_max, s_max)
+
+        t = torch.tanh(raw_s)
+
+        # Usual case: direction contains both positive and negative entries.
+        bounded = torch.where(
+            t >= 0,
+            t * s_max,
+            (-t) * s_min,
         )
-        bounded = (1.0 - self.positivity_margin) * s_cap * torch.sigmoid(raw_s)
-        unbounded = F.softplus(raw_s)
-        return torch.where(has_bound, bounded, unbounded)
+
+        # Handle one-sided-unbounded rows.
+        positive_unbounded = torch.expm1(raw_s.clamp_min(0.0))
+        negative_unbounded = -torch.expm1((-raw_s).clamp_min(0.0))
+
+        s = bounded
+
+        # No upper bound: positive motion can be unbounded.
+        s = torch.where(
+            (~has_upper) & (t >= 0),
+            positive_unbounded,
+            s,
+        )
+
+        # No lower bound: negative motion can be unbounded.
+        s = torch.where(
+            (~has_lower) & (t < 0),
+            negative_unbounded,
+            s,
+        )
+
+        return s
 
     def _slot_state(
         self,
         y: torch.Tensor,
         d: int,
+        C_d: torch.Tensor | None = None,
+        raw_s_d: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return pointwise X_A(x_<d), X_B(x_<d) for one coordinate slot."""
+        """Return pointwise X_A(x_<d), X_B(x_<d) for one coordinate slot.
+
+        ``C_d`` / ``raw_s_d`` have shape ``(batch, n_layers, m, r)`` /
+        ``(batch, n_layers, r)``.  If omitted, they are taken from a single
+        shared ``update_mlp`` forward on ``y``.
+        """
         n_data = y.shape[0]
         G = self._G
         XA = self.X_A0[d].unsqueeze(0).expand(n_data, -1, -1)  # (b, r, m)
         XB = self.X_B0[d].unsqueeze(0).expand(n_data, -1, -1)
-        prefix = y[:, :d]
+
+        if C_d is None or raw_s_d is None:
+            C_all, s_all = self.update_mlp(y)
+            C_d = C_all[:, d]
+            raw_s_d = s_all[:, d]
 
         for ell in range(self.n_layers):
-            C, raw_s = self.update_mlps[ell][d](prefix)         # C: (b, m, r)
+            C = C_d[:, ell]                                      # (b, m, r)
+            raw_s = raw_s_d[:, ell]                              # (b, r)
 
             if ell % 2 == 0:
                 # B update. Z lies in ker(X_A G).
@@ -578,8 +614,9 @@ class AutoregressiveConeLayerBasis(torch.nn.Module, MutualPairBasis):
         alpha = y.new_ones(n_data, m)
         beta = y.new_ones(n_data, m)
 
+        C_all, s_all = self.update_mlp(y)  # (n, D, L, m, r), (n, D, L, r)
         for d in range(self._dim):
-            XA, XB = self._slot_state(y, d)
+            XA, XB = self._slot_state(y, d, C_all[:, d], s_all[:, d])
             nom_a = self._eval_nom(self.nom_alpha_basis, y[:, d : d + 1])
             nom_b = self._eval_nom(self.nom_beta_basis, y[:, d : d + 1])
 

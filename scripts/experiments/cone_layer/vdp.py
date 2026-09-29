@@ -11,6 +11,7 @@ from rational_factor.models.autoregressive_basis import AutoregressiveConeLayerB
 from rational_factor.models.basis_functions import BSpline1DBasis
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.kde import GaussianKDE
+from rational_factor.models.mlp import MaskedInputMLP
 from rational_factor.models.parameters import (
     PositiveParameters,
     LowRankFactorizationParameters,
@@ -62,14 +63,27 @@ def _positive_low_rank(
     )
 
 
-def _jitter_cone_mlp_last_layers(pair: AutoregressiveConeLayerBasis, std: float = 1e-3) -> None:
-    """Break exact zero-init on update MLP heads so cone layers get signal."""
-    for layer in pair.update_mlps:
-        for mlp in layer:
-            if mlp.net is None:
-                continue
-            torch.nn.init.normal_(mlp.net[-1].weight, std=std)
-            torch.nn.init.zeros_(mlp.net[-1].bias)
+def _jitter_cone_mlp_last_layers(
+    mlp: MaskedInputMLP,
+    c_std: float = 1e-2,
+) -> None:
+    """Init cone MLP head so C is nonzero but raw_s = 0.
+
+    The update MLP final layer is zero-initialized so X starts at X0.  With the
+    signed positivity step, exactly-zero C makes dX = 0, hence s_min/s_max =
+    ±∞ and ``tanh(0) * ∞`` produces NaN gradients.  A small C bias (weights
+    still zero, raw_s channels still zero) keeps s = 0 at init — so X is
+    unchanged — while giving dX both signs so the bounds stay finite.
+    """
+    with torch.no_grad():
+        split_c = mlp.m * mlp.r
+        split_full = split_c + mlp.r
+        torch.nn.init.zeros_(mlp.net[-1].weight)
+        bias = torch.zeros_like(mlp.net[-1].bias)
+        for ell in range(mlp.n_layers):
+            base = ell * split_full
+            bias[base : base + split_c].normal_(0.0, c_std)
+        mlp.net[-1].bias.copy_(bias)
 
 
 def _plot_conditional_slices_model_vs_data(
@@ -388,58 +402,167 @@ def _plot_2d_pair_member_grid(
     _plot_2d_values_grid(vals, X, Y, out_path, title=title)
 
 
-def _plot_matrix_entries_vs_x1_grid(
+def _eval_slot_alpha(
+    pair_basis: AutoregressiveConeLayerBasis,
+    y: torch.Tensor,
+    slot: int,
+) -> torch.Tensor:
+    """Return per-coordinate factor ``α_d(x) = A_d(x_<d) nom_α(x_d)``, shape (n, m)."""
+    if not isinstance(pair_basis, AutoregressiveConeLayerBasis):
+        raise TypeError("_eval_slot_alpha expects AutoregressiveConeLayerBasis")
+    dim = pair_basis.dim()
+    if not (0 <= slot < dim):
+        raise ValueError(f"slot must be in 0..{dim - 1}, got {slot}")
+
+    dtype, device = pair_basis.dtype_device()
+    y = torch.as_tensor(y, dtype=dtype, device=device)
+    if y.ndim != 2 or y.shape[1] != dim:
+        raise ValueError(f"y must have shape (n_data, {dim}), got {tuple(y.shape)}")
+
+    XA, _XB = pair_basis._slot_state(y, slot)
+    nom_a = pair_basis._eval_nom(pair_basis.nom_alpha_basis, y[:, slot : slot + 1])
+    u_a = torch.einsum("brm,bm->br", XA, nom_a)
+    return torch.einsum("mr,br->bm", pair_basis.L_A[slot], u_a)
+
+
+def _plot_1d_basis_curves_grid(
+    vals: torch.Tensor,
+    x: torch.Tensor,
+    out_path: Path,
+    *,
+    title: str,
+    xlabel: str = "x1",
+    color: str = "C0",
+) -> None:
+    """Plot ``(n_x, n_basis)`` 1D curves as a near-square subplot grid."""
+    while vals.ndim > 2 and vals.shape[0] == 1:
+        vals = vals.squeeze(0)
+    if vals.ndim != 2:
+        raise ValueError(f"Expected vals shape (n_x, n_basis), got {tuple(vals.shape)}")
+    if x.ndim != 1 or x.shape[0] != vals.shape[0]:
+        raise ValueError(
+            f"x shape {tuple(x.shape)} must be (n_x,) matching vals={tuple(vals.shape)}"
+        )
+
+    x_np = x.detach().cpu().numpy()
+    vals_np = vals.detach().cpu().numpy()
+    n_basis = vals_np.shape[1]
+    n_cols = max(1, ceil(sqrt(n_basis)))
+    n_rows = max(1, ceil(n_basis / n_cols))
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(1.8 * n_cols, 1.5 * n_rows),
+        sharex=True,
+        squeeze=False,
+    )
+    if title:
+        fig.suptitle(title, y=1.01)
+
+    for i in range(n_basis):
+        r, c = divmod(i, n_cols)
+        ax = axes[r, c]
+        ax.plot(x_np, vals_np[:, i], color=color, lw=1.0)
+        ax.set_title(str(i), fontsize=7, pad=1)
+        ax.set_xlim(float(x_np[0]), float(x_np[-1]))
+        ax.tick_params(labelsize=5)
+        if r < n_rows - 1:
+            ax.set_xticklabels([])
+        if r == n_rows - 1:
+            ax.set_xlabel(xlabel, fontsize=7)
+
+    for j in range(n_basis, n_rows * n_cols):
+        r, c = divmod(j, n_cols)
+        axes[r, c].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_autoregressive_alpha_factors(
+    pair_basis: AutoregressiveConeLayerBasis,
+    out_path_d0: Path,
+    out_path_d1: Path,
+    *,
+    n_grid: int = 64,
+    title_d0: str = "",
+    title_d1: str = "",
+) -> None:
+    """Plot α_{d=0}(x1) curves and α_{d=1}(x2; x1) fields, one panel per basis."""
+    if not isinstance(pair_basis, AutoregressiveConeLayerBasis):
+        raise TypeError(
+            "_plot_autoregressive_alpha_factors expects AutoregressiveConeLayerBasis"
+        )
+    if pair_basis.dim() != 2:
+        raise ValueError(
+            f"_plot_autoregressive_alpha_factors expects dim=2, got {pair_basis.dim()}"
+        )
+
+    dtype, device = pair_basis.dtype_device()
+    x1 = torch.linspace(0.0, 1.0, n_grid, device=device, dtype=dtype)
+    y_d0 = torch.zeros(n_grid, 2, device=device, dtype=dtype)
+    y_d0[:, 0] = x1
+
+    X, Y, y_d1 = _unit_square_mesh(pair_basis, n_grid=n_grid)
+
+    with torch.no_grad():
+        torch.nn.Module.eval(pair_basis)
+        alpha0 = _eval_slot_alpha(pair_basis, y_d0, slot=0).detach().cpu()
+        alpha1 = _eval_slot_alpha(pair_basis, y_d1, slot=1).detach().cpu()
+
+    _plot_1d_basis_curves_grid(
+        alpha0,
+        x1.detach().cpu(),
+        out_path_d0,
+        title=title_d0 or r"$\alpha_{d=0}(x_1)$ by basis index",
+        xlabel="x1",
+        color="C0",
+    )
+    _plot_2d_values_grid(
+        alpha1,
+        X,
+        Y,
+        out_path_d1,
+        title=title_d1 or r"$\alpha_{d=1}(x_2; x_1)$ by basis index",
+    )
+
+
+def _plot_matrix_entries_vs_x1_overlay(
     mat: torch.Tensor,
     x1: torch.Tensor,
     out_path: Path,
     *,
     title: str,
     color: str = "C0",
+    ylabel: str = "entry",
 ) -> None:
-    """Plot ``(n_x1, m, m)`` matrix entries as an ``m x m`` subplot grid vs x1."""
+    """Overlay all ``(n_x1, n_rows, n_cols)`` matrix entry curves on one axes."""
     while mat.ndim > 3 and mat.shape[0] == 1:
         mat = mat.squeeze(0)
-    if mat.ndim != 3 or mat.shape[1] != mat.shape[2]:
+    if mat.ndim != 3:
         raise ValueError(
-            f"Expected mat shape (n_x1, m, m), got {tuple(mat.shape)}"
+            f"Expected mat shape (n_x1, n_rows, n_cols), got {tuple(mat.shape)}"
         )
     if x1.ndim != 1 or x1.shape[0] != mat.shape[0]:
         raise ValueError(
             f"x1 shape {tuple(x1.shape)} must be (n_x1,) matching mat={tuple(mat.shape)}"
         )
 
-    n_x1, m, _ = mat.shape
     x1_np = x1.detach().cpu().numpy()
-    mat_np = mat.detach().cpu().numpy()
+    # One column per entry so matplotlib draws all curves in a single call.
+    mat_np = mat.detach().cpu().numpy().reshape(mat.shape[0], -1)
 
-    fig, axes = plt.subplots(
-        m,
-        m,
-        figsize=(0.45 * m, 0.40 * m),
-        sharex=True,
-        sharey=True,
-        squeeze=False,
-    )
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.plot(x1_np, mat_np, color=color, lw=0.25, alpha=0.55)
+    ax.set_xlim(float(x1_np[0]), float(x1_np[-1]))
+    ax.set_xlabel("x1")
+    ax.set_ylabel(ylabel)
     if title:
-        fig.suptitle(title, y=1.01)
-
-    for i in range(m):
-        for j in range(m):
-            ax = axes[i, j]
-            ax.plot(x1_np, mat_np[:, i, j], color=color, lw=0.6)
-            ax.set_xlim(float(x1_np[0]), float(x1_np[-1]))
-            ax.tick_params(labelsize=3, length=1, pad=0.5)
-            if i < m - 1:
-                ax.set_xticklabels([])
-            if j > 0:
-                ax.set_yticklabels([])
-            if i == m - 1 and j == m // 2:
-                ax.set_xlabel("x1", fontsize=7)
-            if j == 0 and i == m // 2:
-                ax.set_ylabel("entry", fontsize=7)
-
-    fig.subplots_adjust(wspace=0.05, hspace=0.05)
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=400, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -457,7 +580,7 @@ def _plot_final_AB_entries_vs_x1(
 
     Slot ``d=0`` has an empty prefix, so A0/B0 are constant.  Slot ``d=1``
     (the non-constant factor for 2D) depends only on ``x1`` through the cone
-    layers.  Writes two ``m x m`` subplot grids (one entry per panel).
+    layers.  Writes two single-axes overlays (all entries as thin curves).
     """
     dim = pair_basis.dim()
     if not (0 < slot < dim):
@@ -481,14 +604,14 @@ def _plot_final_AB_entries_vs_x1(
         A = torch.einsum("ik,bkj->bij", pair_basis.L_A[slot], XA)
         B = torch.einsum("ik,bkj->bij", pair_basis.L_B[slot], XB)
 
-    _plot_matrix_entries_vs_x1_grid(
+    _plot_matrix_entries_vs_x1_overlay(
         A,
         x1,
         out_path_a,
         title=title_a or f"A_{slot}(x1) entries",
         color="C0",
     )
-    _plot_matrix_entries_vs_x1_grid(
+    _plot_matrix_entries_vs_x1_overlay(
         B,
         x1,
         out_path_b,
@@ -497,29 +620,92 @@ def _plot_final_AB_entries_vs_x1(
     )
 
 
+def _plot_final_XAB_entries_vs_x1(
+    pair_basis: AutoregressiveConeLayerBasis,
+    out_path_xa: Path,
+    out_path_xb: Path,
+    *,
+    slot: int = 1,
+    n_x1: int = 128,
+    title_xa: str = "",
+    title_xb: str = "",
+) -> None:
+    """Plot right factors X_A(x1), X_B(x1) for a non-constant slot.
+
+    ``X`` has shape ``(r, m)`` at each ``x1``; all entries are overlaid as
+    thin curves on a single axes per factor.
+    """
+    dim = pair_basis.dim()
+    if not (0 < slot < dim):
+        raise ValueError(
+            f"slot must be in 1..{dim - 1} (non-constant prefixes), got {slot}"
+        )
+    if not isinstance(pair_basis, AutoregressiveConeLayerBasis):
+        raise TypeError(
+            "_plot_final_XAB_entries_vs_x1 expects AutoregressiveConeLayerBasis"
+        )
+
+    dtype, device = pair_basis.dtype_device()
+    x1 = torch.linspace(0.0, 1.0, n_x1, device=device, dtype=dtype)
+    y = torch.zeros(n_x1, dim, device=device, dtype=dtype)
+    y[:, 0] = x1
+
+    with torch.no_grad():
+        torch.nn.Module.eval(pair_basis)
+        XA, XB = pair_basis._slot_state(y, slot)
+
+    _plot_matrix_entries_vs_x1_overlay(
+        XA,
+        x1,
+        out_path_xa,
+        title=title_xa or f"X_A_{slot}(x1) entries (r × m)",
+        color="C0",
+        ylabel=r"$X_A$",
+    )
+    _plot_matrix_entries_vs_x1_overlay(
+        XB,
+        x1,
+        out_path_xb,
+        title=title_xb or f"X_B_{slot}(x1) entries (r × m)",
+        color="C1",
+        ylabel=r"$X_B$",
+    )
+
+
 if __name__ == "__main__":
     problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 36
+    n_basis = 25
     bspline_degree = 3
-    n_cone_layers = 4
-    n_hidden_features = 64
+    n_cone_layers = 20
+    n_hidden_features = 32
+    n_hidden_layers = 2
+    rank_increase = 5
     tran_params = {
-        "n_epochs_per_group": [5, 5],  # wrap + cone layers, weights
-        "iterations": 10,
+        "n_epochs_per_group": [5, 3],  # wrap + cone layers, weights
+        "iterations": 40,
         "lr_basis": 1e-3,
         "lr_weights": 5e-2,
         "lr_wrap": 1e-3,
     }
+
+    #tran_params = {
+    #    "n_epochs_per_group": [1],  # all
+    #    "iterations": 100,
+    #    "lr_basis": 1e-3,
+    #    "lr_weights": 5e-2,
+    #    "lr_wrap": 1e-3,
+    #}
+
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
         "iterations": 20,
         "lr_weights": 1e-2,
     }
 
-    batch_size = 256
+    batch_size = 512  #256
     n_timesteps_prop = problem.n_timesteps
 
     ###
@@ -535,7 +721,7 @@ if __name__ == "__main__":
 
     m = n_basis
     d = dim
-    rank = max(1, ceil(m ** (1.0 / d))) 
+    rank = max(1, ceil(m ** (1.0 / d))) + rank_increase
 
     x0 = problem.train_initial_state_data()
     x_k, x_kp1 = problem.train_state_transition_data()
@@ -552,7 +738,7 @@ if __name__ == "__main__":
     if n_cells < 1:
         raise ValueError(f"n_basis={n_basis} too small for degree={bspline_degree}")
 
-    print(f"n_basis={m}, dim={d}, rank=ceil(m^(1/d))={rank}, n_cone_layers={n_cone_layers}")
+    print(f"n_basis={m}, dim={d}, rank=ceil(m^(1/d)) + rank_increase={rank}, n_cone_layers={n_cone_layers}")
 
     nom_alpha_basis = BSpline1DBasis(
         n_cells=n_cells,
@@ -569,15 +755,23 @@ if __name__ == "__main__":
     A0 = _positive_low_rank(d, m, rank, device=device)
     B0 = _positive_low_rank(d, m, rank, device=device)
 
+    update_mlp = MaskedInputMLP(
+        n_features=d,
+        n_layers=n_cone_layers,
+        m=m,
+        r=rank,
+        hidden_features=n_hidden_features,
+        num_hidden_layers=n_hidden_layers,
+    ).to(device)
+    _jitter_cone_mlp_last_layers(update_mlp)
+
     phi_psi_mutual = AutoregressiveConeLayerBasis(
         nom_alpha_basis,
         nom_beta_basis,
         A0,
         B0,
-        n_layers=n_cone_layers,
-        hidden_features=n_hidden_features,
+        update_mlp,
     ).to(device)
-    _jitter_cone_mlp_last_layers(phi_psi_mutual)
 
     g_coeffs = PositiveParameters.random_init(
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=1e-3
@@ -622,6 +816,16 @@ if __name__ == "__main__":
             lr=tran_params["lr_weights"],
         ),
     }
+    #optimizers = {
+    #    "all": torch.optim.Adam(
+    #        [
+    #            {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
+    #            #{"params": param_group_iter(A0.parameter_modules() + B0.parameter_modules()), "lr": tran_params["lr_basis"]},
+    #            {"params": tran_model.transform.parameters(), "lr": tran_params["lr_wrap"]},
+    #            {"params": param_group_iter((g_coeffs, B_coeffs)), "lr": tran_params["lr_weights"]},
+    #        ]
+    #    ),
+    #}
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(
         tran_model,
@@ -713,6 +917,18 @@ if __name__ == "__main__":
     )
     print(f"Saved 2D mutual psi grid to {mutual_psi_out}")
 
+    alpha_d0_out = output_dir / "alpha_d0_vs_x1.png"
+    alpha_d1_out = output_dir / "alpha_d1_vs_x1_x2.png"
+    _plot_autoregressive_alpha_factors(
+        phi_psi_mutual,
+        alpha_d0_out,
+        alpha_d1_out,
+        title_d0=r"VDP cone-layer: $\alpha_{d=0}(x_1)$ by basis index",
+        title_d1=r"VDP cone-layer: $\alpha_{d=1}(x_2; x_1)$ by basis index",
+    )
+    print(f"Saved alpha_d=0 curves to {alpha_d0_out}")
+    print(f"Saved alpha_d=1 fields to {alpha_d1_out}")
+
     a_vs_x1_out = output_dir / "A_final_layer_entries_vs_x1.png"
     b_vs_x1_out = output_dir / "B_final_layer_entries_vs_x1.png"
     _plot_final_AB_entries_vs_x1(
@@ -725,6 +941,19 @@ if __name__ == "__main__":
     )
     print(f"Saved final A entries vs x1 to {a_vs_x1_out}")
     print(f"Saved final B entries vs x1 to {b_vs_x1_out}")
+
+    xa_vs_x1_out = output_dir / "XA_final_layer_entries_vs_x1.png"
+    xb_vs_x1_out = output_dir / "XB_final_layer_entries_vs_x1.png"
+    _plot_final_XAB_entries_vs_x1(
+        phi_psi_mutual,
+        xa_vs_x1_out,
+        xb_vs_x1_out,
+        slot=1,
+        title_xa="VDP cone-layer: final X_A₁(x1) right factors (r × m)",
+        title_xb="VDP cone-layer: final X_B₁(x1) right factors (r × m)",
+    )
+    print(f"Saved final X_A entries vs x1 to {xa_vs_x1_out}")
+    print(f"Saved final X_B entries vs x1 to {xb_vs_x1_out}")
 
     cond_slice_out_path = output_dir / "conditional_slices_model_vs_data.png"
     _plot_conditional_slices_model_vs_data(

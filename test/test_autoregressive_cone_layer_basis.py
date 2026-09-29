@@ -16,6 +16,7 @@ import torch
 
 from rational_factor.models.autoregressive_basis import AutoregressiveConeLayerBasis
 from rational_factor.models.basis_functions import BSpline1DBasis
+from rational_factor.models.mlp import MaskedInputMLP
 from rational_factor.models.parameters import LowRankFactorizationParameters, PositiveParameters
 
 
@@ -46,13 +47,20 @@ def _make_basis() -> AutoregressiveConeLayerBasis:
     r = math.ceil(N_BASIS ** (1.0 / DIM))
     A0 = _positive_low_rank(DIM, N_BASIS, r)
     B0 = _positive_low_rank(DIM, N_BASIS, r)
+    update_mlp = MaskedInputMLP(
+        n_features=DIM,
+        n_layers=N_LAYERS,
+        m=N_BASIS,
+        r=r,
+        hidden_features=16,
+        num_hidden_layers=2,
+    )
     return AutoregressiveConeLayerBasis(
         nom_alpha,
         nom_beta,
         A0,
         B0,
-        n_layers=N_LAYERS,
-        hidden_features=16,
+        update_mlp,
     )
 
 

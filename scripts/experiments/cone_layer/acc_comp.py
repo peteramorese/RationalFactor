@@ -9,6 +9,7 @@ from normalizing_flow.transforms import Transforms
 from rational_factor.models.autoregressive_basis import AutoregressiveConeLayerBasis
 from rational_factor.models.basis_functions import BSpline1DBasis
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.mlp import MaskedInputMLP
 from rational_factor.models.parameters import (
     PositiveParameters,
     LowRankFactorizationParameters,
@@ -57,14 +58,26 @@ def _positive_low_rank(
     )
 
 
-def _jitter_cone_mlp_last_layers(pair: AutoregressiveConeLayerBasis, std: float = 1e-3) -> None:
-    """Break exact zero-init on update MLP heads so cone layers get signal."""
-    for layer in pair.update_mlps:
-        for mlp in layer:
-            if mlp.net is None:
-                continue
-            torch.nn.init.normal_(mlp.net[-1].weight, std=std)
-            torch.nn.init.zeros_(mlp.net[-1].bias)
+def _jitter_cone_mlp_last_layers(
+    mlp: MaskedInputMLP,
+    c_std: float = 1e-2,
+) -> None:
+    """Init cone MLP head so C is nonzero but raw_s = 0.
+
+    Exactly-zero C makes dX = 0 under the signed positivity step, so
+    s_min/s_max = ±∞ and ``tanh(0) * ∞`` yields NaN gradients.  A small C
+    bias with raw_s held at 0 keeps s = 0 (X stays at X0) while making the
+    step bounds finite.
+    """
+    with torch.no_grad():
+        split_c = mlp.m * mlp.r
+        split_full = split_c + mlp.r
+        torch.nn.init.zeros_(mlp.net[-1].weight)
+        bias = torch.zeros_like(mlp.net[-1].bias)
+        for ell in range(mlp.n_layers):
+            base = ell * split_full
+            bias[base : base + split_c].normal_(0.0, c_std)
+        mlp.net[-1].bias.copy_(bias)
 
 
 if __name__ == "__main__":
@@ -72,14 +85,16 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 81
+    n_basis = 200
     bspline_degree = 3
-    n_cone_layers = 4
-    n_hidden_features = 64
+    n_cone_layers = 10
+    n_hidden_features = 32
+    n_hidden_layers = 2
+    rank_increase = 0
     tran_params = {
         "n_epochs_per_group": [5, 3],  # wrap + cone layers, weights
         "iterations": 40,
-        "lr_basis": 3e-3,
+        "lr_basis": 1e-3,
         "lr_weights": 5e-2,
         "lr_wrap": 1e-3,
     }
@@ -103,7 +118,7 @@ if __name__ == "__main__":
 
     m = n_basis
     d = dim
-    rank = max(1, ceil(m ** (1.0 / d)))
+    rank = max(1, ceil(m ** (1.0 / d))) + rank_increase
 
     x0 = problem.train_initial_state_data()
     x_k, x_kp1 = problem.train_state_transition_data()
@@ -120,7 +135,7 @@ if __name__ == "__main__":
     if n_cells < 1:
         raise ValueError(f"n_basis={n_basis} too small for degree={bspline_degree}")
 
-    print(f"n_basis={m}, dim={d}, rank=ceil(m^(1/d))={rank}, n_cone_layers={n_cone_layers}")
+    print(f"n_basis={m}, dim={d}, rank=ceil(m^(1/d)) + rank_increase={rank}, n_cone_layers={n_cone_layers}")
 
     nom_alpha_basis = BSpline1DBasis(
         n_cells=n_cells,
@@ -137,15 +152,23 @@ if __name__ == "__main__":
     A0 = _positive_low_rank(d, m, rank, device=device)
     B0 = _positive_low_rank(d, m, rank, device=device)
 
+    update_mlp = MaskedInputMLP(
+        n_features=d,
+        n_layers=n_cone_layers,
+        m=m,
+        r=rank,
+        hidden_features=n_hidden_features,
+        num_hidden_layers=n_hidden_layers,
+    ).to(device)
+    _jitter_cone_mlp_last_layers(update_mlp)
+
     phi_psi_mutual = AutoregressiveConeLayerBasis(
         nom_alpha_basis,
         nom_beta_basis,
         A0,
         B0,
-        n_layers=n_cone_layers,
-        hidden_features=n_hidden_features,
+        update_mlp,
     ).to(device)
-    _jitter_cone_mlp_last_layers(phi_psi_mutual)
 
     g_coeffs = PositiveParameters.random_init(
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=1e-3

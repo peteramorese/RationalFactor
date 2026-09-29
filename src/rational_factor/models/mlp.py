@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 from rational_factor.models.structured_matrices import (
@@ -45,6 +47,127 @@ class MLP(torch.nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class MaskedInputMLP(MLP):
+    r"""Shared autoregressive-masked MLP over all slots and cone layers.
+
+    Takes ``x`` of shape ``(batch, D)`` and applies the triangular mask
+
+        ``x̃_ℓ = (x_0, …, x_{ℓ-1}, 0, …, 0)``
+
+    so every slot shares one network (slot ``0`` is input-independent).  The
+    shared head produces, for each slot and each of ``n_layers`` cone updates,
+
+        ``C_{ℓ,k} ∈ R^{m×r}``,   ``raw_s_{ℓ,k} ∈ R^r``,
+
+    returned as
+
+        ``C`` of shape ``(batch, D, n_layers, m, r)``,
+        ``raw_s`` of shape ``(batch, D, n_layers, r)``.
+
+    Multiple hidden layers use ``num_hidden_layers`` with uniform width
+    ``hidden_features``, or a sequence of per-layer widths.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        n_layers: int,
+        m: int,
+        r: int,
+        hidden_features: int | Sequence[int] = 128,
+        num_hidden_layers: int = 2,
+        activation=torch.nn.SiLU,
+        zero_init_last: bool = True,
+    ):
+        if n_features < 1:
+            raise ValueError(f"n_features must be positive, got {n_features}")
+        if n_layers < 0:
+            raise ValueError(f"n_layers must be nonnegative, got {n_layers}")
+        if m < 1 or r < 1:
+            raise ValueError(f"m and r must be positive, got m={m}, r={r}")
+
+        out_per_slot = n_layers * (m * r + r)
+
+        if isinstance(hidden_features, Sequence) and not isinstance(
+            hidden_features, (str, bytes)
+        ):
+            widths = tuple(int(h) for h in hidden_features)
+            if not widths:
+                raise ValueError("hidden_features sequence must be nonempty")
+            if any(h != widths[0] for h in widths):
+                uniform_hidden = False
+                custom_widths = widths
+                hidden_width = widths[0]
+                n_hidden = len(widths)
+            else:
+                uniform_hidden = True
+                custom_widths = None
+                hidden_width = widths[0]
+                n_hidden = len(widths)
+        else:
+            uniform_hidden = True
+            custom_widths = None
+            hidden_width = int(hidden_features)
+            n_hidden = int(num_hidden_layers)
+            if n_hidden < 0:
+                raise ValueError("num_hidden_layers must be nonnegative")
+
+        super().__init__(
+            in_features=n_features,
+            out_features=out_per_slot,
+            hidden_features=hidden_width,
+            num_hidden_layers=max(n_hidden, 0),
+            activation=activation,
+            zero_init_last=False,
+        )
+
+        if not uniform_hidden:
+            layers: list[torch.nn.Module] = []
+            last = n_features
+            for width in custom_widths:
+                layers += [torch.nn.Linear(last, width), activation()]
+                last = width
+            layers.append(torch.nn.Linear(last, out_per_slot))
+            self.net = torch.nn.Sequential(*layers)
+
+        if zero_init_last:
+            final = self.net[-1]
+            torch.nn.init.zeros_(final.weight)
+            torch.nn.init.zeros_(final.bias)
+
+        self.n_features = int(n_features)
+        self.n_layers = int(n_layers)
+        self.m = int(m)
+        self.r = int(r)
+        # Row ℓ keeps x_<ℓ; row 0 is all zeros.
+        self.register_buffer(
+            "_input_mask",
+            torch.tril(torch.ones(n_features, n_features), diagonal=-1),
+        )
+
+    def _masked_inputs(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.as_tensor(x)
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        if x.ndim != 2 or x.shape[1] != self.n_features:
+            raise ValueError(
+                f"x must have shape (batch, {self.n_features}), got {tuple(x.shape)}"
+            )
+        # (batch, D) -> (batch, D, D) with triangular zeros.
+        return x.unsqueeze(-2) * self._input_mask
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out = MLP.forward(self, self._masked_inputs(x))  # (batch, D, L*(m*r+r))
+        batch, d, _ = out.shape
+        per = self.m * self.r + self.r
+        out = out.reshape(batch, d, self.n_layers, per)
+        C = out[..., : self.m * self.r].reshape(
+            batch, d, self.n_layers, self.m, self.r
+        )
+        raw_s = out[..., self.m * self.r :]
+        return C, raw_s
 
 
 class MetzlerConeMLP(MLP):
