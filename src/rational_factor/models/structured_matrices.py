@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
+from typing import Any, Sequence
+
+
 
 import torch
+
 
 
 class Matrix(ABC):
@@ -1826,4 +1831,380 @@ class Order1Quasiseparable(Quasiseparable):
             g=gen.g.squeeze(-1),
             b=gen.b.squeeze(-1),
             h=gen.h.squeeze(-1),
+        )
+
+
+try:
+    import torchtt
+except ImportError:  # Keep the rest of this module importable without torchTT.
+    torchtt = None
+
+
+class TTMatrix(Matrix):
+    r"""Matrix stored as a Tensor-Train matrix / MPO.
+
+    Internally, torchTT represents a matrix with tensorized shape
+
+        (M_1 x ... x M_d) by (N_1 x ... x N_d),
+
+    using TT-matrix cores
+
+        core[k].shape == (
+            r[k],
+            M_k,
+            N_k,
+            r[k + 1],
+        ).
+
+    The public :class:`Matrix` interface sees only the flattened matrix
+
+        shape == (prod(M_k), prod(N_k)).
+
+    Notes
+    -----
+    * This class currently represents ONE TT matrix, i.e. there are no
+      independent leading matrix-batch dimensions.
+    * ``matvec(torch.Tensor)`` accepts dense flattened vectors / RHS matrices
+      and returns dense flattened outputs.
+    * ``matvec_tt(torchtt.TT)`` performs an exact TT-matrix x TT-vector
+      contraction and returns a TT vector. No rounding is performed, so output
+      TT ranks can grow as the product of the operator and vector ranks.
+    """
+
+    def __init__(
+        self,
+        tt_or_cores: Any,
+    ) -> None:
+        if torchtt is None:
+            raise ImportError(
+                "TTMatrix requires torchTT. Install it with `pip install torchTT`."
+            )
+
+        # Allow either an already-constructed torchtt.TT or a list of
+        # TT-matrix cores.
+        if isinstance(tt_or_cores, (list, tuple)):
+            tt = torchtt.TT(list(tt_or_cores))
+        else:
+            tt = tt_or_cores
+
+        if not isinstance(tt, torchtt.TT):
+            raise TypeError(
+                "tt_or_cores must be a torchtt.TT or a sequence of TT cores, "
+                f"got {type(tt_or_cores)!r}"
+            )
+
+        if not tt.is_ttm:
+            raise ValueError("TTMatrix requires a torchTT TT-matrix/operator.")
+
+        if len(tt.cores) == 0:
+            raise ValueError("TTMatrix requires at least one TT core.")
+
+        self._tt = tt
+
+        # torchTT convention:
+        #   M = row mode sizes
+        #   N = column mode sizes
+        self._row_modes = tuple(int(n) for n in tt.M)
+        self._col_modes = tuple(int(n) for n in tt.N)
+
+        self._n_rows = math.prod(self._row_modes)
+        self._n_cols = math.prod(self._col_modes)
+
+    # ------------------------------------------------------------------
+    # Construction / access
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_cores(
+        cls,
+        cores: Sequence[torch.Tensor],
+    ) -> TTMatrix:
+        r"""Construct directly from MPO cores.
+
+        Each core must have shape
+
+            (r_{k-1}, M_k, N_k, r_k),
+
+        with r_0 = r_d = 1.
+        """
+        return cls(list(cores))
+
+    @property
+    def tt(self) -> Any:
+        """Underlying ``torchtt.TT`` object."""
+        return self._tt
+
+    @property
+    def cores(self) -> tuple[torch.Tensor, ...]:
+        """TT-matrix cores."""
+        return tuple(self._tt.cores)
+
+    @property
+    def row_modes(self) -> tuple[int, ...]:
+        """Tensorized row dimensions ``(M_1, ..., M_d)``."""
+        return self._row_modes
+
+    @property
+    def col_modes(self) -> tuple[int, ...]:
+        """Tensorized column dimensions ``(N_1, ..., N_d)``."""
+        return self._col_modes
+
+    @property
+    def ranks(self) -> tuple[int, ...]:
+        """TT ranks ``(1, r_1, ..., r_{d-1}, 1)``."""
+        return tuple(int(r) for r in self._tt.R)
+
+    # ------------------------------------------------------------------
+    # Matrix interface
+    # ------------------------------------------------------------------
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size((self._n_rows, self._n_cols))
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._tt.cores[0].dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self._tt.cores[0].device
+
+    @property
+    def T(self) -> TTMatrix:
+        # Exact: each core swaps its M_k and N_k indices.
+        return TTMatrix(self._tt.t())
+
+    def to_dense(self) -> torch.Tensor:
+        r"""Materialize the full flattened matrix.
+
+        torchTT returns the operator tensor in mode order
+
+            (M_1, ..., M_d, N_1, ..., N_d),
+
+        so a reshape gives the ordinary flattened matrix.
+        """
+        return self._tt.full().reshape(self._n_rows, self._n_cols)
+
+    # ------------------------------------------------------------------
+    # Dense-vector matvec
+    # ------------------------------------------------------------------
+
+    def _matvec_dense_batch(self, x: torch.Tensor) -> torch.Tensor:
+        r"""Apply the TT matrix to a 2-D batch ``(B, n_cols)``.
+
+        Returns
+        -------
+        Tensor
+            Shape ``(B, n_rows)``.
+
+        This is still an implicit TT contraction: the matrix is never
+        materialized.
+        """
+        if x.ndim != 2 or x.shape[-1] != self._n_cols:
+            raise ValueError(
+                f"expected x with shape (B, {self._n_cols}), "
+                f"got {tuple(x.shape)}"
+            )
+
+        batch = x.shape[0]
+
+        # Flattened column index j <-> tensorized index (j_1, ..., j_d).
+        x_tt_shape = x.reshape(batch, *self._col_modes)
+
+        # torchTT contracts over the last N_1,...,N_d modes and leaves
+        # the batch dimension untouched.
+        y_tt_shape = self._tt @ x_tt_shape
+
+        # Tensorized row index -> flattened matrix row index.
+        return y_tt_shape.reshape(batch, self._n_rows)
+
+    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+        r"""Apply the TT matrix to dense flattened vectors.
+
+        Accepted shapes are consistent with :class:`Matrix`:
+
+        ``(..., n_cols)``
+            Batched vectors.
+
+        ``(..., n_cols, k)``
+            Batched matrices / multiple right-hand sides.
+
+        Returns respectively
+
+        ``(..., n_rows)`` or ``(..., n_rows, k)``.
+        """
+        x = torch.as_tensor(
+            x,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        if x.ndim == 0:
+            raise ValueError(
+                f"x must have shape (..., {self._n_cols}) or "
+                f"(..., {self._n_cols}, k), got scalar"
+            )
+
+        # Follow the same convention as Matrix.inverse_matvec:
+        # if the second-to-last dimension is n_cols, interpret the final
+        # dimension as multiple RHS columns.
+        if x.ndim >= 2 and x.shape[-2] == self._n_cols:
+            # (..., n_cols, k)
+            #
+            # Move RHS index before the flattened vector dimension:
+            #
+            # (..., n_cols, k) -> (..., k, n_cols)
+            x_rhs = x.transpose(-2, -1)
+            leading = x_rhs.shape[:-1]
+
+            x_flat = x_rhs.reshape(-1, self._n_cols)
+            y_flat = self._matvec_dense_batch(x_flat)
+
+            # (..., k, n_rows) -> (..., n_rows, k)
+            y = y_flat.reshape(*leading, self._n_rows)
+            return y.transpose(-2, -1)
+
+        if x.shape[-1] == self._n_cols:
+            # (..., n_cols)
+            leading = x.shape[:-1]
+
+            x_flat = x.reshape(-1, self._n_cols)
+            y_flat = self._matvec_dense_batch(x_flat)
+
+            return y_flat.reshape(*leading, self._n_rows)
+
+        raise ValueError(
+            f"x must have shape (..., {self._n_cols}) or "
+            f"(..., {self._n_cols}, k), got {tuple(x.shape)}"
+        )
+
+    # ------------------------------------------------------------------
+    # TT-vector matvec
+    # ------------------------------------------------------------------
+
+    def matvec_tt(self, x: Any) -> Any:
+        r"""Exact TT-matrix x TT-vector multiplication.
+
+        Parameters
+        ----------
+        x:
+            A non-matrix ``torchtt.TT`` with tensorized shape
+            ``self.col_modes``.
+
+        Returns
+        -------
+        torchtt.TT
+            TT vector with tensorized shape ``self.row_modes``.
+
+        Notes
+        -----
+        No TT rounding/compression is performed. If the matrix ranks are
+        ``R_k`` and vector ranks are ``S_k``, the exact output ranks are
+        bounded by approximately ``R_k * S_k``.
+        """
+        if torchtt is None:
+            raise ImportError("torchTT is not installed.")
+
+        if not isinstance(x, torchtt.TT):
+            raise TypeError(
+                f"x must be a torchtt.TT, got {type(x)!r}"
+            )
+
+        if x.is_ttm:
+            raise ValueError("matvec_tt expects a TT vector, not a TT matrix.")
+
+        x_modes = tuple(int(n) for n in x.N)
+        if x_modes != self._col_modes:
+            raise ValueError(
+                "TT-vector mode shape does not match matrix column modes: "
+                f"{x_modes} != {self._col_modes}"
+            )
+
+        # Exact torchTT contraction. No .round() and no fast_matvec().
+        return self._tt @ x
+
+    def rev_matvec_tt(self, x: Any) -> Any:
+        """Exact ``M.T @ x`` for a TT vector."""
+        return self.T.matvec_tt(x)
+
+    # Let ``M @ x_tt`` work naturally as well.
+    def __matmul__(self, other: Any) -> Any:
+        if torchtt is not None and isinstance(other, torchtt.TT):
+            return self.matvec_tt(other)
+        return self.matvec(other)
+
+    # ------------------------------------------------------------------
+    # Cheap structured operations
+    # ------------------------------------------------------------------
+
+    def sum(self) -> torch.Tensor:
+        """Sum all matrix entries without materializing the matrix."""
+        return self._tt.sum()
+
+    def diag(self) -> torch.Tensor:
+        r"""Main diagonal without materializing, when modes align.
+
+        For a mode-wise square operator
+
+            M_k == N_k
+
+        the ordinary flattened diagonal is exactly the TT diagonal.
+
+        If the row/column tensorizations differ, fall back to the generic
+        dense implementation because local mode-wise diagonal extraction
+        would not necessarily equal the flattened matrix diagonal.
+        """
+        if self._row_modes == self._col_modes:
+            return torchtt.diag(self._tt).full().reshape(-1)
+        return super().diag()
+
+    def scale(self, s: torch.Tensor | float) -> Matrix:
+        r"""Scale by a scalar while preserving TT structure."""
+        s = torch.as_tensor(
+            s,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        if s.numel() != 1:
+            # There is no matrix batch axis in this implementation.
+            return super().scale(s)
+
+        return TTMatrix(self._tt * s)
+
+    # ------------------------------------------------------------------
+    # Convenience
+    # ------------------------------------------------------------------
+
+    def to(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> TTMatrix:
+        """Move/cast all TT cores."""
+        if device is None:
+            device = self.device
+        if dtype is None:
+            dtype = self.dtype
+
+        return TTMatrix(
+            self._tt.to(
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+    def clone(self) -> TTMatrix:
+        return TTMatrix(self._tt.clone())
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"shape={tuple(self.shape)}, "
+            f"modes={list(zip(self.row_modes, self.col_modes))}, "
+            f"ranks={self.ranks}, "
+            f"dtype={self.dtype}, "
+            f"device={self.device})"
         )

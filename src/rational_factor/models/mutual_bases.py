@@ -3,26 +3,26 @@ from __future__ import annotations
 import math
 from math import ceil
 
-import torch
 
-import numpy as np
-from numpy.polynomial.legendre import leggauss
+from collections.abc import Sequence
+
+import torch
+import torch.nn.functional as F
 
 from normalizing_flow.vp_flow import ConditionalUnitBoxVolumePreservingFlow
-from rational_factor.models.basis_functions import Basis, BetaBasis, GaussianBasis
+from rational_factor.models.basis_functions import Basis, SeparableBasis, BetaBasis, GaussianBasis
 from rational_factor.models.density_model import ConditionalDensityModel
 from nflows.transforms.base import Transform
-from rational_factor.models.parameters import Parameters, Order1QuasiseparableFactorization
+from rational_factor.models.parameters import Parameters
 from rational_factor.models.structured_matrices import (
     Banded,
+    TTMatrix,
     DenseMatrix,
     Identity,
     Diagonal,
     Matrix,
-    Order1QSGenerators,
-    Order1Quasiseparable,
-    Rank1PlusDiagonal,
     )
+
 
 
 class MutualPairBasis:
@@ -434,228 +434,547 @@ class NormalizedProductPairBasis(torch.nn.Module, MutualPairBasis):
         return self.supremum_bound(index)
 
 
-# Backward-compatible alias.
-NFPairBasis = NormalizedProductPairBasis
+class TTMutualBasis(torch.nn.Module, MutualPairBasis):
+    r"""Mutual basis whose m = p**d functions are represented by TT cores.
 
+    Let ``phi_primitive`` and ``psi_primitive`` be SeparableBasis objects
+    containing p primitive 1-D basis functions in each of d dimensions.
 
-class MaskedGramMutualBasis(torch.nn.Module, MutualPairBasis):
-    """
-    Elementwise product of a masking basis and a free basis to achieve a
-    diagonal matched Gram matrix.
+    A basis-function index is tensorized as
 
-    If ``free_basis`` is ``None``, the rest space is 0-dimensional and the free
-    pair is the identity ``α = β = 1``.
+        i = (i_1, ..., i_d),    i_k = 0, ..., p-1,
 
-    If ``swap_alpha_beta`` is True, logical index 0 is the underlying beta and
-    index 1 is the underlying alpha; ``Omega2`` is transposed accordingly so
-    it remains ``∫ logical_α_i logical_β_j``.
+    so the total number of multivariate basis functions is
+
+        m = p**d.
+
+    At dimension k, phi has a nonnegative coefficient core
+
+        A_phi[k] : (r_{k-1}, p, p, r_k)
+
+    whose entries are indexed as
+
+        A_phi[k][a, i_k, alpha_k, b].
+
+    The resulting basis function is
+
+        phi_i(x)
+          = sum_{alpha_1,...,alpha_d}
+              A_phi[0][i_1,alpha_1]
+              ...
+              A_phi[d-1][i_d,alpha_d]
+              prod_k primitive_phi[alpha_k](x_k),
+
+    with matrix multiplication/contraction over the TT rank indices.
+
+    psi is represented analogously.
+
+    Because primitive functions and coefficient cores are nonnegative,
+    all resulting phi_i and psi_j are nonnegative.
+
+    The cross Gram is returned directly as a TTMatrix/MPO.  Its k-th core is
+
+        W_k[(a,c), i, j, (b,d)]
+          = sum_{alpha,beta}
+              A_phi[k][a,i,alpha,b]
+              H_k[alpha,beta]
+              A_psi[k][c,j,beta,d],
+
+    where
+
+        H_k[alpha,beta]
+          = <primitive_phi_alpha, primitive_psi_beta>_k.
+
+    Thus if phi and psi have TT rank r, the Gram MPO has ranks at most r**2.
+
+    Notes
+    -----
+    The current TTMatrix implementation is unbatched. Therefore Omega2()
+    currently requires the primitive 1-D Gram to have batch size 1.
+    eval(), however, supports ordinary data batches.
     """
 
     def __init__(
         self,
-        masking_basis: LocalBSplineMutualBasis,
-        sacrificial_index: int,
-        free_basis: VolumePreservingPairBasis | NormalizedProductPairBasis | None = None,
-        coeffs: tuple[Parameters | None, Parameters | None] | None = None,
-        swap_alpha_beta: bool = False,
+        phi_primitive: SeparableBasis,
+        psi_primitive: SeparableBasis,
+        rank: int | Sequence[int] = 1,
+        *,
+        init_std: float = 0.1,
     ):
         torch.nn.Module.__init__(self)
-        if masking_basis.dim() != 1:
-            raise ValueError("masking_basis must be 1-dimensional")
 
-        if free_basis is None:
-            dim = 1
-            if sacrificial_index != 0:
-                raise ValueError(
-                    "sacrificial_index must be 0 when free_basis is None (0-d rest space)"
-                )
-        else:
-            dim = free_basis.dim() + 1
-            if not (0 <= sacrificial_index < dim):
-                raise ValueError(
-                    f"sacrificial_index must be in [0, {dim}), got {sacrificial_index}"
-                )
-            if masking_basis.n_basis_functions() != free_basis.n_basis_functions():
-                raise ValueError(
-                    f"masking_basis n_basis {masking_basis.n_basis_functions()} must match "
-                    f"free_basis n_basis {free_basis.n_basis_functions()}"
-                )
+        # --------------------------------------------------------------
+        # Validate primitive bases.
+        # --------------------------------------------------------------
+        if phi_primitive.dim() != psi_primitive.dim():
+            raise ValueError(
+                "phi_primitive and psi_primitive must have the same dimension, "
+                f"got {phi_primitive.dim()} and {psi_primitive.dim()}"
+            )
+
+        if phi_primitive.batch_size() != psi_primitive.batch_size():
+            raise ValueError(
+                "phi_primitive and psi_primitive must have the same batch size, "
+                f"got {phi_primitive.batch_size()} and "
+                f"{psi_primitive.batch_size()}"
+            )
+
+        p = phi_primitive.n_basis_functions()
+
+        if psi_primitive.n_basis_functions() != p:
+            raise ValueError(
+                "For this implementation, phi_primitive and psi_primitive "
+                "must have the same number p of primitive 1-D basis functions. "
+                f"Got {p} and {psi_primitive.n_basis_functions()}."
+            )
+
+        d = phi_primitive.dim()
+        m = p**d
+
+        phi_dtype, phi_device = phi_primitive.dtype_device()
+        psi_dtype, psi_device = psi_primitive.dtype_device()
+
+        if phi_dtype != psi_dtype:
+            raise ValueError(
+                "phi_primitive and psi_primitive must have the same dtype, "
+                f"got {phi_dtype} and {psi_dtype}"
+            )
+        if phi_device != psi_device:
+            raise ValueError(
+                "phi_primitive and psi_primitive must be on the same device, "
+                f"got {phi_device} and {psi_device}"
+            )
 
         MutualPairBasis.__init__(
             self,
-            dim,
-            masking_basis.batch_size(),
-            masking_basis.n_basis_functions(),
-            masking_basis._params,
-            coeffs,
+            dim=d,
+            batch_size=phi_primitive.batch_size(),
+            n_basis=m,
+            params=(),
         )
-        self.masking_basis = masking_basis
-        self.free_basis = free_basis
-        self.sacrificial_index = sacrificial_index
-        self.swap_alpha_beta = bool(swap_alpha_beta)
+
+        self.phi_primitive = phi_primitive
+        self.psi_primitive = psi_primitive
+
+        self._p = p
+        self._ranks = self._normalize_ranks(d, rank)
+
+        # --------------------------------------------------------------
+        # Raw trainable cores.
+        #
+        # softplus(raw_core) is used everywhere below, guaranteeing
+        # nonnegative TT coefficients.
+        # --------------------------------------------------------------
+        self.phi_raw_cores = torch.nn.ParameterList()
+        self.psi_raw_cores = torch.nn.ParameterList()
+
+        for k in range(d):
+            r_left = self._ranks[k]
+            r_right = self._ranks[k + 1]
+
+            shape = (r_left, p, p, r_right)
+
+            phi_raw = self._initial_raw_core(
+                shape,
+                p=p,
+                r_right=r_right,
+                dtype=phi_dtype,
+                device=phi_device,
+                std=init_std,
+            )
+
+            psi_raw = self._initial_raw_core(
+                shape,
+                p=p,
+                r_right=r_right,
+                dtype=psi_dtype,
+                device=psi_device,
+                std=init_std,
+            )
+
+            self.phi_raw_cores.append(torch.nn.Parameter(phi_raw))
+            self.psi_raw_cores.append(torch.nn.Parameter(psi_raw))
+
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_ranks(
+        d: int,
+        rank: int | Sequence[int],
+    ) -> tuple[int, ...]:
+        """Return TT rank tuple ``(1, r_1, ..., r_{d-1}, 1)``."""
+
+        if isinstance(rank, int):
+            if rank < 1:
+                raise ValueError(f"rank must be >= 1, got {rank}")
+            return (1,) + (rank,) * max(d - 1, 0) + (1,)
+
+        ranks = tuple(int(r) for r in rank)
+
+        # Conveniently allow just the internal ranks.
+        if len(ranks) == d - 1:
+            ranks = (1,) + ranks + (1,)
+
+        if len(ranks) != d + 1:
+            raise ValueError(
+                f"rank sequence must have length d-1={d - 1} "
+                f"or d+1={d + 1}, got {len(ranks)}"
+            )
+
+        if ranks[0] != 1 or ranks[-1] != 1:
+            raise ValueError(
+                "TT boundary ranks must both equal 1, "
+                f"got {ranks[0]} and {ranks[-1]}"
+            )
+
+        if any(r < 1 for r in ranks):
+            raise ValueError(f"all TT ranks must be >= 1, got {ranks}")
+
+        return ranks
+
+    @staticmethod
+    def _initial_raw_core(
+        shape: tuple[int, int, int, int],
+        *,
+        p: int,
+        r_right: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        std: float,
+    ) -> torch.Tensor:
+        """Initialize raw parameters at a modest positive softplus value."""
+
+        # Avoid huge initial products/sums across dimensions.
+        target = 1.0 / max(p * r_right, 1)
+
+        target_t = torch.tensor(target, dtype=dtype, device=device)
+        raw_mean = torch.log(torch.expm1(target_t))
+
+        return raw_mean + std * torch.randn(
+            shape,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _phi_core(self, k: int) -> torch.Tensor:
+        return F.softplus(self.phi_raw_cores[k])
+
+    def _psi_core(self, k: int) -> torch.Tensor:
+        return F.softplus(self.psi_raw_cores[k])
+
+    # ------------------------------------------------------------------
+    # Useful metadata
+    # ------------------------------------------------------------------
+
+    @property
+    def mode_size(self) -> int:
+        """Number p of function indices per TT site."""
+        return self._p
+
+    @property
+    def tt_ranks(self) -> tuple[int, ...]:
+        return self._ranks
 
     def dtype_device(self):
-        return self.masking_basis.dtype_device()
+        core = self.phi_raw_cores[0]
+        return core.dtype, core.device
 
-    def _pair_index(self, index: int | None) -> int | None:
-        """Map logical (α, β) index to underlying (α, β) index."""
-        if self.swap_alpha_beta and index in (0, 1):
-            return 1 - index
-        return index
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
 
-    def _ones(self, n_data: int | None = None) -> torch.Tensor:
+    def _eval_side(
+        self,
+        y: torch.Tensor,
+        primitive: SeparableBasis,
+        *,
+        side: int,
+    ) -> torch.Tensor:
+        """Evaluate all p**d functions for one side.
+
+        Returns
+        -------
+        Tensor
+            Shape ``(batch, p**d)``.
+
+        Flattening convention
+        ---------------------
+        The function grid
+
+            (i_1, ..., i_d)
+
+        is flattened in standard PyTorch row-major order, so ``i_d`` varies
+        fastest. This is the same ordering used by TTMatrix when its row modes
+        are ``(p, ..., p)``.
+        """
+
         dtype, device = self.dtype_device()
-        if n_data is None:
-            return torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)
-        return torch.ones(n_data, self._n_basis, dtype=dtype, device=device)
 
-    def _free_eval(self, x_rest: torch.Tensor, index: int | None):
-        if self.free_basis is None:
-            ones = self._ones(x_rest.shape[0])
-            if index in (0, 1):
-                return ones
-            if index is None:
-                return torch.stack([ones, ones], dim=1)
-            raise ValueError("index must be 0, 1, or None")
-        return self.free_basis.eval(x_rest, index)
-
-    def _free_Omega1(self, index: int) -> torch.Tensor:
-        if self.free_basis is None:
-            if index not in (0, 1):
-                raise ValueError("index must be 0 or 1")
-            # Empty product over no free coordinates is the constant 1.
-            return self._ones()
-        return self.free_basis.Omega1(index)
-
-    def _free_Omega2_diag(self) -> torch.Tensor:
-        if self.free_basis is None:
-            return self._ones()
-        return self.free_basis.Omega2_diag()
-
-    def _free_supremum(self, index: int) -> torch.Tensor:
-        if self.free_basis is None:
-            if index not in (0, 1):
-                raise ValueError("index must be 0 or 1")
-            return self._ones()
-        return self.free_basis.supremum(index)
-
-    def _split_coords(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        y = torch.as_tensor(y)
-        if y.ndim == 1:
-            y = y.unsqueeze(0)
-        if y.ndim != 2 or y.shape[1] != self._dim:
-            raise ValueError(f"y must have shape (n_data, {self._dim}), got {tuple(y.shape)}")
-        l = self.sacrificial_index
-        rest = [i for i in range(self._dim) if i != l]
-        return y[:, l], y[:, rest]
-
-    def _omega2_unswapped(self) -> Matrix:
-        return self.masking_basis.Omega2().mul_diag_right(self._free_Omega2_diag())
-
-    def eval(self, y: torch.Tensor | None = None, index: int | None = None):
-        if y is None:
-            return torch.nn.Module.eval(self)
-        x_l, x_rest = self._split_coords(y)
-        raw = self._pair_index(index)
-        if raw is None:
-            out = self.masking_basis.eval(x_l, None) * self._free_eval(x_rest, None)
-            return out.flip(1) if self.swap_alpha_beta else out
-        return self.masking_basis.eval(x_l, raw) * self._free_eval(x_rest, raw)
-
-    def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
-        if lows is not None or highs is not None:
-            raise ValueError("MaskedGramMutualBasis.Omega1 is only defined on the full domain")
-        raw = self._pair_index(index)
-        return self.masking_basis.Omega1(raw) * self._free_Omega1(raw)
-
-    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
-        if lows is not None or highs is not None:
-            raise ValueError("MaskedGramMutualBasis.Omega2 is only defined on the full domain")
-        G = self._omega2_unswapped()
-        return G.T if self.swap_alpha_beta else G
-
-    def supremum(self, index: int) -> torch.Tensor:
-        # Local B-spline alpha is a partition of unity (≤ 1), so
-        # α = α_mask α_free ≤ α_free ≤ free.supremum(0).
-        if self._pair_index(index) == 0:
-            return self._free_supremum(0)
-        raise NotImplementedError("MaskedGramMutualBasis.supremum is only implemented for alpha")
-
-
-class PositiveMaskedGramMutualBasis(MaskedGramMutualBasis):
-    r"""Masked pair with a positivity correction on beta only.
-
-    Alpha is the unsigned product (assumed nonnegative):
-
-        α_i(y) = α^m_i(x_s) α^f_i(x_rest)
-
-    Beta corrects the possibly-negative masking dual with
-    ``b_j = relu(-β^m_j)`` and a free-beta bound ``u_b ≥ β^f``:
-
-        β_j(y) = β^m_j(x_s) β^f_j(x_rest) + u_{b,j} \, b_j(x_s)
-
-    When ``β^m_j ≥ 0`` the correction vanishes. When ``β^m_j < 0``,
-    ``β_j = β^m_j (β^f_j - u_{b,j}) ≥ 0`` provided ``β^f_j ≤ u_{b,j}``.
-    If ``free_basis is None`` then ``α^f = β^f = u_b = 1`` and
-    ``β = relu(β^m)``.
-
-    The matched Gram gains one extra term from the correction:
-
-        ∫ α_i β_j = (Ω²_mask ∘ Ω²_free)_{ij}
-            + G^{αb}_{ij} (Ω¹_free_α)_i u_{b,j}
-
-    i.e. ``Omega2_alpha_b().mul_diag_left(free.Omega1(0)).mul_diag_right(u_b)``.
-
-    With ``swap_alpha_beta=True``, logical index 0 is the corrected beta and
-    index 1 is unsigned alpha; ``Omega2`` is transposed to match.
-    """
-
-    def eval(self, y: torch.Tensor | None = None, index: int | None = None):
-        if y is None:
-            return torch.nn.Module.eval(self)
-        if index not in (0, 1, None):
-            raise ValueError("index must be 0, 1, or None")
-
-        x_l, x_rest = self._split_coords(y)
-        u_b = self._free_supremum(1)
-        alpha = self.masking_basis.eval(x_l, 0) * self._free_eval(x_rest, 0)
-        beta = self.masking_basis.eval(x_l, 1) * self._free_eval(x_rest, 1) + self.masking_basis.eval_b(x_l) * u_b
-        if self.swap_alpha_beta:
-            alpha, beta = beta, alpha
-
-        if index == 0:
-            return alpha
-        if index == 1:
-            return beta
-        return torch.stack([alpha, beta], dim=1)
-
-    def Omega1(self, index: int, lows: torch.Tensor = None, highs: torch.Tensor = None) -> torch.Tensor:
-        if lows is not None or highs is not None:
-            raise ValueError("PositiveMaskedGramMutualBasis.Omega1 is only defined on the full domain")
-        # Integral of unsigned alpha only; corrected beta needs ∫b.
-        if self._pair_index(index) == 0:
-            return self.masking_basis.Omega1(0) * self._free_Omega1(0)
-        raise NotImplementedError(
-            "PositiveMaskedGramMutualBasis.Omega1 for beta requires ∫b, not yet implemented"
+        y = torch.as_tensor(
+            y,
+            dtype=dtype,
+            device=device,
         )
 
-    def Omega2(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> Matrix:
-        if lows is not None or highs is not None:
-            raise ValueError("PositiveMaskedGramMutualBasis.Omega2 is only defined on the full domain")
-        unsigned = self._omega2_unswapped()
-        gab = self.masking_basis.Omega2_alpha_b()
-        omega1 = self._free_Omega1(0)
-        u_b = self._free_supremum(1)
-        # extra_ij = Gab_ij * omega1_i * u_b_j  (underlying α row, β column)
-        if omega1.shape[0] == 1 and u_b.shape[0] == 1:
-            extra = gab.mul_diag_left(omega1[0]).mul_diag_right(u_b[0])
-            G = DenseMatrix(unsigned.to_dense() + extra.to_dense())
-        else:
-            extra_dense = omega1.unsqueeze(-1) * gab.to_dense() * u_b.unsqueeze(-2)
-            G = DenseMatrix(unsigned.to_dense() + extra_dense)
-        return G.T if self.swap_alpha_beta else G
+        if y.ndim == 1:
+            y = y.unsqueeze(0)
 
-    def supremum(self, index: int) -> torch.Tensor:
-        if self._pair_index(index) == 0:
-            return self._free_supremum(0)
-        raise NotImplementedError("PositiveMaskedGramMutualBasis.supremum is only implemented for alpha")
+        if y.ndim != 2 or y.shape[1] != self._dim:
+            raise ValueError(
+                f"y must have shape (batch, {self._dim}), "
+                f"got {tuple(y.shape)}"
+            )
+
+        # (batch, d, p)
+        primitive_values = primitive.eval_dim(y)
+
+        if primitive_values.shape != (
+            y.shape[0],
+            self._dim,
+            self._p,
+        ):
+            raise ValueError(
+                "primitive.eval_dim returned an unexpected shape: "
+                f"expected {(y.shape[0], self._dim, self._p)}, "
+                f"got {tuple(primitive_values.shape)}"
+            )
+
+        cores = (
+            [self._phi_core(k) for k in range(self._dim)]
+            if side == 0
+            else [self._psi_core(k) for k in range(self._dim)]
+        )
+
+        batch = y.shape[0]
+
+        # Start with the left TT boundary rank r_0 = 1.
+        #
+        # During the sweep:
+        #
+        #   out.shape =
+        #       (batch, i_1, ..., i_k, r_k)
+        #
+        out = torch.ones(
+            batch,
+            1,
+            dtype=dtype,
+            device=device,
+        )
+
+        for k, core in enumerate(cores):
+            # core:
+            #   (r_{k-1}, i_k, alpha_k, r_k)
+            #
+            # primitive_values[:, k]:
+            #   (batch, alpha_k)
+            #
+            # local:
+            #   (batch, r_{k-1}, i_k, r_k)
+            local = torch.einsum(
+                "nu,aiur->nair",
+                primitive_values[:, k, :],
+                core,
+            )
+
+            # Contract the previous TT rank while appending the new
+            # function-grid index i_k.
+            #
+            # before:
+            #   out   : (batch, i_1, ..., i_{k-1}, r_{k-1})
+            #   local : (batch, r_{k-1}, i_k, r_k)
+            #
+            # after:
+            #   out   : (batch, i_1, ..., i_k, r_k)
+            out = torch.einsum(
+                "n...a,nair->n...ir",
+                out,
+                local,
+            )
+
+        # Final TT boundary rank is 1.
+        out = out.squeeze(-1)
+
+        return out.reshape(batch, self._n_basis)
+
+    def eval(
+        self,
+        y: torch.Tensor | None = None,
+        index: int | None = None,
+    ):
+        """Evaluate phi, psi, or both.
+
+        Parameters
+        ----------
+        y:
+            Input with shape ``(batch, d)``.
+        index:
+            ``0`` -> phi
+            ``1`` -> psi
+            ``None`` -> both
+
+        Returns
+        -------
+        index == 0 or 1:
+            ``(batch, m)``
+        index is None:
+            ``(batch, 2, m)``
+        """
+
+        # Preserve torch.nn.Module.eval() behavior.
+        if y is None:
+            return torch.nn.Module.eval(self)
+
+        if index not in (0, 1, None):
+            raise ValueError(
+                f"index must be 0, 1, or None, got {index!r}"
+            )
+
+        if index == 0:
+            return self._eval_side(
+                y,
+                self.phi_primitive,
+                side=0,
+            )
+
+        if index == 1:
+            return self._eval_side(
+                y,
+                self.psi_primitive,
+                side=1,
+            )
+
+        phi = self._eval_side(
+            y,
+            self.phi_primitive,
+            side=0,
+        )
+        psi = self._eval_side(
+            y,
+            self.psi_primitive,
+            side=1,
+        )
+
+        return torch.stack((phi, psi), dim=1)
+
+    # ------------------------------------------------------------------
+    # Gram / Omega2
+    # ------------------------------------------------------------------
+
+    def Omega2(
+        self,
+        lows: torch.Tensor = None,
+        highs: torch.Tensor = None,
+    ) -> Matrix:
+        r"""Return the exact phi/psi cross Gram as a TTMatrix.
+
+        For dimension k, let
+
+            H_k[alpha,beta]
+              = integral primitive_phi_alpha(x_k)
+                         primitive_psi_beta(x_k) dx_k.
+
+        The Gram MPO core is
+
+            W_k[(a,c), i, j, (b,d)]
+              =
+                sum_{alpha,beta}
+                    A_phi[k][a,i,alpha,b]
+                    H_k[alpha,beta]
+                    A_psi[k][c,j,beta,d].
+
+        Hence the Gram's TT/MPO ranks are the products of the phi and psi
+        ranks. With equal rank r, its internal MPO rank is at most r**2.
+        """
+
+        # (primitive_batch, d, p, p)
+        log_H = self.phi_primitive.log_Omega2_dim(
+            self.psi_primitive,
+            lows=lows,
+            highs=highs,
+        )
+
+        expected_tail = (
+            self._dim,
+            self._p,
+            self._p,
+        )
+
+        if log_H.ndim != 4 or tuple(log_H.shape[1:]) != expected_tail:
+            raise ValueError(
+                "phi_primitive.log_Omega2_dim(psi_primitive) returned "
+                "an unexpected shape: expected "
+                f"(batch, {self._dim}, {self._p}, {self._p}), "
+                f"got {tuple(log_H.shape)}"
+            )
+
+        # The TTMatrix implementation written previously represents one
+        # operator, not a leading batch of operators.
+        if log_H.shape[0] != 1:
+            raise NotImplementedError(
+                "TTMutualBasis.Omega2 currently requires primitive Gram "
+                "batch size 1 because TTMatrix is currently unbatched. "
+                f"Got batch size {log_H.shape[0]}. "
+                "eval() still supports ordinary data batches."
+            )
+
+        # (d, p, p)
+        H = torch.exp(log_H[0])
+
+        gram_cores: list[torch.Tensor] = []
+
+        for k in range(self._dim):
+            A = self._phi_core(k)
+            B = self._psi_core(k)
+            Hk = H[k]
+
+            # Shapes:
+            #
+            #   A  : (ra0, i, alpha, ra1)
+            #   Hk : (alpha, beta)
+            #   B  : (rb0, j, beta, rb1)
+            #
+            # First contract the primitive phi index against H.
+            #
+            #   AH : (ra0, i, beta, ra1)
+            AH = torch.einsum(
+                "aiub,uv->aivb",
+                A,
+                Hk,
+            )
+
+            # Contract beta with the psi core.
+            #
+            # Result:
+            #
+            #   W6 :
+            #       (ra0, rb0, i, j, ra1, rb1)
+            W6 = torch.einsum(
+                "aivb,cjvd->acijbd",
+                AH,
+                B,
+            )
+
+            ra0, _, _, ra1 = A.shape
+            rb0, _, _, rb1 = B.shape
+
+            # Pair phi/psi hidden states:
+            #
+            #   (ra0, rb0) -> Gram left rank
+            #   (ra1, rb1) -> Gram right rank
+            #
+            # torchTT MPO core convention:
+            #
+            #   (R_left, row_mode, col_mode, R_right)
+            W = W6.reshape(
+                ra0 * rb0,
+                self._p,
+                self._p,
+                ra1 * rb1,
+            )
+
+            gram_cores.append(W)
+
+        return TTMatrix.from_cores(gram_cores)

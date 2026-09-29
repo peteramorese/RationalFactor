@@ -22,12 +22,12 @@ import rational_factor.tools.propagate as propagate
 
 
 if __name__ == "__main__":
-    problem_name = "cartpole"
+    problem_name = "van_der_pol"
     problem = FULLY_OBSERVABLE_PROBLEMS[problem_name]
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 200
+    n_basis = 25
     tran_params = {
         "n_epochs_per_group": [3, 3],
         "iterations": 100,
