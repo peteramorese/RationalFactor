@@ -118,9 +118,7 @@ def main() -> None:
         normalization="r",
     )
     sp = SumProdRFF(g, psi, B, register_modules=False)
-    Q = sp.get_Q()
-    assert isinstance(Q, R1PDFactorization)
-    assert Q.shape == (1, n, n)
+    assert sp.B().shape == (1, n, n)
     seq_sp = propagate.propagate(init, sp, n_steps=2)
     assert len(seq_sp) == 3
     logp = sp.log_density(torch.randn(4, dim), conditioner=torch.randn(4, dim))

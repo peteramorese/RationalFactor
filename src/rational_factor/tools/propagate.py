@@ -1,7 +1,7 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
 from normalizing_flow.composite_model import CompositeConditionalModel
 from rational_factor.models.parameters import FixedParameters
-from rational_factor.models.structured_matrices import Matrix
+from rational_factor.models.structured_matrices import Matrix, as_matrix
 import torch
 import copy 
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
@@ -57,10 +57,16 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         psi0 = copy.copy(init_belief.h)
         psi0.set_coeffs_to_one()
 
-        Omega2_0 = phi.Omega2(psi0)
-        Omega2 = phi.Omega2(transition_model.psi)
-        
-        Q = transition_model.get_Q()
+        Omega2_0 = as_matrix(phi.Omega2(psi0))
+        Omega2 = as_matrix(phi.Omega2(transition_model.psi))
+
+        # Q = diag(a) @ diag(B 1)^{-1} @ B @ diag(q)^{-1}, so
+        # Q^T s = B^T ((a * s) / row_sums) / q  (elementwise scales + rev_matvec).
+        B = transition_model.B()
+        tol = transition_model.numerical_tolerance
+        row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
+        a = transition_model.g.coeffs()
+        q = Omega2.rev_matvec(a)
 
         c0_norm_constant = torch.exp(init_belief.log_norm_constant())
         c0 = c0_norm_constant * init_belief.h.coeffs()
@@ -69,16 +75,16 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         h0.set_coeffs(FixedParameters(c0))
         h_seq = [h0]
         
-        def _Omega2_GammaT_B_matmul(c : torch.tensor, _Omega2 : Matrix):
+        def _Omega2_QT_matmul(c : torch.tensor, _Omega2 : Matrix):
             s1 = _Omega2.matvec(c)
-            return Q.rev_matvec(s1)
+            return B.rev_matvec((a * s1) / (row_sums + tol)) / (q + tol)
         
-        c1 = _Omega2_GammaT_B_matmul(c0, Omega2_0)
+        c1 = _Omega2_QT_matmul(c0, Omega2_0)
         h1 = copy.copy(transition_model.psi)
         h1.set_coeffs(FixedParameters(c1))
         h_seq.append(h1)
         for _ in range(1, n_steps):
-            ck = _Omega2_GammaT_B_matmul(h_seq[-1].coeffs(), Omega2)
+            ck = _Omega2_QT_matmul(h_seq[-1].coeffs(), Omega2)
             hk = copy.copy(transition_model.psi)
             hk.set_coeffs(FixedParameters(ck))
             h_seq.append(hk)

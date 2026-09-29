@@ -107,10 +107,19 @@ class SumProdRFF(ConditionalDensityModel):
         batch_size = g.batch_size()
         n_basis = g.n_basis_functions()
         expected = (batch_size, n_basis, n_basis)
+        # Unbatched structured matrices (e.g. TTMatrix) expose shape (n, n);
+        # that is accepted when the basis batch size is 1.
+        expected_unbatched = (n_basis, n_basis)
 
         B_m = B()
-        assert isinstance(B_m, Matrix) and B_m.shape == expected, (
-            f"B() must be a Matrix of shape {expected}, got {type(B_m).__name__} {tuple(getattr(B_m, 'shape', ()))}"
+        shape_ok = isinstance(B_m, Matrix) and (
+            B_m.shape == expected
+            or (batch_size == 1 and B_m.shape == expected_unbatched)
+        )
+        assert shape_ok, (
+            f"B() must be a Matrix of shape {expected}"
+            + (f" or {expected_unbatched}" if batch_size == 1 else "")
+            + f", got {type(B_m).__name__} {tuple(getattr(B_m, 'shape', ()))}"
         )
 
         self.B = B
@@ -127,44 +136,31 @@ class SumProdRFF(ConditionalDensityModel):
         return self.g.dtype_device()
 
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
-        # phi(x)^T @ Q @ psi(xp)
+        # f(x, xp) = phi(x)^T Q psi(xp) with Q = diag(a) @ B_row @ diag(q)^{-1},
+        # B_row = diag(B 1)^{-1} @ B, q = Omega2^T a.  Applied as elementwise
+        # scales around B.matvec — no explicit Q / mul_diag.
         x = conditioner
+        tol = self.numerical_tolerance
 
-        log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance)
-        log_g_xp = torch.log(self.g(xp).sum(dim=-1) + self.numerical_tolerance)
+        log_g_x = torch.log(self.g(x).sum(dim=-1) + tol)
+        log_g_xp = torch.log(self.g(xp).sum(dim=-1) + tol)
 
         phi = copy.copy(self.g)
         phi.set_coeffs_to_one()
         phi_x = phi(x)
         psi_xp = self.psi(xp)
 
-        Q = self.get_Q()
+        B = self.B()
+        row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
+        a = self.g.coeffs()
+        q = as_matrix(phi.Omega2(self.psi)).rev_matvec(a)
 
-        Q_psi_xp = Q.matvec(psi_xp)
-        log_f = torch.log((phi_x * Q_psi_xp).sum(dim=-1) + self.numerical_tolerance)
+        # Q @ psi = a * (B @ (psi / q)) / row_sums
+        Q_psi_xp = a * B.matvec(psi_xp / (q + tol)) / (row_sums + tol)
+        log_f = torch.log((phi_x * Q_psi_xp).sum(dim=-1) + tol)
 
         return log_g_xp + log_f - log_g_x
 
-    def get_Q(self, B : Matrix = None, Omega2 : torch.Tensor = None) -> Matrix: 
-        # Q = diag(a) @ B_row @ diag(Omega^T a)^-1 with B_row @ 1 = 1, so Q q = a.
-        if B is None:
-            B = self.B()
-        else:
-            B = as_matrix(B)
-
-        # Row-stochasticize: diag(1 / (B 1)) @ B  (must be mul_diag_left, not right).
-        row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
-        B_normalized = B.mul_diag_left(1.0 / (row_sums + self.numerical_tolerance))
-        
-        if Omega2 is None:
-            phi = copy.copy(self.g)
-            phi.set_coeffs_to_one()
-            Omega2 = phi.Omega2(self.psi)
-
-        a = self.g.coeffs()
-        q = as_matrix(Omega2).rev_matvec(a)
-        return B_normalized.mul_diag_right(1.0 / (q + self.numerical_tolerance)).mul_diag_left(a)
-    
 
 #class MLPContextLinearRFF(ConditionalDensityModel):
 #    """

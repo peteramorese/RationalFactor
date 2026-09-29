@@ -401,8 +401,16 @@ if __name__ == "__main__":
     )
     print("Done! \n")
 
-    # DEBUG
-    Q = rff.get_Q().to_dense()
+    # DEBUG: dense Q = diag(a) @ diag(B1)^{-1} @ B @ diag(q)^{-1}
+    from rational_factor.models.structured_matrices import as_matrix
+    B = rff.B()
+    tol = rff.numerical_tolerance
+    row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
+    a_dbg = rff.g.coeffs()
+    phi_dbg = copy.copy(rff.g)
+    phi_dbg.set_coeffs_to_one()
+    q_dbg = as_matrix(phi_dbg.Omega2(rff.psi)).rev_matvec(a_dbg)
+    Q = a_dbg.unsqueeze(-1) * B.to_dense() / (row_sums.unsqueeze(-1) + tol) / (q_dbg.unsqueeze(-2) + tol)
     print(Q)
     s = torch.linalg.svdvals(Q)
     print(s)
