@@ -501,6 +501,7 @@ class TTMutualBasis(torch.nn.Module, MutualPairBasis):
         output_mode_sizes: Sequence[int] | None = None,
         output_positions: Sequence[int] | None = None,
         init_std: float = 0.05,
+        epsilon: float = 1e-3,
     ):
         torch.nn.Module.__init__(self)
 
@@ -534,7 +535,7 @@ class TTMutualBasis(torch.nn.Module, MutualPairBasis):
 
         self.phi_primitive = phi_primitive
         self.psi_primitive = psi_primitive
-
+        self.epsilon = epsilon
         self._n_phi_primitive = phi_primitive.n_basis_functions()
         self._n_psi_primitive = psi_primitive.n_basis_functions()
 
@@ -806,16 +807,16 @@ class TTMutualBasis(torch.nn.Module, MutualPairBasis):
         )
 
     def _phi_dim_core(self, k):
-        return F.softplus(self.phi_dim_raw_cores[k])
+        return F.softplus(self.phi_dim_raw_cores[k]) + self.epsilon
 
     def _psi_dim_core(self, k):
-        return F.softplus(self.psi_dim_raw_cores[k])
+        return F.softplus(self.psi_dim_raw_cores[k]) + self.epsilon
 
     def _phi_output_core(self, s):
-        return F.softplus(self.phi_output_raw_cores[s])
+        return F.softplus(self.phi_output_raw_cores[s]) + self.epsilon
 
     def _psi_output_core(self, s):
-        return F.softplus(self.psi_output_raw_cores[s])
+        return F.softplus(self.psi_output_raw_cores[s]) + self.epsilon
 
     @property
     def n_output_modes(self):

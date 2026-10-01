@@ -27,66 +27,6 @@ import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 
 
-def _inverse_softplus(y: torch.Tensor) -> torch.Tensor:
-    """Map positive targets to PositiveParameters raw values (softplus + eps)."""
-    return y + torch.log(-torch.expm1(-y.clamp_min(torch.finfo(y.dtype).tiny)))
-
-
-def _positive_low_rank(
-    d: int,
-    m: int,
-    r: int,
-    *,
-    device: torch.device,
-    epsilon: float = 1e-6,
-) -> LowRankFactorizationParameters:
-    """Near-diagonal nonnegative rank-r factors for A0/B0.
-
-    i.i.d. PositiveParameters factors yield dense all-positive A = U Vᵀ whose
-    columns are nearly parallel, so α(x) ≈ c(x) v₀ across the domain and the
-    RFF collapses to a near-uniform unit-box density (loss ≈ erf Jacobian only).
-    Localized factor columns keep A banded and the bases expressive.
-    """
-    rows = torch.arange(m, device=device, dtype=torch.float32).unsqueeze(1)
-    centers = torch.linspace(0.0, m - 1.0, r, device=device).unsqueeze(0)
-    width = max(m / r, 1.5)
-    # Strictly positive targets, peaked near the diagonal in factor space.
-    envelope = 0.05 + 0.95 * torch.exp(-0.5 * ((rows - centers) / width) ** 2)
-    scale = 1.0
-    U = scale * envelope * torch.exp(0.15 * torch.randn(d, m, r, device=device))
-    V = scale * envelope * torch.exp(0.15 * torch.randn(d, m, r, device=device))
-    # PositiveParameters stores unconstrained raw values; invert softplus(+eps).
-    U_raw = _inverse_softplus((U - epsilon).clamp_min(torch.finfo(U.dtype).tiny))
-    V_raw = _inverse_softplus((V - epsilon).clamp_min(torch.finfo(V.dtype).tiny))
-    return LowRankFactorizationParameters(
-        PositiveParameters.from_values(U_raw, epsilon=epsilon).to(device),
-        PositiveParameters.from_values(V_raw, epsilon=epsilon).to(device),
-    )
-
-
-def _jitter_cone_mlp_last_layers(
-    mlp: MaskedInputMLP,
-    c_std: float = 1e-2,
-) -> None:
-    """Init cone MLP head so C is nonzero but raw_s = 0.
-
-    The update MLP final layer is zero-initialized so X starts at X0.  With the
-    signed positivity step, exactly-zero C makes dX = 0, hence s_min/s_max =
-    ±∞ and ``tanh(0) * ∞`` produces NaN gradients.  A small C bias (weights
-    still zero, raw_s channels still zero) keeps s = 0 at init — so X is
-    unchanged — while giving dX both signs so the bounds stay finite.
-    """
-    with torch.no_grad():
-        split_c = mlp.m * mlp.r
-        split_full = split_c + mlp.r
-        torch.nn.init.zeros_(mlp.net[-1].weight)
-        bias = torch.zeros_like(mlp.net[-1].bias)
-        for ell in range(mlp.n_layers):
-            base = ell * split_full
-            bias[base : base + split_c].normal_(0.0, c_std)
-        mlp.net[-1].bias.copy_(bias)
-
-
 def _plot_conditional_slices_model_vs_data(
     tran_model,
     x_k_data: torch.Tensor,
@@ -406,8 +346,12 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 200
-    rank = 4
+    output_mode_size = 20
+    n_output_modes = 2
+    n_basis = output_mode_size ** n_output_modes
+    # Primitive 1-D count is independent of TT output size m = p^q.
+    n_primitive = 100
+    rank = 10
     tran_params = {
         "n_epochs_per_group": [5, 2],  # wrap + cone layers, weights
         "iterations": 20,
@@ -458,21 +402,20 @@ if __name__ == "__main__":
         TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
     )
 
-    print(f"n_basis={m}, dim={d}, rank={rank}")
+    print(f"n_basis={m}, n_primitive={n_primitive}, dim={d}, rank={rank}")
 
-    batch_size = 1
-    parameter_shape = (batch_size, d, n_basis)
+    parameter_shape = (1, d, n_primitive)
     phi_means = TrainableParameters.random_init(
         shape=parameter_shape, mean=torch.tensor([0.0]), std=torch.tensor([3.0])
     ).to(device)
     phi_std = PositiveParameters.random_init(
-        shape=parameter_shape, mean=torch.tensor([3.0]), std=torch.tensor([1.0])
+        shape=parameter_shape, mean=torch.tensor([3.0]), std=torch.tensor([1.0]), epsilon=1e-3
     ).to(device)
     psi_means = TrainableParameters.random_init(
         shape=parameter_shape, mean=torch.tensor([0.0]), std=torch.tensor([3.0])
     ).to(device)
     psi_std = PositiveParameters.random_init(
-        shape=parameter_shape, mean=torch.tensor([3.0]), std=torch.tensor([1.0])
+        shape=parameter_shape, mean=torch.tensor([3.0]), std=torch.tensor([1.0]), epsilon=1e-3
     ).to(device)
     phi_primitive = GaussianBasis(mean_params=phi_means, std_params=phi_std)
     psi_primitive = GaussianBasis(mean_params=psi_means, std_params=psi_std)
@@ -481,8 +424,8 @@ if __name__ == "__main__":
         phi_primitive,
         psi_primitive,
         rank=rank,
-        n_output_modes=1,
-        output_mode_size=n_basis,
+        n_output_modes=n_output_modes,
+        output_mode_size=output_mode_size,
         init_std=2.00,
     ).to(device)
 
@@ -493,20 +436,15 @@ if __name__ == "__main__":
         shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
     ).to(device)
 
-    # TT-matrix B: factor n_basis into modes so the MPO stays compact.
-    # (10, 20) covers n_basis=200; adjust if n_basis changes.
-    B_modes = (10, 20)
-    if prod(B_modes) != n_basis:
-        raise ValueError(
-            f"B_modes={B_modes} product {prod(B_modes)} != n_basis={n_basis}"
-        )
+    # TT-matrix B shares the mutual basis output mode shape.
     B = TTMatrixParameters.random_init(
-        B_modes,
+        phi_psi_mutual.output_mode_sizes,
         ranks=rank,
         mean=1.0,
         std=1.0,
-        epsilon=0.0,
+        epsilon=1e-3,
         device=device,
+        positive=True,
     )
 
     g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)

@@ -12,7 +12,7 @@ from rational_factor.models.parameters import (
     PositiveParameters,
     TrainableParameters,
     param_group_iter,
-    DenseMatrixFactorization,
+    DenseMatrixParameters,
 )
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
@@ -22,12 +22,12 @@ import rational_factor.tools.propagate as propagate
 
 
 if __name__ == "__main__":
-    problem_name = "van_der_pol"
+    problem_name = "cartpole"
     problem = FULLY_OBSERVABLE_PROBLEMS[problem_name]
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 25
+    n_basis = 1000
     tran_params = {
         "n_epochs_per_group": [3, 3],
         "iterations": 100,
@@ -104,7 +104,7 @@ if __name__ == "__main__":
         std=torch.tensor([1.0]),
         epsilon=0.0,
     ).to(device)
-    B = DenseMatrixFactorization(B_coeffs)
+    B = DenseMatrixParameters(B_coeffs)
 
     g_basis = GaussianBasis(phi_means, phi_stds, coeffs=g_coeffs)
     psi_basis = GaussianBasis(psi_means, psi_stds, coeffs=None)
