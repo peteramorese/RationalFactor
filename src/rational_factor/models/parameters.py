@@ -5,6 +5,7 @@ from collections.abc import Sequence
 
 from rational_factor.models.structured_matrices import (
     DenseMatrix,
+    Identity,
     LowRankFactorization,
     Order1Quasiseparable,
     Quasiseparable,
@@ -178,6 +179,19 @@ class PositiveParameters(TrainableParameters):
     def get_normalization_dim(self):
         return self._normalization_dim
 
+
+class IdentityParameters(Parameters):
+    def __init__(self):
+        pass
+
+    def __call__(self):
+        return Identity()
+
+    def is_trainable(self):
+        return False
+
+    def is_module(self):
+        return False
 
 class R1PDFactorizationParameters(Parameters):
     """Trainable factors of a sequential rank-1-plus-diagonal product.

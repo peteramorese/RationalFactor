@@ -411,7 +411,7 @@ if __name__ == "__main__":
     tran_params = {
         "n_epochs_per_group": [5, 2],  # wrap + cone layers, weights
         "iterations": 20,
-        "lr_basis": 5e-2,
+        "lr_basis": 1e-2,
         "lr_weights": 5e-2,
         "lr_wrap": 1e-3,
     }
