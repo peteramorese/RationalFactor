@@ -522,8 +522,15 @@ class LinearFF(DensityModel):
         return -torch.log(as_matrix(Omega2).sum() + self.numerical_tolerance)
         
     def log_density(self, x : torch.Tensor):
-        log_g_x = torch.log(self.g(x).sum(dim=-1) + self.numerical_tolerance) # (n_data)
-        log_h_x = torch.log(self.h(x).sum(dim=-1) + self.numerical_tolerance) # (n_data)
+        # Use machine tiny for log floors — NOT numerical_tolerance.
+        # SumProdRFF often passes a coarse tol (e.g. 1e-5) that is only meant for
+        # conditional ratios; flooring log(h+tol) while Omega2 uses the true tiny h
+        # makes p(x)=g h/Z appear enormously peaked (bogus large negative NLL).
+        g_sum = self.g(x).sum(dim=-1).clamp_min(0)
+        h_sum = self.h(x).sum(dim=-1).clamp_min(0)
+        log_eps = torch.finfo(g_sum.dtype).tiny
+        log_g_x = torch.log(g_sum + log_eps)
+        log_h_x = torch.log(h_sum + log_eps)
 
         return self.log_norm_constant() + log_g_x + log_h_x
 

@@ -3,9 +3,11 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from normalizing_flow.composite_model import CompositeConditionalModel, CompositeDensityModel
+from normalizing_flow.transforms import Transforms
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.mutual_bases import TTMutualBasis
-from rational_factor.models.basis_functions import GaussianBasis
+from rational_factor.models.basis_functions import BetaBasis
 from rational_factor.models.parameters import (
     PositiveParameters,
     TrainableParameters,
@@ -36,7 +38,7 @@ if __name__ == "__main__":
     #   Prefer NOT raising n_output_modes (deeper TT), tt_init_std, lr_basis, or
     #   n_primitive — those amplify core products and make phi/psi scales explode,
     #   which then breaks LinearFF init even when conditional tran loss looks fine.
-    n_primitive = 10
+    n_primitive = 100
     rank = 10
     tt_init_std = 1.55
     # Floor Gaussian bandwidths so MLE cannot form Dirac peaks (loss -> -inf).
@@ -47,7 +49,8 @@ if __name__ == "__main__":
         "n_epochs_per_group": [5, 2],  # TT/basis, weights
         "iterations": 100,
         "lr_basis": 4 * 3e-3,
-        "lr_weights": 1 * 5e-2,
+        "lr_weights": 4 * 5e-2,
+        "lr_wrap": 1e-3,
     }
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
@@ -55,7 +58,7 @@ if __name__ == "__main__":
         "lr_weights": 1e-2,
     }
 
-    batch_size = 512 #256
+    batch_size = 256
     n_timesteps_prop = problem.n_timesteps
 
     ###
@@ -94,26 +97,33 @@ if __name__ == "__main__":
 
     parameter_shape = (1, d, n_primitive)
     # Means/stds are in the erf-wrapped coordinates (roughly O(1)).
-    phi_means = TrainableParameters.random_init(
-        shape=parameter_shape, mean=torch.tensor([0.0]), std=torch.tensor([3.5])
-    ).to(device, dtype=dtype)
-    phi_std = PositiveParameters.random_init(
+    phi_alpha = PositiveParameters.random_init(
         shape=parameter_shape,
-        mean=torch.tensor([0.8]),
-        std=torch.tensor([0.5]),
-        epsilon=gaussian_std_epsilon,
+        mean=torch.tensor([5.0]),
+        std=torch.tensor([10.0]),
+        epsilon=1.0,
     ).to(device, dtype=dtype)
-    psi_means = TrainableParameters.random_init(
-        shape=parameter_shape, mean=torch.tensor([0.0]), std=torch.tensor([3.5])
-    ).to(device, dtype=dtype)
-    psi_std = PositiveParameters.random_init(
+    phi_beta = PositiveParameters.random_init(
         shape=parameter_shape,
-        mean=torch.tensor([0.8]),
-        std=torch.tensor([0.5]),
-        epsilon=gaussian_std_epsilon,
+        mean=torch.tensor([5.0]),
+        std=torch.tensor([10.0]),
+        epsilon=1.0,
     ).to(device, dtype=dtype)
-    phi_primitive = GaussianBasis(mean_params=phi_means, std_params=phi_std)
-    psi_primitive = GaussianBasis(mean_params=psi_means, std_params=psi_std)
+    psi_alpha = PositiveParameters.random_init(
+        shape=parameter_shape,
+        mean=torch.tensor([5.0]),
+        std=torch.tensor([10.0]),
+        epsilon=1.0,
+    ).to(device, dtype=dtype)
+    psi_beta = PositiveParameters.random_init(
+        shape=parameter_shape,
+        mean=torch.tensor([5.0]),
+        std=torch.tensor([10.0]),
+        epsilon=1.0,
+    ).to(device, dtype=dtype)
+
+    phi_primitive = BetaBasis(alpha_params=phi_alpha, beta_params=phi_beta)
+    psi_primitive = BetaBasis(alpha_params=psi_alpha, beta_params=psi_beta)
 
     phi_psi_mutual = TTMutualBasis(
         phi_primitive,
@@ -150,6 +160,13 @@ if __name__ == "__main__":
 
     # cartpole default tolerance (1e-20) is too tight once basis values are O(1e-6).
     rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=1e-10)
+    tran_model = CompositeConditionalModel(
+        base_density=rff, 
+        context_features=d, 
+        transform="erf", 
+        x_data=x_k_train,
+        trainable=True, 
+        transform_conditioner=True).to(device, dtype=dtype)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss
@@ -157,7 +174,8 @@ if __name__ == "__main__":
         "basis": torch.optim.Adam(
             [
                 {"params": phi_psi_mutual.parameters(), "lr": tran_params["lr_basis"]},
-                {"params": param_group_iter((phi_means, phi_std, psi_means, psi_std)), "lr": tran_params["lr_basis"]},
+                {"params": tran_model.transform.parameters(), "lr": tran_params["lr_wrap"]},
+                {"params": param_group_iter((phi_alpha, phi_beta, psi_alpha, psi_beta)), "lr": tran_params["lr_basis"]},
             ]
         ),
         "weights": torch.optim.Adam(
@@ -167,7 +185,7 @@ if __name__ == "__main__":
     }
 
     tran_model, best_loss_tran, training_time_tran = train.train_iterate(
-        rff,
+        tran_model,
         xp_dataloader,
         {"mle": mle_loss_fn},
         optimizers,
@@ -200,9 +218,10 @@ if __name__ == "__main__":
     for p in phi_psi_mutual.parameters():
         p.requires_grad_(False)
     g_coeffs.set_requires_grad(False)
+    trained_wrap_tf = Transforms.freeze(tran_model.transform).to(device)
 
     h0_basis = phi_psi_mutual.get_basis(1, coeffs=h0_coeffs)
-    init_model = LinearFF.from_rff(rff, h0_basis).to(device=device, dtype=dtype)
+    init_model = CompositeDensityModel(base_density=LinearFF.from_rff(rff, h0_basis), transform="stacked", transforms=[trained_wrap_tf]).to(device=device, dtype=dtype)
 
     print("Training initial model")
     mle_loss_fn = loss.mle_loss
@@ -243,12 +262,12 @@ if __name__ == "__main__":
     n_slices = n_timesteps_prop + 1
 
     base_belief_seq = propagate.propagate(
-        init_model,
-        tran_model,
+        init_model.base_density,
+        tran_model.base_density,
         n_steps=n_timesteps_prop,
     )
     belief_seq = [
-        belief.to(device=analysis_device, dtype=dtype).eval()
+        CompositeDensityModel(belief, transform="stacked", transforms=[trained_wrap_tf]).to(device=analysis_device, dtype=dtype).eval()
         for belief in base_belief_seq
     ]
 
