@@ -11,9 +11,9 @@ import torch
 
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF
-from rational_factor.models.parameters import FixedParameters, PositiveParameters, TrainableParameters, R1PDFactorizationParameters
+from rational_factor.models.parameters import FixedParameters, PositiveParameters, DenseMatrixParameters
 import rational_factor.tools.propagate as propagate
-from rational_factor.models.structured_matrices import DenseMatrix, Rank1PlusDiagonal, R1PDFactorization, as_matrix
+from rational_factor.models.structured_matrices import DenseMatrix, Rank1PlusDiagonal, as_matrix
 
 
 SEED = 0
@@ -70,10 +70,11 @@ def main() -> None:
     # LinearRFF.get_b / one-step propagate use the same matvec API.
     torch.manual_seed(SEED)
     n_basis, dim = 4, 2
-    g = GaussianBasis(
+    a_params = FixedParameters(0.4 + torch.rand(1, n_basis))
+    phi = GaussianBasis(
         FixedParameters(torch.randn(1, dim, n_basis)),
         PositiveParameters.set_init((1, dim, n_basis), 0.8),
-        coeffs=FixedParameters(0.4 + torch.rand(1, n_basis)),
+        coeffs=FixedParameters(torch.ones(1, n_basis)),
     )
     psi = GaussianBasis(
         FixedParameters(torch.randn(1, dim, n_basis)),
@@ -85,14 +86,15 @@ def main() -> None:
         PositiveParameters.set_init((1, dim, n_basis), 0.8),
         coeffs=FixedParameters(0.4 + torch.rand(1, n_basis)),
     )
-    rff = LinearRFF(g, psi, register_modules=False)
-    Omega = g.Omega2(psi)
+    rff = LinearRFF(a_params, phi, psi, register_modules=False)
+    Omega = phi.Omega2(psi)
     assert isinstance(Omega, DenseMatrix)
-    a_coeff = g.coeffs()
+    a_coeff = a_params()
     b = rff.get_b(a=a_coeff, Omega2=Omega)
     b_einsum = a_coeff / (torch.einsum("...ij,...i->...j", Omega.to_dense(), a_coeff) + rff.numerical_tolerance)
     assert torch.allclose(b, b_einsum)
 
+    g = rff.g_basis()
     init = LinearFF(g, h0, numerical_tolerance=rff.numerical_tolerance, register_modules=False)
     seq = propagate.propagate(init, rff, n_steps=2)
     assert len(seq) == 3
@@ -109,15 +111,12 @@ def main() -> None:
     c_old = torch.einsum("...ij,...i->...j", M, c)
     assert torch.allclose(c_next, c_old)
 
-    # SumProdRFF B is a sequential R1PD factorization.
+    # SumProdRFF with a dense B matrix.
     n = n_basis
-    B = R1PDFactorizationParameters(
-        TrainableParameters.random_init((1, 2, n), std=0.1),
-        TrainableParameters.random_init((1, 2, n), std=0.1),
-        seq_dim=1,
-        normalization="r",
+    B = DenseMatrixParameters(
+        PositiveParameters.random_init((1, n, n), mean=1.0, std=0.1, epsilon=1e-3)
     )
-    sp = SumProdRFF(g, psi, B, register_modules=False)
+    sp = SumProdRFF(a_params, phi, psi, B, register_modules=False)
     assert sp.B().shape == (1, n, n)
     seq_sp = propagate.propagate(init, sp, n_steps=2)
     assert len(seq_sp) == 3

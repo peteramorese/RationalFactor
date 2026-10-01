@@ -144,11 +144,11 @@ if __name__ == "__main__":
     ).to(device)
     B = DenseMatrixFactorization(B_coeffs)
 
-    g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
+    phi_basis = phi_psi_mutual.get_basis(0)
     psi_basis = phi_psi_mutual.get_basis(1)
 
     # cartpole default tolerance (1e-20) is too tight once basis values are O(1e-6).
-    tran_model = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=1e-10)
+    tran_model = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss

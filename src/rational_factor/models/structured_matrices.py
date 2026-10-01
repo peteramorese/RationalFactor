@@ -1,15 +1,17 @@
-"""Structured matrix approximators: banded, low-rank, rank-1-plus-diagonal, and quasiseparable."""
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import math
-from typing import Any, Sequence
-
-
+from typing import Sequence
 
 import torch
+
+from rational_factor.models.structured_vectors import (
+    TTVector,
+    Vector,
+    as_vector,
+)
 
 
 
@@ -40,9 +42,9 @@ class Matrix(ABC):
     def to_dense(self) -> torch.Tensor: ...
 
     @abstractmethod
-    def matvec(self, x: torch.Tensor) -> torch.Tensor: ...
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor | Vector: ...
 
-    def rev_matvec(self, x: torch.Tensor) -> torch.Tensor:
+    def rev_matvec(self, x: torch.Tensor | Vector) -> torch.Tensor | Vector:
         """``Mᵀ @ x``."""
         return self.T.matvec(x)
 
@@ -142,11 +144,13 @@ class Matrix(ABC):
     def expm(self) -> Matrix:
         return DenseMatrix(torch.matrix_exp(self.to_dense()))
 
-    def __matmul__(self, other: torch.Tensor) -> torch.Tensor:
+    def __matmul__(self, other: torch.Tensor | Vector) -> torch.Tensor | Vector:
         return self.matvec(other)
 
-    def __rmatmul__(self, other: torch.Tensor) -> torch.Tensor:
+    def __rmatmul__(self, other: torch.Tensor | Vector) -> torch.Tensor | Vector:
         """Row-vector / left multiply: ``x @ M == (Mᵀ @ xᵀ)ᵀ``."""
+        if isinstance(other, Vector):
+            return self.T.matvec(other)
         other = torch.as_tensor(other, dtype=self.dtype, device=self.device)
         n_out = self.shape[-2]
         if other.shape[-1] != n_out:
@@ -199,8 +203,8 @@ class DenseMatrix(Matrix):
     def sum(self) -> torch.Tensor:
         return self._values.sum()
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
+        x = as_vector(x).to_dense().to(dtype=self.dtype, device=self.device)
         n_in = self._values.shape[-1]
         batch_ndim = self._values.dim() - 2
         if x.dim() >= batch_ndim + 2 and x.shape[-2] == n_in:
@@ -299,11 +303,11 @@ class Identity(Matrix):
     from operations that provide tensor inputs.
     """
     
-    def __init__(self, n: int, batch_shape: tuple[int, ...] = (), dtype: torch.dtype | None = None, device: torch.device | None = None):
+    def __init__(self, n: int, batch_shape: tuple[int, ...] = (), dtype: torch.dtype = torch.float32, device: torch.device = torch.device("cpu")):
         self.n = n
         self._batch_shape = batch_shape
-        self._dtype = dtype if dtype is not None else torch.float32
-        self._device = device if device is not None else torch.device("cpu")
+        self._dtype = dtype
+        self._device = device
 
     @property
     def shape(self) -> torch.Size:
@@ -334,8 +338,8 @@ class Identity(Matrix):
     def sum(self) -> torch.Tensor:
         return torch.full(self._batch_shape, self.n, dtype=self._dtype, device=self._device)
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
-        return x.to(dtype=self._dtype, device=self._device)
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
+        return as_vector(x).to_dense().to(dtype=self._dtype, device=self._device)
 
     def mul_diag_left(self, a: torch.Tensor) -> "Diagonal":
         a = torch.as_tensor(a, dtype=self._dtype, device=self._device)
@@ -361,7 +365,7 @@ class Identity(Matrix):
         return Identity(self.n, self._batch_shape, self._dtype, self._device)
 
     def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
-        return x.to(dtype=self._dtype, device=self._device)
+        return as_vector(x).to_dense().to(dtype=self._dtype, device=self._device)
 
 
 class Diagonal(Matrix):
@@ -439,8 +443,8 @@ class Diagonal(Matrix):
     def inverse(self) -> Diagonal:
         return Diagonal(self.d.reciprocal())
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
-        return self.d * x
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
+        return self.d * as_vector(x).to_dense()
 
     def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
@@ -679,14 +683,14 @@ class Banded(Matrix):
             return self.mul_diag_right(a)
         raise ValueError(f"side must be 'left' or 'right', got {side!r}")
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
         """Compute ``A @ x`` in ``O(n * n_diag)`` time.
 
         Args:
             x: ``(..., n)`` or ``(..., n, k)``. Leading dims broadcast with
                 ``batch_shape``.
         """
-        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        x = as_vector(x).to_dense().to(dtype=self.dtype, device=self.device)
         n = self.n
         batch_ndim = len(self.batch_shape)
         multi_rhs = x.dim() >= batch_ndim + 2 and x.shape[-2] == n
@@ -940,14 +944,14 @@ class LowRankFactorization(Matrix):
             f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
         )
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
         """Compute ``M @ x = U (Vᵀ x)`` in ``O((n + m) r)`` time.
 
         Args:
             x: ``(..., m)`` or ``(..., m, k)``. Leading dims broadcast with
                 ``batch_shape``.
         """
-        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        x = as_vector(x).to_dense().to(dtype=self.dtype, device=self.device)
         m = self.m
         batch_ndim = self.U.dim() - 2
         if x.dim() >= batch_ndim + 2 and x.shape[-2] == m:
@@ -1121,14 +1125,14 @@ class Rank1PlusDiagonal(Matrix):
         """Solve ``M y = x`` in ``O(n)`` via Sherman–Morrison (no dense inverse)."""
         return self.inverse().matvec(x)
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
         """Compute ``M @ x`` in ``O(n)`` time (per batch / RHS).
 
         Args:
             x: ``(..., n)`` or ``(..., n, m)``. Leading dims broadcast with
                 ``batch_shape``.
         """
-        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        x = as_vector(x).to_dense().to(dtype=self.dtype, device=self.device)
         n = self.n
         batch_ndim = self.d.dim() - 1
         if x.dim() >= batch_ndim + 2 and x.shape[-2] == n:
@@ -1226,7 +1230,7 @@ class R1PDFactorization(Rank1PlusDiagonal):
 
     def matvec(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | Vector,
         *,
         reverse: bool = False,
         return_trajectory: bool = False,
@@ -1251,7 +1255,7 @@ class R1PDFactorization(Rank1PlusDiagonal):
         if reverse:
             return self.flip().matvec(x, reverse=False, return_trajectory=return_trajectory)
 
-        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+        x = as_vector(x).to_dense().to(dtype=self.dtype, device=self.device)
         d = self.d.movedim(self.seq_dim, 0)
         u = self.u.movedim(self.seq_dim, 0)
         v = self.v.movedim(self.seq_dim, 0)
@@ -1395,8 +1399,8 @@ class Semiseparable(Matrix):
     def T(self) -> Semiseparable:
         return Semiseparable(self.q, self.a, self.p, upper=not self.upper)
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
-        return self._apply(x, solve=False)
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
+        return self._apply(as_vector(x).to_dense(), solve=False)
 
     def solve(self, x: torch.Tensor) -> torch.Tensor:
         """Solve ``M y = x`` (unit triangular, ``O(k n)``)."""
@@ -1644,15 +1648,16 @@ class Quasiseparable(Matrix):
     def uh(self) -> torch.Tensor:
         return self.U.q
 
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
         """``P x = L D U x``."""
+        x = as_vector(x).to_dense()
         return self.L.matvec(self.d * self.U.matvec(x))
 
     def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
         """``P^{-1} x = U^{-1} D^{-1} L^{-1} x``."""
         return self.U.solve(self.L.solve(x) / self.d)
 
-    def T_matvec(self, x: torch.Tensor) -> torch.Tensor:
+    def T_matvec(self, x: torch.Tensor | Vector) -> torch.Tensor:
         """``P^T x = U^T D L^T x``."""
         return self.T.matvec(x)
 
@@ -1833,130 +1838,65 @@ class Order1Quasiseparable(Quasiseparable):
             h=gen.h.squeeze(-1),
         )
 
-
-try:
-    import torchtt
-except ImportError:  # Keep the rest of this module importable without torchTT.
-    torchtt = None
-
-
 class TTMatrix(Matrix):
     r"""Matrix stored as a Tensor-Train matrix / MPO.
 
-    Internally, torchTT represents a matrix with tensorized shape
+    Cores have shape ``(r_{k-1}, M_k, N_k, r_k)`` with boundary ranks
+    ``r_0 = r_d = 1``. The public :class:`Matrix` interface sees the flattened
+    shape ``(prod(M_k), prod(N_k))``.
 
-        (M_1 x ... x M_d) by (N_1 x ... x N_d),
-
-    using TT-matrix cores
-
-        core[k].shape == (
-            r[k],
-            M_k,
-            N_k,
-            r[k + 1],
-        ).
-
-    The public :class:`Matrix` interface sees only the flattened matrix
-
-        shape == (prod(M_k), prod(N_k)).
-
-    Notes
-    -----
-    * This class currently represents ONE TT matrix, i.e. there are no
-      independent leading matrix-batch dimensions.
-    * ``matvec(torch.Tensor)`` accepts dense flattened vectors / RHS matrices
-      and returns dense flattened outputs.
-    * ``matvec_tt(torchtt.TT)`` performs an exact TT-matrix x TT-vector
-      contraction and returns a TT vector. No rounding is performed, so output
-      TT ranks can grow as the product of the operator and vector ranks.
+    ``matvec`` with a compatible :class:`~rational_factor.models.structured_vectors.TTVector`
+    contracts core-wise and returns a :class:`TTVector` (exact, no rounding).
+    Dense vectors densify through :func:`as_vector` and use an implicit TT
+    contraction that never materializes the full matrix.
     """
 
-    def __init__(
-        self,
-        tt_or_cores: Any,
-    ) -> None:
-        if torchtt is None:
-            raise ImportError(
-                "TTMatrix requires torchTT. Install it with `pip install torchTT`."
+    def __init__(self, cores: Sequence[torch.Tensor]) -> None:
+        if len(cores) == 0:
+            raise ValueError("TTMatrix requires at least one core")
+        cores_t = tuple(torch.as_tensor(c) for c in cores)
+        for i, c in enumerate(cores_t):
+            if c.dim() != 4:
+                raise ValueError(
+                    f"TTMatrix core {i} must have shape (r_left, M, N, r_right), "
+                    f"got {tuple(c.shape)}"
+                )
+        if cores_t[0].shape[0] != 1 or cores_t[-1].shape[-1] != 1:
+            raise ValueError(
+                "TTMatrix boundary ranks must be 1, got "
+                f"r0={cores_t[0].shape[0]}, rd={cores_t[-1].shape[-1]}"
             )
-
-        # Allow either an already-constructed torchtt.TT or a list of
-        # TT-matrix cores.
-        if isinstance(tt_or_cores, (list, tuple)):
-            tt = torchtt.TT(list(tt_or_cores))
-        else:
-            tt = tt_or_cores
-
-        if not isinstance(tt, torchtt.TT):
-            raise TypeError(
-                "tt_or_cores must be a torchtt.TT or a sequence of TT cores, "
-                f"got {type(tt_or_cores)!r}"
-            )
-
-        if not tt.is_ttm:
-            raise ValueError("TTMatrix requires a torchTT TT-matrix/operator.")
-
-        if len(tt.cores) == 0:
-            raise ValueError("TTMatrix requires at least one TT core.")
-
-        self._tt = tt
-
-        # torchTT convention:
-        #   M = row mode sizes
-        #   N = column mode sizes
-        self._row_modes = tuple(int(n) for n in tt.M)
-        self._col_modes = tuple(int(n) for n in tt.N)
-
-        self._n_rows = math.prod(self._row_modes)
-        self._n_cols = math.prod(self._col_modes)
-
-    # ------------------------------------------------------------------
-    # Construction / access
-    # ------------------------------------------------------------------
+        for i in range(len(cores_t) - 1):
+            if cores_t[i].shape[-1] != cores_t[i + 1].shape[0]:
+                raise ValueError(
+                    f"TTMatrix rank mismatch at bond {i}: "
+                    f"{cores_t[i].shape[-1]} != {cores_t[i + 1].shape[0]}"
+                )
+        self._cores = cores_t
+        self._row_modes = tuple(int(c.shape[1]) for c in cores_t)
+        self._col_modes = tuple(int(c.shape[2]) for c in cores_t)
+        self._n_rows = int(math.prod(self._row_modes))
+        self._n_cols = int(math.prod(self._col_modes))
 
     @classmethod
-    def from_cores(
-        cls,
-        cores: Sequence[torch.Tensor],
-    ) -> TTMatrix:
-        r"""Construct directly from MPO cores.
-
-        Each core must have shape
-
-            (r_{k-1}, M_k, N_k, r_k),
-
-        with r_0 = r_d = 1.
-        """
-        return cls(list(cores))
-
-    @property
-    def tt(self) -> Any:
-        """Underlying ``torchtt.TT`` object."""
-        return self._tt
+    def from_cores(cls, cores: Sequence[torch.Tensor]) -> TTMatrix:
+        return cls(cores)
 
     @property
     def cores(self) -> tuple[torch.Tensor, ...]:
-        """TT-matrix cores."""
-        return tuple(self._tt.cores)
+        return self._cores
 
     @property
     def row_modes(self) -> tuple[int, ...]:
-        """Tensorized row dimensions ``(M_1, ..., M_d)``."""
         return self._row_modes
 
     @property
     def col_modes(self) -> tuple[int, ...]:
-        """Tensorized column dimensions ``(N_1, ..., N_d)``."""
         return self._col_modes
 
     @property
     def ranks(self) -> tuple[int, ...]:
-        """TT ranks ``(1, r_1, ..., r_{d-1}, 1)``."""
-        return tuple(int(r) for r in self._tt.R)
-
-    # ------------------------------------------------------------------
-    # Matrix interface
-    # ------------------------------------------------------------------
+        return (1,) + tuple(int(c.shape[-1]) for c in self._cores)
 
     @property
     def shape(self) -> torch.Size:
@@ -1964,218 +1904,103 @@ class TTMatrix(Matrix):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self._tt.cores[0].dtype
+        return self._cores[0].dtype
 
     @property
     def device(self) -> torch.device:
-        return self._tt.cores[0].device
+        return self._cores[0].device
 
     @property
     def T(self) -> TTMatrix:
-        # Exact: each core swaps its M_k and N_k indices.
-        return TTMatrix(self._tt.t())
+        return TTMatrix([c.permute(0, 2, 1, 3).contiguous() for c in self._cores])
 
     def to_dense(self) -> torch.Tensor:
-        r"""Materialize the full flattened matrix.
+        eye = torch.eye(self._n_cols, dtype=self.dtype, device=self.device)
+        return self.matvec(eye)
 
-        torchTT returns the operator tensor in mode order
-
-            (M_1, ..., M_d, N_1, ..., N_d),
-
-        so a reshape gives the ordinary flattened matrix.
-        """
-        return self._tt.full().reshape(self._n_rows, self._n_cols)
-
-    # ------------------------------------------------------------------
-    # Dense-vector matvec
-    # ------------------------------------------------------------------
-
-    def _matvec_dense_batch(self, x: torch.Tensor) -> torch.Tensor:
-        r"""Apply the TT matrix to a 2-D batch ``(B, n_cols)``.
-
-        Returns
-        -------
-        Tensor
-            Shape ``(B, n_rows)``.
-
-        This is still an implicit TT contraction: the matrix is never
-        materialized.
-        """
-        if x.ndim != 2 or x.shape[-1] != self._n_cols:
-            raise ValueError(
-                f"expected x with shape (B, {self._n_cols}), "
-                f"got {tuple(x.shape)}"
-            )
-
-        batch = x.shape[0]
-
-        # Flattened column index j <-> tensorized index (j_1, ..., j_d).
-        x_tt_shape = x.reshape(batch, *self._col_modes)
-
-        # torchTT contracts over the last N_1,...,N_d modes and leaves
-        # the batch dimension untouched.
-        y_tt_shape = self._tt @ x_tt_shape
-
-        # Tensorized row index -> flattened matrix row index.
-        return y_tt_shape.reshape(batch, self._n_rows)
-
-    def matvec(self, x: torch.Tensor) -> torch.Tensor:
-        r"""Apply the TT matrix to dense flattened vectors.
-
-        Accepted shapes are consistent with :class:`Matrix`:
-
-        ``(..., n_cols)``
-            Batched vectors.
-
-        ``(..., n_cols, k)``
-            Batched matrices / multiple right-hand sides.
-
-        Returns respectively
-
-        ``(..., n_rows)`` or ``(..., n_rows, k)``.
-        """
-        x = torch.as_tensor(
-            x,
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-        if x.ndim == 0:
-            raise ValueError(
-                f"x must have shape (..., {self._n_cols}) or "
-                f"(..., {self._n_cols}, k), got scalar"
-            )
-
-        # Follow the same convention as Matrix.inverse_matvec:
-        # if the second-to-last dimension is n_cols, interpret the final
-        # dimension as multiple RHS columns.
+    def _matvec_dense(self, x: torch.Tensor) -> torch.Tensor:
+        """Implicit TT contraction for dense ``(..., n_cols)`` or ``(..., n_cols, k)``."""
         if x.ndim >= 2 and x.shape[-2] == self._n_cols:
-            # (..., n_cols, k)
-            #
-            # Move RHS index before the flattened vector dimension:
-            #
-            # (..., n_cols, k) -> (..., k, n_cols)
+            # (..., n_cols, k) -> (..., k, *col_modes)
             x_rhs = x.transpose(-2, -1)
             leading = x_rhs.shape[:-1]
-
-            x_flat = x_rhs.reshape(-1, self._n_cols)
-            y_flat = self._matvec_dense_batch(x_flat)
-
-            # (..., k, n_rows) -> (..., n_rows, k)
-            y = y_flat.reshape(*leading, self._n_rows)
-            return y.transpose(-2, -1)
+            x_modes = x_rhs.reshape(*leading, *self._col_modes)
+            y_modes = self._contract_dense(x_modes)
+            return y_modes.reshape(*leading, self._n_rows).transpose(-2, -1)
 
         if x.shape[-1] == self._n_cols:
-            # (..., n_cols)
             leading = x.shape[:-1]
-
-            x_flat = x.reshape(-1, self._n_cols)
-            y_flat = self._matvec_dense_batch(x_flat)
-
-            return y_flat.reshape(*leading, self._n_rows)
+            x_modes = x.reshape(*leading, *self._col_modes)
+            y_modes = self._contract_dense(x_modes)
+            return y_modes.reshape(*leading, self._n_rows)
 
         raise ValueError(
             f"x must have shape (..., {self._n_cols}) or "
             f"(..., {self._n_cols}, k), got {tuple(x.shape)}"
         )
 
-    # ------------------------------------------------------------------
-    # TT-vector matvec
-    # ------------------------------------------------------------------
+    def _contract_dense(self, x_modes: torch.Tensor) -> torch.Tensor:
+        """Contract MPO cores into a tensorized dense vector.
 
-    def matvec_tt(self, x: Any) -> Any:
-        r"""Exact TT-matrix x TT-vector multiplication.
-
-        Parameters
-        ----------
-        x:
-            A non-matrix ``torchtt.TT`` with tensorized shape
-            ``self.col_modes``.
-
-        Returns
-        -------
-        torchtt.TT
-            TT vector with tensorized shape ``self.row_modes``.
-
-        Notes
-        -----
-        No TT rounding/compression is performed. If the matrix ranks are
-        ``R_k`` and vector ranks are ``S_k``, the exact output ranks are
-        bounded by approximately ``R_k * S_k``.
+        ``x_modes`` has shape ``(B..., N_1, ..., N_d)``; returns
+        ``(B..., M_1, ..., M_d)``.
         """
-        if torchtt is None:
-            raise ImportError("torchTT is not installed.")
+        d = len(self._cores)
+        batch_ndim = x_modes.dim() - d
+        result = x_modes.unsqueeze(-1)
+        for core in self._cores:
+            # Contract current N (always at ``batch_ndim``) and the TT bond.
+            result = torch.tensordot(result, core, dims=([batch_ndim, -1], [2, 0]))
+        return result.squeeze(-1)
 
-        if not isinstance(x, torchtt.TT):
-            raise TypeError(
-                f"x must be a torchtt.TT, got {type(x)!r}"
-            )
-
-        if x.is_ttm:
-            raise ValueError("matvec_tt expects a TT vector, not a TT matrix.")
-
-        x_modes = tuple(int(n) for n in x.N)
-        if x_modes != self._col_modes:
+    def _matvec_tt(self, x: TTVector) -> TTVector:
+        if x.modes != self._col_modes:
             raise ValueError(
-                "TT-vector mode shape does not match matrix column modes: "
-                f"{x_modes} != {self._col_modes}"
+                "TTVector modes do not match TTMatrix column modes: "
+                f"{x.modes} != {self._col_modes}"
             )
+        out_cores = []
+        for Mc, xc in zip(self._cores, x.cores):
+            # Mc: (R0, M, N, R1), xc: (S0, N, S1)
+            core = torch.einsum("ijkl,mkp->imjlp", Mc, xc)
+            core = core.reshape(
+                Mc.shape[0] * xc.shape[0],
+                Mc.shape[1],
+                Mc.shape[3] * xc.shape[2],
+            )
+            out_cores.append(core)
+        return TTVector(out_cores)
 
-        # Exact torchTT contraction. No .round() and no fast_matvec().
-        return self._tt @ x
-
-    def rev_matvec_tt(self, x: Any) -> Any:
-        """Exact ``M.T @ x`` for a TT vector."""
-        return self.T.matvec_tt(x)
-
-    # Let ``M @ x_tt`` work naturally as well.
-    def __matmul__(self, other: Any) -> Any:
-        if torchtt is not None and isinstance(other, torchtt.TT):
-            return self.matvec_tt(other)
-        return self.matvec(other)
-
-    # ------------------------------------------------------------------
-    # Cheap structured operations
-    # ------------------------------------------------------------------
-
-    def sum(self) -> torch.Tensor:
-        """Sum all matrix entries without materializing the matrix."""
-        return self._tt.sum()
-
-    def diag(self) -> torch.Tensor:
-        r"""Main diagonal without materializing, when modes align.
-
-        For a mode-wise square operator
-
-            M_k == N_k
-
-        the ordinary flattened diagonal is exactly the TT diagonal.
-
-        If the row/column tensorizations differ, fall back to the generic
-        dense implementation because local mode-wise diagonal extraction
-        would not necessarily equal the flattened matrix diagonal.
-        """
-        if self._row_modes == self._col_modes:
-            return torchtt.diag(self._tt).full().reshape(-1)
-        return super().diag()
-
-    def scale(self, s: torch.Tensor | float) -> Matrix:
-        r"""Scale by a scalar while preserving TT structure."""
-        s = torch.as_tensor(
-            s,
-            dtype=self.dtype,
-            device=self.device,
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor | TTVector:
+        x = as_vector(x)
+        if isinstance(x, TTVector):
+            return self._matvec_tt(x)
+        return self._matvec_dense(
+            x.to_dense().to(dtype=self.dtype, device=self.device)
         )
 
+    def sum(self) -> torch.Tensor:
+        acc = self._cores[0].sum(dim=(1, 2))  # (1, r1)
+        for c in self._cores[1:]:
+            acc = acc @ c.sum(dim=(1, 2))
+        return acc.reshape(())
+
+    def diag(self) -> torch.Tensor:
+        if self._row_modes != self._col_modes:
+            return super().diag()
+        diag_cores = [
+            torch.diagonal(c, dim1=1, dim2=2).permute(0, 2, 1).contiguous()
+            for c in self._cores
+        ]
+        return TTVector(diag_cores).to_dense()
+
+    def scale(self, s: torch.Tensor | float) -> Matrix:
+        s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
         if s.numel() != 1:
-            # There is no matrix batch axis in this implementation.
             return super().scale(s)
-
-        return TTMatrix(self._tt * s)
-
-    # ------------------------------------------------------------------
-    # Convenience
-    # ------------------------------------------------------------------
+        cores = list(self._cores)
+        cores[0] = cores[0] * s
+        return TTMatrix(cores)
 
     def to(
         self,
@@ -2183,21 +2008,14 @@ class TTMatrix(Matrix):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> TTMatrix:
-        """Move/cast all TT cores."""
-        if device is None:
-            device = self.device
-        if dtype is None:
-            dtype = self.dtype
-
-        return TTMatrix(
-            self._tt.to(
-                device=device,
-                dtype=dtype,
-            )
-        )
+        return TTMatrix([
+            c.to(device=device if device is not None else c.device,
+                 dtype=dtype if dtype is not None else c.dtype)
+            for c in self._cores
+        ])
 
     def clone(self) -> TTMatrix:
-        return TTMatrix(self._tt.clone())
+        return TTMatrix([c.clone() for c in self._cores])
 
     def __repr__(self) -> str:
         return (

@@ -43,69 +43,90 @@ class LinearRFF(ConditionalDensityModel):
     """
     Linear Rational Factor Form
 
-    Used for Markov transition distribution for propagation only models
+    Used for Markov transition distribution for propagation only models.
     """
-    def __init__(self, g : Basis, psi : Basis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
-        assert g.dim() == psi.dim(), "g and psi must have the same dimension"
-        assert isinstance(g, Basis), "g must be a Basis"
+    def __init__(self, a : Parameters, phi : Basis, psi : Basis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
+        assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
+        assert isinstance(a, Parameters), "a must be a Parameters"
+        assert isinstance(phi, Basis), "phi must be a Basis"
         assert isinstance(psi, Basis), "psi must be a Basis"
-        super().__init__(g.dim(), psi.dim())
+        a_vals = a()
+        a_shape = a_vals.shape if hasattr(a_vals, "shape") else a_vals.size()
+        assert tuple(a_shape) == (phi.batch_size(), phi.n_basis_functions()), (
+            "a must have shape (batch_size, n_basis) matching phi"
+        )
+        super().__init__(phi.dim(), psi.dim())
 
-        self.g = g
+        self.a = a
+        self.phi = phi
         self.psi = psi
         self.numerical_tolerance = numerical_tolerance
 
         if register_modules:
             # Register the parameter modules to use parameters() and to() methods
-            param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, psi])
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
+            coeff_modules = list(coeff_modules)
+            if a.is_module() and id(a) not in {id(c) for c in coeff_modules}:
+                coeff_modules.append(a)
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
-    
+
     def dtype_device(self):
-        return self.g.dtype_device()
+        return self.phi.dtype_device()
+
+    def g_basis(self) -> Basis:
+        """Return a Basis view of ``g = a * phi`` (phi shallow-copied with coeffs ``a``)."""
+        g = copy.copy(self.phi)
+        g.set_coeffs(self.a)
+        return g
 
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         x = conditioner
+        tol = self.numerical_tolerance
 
-        g_x = self.g(x)
-        g_xp = self.g(xp)
-        log_g_x = torch.log(g_x.sum(dim=-1) + self.numerical_tolerance)
-        log_g_xp = torch.log(g_xp.sum(dim=-1) + self.numerical_tolerance)
+        a = self.a()
+        phi_x = self.phi(x)
+        phi_xp = self.phi(xp)
+        log_g_x = torch.log((a * phi_x).sum(dim=-1) + tol)
+        log_g_xp = torch.log((a * phi_xp).sum(dim=-1) + tol)
 
-        a = self.g.coeffs().to(dtype=g_x.dtype, device=g_x.device)
-        phi_x = g_x / a.clamp_min(self.numerical_tolerance)
         psi_xp = self.psi(xp)
-        b = self.get_b()
+        b = self.get_b(a=a)
 
-        log_f = torch.log((phi_x * psi_xp * b).sum(dim=-1) + self.numerical_tolerance)
+        log_f = torch.log((phi_x * psi_xp * b).sum(dim=-1) + tol)
 
         return log_g_xp + log_f - log_g_x
 
     def get_b(self, a : torch.Tensor = None, Omega2 : torch.Tensor = None):
         if a is None:
-            a = self.g.coeffs()
+            a = self.a()
 
         if Omega2 is None:
-            phi = copy.copy(self.g)
-            phi.set_coeffs_to_one()
-            Omega2 = phi.Omega2(self.psi)
+            Omega2 = self.phi.Omega2(self.psi)
 
         return a / (as_matrix(Omega2).rev_matvec(a) + self.numerical_tolerance)
 
 
 class SumProdRFF(ConditionalDensityModel):
-    def __init__(self, g : SeparableBasis, psi : SeparableBasis, B : Parameters,
+    def __init__(self, a : Parameters, phi : SeparableBasis, psi : SeparableBasis, B : Parameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
-        assert g.dim() == psi.dim(), "g and psi must have the same dimension"
-        assert isinstance(g, Basis), "g must be a Basis"
+        assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
+        assert isinstance(a, Parameters), "a must be a Parameters"
+        assert isinstance(phi, Basis), "phi must be a Basis"
         assert isinstance(psi, Basis), "psi must be a Basis"
-        super().__init__(g.dim(), psi.dim())
+        a_vals = a()
+        a_shape = a_vals.shape if hasattr(a_vals, "shape") else a_vals.size()
+        assert tuple(a_shape) == (phi.batch_size(), phi.n_basis_functions()), (
+            "a must have shape (batch_size, n_basis) matching phi"
+        )
+        super().__init__(phi.dim(), psi.dim())
 
-        self.g = g
+        self.a = a
+        self.phi = phi
         self.psi = psi
         
-        batch_size = g.batch_size()
-        n_basis = g.n_basis_functions()
+        batch_size = phi.batch_size()
+        n_basis = phi.n_basis_functions()
         expected = (batch_size, n_basis, n_basis)
         # Unbatched structured matrices (e.g. TTMatrix) expose shape (n, n);
         # that is accepted when the basis batch size is 1.
@@ -126,14 +147,23 @@ class SumProdRFF(ConditionalDensityModel):
         self.numerical_tolerance = numerical_tolerance
 
         if register_modules:
-            param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, psi])
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
+            coeff_modules = list(coeff_modules)
+            if a.is_module() and id(a) not in {id(c) for c in coeff_modules}:
+                coeff_modules.append(a)
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
             matrix_modules = B.parameter_modules()
             self._matrix_param_modules = torch.nn.ModuleList(dict.fromkeys(matrix_modules))
 
     def dtype_device(self):
-        return self.g.dtype_device()
+        return self.phi.dtype_device()
+
+    def g_basis(self) -> Basis:
+        """Return a Basis view of ``g = a * phi`` (phi shallow-copied with coeffs ``a``)."""
+        g = copy.copy(self.phi)
+        g.set_coeffs(self.a)
+        return g
 
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         # f(x, xp) = phi(x)^T Q psi(xp) with Q = diag(a) @ B_row @ diag(q)^{-1},
@@ -142,97 +172,23 @@ class SumProdRFF(ConditionalDensityModel):
         x = conditioner
         tol = self.numerical_tolerance
 
-        log_g_x = torch.log(self.g(x).sum(dim=-1) + tol)
-        log_g_xp = torch.log(self.g(xp).sum(dim=-1) + tol)
+        a = self.a()
+        phi_x = self.phi(x)
+        phi_xp = self.phi(xp)
+        log_g_x = torch.log((a * phi_x).sum(dim=-1) + tol)
+        log_g_xp = torch.log((a * phi_xp).sum(dim=-1) + tol)
 
-        phi = copy.copy(self.g)
-        phi.set_coeffs_to_one()
-        phi_x = phi(x)
         psi_xp = self.psi(xp)
 
         B = self.B()
         row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
-        a = self.g.coeffs()
-        q = as_matrix(phi.Omega2(self.psi)).rev_matvec(a)
+        q = as_matrix(self.phi.Omega2(self.psi)).rev_matvec(a)
 
         # Q @ psi = a * (B @ (psi / q)) / row_sums
         Q_psi_xp = a * B.matvec(psi_xp / (q + tol)) / (row_sums + tol)
         log_f = torch.log((phi_x * Q_psi_xp).sum(dim=-1) + tol)
 
         return log_g_xp + log_f - log_g_x
-
-
-#class MLPContextLinearRFF(ConditionalDensityModel):
-#    """
-#    MLP Context Linear Rational Factor Form
-#
-#    Used for Markov transition with variable future factor dependencies dependent on a given context
-#    """
-#    def __init__(self, 
-#            g_mlp_form : MLPMetaForm,
-#            psi_mlp_form : MLPMetaForm,
-#            numerical_tolerance : float = 1e-20):
-#
-#        g_dim = g_mlp_form.dim()
-#        psi_dim = psi_mlp_form.dim()
-#        assert g_dim == psi_dim, "g_dim and psi_dim must have the same dimension"
-#        super().__init__(g_dim, g_dim)
-#
-#        self.g_mlp_form = g_mlp_form
-#        self.psi_mlp_form = psi_mlp_form
-#
-#        self.numerical_tolerance = numerical_tolerance
-#    
-#    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
-#        x = conditioner
-#        u = contexts["u"]
-#        up = contexts["up"]
-#        phi_x = self.g_mlp_form(x, u=u, ignore_coeffs=True) # (n_data, n_phi)
-#        psi_xp = self.psi_mlp_form(xp, u=u, up=up) # (n_data, n_psi)
-#        phi_xp = self.g_mlp_form(xp, u=up, ignore_coeffs=True) # (n_data, n_phi)
-#
-#        #means, stds = self.psi_mlp_form.means_stds(u=u, up=up)
-#        #print("psi Means: ", means)
-#        #print("psi Stds: ", stds)
-#
-#        a_curr = self.get_a(u)
-#        a_next = self.get_a(up)
-#        b = self.get_b(u=u, up=up, a_curr=a_curr, a_next=a_next)
-#
-#        if a_curr.dim() == 1:
-#            log_g_x = torch.log(phi_x @ a_curr + self.numerical_tolerance) # (n_data)
-#            log_g_xp = torch.log(phi_xp @ a_next + self.numerical_tolerance) # (n_data)
-#            log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
-#        else:
-#            log_g_x = torch.log((phi_x * a_curr).sum(dim=-1) + self.numerical_tolerance)
-#            log_g_xp = torch.log((phi_xp * a_next).sum(dim=-1) + self.numerical_tolerance)
-#            log_f = torch.log(((phi_x * psi_xp) * b).sum(dim=-1) + self.numerical_tolerance)
-#
-#        return log_g_xp + log_f - log_g_x
-#
-#    def get_a(self, u : torch.Tensor):
-#        return self.g_mlp_form.instantiate(u=u).coeff_values()
-#
-#    def get_b(self, u : torch.Tensor, up : torch.Tensor, a_curr : torch.Tensor = None, a_next : torch.Tensor = None, Omega : torch.Tensor = None):
-#        u = torch.as_tensor(u)
-#        up = torch.as_tensor(up)
-#
-#        if a_curr is None:
-#            a_curr = self.get_a(u)
-#        if a_next is None:
-#            a_next = self.get_a(up)
-#
-#        if Omega is None:
-#            Omega = self.g_mlp_form.instantiate(u=u).Omega2(
-#                self.psi_mlp_form.instantiate(u=u, up=up),
-#                ignore_coeffs=True,
-#            )
-#
-#        if u.ndim == 1:
-#            return a_curr / (Omega.T @ a_next + self.numerical_tolerance)
-#
-#        denom = torch.einsum("nij,ni->nj", Omega, a_next)
-#        return a_curr / (denom + self.numerical_tolerance)
 
 
 class LinearRF(ConditionalDensityModel):
@@ -508,7 +464,7 @@ class LinearFF(DensityModel):
     @classmethod
     def from_rff(cls, rff : LinearRFF | SumProdRFF, h : Basis, renormalize_h : bool = True, register_modules : bool = True):
         assert isinstance(rff, LinearRFF) or isinstance(rff, SumProdRFF), "rff must be a LinearRFF or SumProdRFF"
-        return cls(rff.g, h, numerical_tolerance=rff.numerical_tolerance, renormalize_h=renormalize_h, register_modules=register_modules)
+        return cls(rff.g_basis(), h, numerical_tolerance=rff.numerical_tolerance, renormalize_h=renormalize_h, register_modules=register_modules)
 
     #TODO
     #@classmethod

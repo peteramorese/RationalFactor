@@ -12,6 +12,7 @@ from rational_factor.models.structured_matrices import (
     R1PDFactorization,
     TTMatrix,
 )
+from rational_factor.models.structured_vectors import OneVector, TTVector
 
 
 class Parameters(ABC):
@@ -181,11 +182,14 @@ class PositiveParameters(TrainableParameters):
 
 
 class IdentityParameters(Parameters):
-    def __init__(self):
-        pass
+    def __init__(self, n: int, batch_shape: tuple[int, ...] = (), dtype: torch.dtype = torch.float32, device: torch.device = torch.device("cpu")):
+        self._n = n
+        self._batch_shape = batch_shape
+        self._dtype = dtype
+        self._device = device
 
     def __call__(self):
-        return Identity()
+        return Identity(self._n, self._batch_shape, self._dtype, self._device)
 
     def is_trainable(self):
         return False
@@ -193,24 +197,44 @@ class IdentityParameters(Parameters):
     def is_module(self):
         return False
 
+
+class OneVectorParameters(Parameters):
+    def __init__(self, n: int, batch_shape: tuple[int, ...] = (), dtype: torch.dtype = torch.float32, device: torch.device = torch.device("cpu")):
+        self._n = n
+        self._batch_shape = batch_shape
+        self._dtype = dtype
+        self._device = device
+
+    def __call__(self) -> OneVector:
+        return OneVector(self._n, self._batch_shape, self._dtype, self._device)
+
+    def is_trainable(self):
+        return False
+
+    def is_module(self):
+        return False
+
+
+class DenseMatrixParameters(Parameters):
+    """Wraps a ``(..., n, m)`` tensor parameter; ``()`` returns a ``DenseMatrix``."""
+
+    def __init__(self, values: Parameters):
+        self._values = values
+
+    def __call__(self) -> DenseMatrix:
+        return DenseMatrix(self._values())
+
+    def is_trainable(self):
+        return self._values.is_trainable()
+
+    def parameter_modules(self) -> list[torch.nn.Module]:
+        return self._values.parameter_modules()
+
+    def is_module(self):
+        return False
+
+
 class R1PDFactorizationParameters(Parameters):
-    """Trainable factors of a sequential rank-1-plus-diagonal product.
-
-    Stores ``d, u, v`` with shape ``(..., T, ..., n)`` where ``seq_dim`` indexes
-    the product factors. Calling ``()`` returns an
-    :class:`~rational_factor.models.structured_matrices.R1PDFactorization`
-    representing ``M_{T-1} ⋯ M_0``.
-
-    For row-/column-stochastic factors (``normalization in {'r','c'}``), pass
-    unconstrained :class:`TrainableParameters` for ``u`` and ``v`` and omit
-    ``d`` (it is ignored). Initialize ``u`` large-negative so ``sigmoid(u)≈0``
-    and each factor starts near the identity; otherwise a product of many
-    moderately mixing stochastic factors collapses to the uniform matrix.
-    Do not wrap ``u``/``v`` in :class:`PositiveParameters` when using
-    ``normalization`` — softplus+sigmoid/softmax stacks and destroys the
-    intended near-identity initialization.
-    """
-
     def __init__(
         self,
         u: Parameters,
@@ -265,70 +289,182 @@ class R1PDFactorizationParameters(Parameters):
         return [module for param in params for module in param.parameter_modules()]
 
 
-class DenseMatrixParameters(Parameters):
-    """Wraps a ``(..., n, m)`` tensor parameter; ``()`` returns a ``DenseMatrix``."""
+def _resolve_tt_bond_ranks(n_cores: int, ranks: int | Sequence[int]) -> tuple[int, ...]:
+    """Expand ranks to the full bond sequence ``(1, r_1, ..., r_{d-1}, 1)``."""
+    if n_cores < 1:
+        raise ValueError("n_cores must be >= 1")
+    if isinstance(ranks, int):
+        if ranks < 1:
+            raise ValueError(f"ranks must be >= 1, got {ranks}")
+        return (1,) + (int(ranks),) * (n_cores - 1) + (1,)
 
-    def __init__(self, values: Parameters):
-        self._values = values
+    ranks_seq = tuple(int(r) for r in ranks)
+    if len(ranks_seq) == n_cores - 1:
+        ranks_full = (1,) + ranks_seq + (1,)
+    elif len(ranks_seq) == n_cores + 1:
+        ranks_full = ranks_seq
+    else:
+        raise ValueError(
+            f"ranks must be an int, length {n_cores - 1} (interior), or "
+            f"length {n_cores + 1} (full including boundaries), got length "
+            f"{len(ranks_seq)}"
+        )
+    if any(r < 1 for r in ranks_full):
+        raise ValueError(f"all ranks must be >= 1, got {ranks_full}")
+    if ranks_full[0] != 1 or ranks_full[-1] != 1:
+        raise ValueError(f"boundary ranks must be 1, got ranks={ranks_full}")
+    return ranks_full
 
-    def __call__(self) -> DenseMatrix:
-        return DenseMatrix(self._values())
+
+def _random_tt_core(
+    param_cls: type[TrainableParameters],
+    shape: tuple[int, ...],
+    *,
+    trainable: bool,
+    mean: float,
+    std: float,
+    epsilon: float,
+    device: torch.device | str | None,
+) -> Parameters:
+    if issubclass(param_cls, PositiveParameters):
+        core: Parameters = param_cls.random_init(
+            shape,
+            trainable=trainable,
+            mean=mean,
+            std=std,
+            epsilon=epsilon,
+        )
+    else:
+        core = param_cls.random_init(shape, trainable=trainable, mean=mean, std=std)
+    if device is not None and isinstance(core, torch.nn.Module):
+        core = core.to(device)
+    return core
+
+
+class TTVectorParameters(Parameters):
+    """TT-vector cores; ``()`` returns a :class:`TTVector`.
+
+    Each core is a :class:`Parameters` object producing a 3-D tensor of shape
+    ``(r_{k-1}, n_k, r_k)`` with ``r_0 = r_d = 1``. Positivity is determined by
+    the core type you pass (e.g. :class:`PositiveParameters`).
+    """
+
+    def __init__(self, cores: Sequence[Parameters]):
+        if len(cores) == 0:
+            raise ValueError("TTVectorParameters requires at least one core")
+        self._cores = tuple(cores)
+        _ = self()
+
+    @classmethod
+    def from_cores(cls, cores: Sequence[Parameters]) -> "TTVectorParameters":
+        return cls(cores)
+
+    @classmethod
+    def from_core_spec(
+        cls,
+        modes: Sequence[int],
+        ranks: int | Sequence[int] = 1,
+        *,
+        param_cls: type[TrainableParameters] = TrainableParameters,
+        trainable: bool = True,
+        mean: float = 0.0,
+        std: float = 1.0,
+        epsilon: float = 0.0,
+        device: torch.device | str | None = None,
+    ) -> "TTVectorParameters":
+        """Build random 3-D TT cores from mode sizes and bond ranks.
+
+        ``ranks`` may be a single interior rank, the interior ranks
+        ``(r_1, ..., r_{d-1})``, or the full bond sequence
+        ``(1, r_1, ..., r_{d-1}, 1)``. Core ``k`` has shape
+        ``(r_{k-1}, n_k, r_k)``.
+        """
+        modes = tuple(int(m) for m in modes)
+        if len(modes) == 0:
+            raise ValueError("modes must be non-empty")
+        if any(m < 1 for m in modes):
+            raise ValueError(f"all mode sizes must be >= 1, got {modes}")
+
+        ranks_full = _resolve_tt_bond_ranks(len(modes), ranks)
+        cores = [
+            _random_tt_core(
+                param_cls,
+                (ranks_full[k], modes[k], ranks_full[k + 1]),
+                trainable=trainable,
+                mean=mean,
+                std=std,
+                epsilon=epsilon,
+                device=device,
+            )
+            for k in range(len(modes))
+        ]
+        return cls(cores)
+
+    @property
+    def cores(self) -> tuple[Parameters, ...]:
+        return self._cores
+
+    def __call__(self) -> TTVector:
+        return TTVector.from_cores([core() for core in self._cores])
 
     def is_trainable(self):
-        return self._values.is_trainable()
+        return any(core.is_trainable() for core in self._cores)
 
     def parameter_modules(self) -> list[torch.nn.Module]:
-        return self._values.parameter_modules()
+        return [
+            module
+            for core in self._cores
+            for module in core.parameter_modules()
+        ]
 
     def is_module(self):
         return False
 
 
 class TTMatrixParameters(Parameters):
-    """Trainable TT-matrix / MPO cores; ``()`` returns a :class:`TTMatrix`.
+    """TT-matrix / MPO cores; ``()`` returns a :class:`TTMatrix`.
 
-    Each core has shape ``(r_{k-1}, M_k, N_k, r_k)`` with boundary ranks
-    ``r_0 = r_d = 1``. Like :class:`TTMatrix` itself there is no leading
-    matrix-batch axis, so this is suitable for ``SumProdRFF`` when the
-    basis batch size is 1.
-
-    Pass :class:`PositiveParameters` cores (or use ``random_init`` with
-    ``positive=True``) when the contracted matrix must stay entrywise
-    nonnegative, as required by :class:`~rational_factor.models.factor_forms.SumProdRFF`.
+    Each core is a :class:`Parameters` object producing a 4-D tensor of shape
+    ``(r_{k-1}, M_k, N_k, r_k)`` with ``r_0 = r_d = 1``. Positivity is
+    determined by the core type you pass (e.g. :class:`PositiveParameters`).
     """
 
     def __init__(self, cores: Sequence[Parameters]):
         if len(cores) == 0:
             raise ValueError("TTMatrixParameters requires at least one core")
         self._cores = tuple(cores)
-        # Validate core shapes / TT ranks by building once.
         _ = self()
 
     @classmethod
-    def random_init(
+    def from_cores(cls, cores: Sequence[Parameters]) -> "TTMatrixParameters":
+        return cls(cores)
+
+    @classmethod
+    def from_core_spec(
         cls,
         row_modes: Sequence[int],
+        ranks: int | Sequence[int] = 1,
         col_modes: Sequence[int] | None = None,
-        ranks: int | Sequence[int] = 4,
         *,
+        param_cls: type[TrainableParameters] = TrainableParameters,
         trainable: bool = True,
-        positive: bool = True,
         mean: float = 0.0,
         std: float = 1.0,
         epsilon: float = 0.0,
         device: torch.device | str | None = None,
     ) -> "TTMatrixParameters":
-        """Random TT-matrix cores for modes ``(M_k)`` by ``(N_k)``.
+        """Build random 4-D MPO cores from mode sizes and bond ranks.
 
         ``ranks`` may be a single interior rank, the interior ranks
         ``(r_1, ..., r_{d-1})``, or the full bond sequence
-        ``(1, r_1, ..., r_{d-1}, 1)``.
+        ``(1, r_1, ..., r_{d-1}, 1)``. Core ``k`` has shape
+        ``(r_{k-1}, M_k, N_k, r_k)``.
         """
         row_modes = tuple(int(m) for m in row_modes)
         if col_modes is None:
             col_modes = row_modes
         else:
-            col_modes = tuple(int(m) for m in col_modes)
+            col_modes = tuple(int(n) for n in col_modes)
         if len(row_modes) == 0:
             raise ValueError("row_modes must be non-empty")
         if len(row_modes) != len(col_modes):
@@ -341,64 +477,19 @@ class TTMatrixParameters(Parameters):
                 f"all mode sizes must be >= 1, got row={row_modes}, col={col_modes}"
             )
 
-        d = len(row_modes)
-        if isinstance(ranks, int):
-            if ranks < 1:
-                raise ValueError(f"ranks must be >= 1, got {ranks}")
-            ranks_full = (1,) + (int(ranks),) * (d - 1) + (1,)
-        else:
-            ranks_seq = tuple(int(r) for r in ranks)
-            if len(ranks_seq) == d - 1:
-                ranks_full = (1,) + ranks_seq + (1,)
-            elif len(ranks_seq) == d + 1:
-                ranks_full = ranks_seq
-            else:
-                raise ValueError(
-                    f"ranks must be an int, length {d - 1} (interior), or "
-                    f"length {d + 1} (full including boundaries), got length "
-                    f"{len(ranks_seq)}"
-                )
-            if any(r < 1 for r in ranks_full):
-                raise ValueError(f"all ranks must be >= 1, got {ranks_full}")
-            if ranks_full[0] != 1 or ranks_full[-1] != 1:
-                raise ValueError(
-                    f"boundary ranks must be 1, got ranks={ranks_full}"
-                )
-
-        cores: list[Parameters] = []
-        for k in range(d):
-            shape = (
-                ranks_full[k],
-                row_modes[k],
-                col_modes[k],
-                ranks_full[k + 1],
+        ranks_full = _resolve_tt_bond_ranks(len(row_modes), ranks)
+        cores = [
+            _random_tt_core(
+                param_cls,
+                (ranks_full[k], row_modes[k], col_modes[k], ranks_full[k + 1]),
+                trainable=trainable,
+                mean=mean,
+                std=std,
+                epsilon=epsilon,
+                device=device,
             )
-            if positive:
-                core = PositiveParameters.random_init(
-                    shape,
-                    trainable=trainable,
-                    mean=mean,
-                    std=std,
-                    epsilon=epsilon,
-                )
-            elif trainable:
-                core = TrainableParameters.random_init(
-                    shape, mean=mean, std=std
-                )
-            else:
-                core = TrainableParameters.from_values(
-                    torch.randn(*shape) * std + mean, trainable=False
-                )
-            if device is not None and isinstance(core, torch.nn.Module):
-                core = core.to(device)
-            cores.append(core)
-        return cls(cores)
-
-    @classmethod
-    def from_cores(
-        cls,
-        cores: Sequence[Parameters],
-    ) -> "TTMatrixParameters":
+            for k in range(len(row_modes))
+        ]
         return cls(cores)
 
     @property
@@ -440,6 +531,7 @@ class LowRankFactorizationParameters(Parameters):
 
     def is_module(self):
         return False
+
 
 class Order1Quasiseparable1Parameters(Parameters):
     """Trainable ``P = L D U``.
@@ -563,8 +655,3 @@ class QuasiseparableParameters(Parameters):
 
     def parameter_modules(self) -> list[torch.nn.Module]:
         return [module for param in self.parameters for module in param.parameter_modules()]
-
-
-# Backward-compatible aliases.
-Order1QuasiseparableFactorization = Order1Quasiseparable1Parameters
-QuasiseparableFactorization = QuasiseparableParameters

@@ -142,24 +142,24 @@ if __name__ == "__main__":
     ).to(device, dtype=dtype)
 
     # TT-matrix B shares the mutual basis output mode shape.
-    B = TTMatrixParameters.random_init(
+    B = TTMatrixParameters.from_core_spec(
         phi_psi_mutual.output_mode_sizes,
         ranks=rank,
+        param_cls=PositiveParameters,
         mean=1.0,
         std=1.0,
         epsilon=5e-3,
         device=device,
-        positive=True,
     )
     B = TTMatrixParameters.from_cores(
         [core.to(device=device, dtype=dtype) for core in B.cores]
     )
 
-    g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
+    phi_basis = phi_psi_mutual.get_basis(0)
     psi_basis = phi_psi_mutual.get_basis(1)
 
     # cartpole default tolerance (1e-20) is too tight once basis values are O(1e-6).
-    rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=1e-10)
+    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
     tran_model = CompositeConditionalModel(
         base_density=rff, 
         context_features=d, 

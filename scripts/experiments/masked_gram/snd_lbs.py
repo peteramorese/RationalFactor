@@ -410,13 +410,13 @@ if __name__ == "__main__":
 
     B = _make_qs_B(n_basis, B_order, device)
 
-    g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
+    phi_basis = phi_psi_mutual.get_basis(0)
     psi_basis = phi_psi_mutual.get_basis(1)
 
     wrap_tf = _make_wrap_tf(
         x_k, dim=dim, sacrificial_index=sacrificial_index, trainable=True
     ).to(device)
-    rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
     print("Training transition model")
@@ -513,7 +513,7 @@ if __name__ == "__main__":
 
     phi_out_path = output_dir / "phi_basis_functions.png"
     _plot_basis_functions(
-        g_basis,
+        phi_basis,
         phi_out_path,
         basis_name="phi",
         n_grid=500,

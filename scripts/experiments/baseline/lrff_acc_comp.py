@@ -106,10 +106,7 @@ if __name__ == "__main__":
     ).to(device)
     B = DenseMatrixParameters(B_coeffs)
 
-    g_basis = GaussianBasis(phi_means, phi_stds, coeffs=g_coeffs)
-    psi_basis = GaussianBasis(psi_means, psi_stds, coeffs=None)
-
-    tran_model = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    tran_model = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss

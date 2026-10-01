@@ -324,11 +324,11 @@ if __name__ == "__main__":
 
 
 
-    g_basis = orth_pwc_mutual.get_basis(0, coeffs=g_coeffs)
+    phi_basis = orth_pwc_mutual.get_basis(0)
     psi_basis = orth_pwc_mutual.get_basis(1)
 
     wrap_tf = ErfSeparableTransform.from_data(x_k, trainable=True).to(device)
-    rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
     cell_widths.set_requires_grad(False)
@@ -368,17 +368,15 @@ if __name__ == "__main__":
     B = rff.B()
     tol = rff.numerical_tolerance
     row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
-    a_dbg = rff.g.coeffs()
-    phi_dbg = copy.copy(rff.g)
-    phi_dbg.set_coeffs_to_one()
+    a_dbg = rff.a()
+    phi_dbg = rff.phi
     q_dbg = as_matrix(phi_dbg.Omega2(rff.psi)).rev_matvec(a_dbg)
     Q = a_dbg.unsqueeze(-1) * B.to_dense() / (row_sums.unsqueeze(-1) + tol) / (q_dbg.unsqueeze(-2) + tol)
     print(Q)
     s = torch.linalg.svdvals(Q)
     print(s)
     print("condition number:", s.max() / s.min())
-    phi = copy.copy(g_basis)
-    phi.set_coeffs_to_one()
+    phi = copy.copy(phi_basis)
 
     x_grid = torch.linspace(0, 1, 100, device=device, dtype=torch.float32).reshape(-1, 1)
     phi_x = phi(x_grid)                 # [..., m]
@@ -455,7 +453,7 @@ if __name__ == "__main__":
 
     phi_out_path = output_dir / "phi_basis_functions.png"
     _plot_basis_functions(
-        g_basis,
+        phi_basis,
         phi_out_path,
         basis_name="phi",
         n_grid=500,

@@ -437,20 +437,20 @@ if __name__ == "__main__":
     ).to(device)
 
     # TT-matrix B shares the mutual basis output mode shape.
-    B = TTMatrixParameters.random_init(
+    B = TTMatrixParameters.from_core_spec(
         phi_psi_mutual.output_mode_sizes,
         ranks=rank,
+        param_cls=PositiveParameters,
         mean=1.0,
         std=1.0,
         epsilon=1e-3,
         device=device,
-        positive=True,
     )
 
-    g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
+    phi_basis = phi_psi_mutual.get_basis(0)
     psi_basis = phi_psi_mutual.get_basis(1)
 
-    rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = rff
     #tran_model = CompositeConditionalModel(
     #    rff,

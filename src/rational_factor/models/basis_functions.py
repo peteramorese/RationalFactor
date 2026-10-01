@@ -4,7 +4,7 @@ import torch
 from abc import abstractmethod
 from numpy.polynomial.legendre import leggauss
 
-from .parameters import Parameters, FixedParameters, TrainableParameters, PositiveParameters
+from .parameters import Parameters, TrainableParameters, PositiveParameters, OneVectorParameters
 from .gram import BetaGram, GaussianGram
 from .structured_matrices import Banded, DenseMatrix
 
@@ -21,7 +21,7 @@ class Basis:
             dim : int, number of dimensions
             batch_size : int, number of data points in the batch
             n_basis : int, number of basis functions
-            params : list of tensors where each represents a parameter group for a basis function
+            params : list of tensors where each represents a parameter group 
             coeffs : coefficients
         '''
 
@@ -38,12 +38,6 @@ class Basis:
         else:
             self.set_coeffs_to_one()
 
-    def _coeffs_register(self):
-        return [self.coeffs]
-    
-    def _params_register(self):
-        return [self._params]
-
     @staticmethod
     def get_deduplicated_module_list(bases : list["Basis"]) -> list[torch.nn.Module]:
         '''
@@ -54,17 +48,17 @@ class Basis:
         unique_params = []
         unique_coeffs = []
         for basis in bases:
-            for coeffs in basis._coeffs_register():
-                if coeffs.is_module() and id(coeffs) not in coeffs_seen:
-                    unique_coeffs.append(coeffs)
-                    coeffs_seen[id(coeffs)] = coeffs
+            coeffs = basis.coeffs
+            if coeffs.is_module() and id(coeffs) not in coeffs_seen:
+                unique_coeffs.append(coeffs)
+                coeffs_seen[id(coeffs)] = coeffs
             owner = getattr(basis, "owner", None)
             if isinstance(owner, torch.nn.Module):
                 if id(owner) not in params_seen:
                     unique_params.append(owner)
                     params_seen[id(owner)] = owner
                 continue
-            for params in basis._params_register():
+            for params in basis._params:
                 for param in params:
                     if param.is_module() and id(param) not in params_seen:
                         unique_params.append(param)
@@ -76,13 +70,24 @@ class Basis:
 
     def set_coeffs(self, coeffs : Parameters):
         assert isinstance(coeffs, Parameters), "coeffs must be a Parameters object"
-        assert coeffs().dim() == 2, "coeffs must have shape (batch_size, n_basis)"
-        assert coeffs().size() == (self._batch_size, self._n_basis), "coeffs must have shape (batch_size, n_basis)"
+        vals = coeffs()
+        shape = tuple(vals.shape) if hasattr(vals, "shape") else tuple(vals.size())
+        assert len(shape) == 2, "coeffs must have shape (batch_size, n_basis)"
+        assert shape == (self._batch_size, self._n_basis), "coeffs must have shape (batch_size, n_basis)"
         self.coeffs = coeffs
     
     def set_coeffs_to_one(self):
         dtype, device = self.dtype_device()
-        self.set_coeffs(FixedParameters(torch.ones(self._batch_size, self._n_basis, dtype=dtype, device=device)))
+        self.set_coeffs(OneVectorParameters(self._n_basis, (self._batch_size,), dtype, device))
+    
+    @staticmethod
+    def _coeff_tensor(coeffs_vals):
+        """Materialize coeffs to a dense tensor (supports structured Vectors)."""
+        if hasattr(coeffs_vals, "to_dense"):
+            return coeffs_vals.to_dense()
+        return coeffs_vals 
+    def params(self):
+        return self._params
     
     def dim(self):
         return self._dim
@@ -271,23 +276,25 @@ class SeparableBasis(Basis):
         return torch.exp(self.log_Omega1_dim(lows, highs).sum(dim=1)) * self.coeffs()
     
     def Omega2(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
-        return DenseMatrix(
-            torch.exp(self.log_Omega2_dim(other, lows, highs).sum(dim=1))
-            * self.coeffs()[:, :, None]
-            * other.coeffs()[:, None, :]
+        base = DenseMatrix(torch.exp(self.log_Omega2_dim(other, lows, highs).sum(dim=1)))
+        return base.mul_diag_left(Basis._coeff_tensor(self.coeffs())).mul_diag_right(
+            Basis._coeff_tensor(other.coeffs())
         )
 
     def Omega3(self, other1 : 'Basis', other2 : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
+        c0 = Basis._coeff_tensor(self.coeffs())
+        c1 = Basis._coeff_tensor(other1.coeffs())
+        c2 = Basis._coeff_tensor(other2.coeffs())
         return (
             torch.exp(self.log_Omega3_dim(other1, other2, lows, highs).sum(dim=1))
-            * self.coeffs()[:, :, None, None]
-            * other1.coeffs()[:, None, :, None]
-            * other2.coeffs()[:, None, None, :]
+            * c0[:, :, None, None]
+            * c1[:, None, :, None]
+            * c2[:, None, None, :]
         )
 
     def Omega22(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
-        c1 = self.coeffs()
-        c2 = other.coeffs()
+        c1 = Basis._coeff_tensor(self.coeffs())
+        c2 = Basis._coeff_tensor(other.coeffs())
         return (
             torch.exp(self.log_Omega22_dim(other, lows, highs).sum(dim=1))
             * c1[:, :, None, None, None]

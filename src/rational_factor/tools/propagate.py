@@ -17,8 +17,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
     if isinstance(transition_model, LinearRFF):
         assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
 
-        phi = copy.copy(transition_model.g)
-        phi.set_coeffs_to_one()
+        phi = transition_model.phi
 
         psi0 = copy.copy(init_belief.h)
         psi0.set_coeffs_to_one()
@@ -51,8 +50,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
     elif isinstance(transition_model, SumProdRFF):
         assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for SumProdRFF transition model"
 
-        phi = copy.copy(transition_model.g)
-        phi.set_coeffs_to_one()
+        phi = transition_model.phi
 
         psi0 = copy.copy(init_belief.h)
         psi0.set_coeffs_to_one()
@@ -65,7 +63,7 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         B = transition_model.B()
         tol = transition_model.numerical_tolerance
         row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
-        a = transition_model.g.coeffs()
+        a = transition_model.a()
         q = Omega2.rev_matvec(a)
 
         c0_norm_constant = torch.exp(init_belief.log_norm_constant())
@@ -88,7 +86,8 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
             hk = copy.copy(transition_model.psi)
             hk.set_coeffs(FixedParameters(ck))
             h_seq.append(hk)
-        belief_seq = [LinearFF(transition_model.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False) for h in h_seq]
+        g = transition_model.g_basis()
+        belief_seq = [LinearFF(g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
 
         return belief_seq
 

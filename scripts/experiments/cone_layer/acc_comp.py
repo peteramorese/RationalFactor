@@ -185,11 +185,11 @@ if __name__ == "__main__":
     ).to(device)
     B = DenseMatrixParameters(B_coeffs)
 
-    g_basis = phi_psi_mutual.get_basis(0, coeffs=g_coeffs)
+    phi_basis = phi_psi_mutual.get_basis(0)
     psi_basis = phi_psi_mutual.get_basis(1)
 
     # cartpole default tolerance (1e-20) is too tight once basis values are O(1e-6).
-    rff = SumProdRFF(g_basis, psi_basis, B, numerical_tolerance=1e-10)
+    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
     tran_model = CompositeConditionalModel(
         rff,
         context_features=dim,
