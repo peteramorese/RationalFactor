@@ -243,6 +243,102 @@ class TTVector(Vector):
         """Whether all TT ranks are one."""
         return all(r == 1 for r in self.ranks)
 
+    def elementwise_multiply(self, other: "TTVector") -> "TTVector":
+        r"""Return the elementwise / Hadamard product ``self * other``.
+
+        Leading batch dimensions follow normal PyTorch broadcasting.
+
+        If ``self`` has TT ranks ``r_k`` and ``other`` has TT ranks ``s_k``,
+        the resulting TT has ranks
+
+            r_k * s_k.
+
+        In particular, if either operand has TT rank 1, the rank structure of
+        the other operand is preserved exactly.
+
+        Parameters
+        ----------
+        other:
+            TTVector with the same physical mode sizes.
+
+        Returns
+        -------
+        TTVector
+            Batched TTVector representing the elementwise product.
+        """
+        if not isinstance(other, TTVector):
+            raise TypeError(
+                "TTVector.elementwise_multiply requires another TTVector"
+            )
+
+        if self.modes != other.modes:
+            raise ValueError(
+                "TTVector elementwise multiplication requires matching modes, "
+                f"got {self.modes} and {other.modes}"
+            )
+
+        try:
+            batch_shape = torch.broadcast_shapes(
+                self.batch_shape,
+                other.batch_shape,
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                "TTVector batch shapes are not broadcast-compatible: "
+                f"{tuple(self.batch_shape)} and "
+                f"{tuple(other.batch_shape)}"
+            ) from exc
+
+        out_cores = []
+
+        for a, b in zip(self._cores, other._cores):
+
+            prod = (
+                a[..., :, None, :, :, None]
+                *
+                b[..., None, :, :, None, :]
+            )
+
+            ra_left = a.shape[-3]
+            n = a.shape[-2]
+            ra_right = a.shape[-1]
+
+            rb_left = b.shape[-3]
+            rb_right = b.shape[-1]
+
+            # Combine the two left bonds and the two right bonds.
+            prod = prod.reshape(
+                *batch_shape,
+                ra_left * rb_left,
+                n,
+                ra_right * rb_right,
+            )
+
+            out_cores.append(prod)
+
+        return TTVector(out_cores)
+
+
+    def __mul__(self, other) -> "TTVector":
+        if isinstance(other, TTVector):
+            return self.elementwise_multiply(other)
+
+        # Optional convenience: scalar multiplication.
+        if isinstance(other, (int, float, torch.Tensor)):
+            return self.scale(other)
+
+        return NotImplemented
+
+
+    def __rmul__(self, other) -> "TTVector":
+        if isinstance(other, TTVector):
+            return other.elementwise_multiply(self)
+
+        if isinstance(other, (int, float, torch.Tensor)):
+            return self.scale(other)
+
+        return NotImplemented
+
     def to_dense(self) -> torch.Tensor:
         r"""Materialize the flattened dense vectors.
         """
@@ -368,6 +464,175 @@ class TTVector(Vector):
         other: "TTVector",
     ) -> "TTVector":
         return self.elementwise_divide(other)
+
+    def elementwise_add(self, other: "TTVector") -> "TTVector":
+        r"""Return the exact elementwise sum ``self + other``.
+
+        Leading batch dimensions follow normal PyTorch broadcasting.
+
+        If ``self`` has TT ranks ``r_k`` and ``other`` has TT ranks ``s_k``,
+        the resulting TT has ranks
+
+            r_k + s_k
+
+        at each internal bond.
+
+        No TT rounding/compression is performed.
+        """
+        if not isinstance(other, TTVector):
+            raise TypeError(
+                "TTVector.elementwise_add requires another TTVector"
+            )
+
+        if self.modes != other.modes:
+            raise ValueError(
+                "TTVector addition requires matching modes, got "
+                f"{self.modes} and {other.modes}"
+            )
+
+        if self.device != other.device:
+            raise ValueError(
+                "TTVector addition requires both operands on the same device, "
+                f"got {self.device} and {other.device}"
+            )
+
+        try:
+            batch_shape = torch.broadcast_shapes(
+                self.batch_shape,
+                other.batch_shape,
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                "TTVector batch shapes are not broadcast-compatible: "
+                f"{tuple(self.batch_shape)} and "
+                f"{tuple(other.batch_shape)}"
+            ) from exc
+
+        # torch.cat requires a common dtype.
+        dtype = torch.promote_types(self.dtype, other.dtype)
+
+        a_cores = [
+            c.to(dtype=dtype).expand(*batch_shape, *c.shape[-3:])
+            for c in self._cores
+        ]
+        b_cores = [
+            c.to(dtype=dtype).expand(*batch_shape, *c.shape[-3:])
+            for c in other._cores
+        ]
+
+        d = len(a_cores)
+
+        # Special case: a one-core TT is just a dense physical mode with
+        # boundary ranks (1, 1), so addition is direct.
+        if d == 1:
+            return TTVector([a_cores[0] + b_cores[0]])
+
+        out_cores = []
+
+        out_cores.append(
+            torch.cat(
+                [a_cores[0], b_cores[0]],
+                dim=-1,
+            )
+        )
+
+        for a, b in zip(a_cores[1:-1], b_cores[1:-1]):
+            ra_left, n, ra_right = a.shape[-3:]
+            rb_left, nb, rb_right = b.shape[-3:]
+
+            if n != nb:
+                raise ValueError(
+                    f"TT mode mismatch during addition: {n} != {nb}"
+                )
+
+            c = torch.zeros(
+                *batch_shape,
+                ra_left + rb_left,
+                n,
+                ra_right + rb_right,
+                dtype=dtype,
+                device=self.device,
+            )
+
+            c[..., :ra_left, :, :ra_right] = a
+            c[..., ra_left:, :, ra_right:] = b
+
+            out_cores.append(c)
+
+        out_cores.append(
+            torch.cat(
+                [a_cores[-1], b_cores[-1]],
+                dim=-3,
+            )
+        )
+
+        return TTVector(out_cores)
+
+
+    def add_scalar(
+        self,
+        s: torch.Tensor | float | int,
+    ) -> "TTVector":
+        r"""Add a scalar to every entry of the TTVector.
+
+        ``s`` may be a scalar or a tensor broadcast-compatible with the
+        TT batch dimensions.
+
+        This constructs the rank-1 constant tensor
+
+            s * 1 ⊗ 1 ⊗ ... ⊗ 1
+
+        and adds it exactly to ``self``.
+
+        Therefore the internal TT ranks increase by at most one.
+        """
+        s = torch.as_tensor(
+            s,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        try:
+            batch_shape = torch.broadcast_shapes(
+                self.batch_shape,
+                s.shape,
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Scalar/batch value shape {tuple(s.shape)} is not "
+                f"broadcast-compatible with TT batch shape "
+                f"{tuple(self.batch_shape)}"
+            ) from exc
+
+        # Broadcast s to the common batch shape.
+        s = s.expand(batch_shape)
+
+        constant_cores = []
+
+        for k, n in enumerate(self.modes):
+            if k == 0:
+                core = s[..., None, None, None].expand(*batch_shape, 1, n, 1)
+            else:
+                core = torch.ones(*batch_shape, 1, n, 1, dtype=self.dtype, device=self.device)
+
+            constant_cores.append(core)
+
+        return self.elementwise_add(TTVector(constant_cores))
+
+
+    def __add__(self, other) -> "TTVector":
+        if isinstance(other, TTVector):
+            return self.elementwise_add(other)
+
+        if isinstance(other, (int, float, torch.Tensor)):
+            return self.add_scalar(other)
+
+        return NotImplemented
+
+
+    def __radd__(self, other) -> "TTVector":
+        # Addition is commutative.
+        return self.__add__(other)
 
     def sum(self) -> torch.Tensor:
         r"""Return the sum of all vector entries using TT contraction.

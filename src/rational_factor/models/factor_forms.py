@@ -5,6 +5,7 @@ from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
 from .parameters import Parameters
 from .structured_matrices import Matrix, as_matrix
+from .structured_vectors import as_vector
 
 # Linear models #
 
@@ -84,22 +85,23 @@ class LinearRFF(ConditionalDensityModel):
         x = conditioner
         tol = self.numerical_tolerance
 
-        a = self.a()
-        phi_x = self.phi(x)
-        phi_xp = self.phi(xp)
-        log_g_x = torch.log((a * phi_x).sum(dim=-1) + tol)
-        log_g_xp = torch.log((a * phi_xp).sum(dim=-1) + tol)
+        a = as_vector(self.a())
+        phi_x = as_vector(self.phi(x))
+        phi_xp = as_vector(self.phi(xp))
+        log_g_x = torch.log((a * phi_x).sum() + tol)
+        log_g_xp = torch.log((a * phi_xp).sum() + tol)
 
-        psi_xp = self.psi(xp)
+        psi_xp = as_vector(self.psi(xp))
+        
         b = self.get_b(a=a)
 
-        log_f = torch.log((phi_x * psi_xp * b).sum(dim=-1) + tol)
+        log_f = torch.log(as_vector(phi_x * psi_xp * b).sum() + tol)
 
         return log_g_xp + log_f - log_g_x
 
     def get_b(self, a : torch.Tensor = None, Omega2 : torch.Tensor = None):
         if a is None:
-            a = self.a()
+            a = as_vector(self.a())
 
         if Omega2 is None:
             Omega2 = self.phi.Omega2(self.psi)
@@ -172,13 +174,13 @@ class SumProdRFF(ConditionalDensityModel):
         x = conditioner
         tol = self.numerical_tolerance
 
-        a = self.a()
-        phi_x = self.phi(x)
-        phi_xp = self.phi(xp)
-        log_g_x = torch.log((a * phi_x).sum(dim=-1) + tol)
-        log_g_xp = torch.log((a * phi_xp).sum(dim=-1) + tol)
+        a = as_vector(self.a())
+        phi_x = as_vector(self.phi(x))
+        phi_xp = as_vector(self.phi(xp))
+        log_g_x = torch.log((a * phi_x).sum() + tol)
+        log_g_xp = torch.log((a * phi_xp).sum() + tol)
 
-        psi_xp = self.psi(xp)
+        psi_xp = as_vector(self.psi(xp))
 
         B = self.B()
         row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
@@ -186,7 +188,7 @@ class SumProdRFF(ConditionalDensityModel):
 
         # Q @ psi = a * (B @ (psi / q)) / row_sums
         Q_psi_xp = a * B.matvec(psi_xp / (q + tol)) / (row_sums + tol)
-        log_f = torch.log((phi_x * Q_psi_xp).sum(dim=-1) + tol)
+        log_f = torch.log(as_vector(phi_x * Q_psi_xp).sum() + tol)
 
         return log_g_xp + log_f - log_g_x
 
