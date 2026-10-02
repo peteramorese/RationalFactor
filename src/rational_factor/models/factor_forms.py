@@ -3,7 +3,7 @@ import copy
 import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
-from .parameters import Parameters
+from .parameters import Parameters, RowStochasticMatrixParameters
 from .structured_matrices import Matrix, as_matrix
 from .structured_vectors import as_vector
 
@@ -110,7 +110,7 @@ class LinearRFF(ConditionalDensityModel):
 
 
 class SumProdRFF(ConditionalDensityModel):
-    def __init__(self, a : Parameters, phi : SeparableBasis, psi : SeparableBasis, B : Parameters,
+    def __init__(self, a : Parameters, phi : SeparableBasis, psi : SeparableBasis, B : RowStochasticMatrixParameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
         assert isinstance(a, Parameters), "a must be a Parameters"
@@ -135,12 +135,12 @@ class SumProdRFF(ConditionalDensityModel):
         expected_unbatched = (n_basis, n_basis)
 
         B_m = B()
-        shape_ok = isinstance(B_m, Matrix) and (
+        shape_ok = isinstance(B_m, RowStochasticMatrixParameters) and (
             B_m.shape == expected
             or (batch_size == 1 and B_m.shape == expected_unbatched)
         )
         assert shape_ok, (
-            f"B() must be a Matrix of shape {expected}"
+            f"B() must be a RowStochasticMatrixParameters of shape {expected}"
             + (f" or {expected_unbatched}" if batch_size == 1 else "")
             + f", got {type(B_m).__name__} {tuple(getattr(B_m, 'shape', ()))}"
         )
@@ -183,11 +183,10 @@ class SumProdRFF(ConditionalDensityModel):
         psi_xp = as_vector(self.psi(xp))
 
         B = self.B()
-        row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
         q = as_matrix(self.phi.Omega2(self.psi)).rev_matvec(a)
 
-        # Q @ psi = a * (B @ (psi / q)) / row_sums
-        Q_psi_xp = a * B.matvec(psi_xp / (q + tol)) / (row_sums + tol)
+        # Q @ psi = a * (B @ (psi / q))
+        Q_psi_xp = a * B.matvec(psi_xp / (q + tol))
         log_f = torch.log(as_vector(phi_x * Q_psi_xp).sum() + tol)
 
         return log_g_xp + log_f - log_g_x

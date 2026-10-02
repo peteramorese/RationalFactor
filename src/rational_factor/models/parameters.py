@@ -234,6 +234,16 @@ class DenseMatrixParameters(Parameters):
         return False
 
 
+class RowStochasticMatrixParameters(Parameters):
+    pass
+
+
+class RowStochasticDenseMatrixParameters(DenseMatrixParameters, RowStochasticMatrixParameters):
+    def __call__(self) -> DenseMatrix:
+        row_stochastic_values = torch.softmax(self._values(), dim=-1)
+        return DenseMatrix(row_stochastic_values)
+
+
 class R1PDFactorizationParameters(Parameters):
     def __init__(
         self,
@@ -511,6 +521,26 @@ class TTMatrixParameters(Parameters):
 
     def is_module(self):
         return False
+
+
+class RowStochasticTTMatrixParameters(TTMatrixParameters, RowStochasticMatrixParameters):
+    """TT-matrix parameters whose MPO is row stochastic. """
+
+    def __call__(self) -> TTMatrix:
+        cores = []
+
+        for core_params in self._cores:
+            core = core_params()
+            r_left, m, n, r_right = core.shape
+
+            core = torch.softmax(
+                core.reshape(r_left, m, n * r_right),
+                dim=-1,
+            ).reshape(r_left, m, n, r_right)
+
+            cores.append(core)
+
+        return TTMatrix.from_cores(cores)
 
 
 class LowRankFactorizationParameters(Parameters):
