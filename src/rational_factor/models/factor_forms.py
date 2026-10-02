@@ -5,7 +5,7 @@ from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
 from .parameters import Parameters, RowStochasticMatrixParameters
 from .structured_matrices import Matrix, as_matrix
-from .structured_vectors import as_vector
+from .structured_vectors import TTVector, as_vector
 
 # Linear models #
 
@@ -110,16 +110,24 @@ class LinearRFF(ConditionalDensityModel):
 
 
 class SumProdRFF(ConditionalDensityModel):
-    def __init__(self, a : Parameters, phi : SeparableBasis, psi : SeparableBasis, B : RowStochasticMatrixParameters,
+    def __init__(self, a : Parameters, phi : Basis, psi : Basis, B : Parameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
         assert isinstance(a, Parameters), "a must be a Parameters"
         assert isinstance(phi, Basis), "phi must be a Basis"
         assert isinstance(psi, Basis), "psi must be a Basis"
         a_vals = a()
-        a_shape = a_vals.shape if hasattr(a_vals, "shape") else a_vals.size()
-        assert tuple(a_shape) == (phi.batch_size(), phi.n_basis_functions()), (
-            "a must have shape (batch_size, n_basis) matching phi"
+        a_shape = tuple(a_vals.shape) if hasattr(a_vals, "shape") else tuple(a_vals.size())
+        batch_size = phi.batch_size()
+        n_basis = phi.n_basis_functions()
+        a_ok = a_shape == (batch_size, n_basis) or (
+            batch_size == 1 and a_shape == (n_basis,)
+        )
+        assert a_ok, (
+            "a must have shape "
+            f"({batch_size}, {n_basis})"
+            + (f" or ({n_basis},)" if batch_size == 1 else "")
+            + f", got {a_shape}"
         )
         super().__init__(phi.dim(), psi.dim())
 
@@ -127,20 +135,19 @@ class SumProdRFF(ConditionalDensityModel):
         self.phi = phi
         self.psi = psi
         
-        batch_size = phi.batch_size()
-        n_basis = phi.n_basis_functions()
         expected = (batch_size, n_basis, n_basis)
         # Unbatched structured matrices (e.g. TTMatrix) expose shape (n, n);
         # that is accepted when the basis batch size is 1.
         expected_unbatched = (n_basis, n_basis)
 
         B_m = B()
-        shape_ok = isinstance(B_m, RowStochasticMatrixParameters) and (
+        assert isinstance(B_m, RowStochasticMatrixParameters), "B must be a RowStochasticMatrixParameters"
+        shape_ok = isinstance(B_m, Matrix) and (
             B_m.shape == expected
             or (batch_size == 1 and B_m.shape == expected_unbatched)
         )
         assert shape_ok, (
-            f"B() must be a RowStochasticMatrixParameters of shape {expected}"
+            f"B() must be a Matrix of shape {expected}"
             + (f" or {expected_unbatched}" if batch_size == 1 else "")
             + f", got {type(B_m).__name__} {tuple(getattr(B_m, 'shape', ()))}"
         )
@@ -151,8 +158,14 @@ class SumProdRFF(ConditionalDensityModel):
         if register_modules:
             param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
             coeff_modules = list(coeff_modules)
-            if a.is_module() and id(a) not in {id(c) for c in coeff_modules}:
+            seen = {id(c) for c in coeff_modules}
+            if a.is_module() and id(a) not in seen:
                 coeff_modules.append(a)
+                seen.add(id(a))
+            for module in a.parameter_modules():
+                if id(module) not in seen:
+                    coeff_modules.append(module)
+                    seen.add(id(module))
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
             matrix_modules = B.parameter_modules()
@@ -168,9 +181,9 @@ class SumProdRFF(ConditionalDensityModel):
         return g
 
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
-        # f(x, xp) = phi(x)^T Q psi(xp) with Q = diag(a) @ B_row @ diag(q)^{-1},
-        # B_row = diag(B 1)^{-1} @ B, q = Omega2^T a.  Applied as elementwise
-        # scales around B.matvec — no explicit Q / mul_diag.
+        # f(x, xp) = phi(x)^T Q psi(xp) with Q = diag(a) @ B @ diag(q)^{-1},
+        # q = Omega2^T a.  Applied as elementwise scales around B.matvec.
+        # For TT, avoid ``q + tol`` (raises TT rank); tol is only used in logs.
         x = conditioner
         tol = self.numerical_tolerance
 
@@ -483,8 +496,14 @@ class LinearFF(DensityModel):
         # SumProdRFF often passes a coarse tol (e.g. 1e-5) that is only meant for
         # conditional ratios; flooring log(h+tol) while Omega2 uses the true tiny h
         # makes p(x)=g h/Z appear enormously peaked (bogus large negative NLL).
-        g_sum = self.g(x).sum(dim=-1).clamp_min(0)
-        h_sum = self.h(x).sum(dim=-1).clamp_min(0)
+        g_vals = self.g(x)
+        h_vals = self.h(x)
+        if isinstance(g_vals, torch.Tensor):
+            g_sum = g_vals.sum(dim=-1).clamp_min(0)
+            h_sum = h_vals.sum(dim=-1).clamp_min(0)
+        else:
+            g_sum = as_vector(g_vals).sum().clamp_min(0)
+            h_sum = as_vector(h_vals).sum().clamp_min(0)
         log_eps = torch.finfo(g_sum.dtype).tiny
         log_g_x = torch.log(g_sum + log_eps)
         log_h_x = torch.log(h_sum + log_eps)

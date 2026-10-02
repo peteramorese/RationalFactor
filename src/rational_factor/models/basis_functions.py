@@ -52,17 +52,24 @@ class Basis:
             if coeffs.is_module() and id(coeffs) not in coeffs_seen:
                 unique_coeffs.append(coeffs)
                 coeffs_seen[id(coeffs)] = coeffs
+            for module in coeffs.parameter_modules():
+                if id(module) not in coeffs_seen:
+                    unique_coeffs.append(module)
+                    coeffs_seen[id(module)] = module
             owner = getattr(basis, "owner", None)
             if isinstance(owner, torch.nn.Module):
                 if id(owner) not in params_seen:
                     unique_params.append(owner)
                     params_seen[id(owner)] = owner
                 continue
-            for params in basis._params:
-                for param in params:
-                    if param.is_module() and id(param) not in params_seen:
-                        unique_params.append(param)
-                        params_seen[id(param)] = param
+            for param in basis._params:
+                if param.is_module() and id(param) not in params_seen:
+                    unique_params.append(param)
+                    params_seen[id(param)] = param
+                for module in param.parameter_modules():
+                    if id(module) not in params_seen:
+                        unique_params.append(module)
+                        params_seen[id(module)] = module
         return unique_params, unique_coeffs
 
     def forward(self, y : torch.Tensor):
@@ -72,8 +79,19 @@ class Basis:
         assert isinstance(coeffs, Parameters), "coeffs must be a Parameters object"
         vals = coeffs()
         shape = tuple(vals.shape) if hasattr(vals, "shape") else tuple(vals.size())
-        assert len(shape) == 2, "coeffs must have shape (batch_size, n_basis)"
-        assert shape == (self._batch_size, self._n_basis), "coeffs must have shape (batch_size, n_basis)"
+        # Dense / OneVector coeffs are (batch_size, n_basis). Unbatched structured
+        # vectors (e.g. TTVector) expose shape (n_basis,) when batch_size == 1.
+        if shape == (self._batch_size, self._n_basis):
+            pass
+        elif self._batch_size == 1 and shape == (self._n_basis,):
+            pass
+        else:
+            raise AssertionError(
+                "coeffs must have shape "
+                f"({self._batch_size}, {self._n_basis})"
+                + (f" or ({self._n_basis},)" if self._batch_size == 1 else "")
+                + f", got {shape}"
+            )
         self.coeffs = coeffs
     
     def set_coeffs_to_one(self):

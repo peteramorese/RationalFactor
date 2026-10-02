@@ -1,12 +1,15 @@
-from rational_factor.models.basis_functions import Basis, SeparableBasis
-from rational_factor.models.parameters import TTVectorParameters
-from rational_factor.models.structured_vectors import TTVector
-from rational_factor.models.structured_matrices import TTMatrix
+from __future__ import annotations
 
 import torch
 
+from rational_factor.models.basis_functions import Basis, SeparableBasis
+from rational_factor.models.parameters import FixedParameters, TTVectorParameters
+from rational_factor.models.structured_matrices import TTMatrix
+from rational_factor.models.structured_vectors import TTVector
+
+
 class TTBasis(Basis):
-    r"""Full tensor-product basis with TT-structured coefficients.
+    r"""Full tensor-product basis with optional TT-structured coefficients.
 
     Given a :class:`SeparableBasis` providing per-dimension primitives
 
@@ -17,7 +20,7 @@ class TTBasis(Basis):
         Phi_{i_1,...,i_d}(x)
             = prod_l phi^{(l)}_{i_l}(x_l),
 
-    scaled by a TT coefficient tensor
+    optionally scaled by a TT coefficient tensor
 
         A_{i_1,...,i_d}.
 
@@ -29,60 +32,57 @@ class TTBasis(Basis):
 
     represented as a TTVector.
 
+    If ``coeffs`` is ``None``, ``A`` is the all-ones rank-1 TT (no trainable
+    coefficients).
+
     Notes
     -----
-    ``TTVector`` and ``TTMatrix`` currently do not carry a batch axis.
-    Therefore:
-
-    * ``forward(y)`` returns a TTVector for a single input point, and a tuple
-      of TTVectors for multiple input points.
-    * ``Omega2`` requires the primitive Gram matrices to have batch size 1.
+    ``forward(y)`` returns a (possibly batched) :class:`TTVector`. ``Omega2``
+    still requires the primitive Gram matrices to have batch size 1 because
+    ``TTMatrix`` has no batch axis.
     """
 
     def __init__(
         self,
         primitives: SeparableBasis,
-        coeffs: TTVectorParameters,
+        coeffs: TTVectorParameters | None = None,
     ):
+        if not isinstance(primitives, SeparableBasis):
+            raise TypeError(
+                "primitives must be a SeparableBasis, got "
+                f"{type(primitives).__name__}"
+            )
         assert primitives.batch_size() == 1, "TTBasis currently only supports batch size 1"
 
-        super().__init__(
-            dim=primitives.dim(),
-            batch_size=1,
-            n_basis=coeffs.n,
-            params=primitives.params(),
-            coeffs=coeffs,
-        )
-
-        if not isinstance(primitives, SeparableBasis):
-            raise TypeError( "primitives must be a SeparableBasis, got " f"{type(primitives).__name__}")
-
-        if not isinstance(coeffs, TTVector):
-            raise TypeError( "coeffs must be a TTVector, got " f"{type(coeffs).__name__}")
-
         n_local = primitives.n_basis_functions()
+        dim = primitives.dim()
+        expected_modes = (n_local,) * dim
+        dtype, device = primitives.dtype_device()
 
-        expected_modes = (n_local,) * self.dim()
-        if coeffs.modes != expected_modes:
+        if coeffs is None:
+            coeffs = self._ones_rank1_tt_coeffs()
+        elif not isinstance(coeffs, TTVectorParameters):
+            raise TypeError(
+                "coeffs must be a TTVectorParameters or None, got "
+                f"{type(coeffs).__name__}"
+            )
+        elif coeffs.modes != expected_modes:
             raise ValueError(
                 "TT coefficient modes must match the primitive basis size "
                 "in every dimension. Expected "
                 f"{expected_modes}, got {coeffs.modes}"
             )
 
-        dtype, device = primitives.dtype_device()
-        if coeffs.dtype != dtype:
-            raise ValueError(
-                f"Coefficient dtype {coeffs.dtype} does not match "
-                f"primitive dtype {dtype}"
-            )
-        if coeffs.device != device:
-            raise ValueError(
-                f"Coefficient device {coeffs.device} does not match "
-                f"primitive device {device}"
-            )
-
         self._primitives = primitives
+        self._modes = expected_modes
+
+        super().__init__(
+            dim=dim,
+            batch_size=1,
+            n_basis=coeffs.n,
+            params=primitives.params(),
+            coeffs=coeffs,
+        )
 
     @property
     def primitives(self) -> SeparableBasis:
@@ -90,17 +90,44 @@ class TTBasis(Basis):
 
     @property
     def modes(self) -> tuple[int, ...]:
-        return self._coeffs.modes
+        return self._modes
 
     @property
     def ranks(self) -> tuple[int, ...]:
-        return self._coeffs.ranks
+        return self.coeffs.ranks
 
     def n_primitives_per_dim(self) -> int:
         return self._primitives.n_basis_functions()
 
     def dtype_device(self):
-        return self._coeffs.dtype, self._coeffs.device
+        return self._primitives.dtype_device()
+
+    def set_coeffs(self, coeffs: TTVectorParameters):
+        if not isinstance(coeffs, TTVectorParameters):
+            raise TypeError(
+                "TTBasis coeffs must be TTVectorParameters, got "
+                f"{type(coeffs).__name__}"
+            )
+        if coeffs.modes != self._modes:
+            raise ValueError(
+                "TT coefficient modes must match existing modes "
+                f"{self._modes}, got {coeffs.modes}"
+            )
+        if hasattr(self, "_n_basis") and coeffs.n != self._n_basis:
+            raise ValueError(
+                f"coeffs.n must equal n_basis={self._n_basis}, got {coeffs.n}"
+            )
+        self.coeffs = coeffs
+
+    def set_coeffs_to_one(self):
+        dtype, device = self.dtype_device()
+
+        cores = [
+            FixedParameters(torch.ones(1, n, 1, dtype=dtype, device=device))
+            for n in self._modes
+        ]
+        ones = TTVectorParameters.from_cores(cores)
+        self.set_coeffs(ones)
 
     def forward(self, y: torch.Tensor) -> TTVector:
         r"""Evaluate the TT-weighted tensor-product basis at a batch of points.
@@ -123,16 +150,16 @@ class TTBasis(Basis):
                 f"Expected input dimension {self._dim}, got {dim}"
             )
 
-        if len(self._coeffs.cores) != dim:
+        coeff_cores = self.coeffs().cores
+        if len(coeff_cores) != dim:
             raise ValueError(
                 "Number of TT cores must equal the basis dimension: "
-                f"{len(self._coeffs.cores)} != {dim}"
+                f"{len(coeff_cores)} != {dim}"
             )
 
         out_cores = []
 
-        for ell, core in enumerate(self._coeffs.cores):
-
+        for ell, core in enumerate(coeff_cores):
             if core.shape[-2] != n_local:
                 raise ValueError(
                     f"TT mode mismatch at dimension {ell}: "
@@ -141,19 +168,15 @@ class TTBasis(Basis):
                 )
 
             local_values = values[:, ell, :]
-
             local_values = local_values[:, None, :, None]
-
-            out_core = core * local_values
-
-            out_cores.append(out_core)
+            out_cores.append(core * local_values)
 
         return TTVector(out_cores)
 
     def __call__(
         self,
         y: torch.Tensor,
-    ) -> TTVector | tuple[TTVector, ...]:
+    ) -> TTVector:
         return self.forward(y)
 
     def Omega1(
@@ -180,16 +203,15 @@ class TTBasis(Basis):
             )
 
         omega = torch.exp(log_omega)
+        coeff_cores = self.coeffs().cores
 
         outputs = []
 
         for b in range(omega.shape[0]):
             cores = []
-
-            for ell, core in enumerate(self._coeffs.cores):
+            for ell, core in enumerate(coeff_cores):
                 factor = omega[b, ell].reshape(1, -1, 1)
                 cores.append(core * factor)
-
             outputs.append(TTVector(cores))
 
         if len(outputs) == 1:
@@ -220,11 +242,6 @@ class TTBasis(Basis):
             r_l * s_l.
 
         The primitive tensor-product Gram itself has MPO rank 1.
-
-        Notes
-        -----
-        The current TTMatrix implementation has no batch dimension, so this
-        method requires the per-dimension primitive Gram to have batch size 1.
         """
         if not isinstance(other, TTBasis):
             raise TypeError(
@@ -266,12 +283,12 @@ class TTBasis(Basis):
 
         # (dim, n_self, n_other)
         gram = torch.exp(log_gram[0])
+        self_cores = self.coeffs().cores
+        other_cores = other.coeffs().cores
 
         mpo_cores = []
 
-        for ell, (a_core, b_core) in enumerate(
-            zip(self._coeffs.cores, other._coeffs.cores)
-        ):
+        for ell, (a_core, b_core) in enumerate(zip(self_cores, other_cores)):
             G = gram[ell]
 
             if G.shape != (a_core.shape[1], b_core.shape[1]):
@@ -307,6 +324,6 @@ class TTBasis(Basis):
             f"modes={self.modes}, "
             f"n_basis={self._n_basis}, "
             f"ranks={self.ranks}, "
-            f"dtype={self._coeffs.dtype}, "
-            f"device={self._coeffs.device})"
+            f"dtype={self.dtype_device()[0]}, "
+            f"device={self.dtype_device()[1]})"
         )

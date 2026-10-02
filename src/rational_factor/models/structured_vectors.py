@@ -422,7 +422,9 @@ class TTVector(Vector):
     ) -> "TTVector":
         r"""Return the elementwise quotient ``self / other``.
 
-        Only implemented when both TT vectors have rank one.
+        The denominator ``other`` must be rank one. The numerator may have
+        arbitrary TT ranks; dividing by a rank-1 TT preserves those ranks
+        (core-wise broadcast), which is the Hadamard product with ``1/other``.
         """
         if not isinstance(other, TTVector):
             raise TypeError(
@@ -435,11 +437,10 @@ class TTVector(Vector):
                 f"{self.modes} and {other.modes}"
             )
 
-        if not self.is_rank_one or not other.is_rank_one:
+        if not other.is_rank_one:
             raise ValueError(
-                "TTVector elementwise division is only implemented for "
-                "rank-1 TT vectors, got "
-                f"ranks={self.ranks} and ranks={other.ranks}"
+                "TTVector elementwise division requires a rank-1 denominator, "
+                f"got ranks={other.ranks}"
             )
 
         try:
@@ -662,3 +663,10 @@ class TTVector(Vector):
             f"dtype={self.dtype}, "
             f"device={self.device})"
         )
+
+
+def as_vector(obj: torch.Tensor | Vector) -> Vector:
+    """Return ``obj`` if it is already a ``Vector``, otherwise wrap a dense tensor."""
+    if isinstance(obj, Vector):
+        return obj
+    return DenseVector(torch.as_tensor(obj))

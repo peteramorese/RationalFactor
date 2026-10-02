@@ -1,16 +1,33 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
-from normalizing_flow.composite_model import CompositeConditionalModel
-from rational_factor.models.parameters import FixedParameters
+from rational_factor.models.parameters import FixedParameters, TTVectorParameters
 from rational_factor.models.structured_matrices import Matrix, as_matrix
+from rational_factor.models.structured_vectors import TTVector, as_vector
 import torch
 import copy 
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
+
+
+def _coeff_params_from_values(values):
+    """Wrap vector values as Fixed / TT coefficient Parameters."""
+    values = as_vector(values)
+    if isinstance(values, TTVector):
+        return TTVectorParameters.from_cores(
+            [FixedParameters(core.detach().clone()) for core in values.cores]
+        )
+    dense = values.to_dense() if hasattr(values, "to_dense") else values
+    return FixedParameters(dense.detach().clone() if hasattr(dense, "detach") else dense)
+
 
 def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
     if device is None:
         device = init_belief.dtype_device()[1]
 
-    if isinstance(transition_model, CompositeConditionalModel):
+    try:
+        from normalizing_flow.composite_model import CompositeConditionalModel
+    except ImportError:
+        CompositeConditionalModel = ()  # type: ignore[misc, assignment]
+
+    if CompositeConditionalModel and isinstance(transition_model, CompositeConditionalModel):
         return propagate(init_belief, transition_model.conditional_density_model, n_steps, device)
 
     ##### LINEAR RATIONAL FACTOR #####
@@ -31,16 +48,16 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         c0 = c0_norm_constant * init_belief.h.coeffs()
 
         h0 = copy.copy(init_belief.h)
-        h0.set_coeffs(FixedParameters(c0))
+        h0.set_coeffs(_coeff_params_from_values(c0))
         h_seq = [h0]
         c1 = b * Omega2_0.matvec(c0)
         h1 = copy.copy(transition_model.psi)
-        h1.set_coeffs(FixedParameters(c1))
+        h1.set_coeffs(_coeff_params_from_values(c1))
         h_seq.append(h1)
         for _ in range(1, n_steps):
             ck = b * Omega2.matvec(h_seq[-1].coeffs())
             hk = copy.copy(transition_model.psi)
-            hk.set_coeffs(FixedParameters(ck))
+            hk.set_coeffs(_coeff_params_from_values(ck))
             h_seq.append(hk)
         
         belief_seq = [LinearFF(init_belief.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
@@ -58,33 +75,31 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         Omega2_0 = as_matrix(phi.Omega2(psi0))
         Omega2 = as_matrix(phi.Omega2(transition_model.psi))
 
-        # Q = diag(a) @ diag(B 1)^{-1} @ B @ diag(q)^{-1}, so
-        # Q^T s = B^T ((a * s) / row_sums) / q  (elementwise scales + rev_matvec).
+        # Q = diag(a) @ B @ diag(q)^{-1}, so Q^T s = (B^T (a * s)) / q.
         B = transition_model.B()
-        tol = transition_model.numerical_tolerance
-        row_sums = B.matvec(torch.ones(B.shape[-1], device=B.device, dtype=B.dtype))
-        a = transition_model.a()
-        q = Omega2.rev_matvec(a)
+        a = as_vector(transition_model.a())
+        q = as_vector(Omega2.rev_matvec(a))
 
         c0_norm_constant = torch.exp(init_belief.log_norm_constant())
-        c0 = c0_norm_constant * init_belief.h.coeffs()
+        c0 = c0_norm_constant * as_vector(init_belief.h.coeffs())
 
         h0 = copy.copy(init_belief.h)
-        h0.set_coeffs(FixedParameters(c0))
+        h0.set_coeffs(_coeff_params_from_values(c0))
         h_seq = [h0]
         
-        def _Omega2_QT_matmul(c : torch.tensor, _Omega2 : Matrix):
-            s1 = _Omega2.matvec(c)
-            return B.rev_matvec((a * s1) / (row_sums + tol)) / (q + tol)
+        def _Omega2_QT_matmul(c, _Omega2 : Matrix):
+            c_vec = as_vector(c)
+            s1 = _Omega2.matvec(c_vec)
+            return B.rev_matvec(a * s1) / q
         
         c1 = _Omega2_QT_matmul(c0, Omega2_0)
         h1 = copy.copy(transition_model.psi)
-        h1.set_coeffs(FixedParameters(c1))
+        h1.set_coeffs(_coeff_params_from_values(c1))
         h_seq.append(h1)
         for _ in range(1, n_steps):
             ck = _Omega2_QT_matmul(h_seq[-1].coeffs(), Omega2)
             hk = copy.copy(transition_model.psi)
-            hk.set_coeffs(FixedParameters(ck))
+            hk.set_coeffs(_coeff_params_from_values(ck))
             h_seq.append(hk)
         g = transition_model.g_basis()
         belief_seq = [LinearFF(g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]

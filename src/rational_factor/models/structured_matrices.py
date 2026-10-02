@@ -1961,12 +1961,14 @@ class TTMatrix(Matrix):
             )
         out_cores = []
         for Mc, xc in zip(self._cores, x.cores):
-            # Mc: (R0, M, N, R1), xc: (S0, N, S1)
-            core = torch.einsum("ijkl,mkp->imjlp", Mc, xc)
+            # Mc: (R0, M, N, R1), xc: (*batch, S0, N, S1)
+            core = torch.einsum("ijkl,...mkp->...imjlp", Mc, xc)
+            batch_shape = core.shape[:-5]
             core = core.reshape(
-                Mc.shape[0] * xc.shape[0],
+                *batch_shape,
+                Mc.shape[0] * xc.shape[-3],
                 Mc.shape[1],
-                Mc.shape[3] * xc.shape[2],
+                Mc.shape[3] * xc.shape[-1],
             )
             out_cores.append(core)
         return TTVector(out_cores)

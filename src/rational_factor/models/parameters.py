@@ -414,6 +414,21 @@ class TTVectorParameters(Parameters):
     def cores(self) -> tuple[Parameters, ...]:
         return self._cores
 
+    @property
+    def modes(self) -> tuple[int, ...]:
+        return tuple(int(core.size()[-2]) for core in self._cores)
+
+    @property
+    def ranks(self) -> tuple[int, ...]:
+        return (1,) + tuple(int(core.size()[-1]) for core in self._cores)
+
+    @property
+    def n(self) -> int:
+        n = 1
+        for mode in self.modes:
+            n *= mode
+        return n
+
     def __call__(self) -> TTVector:
         return TTVector.from_cores([core() for core in self._cores])
 
