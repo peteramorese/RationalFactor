@@ -12,6 +12,7 @@ from rational_factor.models.parameters import (
     TTMatrixParameters,
     TTVectorParameters,
     param_group_iter,
+    RowStochasticTTMatrixParameters,
 )
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
@@ -22,7 +23,7 @@ import rational_factor.tools.propagate as propagate
 
 
 if __name__ == "__main__":
-    problem = FULLY_OBSERVABLE_PROBLEMS["cartpole"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
 
     ###
     use_gpu = torch.cuda.is_available()
@@ -39,7 +40,7 @@ if __name__ == "__main__":
     split_seed = 0
     tran_params = {
         "n_epochs_per_group": [5, 2],  # basis, weights
-        "iterations": 100,
+        "iterations": 10,
         "lr_basis": 4 * 3e-3,
         "lr_weights": 1 * 5e-2,
     }
@@ -141,7 +142,7 @@ if __name__ == "__main__":
     )
 
     # Full-rank TT-matrix B on the same mode shape.
-    B = TTMatrixParameters.from_core_spec(
+    B = RowStochasticTTMatrixParameters.from_core_spec(
         tt_modes,
         ranks=rank,
         param_cls=PositiveParameters,
@@ -150,7 +151,7 @@ if __name__ == "__main__":
         epsilon=5e-3,
         device=device,
     )
-    B = TTMatrixParameters.from_cores(
+    B = RowStochasticTTMatrixParameters.from_cores(
         [core.to(device=device, dtype=dtype) for core in B.cores]
     )
 

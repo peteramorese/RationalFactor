@@ -141,7 +141,9 @@ class SumProdRFF(ConditionalDensityModel):
         expected_unbatched = (n_basis, n_basis)
 
         B_m = B()
-        assert isinstance(B_m, RowStochasticMatrixParameters), "B must be a RowStochasticMatrixParameters"
+        assert isinstance(B, RowStochasticMatrixParameters), (
+            "B must be a RowStochasticMatrixParameters"
+        )
         shape_ok = isinstance(B_m, Matrix) and (
             B_m.shape == expected
             or (batch_size == 1 and B_m.shape == expected_unbatched)
@@ -199,7 +201,12 @@ class SumProdRFF(ConditionalDensityModel):
         q = as_matrix(self.phi.Omega2(self.psi)).rev_matvec(a)
 
         # Q @ psi = a * (B @ (psi / q))
-        Q_psi_xp = a * B.matvec(psi_xp / (q + tol))
+        # Do not form ``q + tol`` for TTVectors: add_scalar raises the TT rank
+        # and breaks rank-1 elementwise division. Floor only in the logs.
+        if isinstance(q, TTVector):
+            Q_psi_xp = a * B.matvec(psi_xp / q)
+        else:
+            Q_psi_xp = a * B.matvec(psi_xp / (q + tol))
         log_f = torch.log(as_vector(phi_x * Q_psi_xp).sum() + tol)
 
         return log_g_xp + log_f - log_g_x

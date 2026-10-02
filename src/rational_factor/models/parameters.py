@@ -541,6 +541,41 @@ class TTMatrixParameters(Parameters):
 class RowStochasticTTMatrixParameters(TTMatrixParameters, RowStochasticMatrixParameters):
     """TT-matrix parameters whose MPO is row stochastic. """
 
+    @classmethod
+    def from_cores(cls, cores: Sequence[Parameters]) -> "RowStochasticTTMatrixParameters":
+        return cls(cores)
+
+    @classmethod
+    def from_core_spec(
+        cls,
+        row_modes: Sequence[int],
+        ranks: int | Sequence[int] = 1,
+        col_modes: Sequence[int] | None = None,
+        *,
+        param_cls: type[TrainableParameters] = TrainableParameters,
+        trainable: bool = True,
+        mean: float = 0.0,
+        std: float = 1.0,
+        epsilon: float = 0.0,
+        device: torch.device | str | None = None,
+    ) -> "RowStochasticTTMatrixParameters":
+        """Build random row-stochastic TT-matrix cores from mode sizes and ranks.
+
+        Same core layout as :meth:`TTMatrixParameters.from_core_spec`; row
+        stochasticity is applied in :meth:`__call__`.
+        """
+        return super().from_core_spec(
+            row_modes,
+            ranks=ranks,
+            col_modes=col_modes,
+            param_cls=param_cls,
+            trainable=trainable,
+            mean=mean,
+            std=std,
+            epsilon=epsilon,
+            device=device,
+        )
+
     def __call__(self) -> TTMatrix:
         cores = []
 

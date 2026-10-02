@@ -57,10 +57,14 @@ class TTBasis(Basis):
         n_local = primitives.n_basis_functions()
         dim = primitives.dim()
         expected_modes = (n_local,) * dim
-        dtype, device = primitives.dtype_device()
+
+        self._primitives = primitives
+        self._modes = expected_modes
+
+        n = primitives.n_basis_functions() ** dim
 
         if coeffs is None:
-            coeffs = self._ones_rank1_tt_coeffs()
+            coeffs = self.set_coeffs_to_one()
         elif not isinstance(coeffs, TTVectorParameters):
             raise TypeError(
                 "coeffs must be a TTVectorParameters or None, got "
@@ -73,13 +77,10 @@ class TTBasis(Basis):
                 f"{expected_modes}, got {coeffs.modes}"
             )
 
-        self._primitives = primitives
-        self._modes = expected_modes
-
         super().__init__(
             dim=dim,
             batch_size=1,
-            n_basis=coeffs.n,
+            n_basis=n,
             params=primitives.params(),
             coeffs=coeffs,
         )
