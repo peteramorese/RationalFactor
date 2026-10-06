@@ -24,13 +24,13 @@ import rational_factor.tools.propagate as propagate
 
 
 if __name__ == "__main__":
-    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["cartpole"]
 
     ###
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
     # Primitive 1-D count; TT modes are (n_primitive,) * dim, so n_basis = n_primitive^dim.
-    n_primitive = 10
+    n_primitive = 100
     rank = 10
     # Nested TT hierarchy depth. depth=1 recovers ordinary TT cores as leaves.
     depth = 2
@@ -39,7 +39,7 @@ if __name__ == "__main__":
     test_fraction = 0.15
     split_seed = 0
     tran_params = {
-        "n_epochs_per_group": [5, 2],  # basis, weights
+        "n_epochs_per_group": [5, 5],  # basis, weights
         "iterations": 10,
         "lr_basis": 4 * 3e-3,
         "lr_weights": 1 * 5e-2,

@@ -220,6 +220,7 @@ class _MPOBank:
         bank_labels: Sequence[int],
         row_labels: Sequence[int],
         col_labels: Sequence[int],
+        batch_label: int | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -234,6 +235,7 @@ class _MPOBank:
             bank_labels=bank_labels,
             row_labels=row_labels,
             col_labels=col_labels,
+            batch_label=None,
         )
         dense_modes = builder.contract((*bank_labels, *row_labels, *col_labels))
         return dense_modes.reshape(*self.bank_shape, self.row_dim, self.col_dim)
@@ -335,6 +337,7 @@ class _StaticMPOBank(_MPOBank):
         bank_labels: Sequence[int],
         row_labels: Sequence[int],
         col_labels: Sequence[int],
+        batch_label: int | None = None,
     ) -> None:
         bank_labels = tuple(bank_labels)
         row_labels = tuple(row_labels)
@@ -368,6 +371,7 @@ class _StaticMPOBank(_MPOBank):
                 bank_labels=(*bank_labels, row_labels[k], col_labels[k]),
                 row_labels=left_virtual,
                 col_labels=right_virtual,
+                batch_label=batch_label,
             )
             left_virtual = right_virtual
 
@@ -376,15 +380,32 @@ class _StaticMPOBank(_MPOBank):
 
 
 class _PhysicalScaleBank(_MPOBank):
-    """Scale a one-axis bank by a rank-one physical basis factor."""
+    """Scale a one-axis bank by a rank-one physical basis factor.
+
+    ``weights`` may be shape ``(n,)`` or batched ``(B, n)``.
+    """
 
     def __init__(self, base: _MPOBank, weights: torch.Tensor) -> None:
         if len(base.bank_shape) != 1:
             raise ValueError("physical scaling expects a one-axis vector-core bank")
         weights = torch.as_tensor(weights)
-        if weights.ndim != 1 or int(weights.shape[0]) != base.bank_shape[0]:
+        n = base.bank_shape[0]
+        if weights.ndim == 1:
+            if int(weights.shape[0]) != n:
+                raise ValueError(
+                    f"basis factor must have shape ({n},), got {tuple(weights.shape)}"
+                )
+            self._batch_size: int | None = None
+        elif weights.ndim == 2:
+            if int(weights.shape[-1]) != n:
+                raise ValueError(
+                    f"batched basis factor must have shape (B, {n}), "
+                    f"got {tuple(weights.shape)}"
+                )
+            self._batch_size = int(weights.shape[0])
+        else:
             raise ValueError(
-                f"basis factor must have shape ({base.bank_shape[0]},), "
+                f"basis factor must have shape ({n},) or (B, {n}), "
                 f"got {tuple(weights.shape)}"
             )
         self.base = base
@@ -394,6 +415,10 @@ class _PhysicalScaleBank(_MPOBank):
         self.col_dim = base.col_dim
         self.row_modes = base.row_modes
         self.col_modes = base.col_modes
+
+    @property
+    def batch_size(self) -> int | None:
+        return self._batch_size
 
     @property
     def leaf_count(self) -> int:
@@ -409,6 +434,7 @@ class _PhysicalScaleBank(_MPOBank):
         bank_labels: Sequence[int],
         row_labels: Sequence[int],
         col_labels: Sequence[int],
+        batch_label: int | None = None,
     ) -> None:
         bank_labels = tuple(bank_labels)
         self.base.emit(
@@ -416,13 +442,21 @@ class _PhysicalScaleBank(_MPOBank):
             bank_labels=bank_labels,
             row_labels=row_labels,
             col_labels=col_labels,
+            batch_label=batch_label,
         )
         w = self.weights
         # Match model dtype/device lazily to the first model leaf.
         leaves = self.base.leaves()
         if leaves:
             w = w.to(dtype=leaves[0].dtype, device=leaves[0].device)
-        builder.add(w, (bank_labels[0],))
+        if w.ndim == 1:
+            builder.add(w, (bank_labels[0],))
+            return
+        if batch_label is None:
+            raise ValueError(
+                "batched PhysicalScaleBank requires a batch_label in emit()"
+            )
+        builder.add(w, (batch_label, bank_labels[0]))
 
 
 class _MatvecMPOBank(_MPOBank):
@@ -465,6 +499,7 @@ class _MatvecMPOBank(_MPOBank):
         bank_labels: Sequence[int],
         row_labels: Sequence[int],
         col_labels: Sequence[int],
+        batch_label: int | None = None,
     ) -> None:
         bank_labels = tuple(bank_labels)
         row_labels = tuple(row_labels)
@@ -486,12 +521,14 @@ class _MatvecMPOBank(_MPOBank):
             bank_labels=(bank_labels[0], i_label),
             row_labels=matrix_row,
             col_labels=matrix_col,
+            batch_label=batch_label,
         )
         self.vector_bank.emit(
             builder,
             bank_labels=(i_label,),
             row_labels=vector_row,
             col_labels=vector_col,
+            batch_label=batch_label,
         )
 
 
@@ -687,32 +724,50 @@ def _build_static_bank(
 
 
 def _rank_one_factors(other, modes: Sequence[int]) -> tuple[torch.Tensor, ...]:
+    """Parse rank-one factors with shape ``(n,)`` or batched ``(B, n)``."""
     modes = tuple(int(n) for n in modes)
 
-    if hasattr(other, "cores") and hasattr(other, "modes"):
-        other_modes = tuple(int(n) for n in other.modes)
+    # TTVector-like objects expose tensor cores; NestedTTVector.cores are banks.
+    cores = getattr(other, "cores", None)
+    other_modes = getattr(other, "modes", None)
+    if (
+        cores is not None
+        and other_modes is not None
+        and len(cores) > 0
+        and torch.is_tensor(cores[0])
+    ):
+        other_modes = tuple(int(n) for n in other_modes)
         if other_modes != modes:
             raise ValueError(
                 f"rank-one tensor modes do not match: {other_modes} != {modes}"
             )
         factors = []
-        for k, (core, n) in enumerate(zip(other.cores, modes)):
+        batch_shape: tuple[int, ...] | None = None
+        for k, (core, n) in enumerate(zip(cores, modes)):
             core = torch.as_tensor(core)
-            # Accept unbatched (1, n, 1) or batch-1 (*1, 1, n, 1) TT cores.
+            # Accept (..., 1, n, 1) with optional leading batch dims.
             if core.ndim >= 3 and tuple(core.shape[-3:]) == (1, n, 1):
-                if core.ndim > 3 and any(s != 1 for s in core.shape[:-3]):
+                leading = core.shape[:-3]
+                if batch_shape is None:
+                    batch_shape = tuple(int(s) for s in leading)
+                elif batch_shape != tuple(int(s) for s in leading):
                     raise ValueError(
-                        "elementwise_multiply only supports batch size 1 for "
-                        f"TT factors; core {k} has shape {tuple(core.shape)}"
+                        "inconsistent TT batch shapes across cores: "
+                        f"{batch_shape} vs {tuple(leading)}"
                     )
-                factors.append(core.reshape(n))
-                continue
-            if tuple(core.shape) == (1, n, 1):
-                factors.append(core.reshape(n))
+                if len(leading) == 0:
+                    factors.append(core.reshape(n))
+                elif len(leading) == 1:
+                    factors.append(core.reshape(leading[0], n))
+                else:
+                    raise ValueError(
+                        "NestedTT rank-one factors currently support at most "
+                        f"one batch dim; core {k} has shape {tuple(core.shape)}"
+                    )
                 continue
             raise ValueError(
-                "elementwise_multiply only supports an unbatched rank-one "
-                f"TT; core {k} has shape {tuple(core.shape)}"
+                "elementwise_multiply only supports a rank-one TT with cores "
+                f"shape (..., 1, n, 1); core {k} has shape {tuple(core.shape)}"
             )
         return tuple(factors)
 
@@ -720,17 +775,50 @@ def _rank_one_factors(other, modes: Sequence[int]) -> tuple[torch.Tensor, ...]:
         factors = tuple(torch.as_tensor(x) for x in other)
     except TypeError as exc:
         raise TypeError(
-            "expected a sequence of 1-D factors or a rank-one TT-like object"
+            "expected a sequence of factors or a rank-one TT-like object"
         ) from exc
 
     if len(factors) != len(modes):
         raise ValueError(f"expected {len(modes)} factors, got {len(factors)}")
+
+    batch_size: int | None = None
     for k, (factor, n) in enumerate(zip(factors, modes)):
-        if tuple(factor.shape) != (n,):
+        if factor.ndim == 1:
+            if int(factor.shape[0]) != n:
+                raise ValueError(
+                    f"factor {k} must have shape ({n},), got {tuple(factor.shape)}"
+                )
+            if batch_size is not None:
+                raise ValueError(
+                    "mixed batched / unbatched rank-one factors are not supported"
+                )
+        elif factor.ndim == 2:
+            if int(factor.shape[-1]) != n:
+                raise ValueError(
+                    f"factor {k} must have shape (B, {n}), got {tuple(factor.shape)}"
+                )
+            if batch_size is None:
+                batch_size = int(factor.shape[0])
+            elif batch_size != int(factor.shape[0]):
+                raise ValueError(
+                    "inconsistent batch sizes across rank-one factors: "
+                    f"{batch_size} vs {int(factor.shape[0])}"
+                )
+        else:
             raise ValueError(
-                f"factor {k} must have shape ({n},), got {tuple(factor.shape)}"
+                f"factor {k} must have shape ({n},) or (B, {n}), "
+                f"got {tuple(factor.shape)}"
             )
     return factors
+
+
+def _batch_shape_from_factors(
+    factors: Sequence[torch.Tensor],
+) -> tuple[int, ...]:
+    for factor in factors:
+        if torch.as_tensor(factor).ndim == 2:
+            return (int(factor.shape[0]),)
+    return ()
 
 
 # =============================================================================
@@ -743,12 +831,16 @@ def _emit_vector_network(
     modes: Sequence[int],
     *,
     output_physical: bool,
+    batch_size: int | None = None,
 ) -> tuple[_NetworkBuilder, tuple[int, ...]]:
     modes = tuple(int(n) for n in modes)
     if len(core_banks) != len(modes):
         raise ValueError("core count/mode count mismatch")
 
     builder = _NetworkBuilder()
+    batch_label = (
+        builder.new_label(int(batch_size)) if batch_size is not None else None
+    )
     physical_labels = tuple(builder.new_label(n) for n in modes)
 
     # Left boundary of the first outer core.
@@ -777,10 +869,19 @@ def _emit_vector_network(
             bank_labels=(physical_labels[k],),
             row_labels=left_labels,
             col_labels=right_labels,
+            batch_label=batch_label,
         )
         left_labels = right_labels
 
-    return builder, physical_labels if output_physical else ()
+    if output_physical:
+        output = (
+            (batch_label, *physical_labels)
+            if batch_label is not None
+            else physical_labels
+        )
+    else:
+        output = (batch_label,) if batch_label is not None else ()
+    return builder, output
 
 
 def _emit_matrix_network(
@@ -809,6 +910,7 @@ def _emit_matrix_network(
             bank_labels=(row_labels[k], col_labels[k]),
             row_labels=left_labels,
             col_labels=right_labels,
+            batch_label=None,
         )
         left_labels = right_labels
 
@@ -856,6 +958,7 @@ class NestedTTVector:
         self._modes = tuple(spec.modes)
         self._depth = spec.depth
         self._history_length = 1
+        self._batch_shape: tuple[int, ...] = ()
         self._numerical_tolerance = float(numerical_tolerance)
 
     @classmethod
@@ -867,6 +970,7 @@ class NestedTTVector:
         core_banks: Sequence[_MPOBank],
         history_length: int,
         numerical_tolerance: float = 1e-20,
+        batch_shape: tuple[int, ...] = (),
     ) -> "NestedTTVector":
         obj = cls.__new__(cls)
         obj.spec = None
@@ -874,12 +978,21 @@ class NestedTTVector:
         obj._modes = tuple(int(n) for n in modes)
         obj._depth = int(depth)
         obj._history_length = int(history_length)
+        obj._batch_shape = tuple(int(s) for s in batch_shape)
         obj._numerical_tolerance = float(numerical_tolerance)
         return obj
 
     @property
     def numerical_tolerance(self) -> float:
         return self._numerical_tolerance
+
+    @property
+    def batch_shape(self) -> tuple[int, ...]:
+        return self._batch_shape
+
+    @property
+    def is_batched(self) -> bool:
+        return len(self._batch_shape) > 0
 
     def with_numerical_tolerance(self, numerical_tolerance: float) -> "NestedTTVector":
         return NestedTTVector._from_banks(
@@ -888,6 +1001,7 @@ class NestedTTVector:
             core_banks=self._core_banks,
             history_length=self.history_length,
             numerical_tolerance=numerical_tolerance,
+            batch_shape=self.batch_shape,
         )
 
     @staticmethod
@@ -944,10 +1058,14 @@ class NestedTTVector:
 
     @property
     def shape(self) -> torch.Size:
-        return torch.Size((math.prod(self._modes),))
+        return torch.Size(self._batch_shape + (math.prod(self._modes),))
 
     def materialize_cores(self) -> tuple[torch.Tensor, ...]:
         """Reference/debug operation; not used by ``sum``."""
+        if self.is_batched:
+            raise NotImplementedError(
+                "materialize_cores is not supported for batched NestedTTVector"
+            )
         out = []
         for bank in self._core_banks:
             dense = bank.materialize()  # (n, r_left, r_right)
@@ -957,11 +1075,17 @@ class NestedTTVector:
     def to_dense(self) -> torch.Tensor:
         # Contract the leaf tensor network directly and leave only physical
         # coefficient indices open.  Parent core matrices are never built.
+        batch_size = self._batch_shape[0] if self.is_batched else None
         builder, output = _emit_vector_network(
-            self._core_banks, self._modes, output_physical=True
+            self._core_banks,
+            self._modes,
+            output_physical=True,
+            batch_size=batch_size,
         )
         tensor = builder.contract(output)
-        return tensor.reshape(-1)
+        if self.is_batched:
+            return tensor.reshape(*self._batch_shape, self.n)
+        return tensor.reshape(self.n)
 
     @property
     def n(self) -> int:
@@ -1009,10 +1133,22 @@ class NestedTTVector:
                     "NestedTTVector elementwise product requires matching depth, "
                     f"got {self.depth} and {other.depth}"
                 )
+            if self.is_batched:
+                raise ValueError(
+                    "NestedTTVector * NestedTTVector currently requires the "
+                    "left operand to be unbatched when factorizing it"
+                )
             factors = rank_one_factors_from_nested(self)
             return other.elementwise_multiply(factors)
 
         factors = _rank_one_factors(other, self.modes)
+        factor_batch = _batch_shape_from_factors(factors)
+        if self.is_batched and factor_batch and factor_batch != self.batch_shape:
+            raise ValueError(
+                "incompatible batch shapes for NestedTT elementwise product: "
+                f"{self.batch_shape} vs {factor_batch}"
+            )
+        batch_shape = factor_batch or self.batch_shape
         banks = [
             _PhysicalScaleBank(bank, factor)
             for bank, factor in zip(self._core_banks, factors)
@@ -1023,6 +1159,7 @@ class NestedTTVector:
             core_banks=banks,
             history_length=self.history_length,
             numerical_tolerance=self.numerical_tolerance,
+            batch_shape=batch_shape,
         )
 
     def elementwise_divide(self, other) -> "NestedTTVector":
@@ -1033,10 +1170,20 @@ class NestedTTVector:
         ``q + tol``.
         """
         if isinstance(other, NestedTTVector):
+            if other.is_batched:
+                raise ValueError(
+                    "NestedTTVector division currently requires an unbatched "
+                    "rank-one denominator"
+                )
             factors = rank_one_factors_from_nested(other)
             tol = float(other.numerical_tolerance)
         else:
             factors = _rank_one_factors(other, self.modes)
+            if _batch_shape_from_factors(factors):
+                raise ValueError(
+                    "NestedTTVector division currently requires an unbatched "
+                    "rank-one denominator"
+                )
             tol = float(getattr(other, "numerical_tolerance", self.numerical_tolerance))
         inv = tuple(1.0 / (torch.as_tensor(f) + tol) for f in factors)
         return self.elementwise_multiply(inv)
@@ -1060,16 +1207,27 @@ class NestedTTVector:
         The contraction is emitted directly from the recursively nested MPO
         leaves.  In particular, after recurrent matvecs no matrix of size
         ``R**t * r`` by ``R**t * r`` is constructed.
+
+        Returns a scalar for unbatched vectors, or shape ``batch_shape`` when
+        the vector carries a leading batch from basis evaluation.
         """
+        batch_size = self._batch_shape[0] if self.is_batched else None
         builder, output = _emit_vector_network(
-            self._core_banks, self._modes, output_physical=False
+            self._core_banks,
+            self._modes,
+            output_physical=False,
+            batch_size=batch_size,
         )
-        return builder.contract(output).reshape(())
+        tensor = builder.contract(output)
+        if self.is_batched:
+            return tensor.reshape(*self._batch_shape)
+        return tensor.reshape(())
 
     def __repr__(self) -> str:
         return (
             f"NestedTTVector(shape={tuple(self.shape)}, modes={self.modes}, "
             f"ranks={self.ranks}, depth={self.depth}, "
+            f"batch_shape={self.batch_shape}, "
             f"history_length={self.history_length}, leaves={self.leaf_count})"
         )
 
@@ -1234,7 +1392,12 @@ class NestedTTMatrix:
     def matvec(self, x) -> NestedTTVector:
         # Rank-one TTVectors (e.g. coefficient-free TTBasis evals) convert in.
         if not isinstance(x, NestedTTVector):
-            if hasattr(x, "cores") and hasattr(x, "modes"):
+            if (
+                hasattr(x, "cores")
+                and hasattr(x, "modes")
+                and len(getattr(x, "cores", ())) > 0
+                and torch.is_tensor(x.cores[0])
+            ):
                 factors = _rank_one_factors(x, self.col_modes)
                 tol = float(getattr(x, "numerical_tolerance", 1e-20))
                 x = nested_tt_vector_from_factors(
@@ -1268,6 +1431,7 @@ class NestedTTMatrix:
             core_banks=banks,
             history_length=x.history_length + 1,
             numerical_tolerance=x.numerical_tolerance,
+            batch_shape=x.batch_shape,
         )
 
     def rev_matvec(self, x) -> NestedTTVector:
@@ -1371,10 +1535,32 @@ def nested_tt_vector_from_factors(
     depth: int,
     numerical_tolerance: float = 1e-20,
 ) -> NestedTTVector:
-    """Build a rank-one NestedTTVector whose dense form is ``kron(*factors)``."""
+    """Build a rank-one NestedTTVector whose dense form is ``kron(*factors)``.
+
+    Factors may be ``(n,)`` or batched ``(B, n)``.  Batched factors are applied
+    as physical scales on an all-ones nested vector (no densification).
+    """
     factors = tuple(torch.as_tensor(f) for f in factors)
+    batch_shape = _batch_shape_from_factors(factors)
+    if batch_shape:
+        # Validate shapes then scale an unbatched ones vector.
+        modes = []
+        for f in factors:
+            if f.ndim == 1:
+                modes.append(int(f.shape[0]))
+            else:
+                modes.append(int(f.shape[-1]))
+        ones = ones_nested_tt_vector(
+            modes,
+            depth=depth,
+            dtype=factors[0].dtype,
+            device=factors[0].device,
+            numerical_tolerance=numerical_tolerance,
+        )
+        return ones.elementwise_multiply(factors)
+
     if any(f.ndim != 1 for f in factors):
-        raise ValueError("all factors must be 1-D")
+        raise ValueError("all unbatched factors must be 1-D")
     modes = tuple(int(f.shape[0]) for f in factors)
     depth = int(depth)
     ranks = (1,) * depth

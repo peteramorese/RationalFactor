@@ -190,6 +190,7 @@ class TTBasis(Basis):
         self.set_coeffs(self._default_ones_coeffs())
 
     def _primitive_factors(self, y: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Per-dimension primitive values, shape ``(batch, n)`` each."""
         values = self._primitives.eval_dim(y)
         if values.dim() != 3:
             raise ValueError(
@@ -197,28 +198,30 @@ class TTBasis(Basis):
                 "(batch, dim, n_basis), got "
                 f"{tuple(values.shape)}"
             )
-        batch, dim, n_local = values.shape
-        if batch != 1:
-            raise ValueError(
-                "TTBasis nested / TT evaluation currently supports batch size 1, "
-                f"got {batch}"
-            )
+        batch, dim, _n_local = values.shape
         if dim != self._dim:
             raise ValueError(f"Expected input dimension {self._dim}, got {dim}")
-        return tuple(values[0, ell, :] for ell in range(dim))
+        if batch == 1:
+            return tuple(values[0, ell, :] for ell in range(dim))
+        return tuple(values[:, ell, :] for ell in range(dim))
 
     def forward(self, y: torch.Tensor) -> TTVector | NestedTTVector:
         r"""Evaluate the TT-weighted tensor-product basis at a batch of points.
+
+        Supports arbitrary leading batch size for both TT and NestedTT
+        coefficients.  NestedTT results carry the batch on physical-scale
+        factors (see :class:`NestedTTVector`).
         """
-        factors = self._primitive_factors(y)
         coeff_vals = self.coeffs()
 
         if isinstance(coeff_vals, NestedTTVector):
-            return coeff_vals.elementwise_multiply(factors)
+            return coeff_vals.elementwise_multiply(self._primitive_factors(y))
 
-        # Standard TT path.
+        # Standard TT path: scale each core's physical mode by batched primitives.
         values = self._primitives.eval_dim(y)
         batch, dim, n_local = values.shape
+        if dim != self._dim:
+            raise ValueError(f"Expected input dimension {self._dim}, got {dim}")
         coeff_cores = coeff_vals.cores
         if len(coeff_cores) != dim:
             raise ValueError(
@@ -236,7 +239,8 @@ class TTBasis(Basis):
                 )
             local_values = values[:, ell, :][:, None, :, None]
             out_cores.append(core * local_values)
-        return TTVector(out_cores)
+        tol = float(getattr(coeff_vals, "numerical_tolerance", 1e-20))
+        return TTVector(out_cores, numerical_tolerance=tol)
 
     def __call__(
         self,
