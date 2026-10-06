@@ -4,8 +4,8 @@ import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
 from .parameters import Parameters, RowStochasticMatrixParameters
-from .structured_matrices import Matrix, as_matrix
-from .structured_vectors import TTVector, as_vector
+from .structured_matrices import as_matrix
+from .structured_vectors import as_vector
 
 # Linear models #
 
@@ -85,13 +85,13 @@ class LinearRFF(ConditionalDensityModel):
         x = conditioner
         tol = self.numerical_tolerance
 
-        a = as_vector(self.a())
-        phi_x = as_vector(self.phi(x))
-        phi_xp = as_vector(self.phi(xp))
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        phi_x = as_vector(self.phi(x), numerical_tolerance=tol)
+        phi_xp = as_vector(self.phi(xp), numerical_tolerance=tol)
         log_g_x = torch.log((a * phi_x).sum() + tol)
         log_g_xp = torch.log((a * phi_xp).sum() + tol)
 
-        psi_xp = as_vector(self.psi(xp))
+        psi_xp = as_vector(self.psi(xp), numerical_tolerance=tol)
         
         b = self.get_b(a=a)
 
@@ -100,13 +100,18 @@ class LinearRFF(ConditionalDensityModel):
         return log_g_xp + log_f - log_g_x
 
     def get_b(self, a : torch.Tensor = None, Omega2 : torch.Tensor = None):
+        tol = self.numerical_tolerance
         if a is None:
-            a = as_vector(self.a())
+            a = as_vector(self.a(), numerical_tolerance=tol)
+        else:
+            a = as_vector(a, numerical_tolerance=tol)
 
         if Omega2 is None:
             Omega2 = self.phi.Omega2(self.psi)
 
-        return a / (as_matrix(Omega2).rev_matvec(a) + self.numerical_tolerance)
+        # Denominator floor lives on the vector's elementwise division.
+        q = as_vector(as_matrix(Omega2).rev_matvec(a), numerical_tolerance=tol)
+        return a / q
 
 
 class SumProdRFF(ConditionalDensityModel):
@@ -144,10 +149,10 @@ class SumProdRFF(ConditionalDensityModel):
         assert isinstance(B, RowStochasticMatrixParameters), (
             "B must be a RowStochasticMatrixParameters"
         )
-        shape_ok = isinstance(B_m, Matrix) and (
+        shape_ok = (
             B_m.shape == expected
             or (batch_size == 1 and B_m.shape == expected_unbatched)
-        )
+        ) and hasattr(B_m, "matvec")
         assert shape_ok, (
             f"B() must be a Matrix of shape {expected}"
             + (f" or {expected_unbatched}" if batch_size == 1 else "")
@@ -185,28 +190,27 @@ class SumProdRFF(ConditionalDensityModel):
     def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
         # f(x, xp) = phi(x)^T Q psi(xp) with Q = diag(a) @ B @ diag(q)^{-1},
         # q = Omega2^T a.  Applied as elementwise scales around B.matvec.
-        # For TT, avoid ``q + tol`` (raises TT rank); tol is only used in logs.
+        # Denominator flooring for ``psi / q`` is handled by the vector types'
+        # elementwise division (via ``numerical_tolerance``).
         x = conditioner
         tol = self.numerical_tolerance
 
-        a = as_vector(self.a())
-        phi_x = as_vector(self.phi(x))
-        phi_xp = as_vector(self.phi(xp))
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        phi_x = as_vector(self.phi(x), numerical_tolerance=tol)
+        phi_xp = as_vector(self.phi(xp), numerical_tolerance=tol)
         log_g_x = torch.log((a * phi_x).sum() + tol)
         log_g_xp = torch.log((a * phi_xp).sum() + tol)
 
-        psi_xp = as_vector(self.psi(xp))
+        psi_xp = as_vector(self.psi(xp), numerical_tolerance=tol)
 
         B = self.B()
-        q = as_matrix(self.phi.Omega2(self.psi)).rev_matvec(a)
+        q = as_vector(
+            as_matrix(self.phi.Omega2(self.psi)).rev_matvec(a),
+            numerical_tolerance=tol,
+        )
 
         # Q @ psi = a * (B @ (psi / q))
-        # Do not form ``q + tol`` for TTVectors: add_scalar raises the TT rank
-        # and breaks rank-1 elementwise division. Floor only in the logs.
-        if isinstance(q, TTVector):
-            Q_psi_xp = a * B.matvec(psi_xp / q)
-        else:
-            Q_psi_xp = a * B.matvec(psi_xp / (q + tol))
+        Q_psi_xp = a * B.matvec(psi_xp / q)
         log_f = torch.log(as_vector(phi_x * Q_psi_xp).sum() + tol)
 
         return log_g_xp + log_f - log_g_x

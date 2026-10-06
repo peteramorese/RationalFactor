@@ -8,6 +8,13 @@ import torch
 
 
 class Vector(ABC):
+    """Abstract structured vector.
+
+    Subclasses that support elementwise division should expose
+    ``numerical_tolerance`` and apply it to the denominator inside division
+    (never by forming ``q + tol`` at call sites, which can raise TT rank).
+    """
+
     @property
     @abstractmethod
     def shape(self) -> torch.Size: ...
@@ -24,8 +31,16 @@ class Vector(ABC):
     @abstractmethod
     def device(self) -> torch.device: ...
 
+    @property
+    def numerical_tolerance(self) -> float:
+        return getattr(self, "_numerical_tolerance", 1e-20)
+
     @abstractmethod
     def to_dense(self) -> torch.Tensor: ...
+
+    def with_numerical_tolerance(self, numerical_tolerance: float) -> "Vector":
+        """Return a view/copy of this vector using ``numerical_tolerance`` for division."""
+        raise NotImplementedError
 
     def __mul__(self, other: torch.Tensor) -> torch.Tensor:
         return self.to_dense() * other
@@ -34,10 +49,15 @@ class Vector(ABC):
         return other * self.to_dense()
 
     def __truediv__(self, other: torch.Tensor) -> torch.Tensor:
-        return self.to_dense() / other
+        other_vals = other.to_dense() if hasattr(other, "to_dense") else torch.as_tensor(other)
+        tol = float(
+            getattr(other, "numerical_tolerance", self.numerical_tolerance)
+        )
+        return self.to_dense() / (other_vals + tol)
 
     def __rtruediv__(self, other: torch.Tensor) -> torch.Tensor:
-        return other / self.to_dense()
+        other_vals = torch.as_tensor(other)
+        return other_vals / (self.to_dense() + self.numerical_tolerance)
 
     def sum(self) -> torch.Tensor:
         return self.to_dense().sum(dim=-1)
@@ -97,13 +117,18 @@ class OneVector(Vector):
 
 
 class DenseVector(Vector):
-    def __init__(self, values: torch.Tensor):
+    def __init__(
+        self,
+        values: torch.Tensor,
+        numerical_tolerance: float = 1e-20,
+    ):
         values = torch.as_tensor(values)
         if values.dim() < 1:
             raise ValueError(
                 f"dense vector must have shape (..., n), got {tuple(values.shape)}"
             )
         self._values = values
+        self._numerical_tolerance = float(numerical_tolerance)
 
     @property
     def shape(self) -> torch.Size:
@@ -121,15 +146,46 @@ class DenseVector(Vector):
     def device(self) -> torch.device:
         return self._values.device
 
+    @property
+    def numerical_tolerance(self) -> float:
+        return self._numerical_tolerance
+
+    def with_numerical_tolerance(self, numerical_tolerance: float) -> "DenseVector":
+        return DenseVector(self._values, numerical_tolerance=numerical_tolerance)
+
     def to_dense(self) -> torch.Tensor:
         return self._values
 
+    def elementwise_divide(self, other) -> "DenseVector":
+        other_vals = other.to_dense() if hasattr(other, "to_dense") else torch.as_tensor(other)
+        tol = float(getattr(other, "numerical_tolerance", self.numerical_tolerance))
+        return DenseVector(
+            self._values / (other_vals + tol),
+            numerical_tolerance=self.numerical_tolerance,
+        )
+
+    def __truediv__(self, other) -> "DenseVector":
+        return self.elementwise_divide(other)
+
+    def __rtruediv__(self, other) -> "DenseVector":
+        other_vals = (
+            other.to_dense() if hasattr(other, "to_dense") else torch.as_tensor(other)
+        )
+        return DenseVector(
+            other_vals / (self._values + self.numerical_tolerance),
+            numerical_tolerance=self.numerical_tolerance,
+        )
+
     def __mul__(self, other: torch.Tensor) -> torch.Tensor:
+        if hasattr(other, "to_dense"):
+            other = other.to_dense()
         if other.shape != self.shape:
             raise ValueError(f"Shape mismatch: {other.shape} != {self.shape}")
         return other * self._values
 
     def __rmul__(self, other: torch.Tensor) -> torch.Tensor:
+        if hasattr(other, "to_dense"):
+            other = other.to_dense()
         if other.shape != self.shape:
             raise ValueError(f"Shape mismatch: {other.shape} != {self.shape}")
         return other * self._values
@@ -146,7 +202,11 @@ class TTVector(Vector):
     The flattened vector dimension is n = prod(n_k) and the public dense shape is (*batch_shape, n).
     """
 
-    def __init__(self, cores: Sequence[torch.Tensor]):
+    def __init__(
+        self,
+        cores: Sequence[torch.Tensor],
+        numerical_tolerance: float = 1e-20,
+    ):
         if len(cores) == 0:
             raise ValueError("TTVector requires at least one core")
 
@@ -194,10 +254,25 @@ class TTVector(Vector):
         self._batch_shape = torch.Size(batch_shape)
         self._modes = tuple(int(c.shape[-2]) for c in cores_t)
         self._n = int(math.prod(self._modes))
+        self._numerical_tolerance = float(numerical_tolerance)
 
     @classmethod
-    def from_cores(cls, cores: Sequence[torch.Tensor]) -> "TTVector":
-        return cls(cores)
+    def from_cores(
+        cls,
+        cores: Sequence[torch.Tensor],
+        numerical_tolerance: float = 1e-20,
+    ) -> "TTVector":
+        return cls(cores, numerical_tolerance=numerical_tolerance)
+
+    def _spawn(self, cores: Sequence[torch.Tensor]) -> "TTVector":
+        return TTVector(cores, numerical_tolerance=self.numerical_tolerance)
+
+    @property
+    def numerical_tolerance(self) -> float:
+        return self._numerical_tolerance
+
+    def with_numerical_tolerance(self, numerical_tolerance: float) -> "TTVector":
+        return TTVector(self._cores, numerical_tolerance=numerical_tolerance)
 
     @property
     def cores(self) -> tuple[torch.Tensor, ...]:
@@ -316,7 +391,7 @@ class TTVector(Vector):
 
             out_cores.append(prod)
 
-        return TTVector(out_cores)
+        return self._spawn(out_cores)
 
 
     def __mul__(self, other) -> "TTVector":
@@ -396,7 +471,7 @@ class TTVector(Vector):
         cores = list(self._cores)
         cores[0] = cores[0] * s_core
 
-        return TTVector(cores)
+        return self._spawn(cores)
 
     def batch_select(self, *index) -> "TTVector":
         r"""Index only the leading batch dimensions.
@@ -411,24 +486,38 @@ class TTVector(Vector):
             slice(None),
         ) * (len(self._batch_shape) - len(index))
 
-        return TTVector([
+        return self._spawn([
             c[idx]
             for c in self._cores
         ])
 
     def elementwise_divide(
         self,
-        other: "TTVector",
+        other,
     ) -> "TTVector":
         r"""Return the elementwise quotient ``self / other``.
 
-        The denominator ``other`` must be rank one. The numerator may have
-        arbitrary TT ranks; dividing by a rank-1 TT preserves those ranks
-        (core-wise broadcast), which is the Hadamard product with ``1/other``.
+        The denominator ``other`` must be rank one (TT or NestedTT). The
+        numerator may have arbitrary TT ranks.  The denominator's
+        ``numerical_tolerance`` is added core-wise / factor-wise so call sites
+        never need ``q + tol`` (which would raise TT rank).
         """
+        # NestedTT rank-one denominators: factorize then build a TT divisor.
+        if type(other).__name__ == "NestedTTVector":
+            from rational_factor.models.tt.nested_tt import (
+                rank_one_factors_from_nested,
+            )
+            factors = rank_one_factors_from_nested(other)
+            tol = float(getattr(other, "numerical_tolerance", self.numerical_tolerance))
+            other = TTVector(
+                [f.reshape(1, -1, 1) for f in factors],
+                numerical_tolerance=tol,
+            )
+
         if not isinstance(other, TTVector):
             raise TypeError(
-                "TTVector.elementwise_divide requires another TTVector"
+                "TTVector.elementwise_divide requires another TTVector "
+                f"(or NestedTTVector), got {type(other).__name__}"
             )
 
         if self.modes != other.modes:
@@ -455,14 +544,15 @@ class TTVector(Vector):
                 f"{tuple(other.batch_shape)}"
             ) from exc
 
-        return TTVector([
-            a / b
+        tol = float(other.numerical_tolerance)
+        return self._spawn([
+            a / (b + tol)
             for a, b in zip(self._cores, other._cores)
         ])
 
     def __truediv__(
         self,
-        other: "TTVector",
+        other,
     ) -> "TTVector":
         return self.elementwise_divide(other)
 
@@ -526,7 +616,7 @@ class TTVector(Vector):
         # Special case: a one-core TT is just a dense physical mode with
         # boundary ranks (1, 1), so addition is direct.
         if d == 1:
-            return TTVector([a_cores[0] + b_cores[0]])
+            return self._spawn([a_cores[0] + b_cores[0]])
 
         out_cores = []
 
@@ -567,7 +657,7 @@ class TTVector(Vector):
             )
         )
 
-        return TTVector(out_cores)
+        return self._spawn(out_cores)
 
 
     def add_scalar(
@@ -618,7 +708,7 @@ class TTVector(Vector):
 
             constant_cores.append(core)
 
-        return self.elementwise_add(TTVector(constant_cores))
+        return self.elementwise_add(self._spawn(constant_cores))
 
 
     def __add__(self, other) -> "TTVector":
@@ -648,7 +738,7 @@ class TTVector(Vector):
         return acc.squeeze(-1).squeeze(-1)
 
     def clone(self) -> "TTVector":
-        return TTVector([
+        return self._spawn([
             c.clone()
             for c in self._cores
         ])
@@ -660,13 +750,26 @@ class TTVector(Vector):
             f"batch_shape={tuple(self._batch_shape)}, "
             f"modes={self._modes}, "
             f"ranks={self.ranks}, "
+            f"numerical_tolerance={self.numerical_tolerance}, "
             f"dtype={self.dtype}, "
             f"device={self.device})"
         )
 
 
-def as_vector(obj: torch.Tensor | Vector) -> Vector:
-    """Return ``obj`` if it is already a ``Vector``, otherwise wrap a dense tensor."""
+def as_vector(obj: torch.Tensor | Vector, numerical_tolerance: float | None = None):
+    """Return ``obj`` if it is already a structured vector, otherwise wrap a dense tensor.
+
+    When ``numerical_tolerance`` is given, structured vectors are re-wrapped so
+    that subsequent elementwise divisions use that floor on the denominator.
+    """
     if isinstance(obj, Vector):
+        if numerical_tolerance is not None:
+            return obj.with_numerical_tolerance(numerical_tolerance)
         return obj
-    return DenseVector(torch.as_tensor(obj))
+    # NestedTTVector (and similar) are duck-typed structured vectors.
+    if type(obj).__name__ == "NestedTTVector":
+        if numerical_tolerance is not None and hasattr(obj, "with_numerical_tolerance"):
+            return obj.with_numerical_tolerance(numerical_tolerance)
+        return obj
+    tol = 1e-20 if numerical_tolerance is None else float(numerical_tolerance)
+    return DenseVector(torch.as_tensor(obj), numerical_tolerance=tol)

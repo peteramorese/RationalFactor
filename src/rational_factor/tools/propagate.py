@@ -2,14 +2,26 @@ from rational_factor.models.density_model import DensityModel, ConditionalDensit
 from rational_factor.models.parameters import FixedParameters, TTVectorParameters
 from rational_factor.models.structured_matrices import Matrix, as_matrix
 from rational_factor.models.structured_vectors import TTVector, as_vector
+from rational_factor.models.tt.nested_tt import (
+    NestedTTMatrix,
+    NestedTTVector,
+    _rank_one_factors,
+    nested_tt_matrix_from_tt_matrix,
+    nested_tt_vector_from_factors,
+    rank_one_factors_from_dense,
+    rank_one_factors_from_nested,
+)
+from rational_factor.models.tt.nested_tt_parameters import FixedNestedTTVectorParameters
 import torch
 import copy 
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
 
 
 def _coeff_params_from_values(values):
-    """Wrap vector values as Fixed / TT coefficient Parameters."""
+    """Wrap vector values as Fixed / TT / NestedTT coefficient Parameters."""
     values = as_vector(values)
+    if isinstance(values, NestedTTVector):
+        return FixedNestedTTVectorParameters(values)
     if isinstance(values, TTVector):
         return TTVectorParameters.from_cores(
             [FixedParameters(core.detach().clone()) for core in values.cores]
@@ -72,12 +84,88 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         psi0 = copy.copy(init_belief.h)
         psi0.set_coeffs_to_one()
 
-        Omega2_0 = as_matrix(phi.Omega2(psi0))
-        Omega2 = as_matrix(phi.Omega2(transition_model.psi))
+        Omega2_0_raw = phi.Omega2(psi0)
+        Omega2_raw = phi.Omega2(transition_model.psi)
 
         # Q = diag(a) @ B @ diag(q)^{-1}, so Q^T s = (B^T (a * s)) / q.
         B = transition_model.B()
         a = as_vector(transition_model.a())
+
+        if isinstance(a, NestedTTVector):
+            if not isinstance(B, NestedTTMatrix):
+                raise TypeError(
+                    "NestedTTVector coefficients require NestedTTMatrix B, got "
+                    f"{type(B).__name__}"
+                )
+            depth = a.depth
+            Omega2_0 = (
+                Omega2_0_raw
+                if isinstance(Omega2_0_raw, NestedTTMatrix)
+                else nested_tt_matrix_from_tt_matrix(Omega2_0_raw, depth=depth)
+            )
+            Omega2 = (
+                Omega2_raw
+                if isinstance(Omega2_raw, NestedTTMatrix)
+                else nested_tt_matrix_from_tt_matrix(Omega2_raw, depth=depth)
+            )
+            q = Omega2.rev_matvec(a)
+            q_factors = rank_one_factors_from_nested(q)
+
+            def _as_nested(c):
+                c_vec = as_vector(c)
+                if isinstance(c_vec, NestedTTVector):
+                    return c_vec
+                if isinstance(c_vec, TTVector):
+                    return nested_tt_vector_from_factors(
+                        _rank_one_factors(c_vec, a.modes),
+                        depth=depth,
+                    )
+                dense = (
+                    c_vec.to_dense()
+                    if hasattr(c_vec, "to_dense")
+                    else torch.as_tensor(c_vec)
+                )
+                return nested_tt_vector_from_factors(
+                    rank_one_factors_from_dense(dense, a.modes),
+                    depth=depth,
+                )
+
+            c0_norm_constant = torch.exp(init_belief.log_norm_constant())
+            c0 = c0_norm_constant * as_vector(init_belief.h.coeffs())
+
+            h0 = copy.copy(init_belief.h)
+            h0.set_coeffs(_coeff_params_from_values(_as_nested(c0)))
+            h_seq = [h0]
+
+            def _Omega2_QT_matmul(c, _Omega2: NestedTTMatrix):
+                c_vec = _as_nested(c)
+                s1 = _Omega2.matvec(c_vec)
+                return B.rev_matvec(a * s1).elementwise_divide(q_factors)
+
+            c1 = _Omega2_QT_matmul(c0, Omega2_0)
+            h1 = copy.copy(transition_model.psi)
+            h1.set_coeffs(_coeff_params_from_values(c1))
+            h_seq.append(h1)
+            for _ in range(1, n_steps):
+                ck = _Omega2_QT_matmul(h_seq[-1].coeffs(), Omega2)
+                hk = copy.copy(transition_model.psi)
+                hk.set_coeffs(_coeff_params_from_values(ck))
+                h_seq.append(hk)
+            g = transition_model.g_basis()
+            belief_seq = [
+                LinearFF(
+                    g,
+                    h,
+                    numerical_tolerance=init_belief.numerical_tolerance,
+                    renormalize_h=False,
+                    register_modules=False,
+                )
+                for h in h_seq
+            ]
+            return belief_seq
+
+        Omega2_0 = as_matrix(Omega2_0_raw)
+        Omega2 = as_matrix(Omega2_raw)
         q = as_vector(Omega2.rev_matvec(a))
 
         c0_norm_constant = torch.exp(init_belief.log_norm_constant())

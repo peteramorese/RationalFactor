@@ -24,7 +24,7 @@ from rational_factor.tools.visualization import plot_marginal_trajectory_compari
 
 
 def main() -> None:
-    problem_name = "cartpole"
+    problem_name = "quadcopter"
     problem = FULLY_OBSERVABLE_PROBLEMS[problem_name]
     dim = problem.system.dim()
     use_gpu = torch.cuda.is_available()

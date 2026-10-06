@@ -266,9 +266,12 @@ class DenseMatrix(Matrix):
 
 
 
-def as_matrix(obj: torch.Tensor | Matrix) -> Matrix:
-    """Return ``obj`` if it is already a ``Matrix``, otherwise wrap a dense tensor."""
+def as_matrix(obj: torch.Tensor | Matrix):
+    """Return ``obj`` if it is already a structured matrix, otherwise wrap a dense tensor."""
     if isinstance(obj, Matrix):
+        return obj
+    # NestedTTMatrix is duck-typed against the Matrix interface.
+    if type(obj).__name__ == "NestedTTMatrix":
         return obj
     return DenseMatrix(obj)
 
@@ -1971,12 +1974,21 @@ class TTMatrix(Matrix):
                 Mc.shape[3] * xc.shape[-1],
             )
             out_cores.append(core)
-        return TTVector(out_cores)
+        return TTVector(out_cores, numerical_tolerance=x.numerical_tolerance)
 
     def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor | TTVector:
+        # NestedTTVector operands stay in nested arithmetic via a rank-1
+        # NestedTT embedding of this MPO (same depth as the vector).
+        if type(x).__name__ == "NestedTTVector":
+            from rational_factor.models.tt.nested_tt import (
+                nested_tt_matrix_from_tt_matrix,
+            )
+            return nested_tt_matrix_from_tt_matrix(self, depth=x.depth).matvec(x)
+
         x = as_vector(x)
         if isinstance(x, TTVector):
-            return self._matvec_tt(x)
+            out = self._matvec_tt(x)
+            return out.with_numerical_tolerance(x.numerical_tolerance)
         return self._matvec_dense(
             x.to_dense().to(dtype=self.dtype, device=self.device)
         )
