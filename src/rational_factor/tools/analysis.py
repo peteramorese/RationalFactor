@@ -21,6 +21,7 @@ def avg_log_likelihood(
     belief: DensityModel,
     test_data: torch.Tensor,
     weights: torch.Tensor | None = None,
+    max_chunks: int = 32,
 ):
     """
     Average log-density of ``test_data`` rows under ``belief``.
@@ -29,22 +30,52 @@ def avg_log_likelihood(
     ``log p(x_i)``. If ``weights`` is a length-``n`` tensor aligned with
     ``test_data`` rows, returns ``sum_i w_i log p(x_i)`` after renormalizing
     ``weights`` to sum to 1 (e.g. PF particle weights).
+
+    On CUDA OOM, iteratively halves the evaluation batch (1 → 2 → 4 → … chunks)
+    up to ``max_chunks``, then re-raises.
     """
     with torch.no_grad():
         belief.eval()
-        logp = belief.log_density(test_data)
-        if weights is None:
-            return logp.mean()
-        w = weights.to(device=logp.device, dtype=logp.dtype).reshape(-1)
-        if w.shape[0] != logp.shape[0]:
-            raise ValueError(
-                f"weights length {w.shape[0]} must match number of test rows {logp.shape[0]}"
-            )
-        w_sum = w.sum()
-        if not torch.isfinite(w_sum) or w_sum <= 0:
-            raise ValueError("weights must be finite and sum to a positive value")
-        w = w / w_sum
-        return (w * logp).sum()
+        n = test_data.shape[0]
+        w = None
+        if weights is not None:
+            w = weights.to(device=test_data.device, dtype=test_data.dtype).reshape(-1)
+            if w.shape[0] != n:
+                raise ValueError(
+                    f"weights length {w.shape[0]} must match number of test rows {n}"
+                )
+            w_sum = w.sum()
+            if not torch.isfinite(w_sum) or w_sum <= 0:
+                raise ValueError("weights must be finite and sum to a positive value")
+            w = w / w_sum
+
+        n_chunks = 1
+        while True:
+            try:
+                total = None
+                for i in range(n_chunks):
+                    start = (i * n) // n_chunks
+                    end = ((i + 1) * n) // n_chunks
+                    if start >= end:
+                        continue
+                    logp = belief.log_density(test_data[start:end])
+                    part = logp.sum() if w is None else (w[start:end] * logp).sum()
+                    total = part if total is None else total + part
+                if total is None:
+                    raise ValueError("test_data must contain at least one row")
+                return total / n if w is None else total
+            except Exception as exc:
+                is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or (
+                    isinstance(exc, RuntimeError)
+                    and "out of memory" in str(exc).lower()
+                )
+                if not is_oom:
+                    raise
+                if n_chunks >= max_chunks:
+                    raise
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                n_chunks *= 2
 
 def avg_log_filter_score(
     test_traj_data: Sequence[torch.Tensor],

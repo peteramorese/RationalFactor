@@ -23,25 +23,21 @@ import rational_factor.tools.propagate as propagate
 
 
 if __name__ == "__main__":
-    problem = FULLY_OBSERVABLE_PROBLEMS["van_der_pol"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["quadcopter"]
 
     ###
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    # Primitive 1-D count; TT modes are (n_primitive,) * dim, so n_basis = n_primitive^dim.
-    # Expressivity vs stability (cartpole / TT):
-    #   Prefer raising n_primitive or rank for capacity.
-    #   Prefer NOT raising tt_init_std or lr_basis — those amplify core products.
-    n_primitive = 10
-    rank = 10
+    n_primitive = 30
+    rank = 25
     # Floor Gaussian bandwidths so MLE cannot form Dirac peaks (loss -> -inf).
-    gaussian_std_epsilon = 0.3
+    gaussian_std_epsilon = 0.7
     test_fraction = 0.15
     split_seed = 0
     tran_params = {
         "n_epochs_per_group": [5, 2],  # basis, weights
-        "iterations": 10,
-        "lr_basis": 4 * 3e-3,
+        "iterations": 40,
+        "lr_basis": 1 * 3e-3,
         "lr_weights": 1 * 5e-2,
     }
     init_params = {

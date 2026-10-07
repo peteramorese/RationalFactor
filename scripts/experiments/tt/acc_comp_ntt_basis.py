@@ -30,7 +30,7 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
     # Primitive 1-D count; TT modes are (n_primitive,) * dim, so n_basis = n_primitive^dim.
-    n_primitive = 100
+    n_primitive = 30
     rank = 10
     # Nested TT hierarchy depth. depth=1 recovers ordinary TT cores as leaves.
     depth = 2
@@ -258,6 +258,8 @@ if __name__ == "__main__":
         for belief in base_belief_seq
     ]
 
+    print("Propagation done.")
+    print("Computing log-likelihoods...")
     ll_per_step = []
     for i in range(n_slices):
         data_i = traj_data[i].to(device=analysis_device, dtype=dtype)
