@@ -1,3 +1,5 @@
+import gc
+import traceback
 import torch
 from copy import deepcopy
 from collections.abc import Sequence
@@ -51,8 +53,10 @@ def avg_log_likelihood(
 
         n_chunks = 1
         while True:
+            total = None
+            logp = None
+            part = None
             try:
-                total = None
                 for i in range(n_chunks):
                     start = (i * n) // n_chunks
                     end = ((i + 1) * n) // n_chunks
@@ -65,17 +69,34 @@ def avg_log_likelihood(
                     raise ValueError("test_data must contain at least one row")
                 return total / n if w is None else total
             except Exception as exc:
-                is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or (
+                is_oom = isinstance(
+                    exc, getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+                ) or (
                     isinstance(exc, RuntimeError)
                     and "out of memory" in str(exc).lower()
                 )
                 if not is_oom:
                     raise
                 if n_chunks >= max_chunks:
-                    raise
+                    raise RuntimeError(
+                        f"avg_log_likelihood: CUDA OOM persists with "
+                        f"{max_chunks} chunks (batch ~{max(1, n // max_chunks)})"
+                    ) from exc
+
+                # Exception tracebacks retain locals (including CUDA tensors), so
+                # empty_cache alone cannot free memory for the retry.
+                if exc.__traceback__ is not None:
+                    traceback.clear_frames(exc.__traceback__)
+                exc.__traceback__ = None
+                del exc, total, logp, part
+                gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 n_chunks *= 2
+                print(
+                    f"avg_log_likelihood: CUDA OOM; retrying with {n_chunks} chunks",
+                    flush=True,
+                )
 
 def avg_log_filter_score(
     test_traj_data: Sequence[torch.Tensor],

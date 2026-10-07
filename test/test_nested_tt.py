@@ -152,6 +152,68 @@ def sum_without_materialization_check(depth: int = 3, d: int = 2):
     }
 
 
+def sum_with_many_einsum_labels_check(depth: int = 2, d: int = 4, steps: int = 3):
+    """Regression: torch.einsum rejects opt_einsum unicode labels beyond a-zA-Z.
+
+    After a few nested matvecs the contraction network has >52 distinct edges.
+    ``sum`` must still succeed (via per-step ASCII remapping) and match a
+    numpy/opt_einsum reference that accepts those labels.
+    """
+    import opt_einsum as oe
+
+    from rational_factor.models.tt.nested_tt import _emit_vector_network
+
+    modes = (3,) * d
+    ranks = tuple([1] + [2] * (depth - 1))
+    vspec = NestedTTVectorSpec(modes=modes, depth=depth, ranks=ranks)
+    mspec = NestedTTMatrixSpec(
+        row_modes=modes,
+        col_modes=modes,
+        depth=depth,
+        ranks=ranks,
+    )
+    v = NestedTTVector(
+        vspec,
+        make_leaves(NestedTTVector.leaf_shapes(vspec), seed=7001),
+    )
+    M = NestedTTMatrix(
+        mspec,
+        make_leaves(NestedTTMatrix.leaf_shapes(mspec), seed=7002),
+    )
+    cur = v
+    for _ in range(steps):
+        cur = M.matvec(cur)
+
+    batch = 5
+    factors = [
+        torch.randn(
+            batch, n, dtype=torch.float64, generator=torch.Generator().manual_seed(7003 + k)
+        )
+        for k, n in enumerate(modes)
+    ]
+    weighted = cur.elementwise_multiply(factors)
+    builder, output = _emit_vector_network(
+        weighted._core_banks,
+        weighted._modes,
+        output_physical=False,
+        batch_size=batch,
+    )
+    n_labels = len({lab for _, labs in builder.operands for lab in labs} | set(output))
+    assert n_labels > 52, f"expected >52 labels to exercise remap path, got {n_labels}"
+
+    got = weighted.sum()
+    args: list[object] = []
+    for tensor, labels in builder.operands:
+        args.extend((tensor.detach().cpu().numpy(), list(labels)))
+    args.append(list(output))
+    ref = torch.as_tensor(
+        oe.contract(*args, backend="numpy", optimize="greedy"),
+        dtype=got.dtype,
+    )
+    torch.testing.assert_close(got.cpu(), ref.reshape(got.shape), rtol=1e-10, atol=1e-10)
+    return {"labels": n_labels, "leaves": weighted.leaf_count, "batch": batch}
+
+
 def gradient_check(depth: int = 3, d: int = 2):
     modes = (2,) * d
     ranks = tuple([1] + [2] * (depth - 1))
@@ -188,5 +250,6 @@ if __name__ == "__main__":
     for depth in (1, 2, 3):
         print("matvec:", check_case(depth=depth, d=2, steps=2))
     print("sum:", sum_without_materialization_check(depth=3, d=2))
+    print("sum many labels:", sum_with_many_einsum_labels_check())
     gradient_check(depth=3, d=2)
     print("gradient check: ok")

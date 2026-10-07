@@ -334,6 +334,9 @@ class TTBasis(Basis):
 
         # (dim, n_self, n_other)
         gram = torch.exp(log_gram[0])
+        
+        assert self.coeffs() is None, "TTBasis.Omega2 currently does not support trainable coefficients"
+
         self_vals = self.coeffs()
         other_vals = other.coeffs()
         use_nested = isinstance(self_vals, NestedTTVector) or isinstance(

@@ -129,6 +129,11 @@ def _flatten_index(index: Sequence[int], modes: Sequence[int]) -> int:
 # =============================================================================
 
 
+# torch.einsum only accepts subscripts in [a-zA-Z] (52 letters).  opt_einsum maps
+# integer labels beyond that to unicode, which torch then rejects.
+_TORCH_EINSUM_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
 class _NetworkBuilder:
     """Collect tensors with integer-labelled axes for opt_einsum."""
 
@@ -176,11 +181,84 @@ class _NetworkBuilder:
         *,
         optimize: str = "greedy",
     ) -> torch.Tensor:
-        args: list[object] = []
-        for tensor, labels in self.operands:
-            args.extend((tensor, list(labels)))
-        args.append(list(output_labels))
-        return oe.contract(*args, backend="torch", optimize=optimize)
+        output_labels = tuple(int(x) for x in output_labels)
+        if not self.operands:
+            raise ValueError("cannot contract an empty tensor network")
+
+        unique_labels = {lab for _, labs in self.operands for lab in labs}
+        unique_labels.update(output_labels)
+        if len(unique_labels) <= len(_TORCH_EINSUM_CHARS):
+            args: list[object] = []
+            for tensor, labels in self.operands:
+                args.extend((tensor, list(labels)))
+            args.append(list(output_labels))
+            return oe.contract(*args, backend="torch", optimize=optimize)
+
+        # More than 52 distinct edges: run the opt_einsum path one step at a
+        # time, remapping each step's labels onto ASCII letters torch accepts.
+        remaining: list[tuple[torch.Tensor, tuple[int, ...]]] = [
+            (tensor, tuple(labels)) for tensor, labels in self.operands
+        ]
+        path_args: list[object] = []
+        for tensor, labels in remaining:
+            path_args.extend((tensor, list(labels)))
+        path_args.append(list(output_labels))
+        path, _info = oe.contract_path(*path_args, optimize=optimize)
+
+        final_needed = set(output_labels)
+        for indices in path:
+            idxs = tuple(int(i) for i in indices)
+            chosen = [remaining[i] for i in idxs]
+            for i in sorted(idxs, reverse=True):
+                remaining.pop(i)
+
+            needed = set(final_needed)
+            for _, labs in remaining:
+                needed.update(labs)
+
+            appearance: list[int] = []
+            for _, labs in chosen:
+                for lab in labs:
+                    if lab not in appearance:
+                        appearance.append(lab)
+            step_out = tuple(lab for lab in appearance if lab in needed)
+
+            remap: dict[int, str] = {}
+
+            def _sym(lab: int) -> str:
+                ch = remap.get(lab)
+                if ch is None:
+                    if len(remap) >= len(_TORCH_EINSUM_CHARS):
+                        raise RuntimeError(
+                            "tensor-network contraction step needs more than "
+                            f"{len(_TORCH_EINSUM_CHARS)} indices; torch.einsum "
+                            "cannot express it"
+                        )
+                    ch = _TORCH_EINSUM_CHARS[len(remap)]
+                    remap[lab] = ch
+                return ch
+
+            terms = ["".join(_sym(lab) for lab in labs) for _, labs in chosen]
+            rhs = "".join(_sym(lab) for lab in step_out)
+            equation = ",".join(terms) + "->" + rhs
+            remaining.append(
+                (torch.einsum(equation, *[tensor for tensor, _ in chosen]), step_out)
+            )
+
+        if len(remaining) != 1:
+            raise RuntimeError(
+                f"contraction path left {len(remaining)} tensors; expected 1"
+            )
+        tensor, labels = remaining[0]
+        if tuple(labels) == output_labels:
+            return tensor
+        if set(labels) != set(output_labels) or len(labels) != len(output_labels):
+            raise RuntimeError(
+                f"contraction output labels {labels} != requested {output_labels}"
+            )
+        if not output_labels:
+            return tensor
+        return tensor.permute(*[labels.index(lab) for lab in output_labels])
 
 
 # =============================================================================
@@ -1668,6 +1746,35 @@ def rank_one_factors_from_dense(
     return tuple(factors)
 
 
-def rank_one_factors_from_nested(v: NestedTTVector) -> tuple[torch.Tensor, ...]:
-    """Factorize a NestedTTVector that is (numerically) rank-one."""
-    return rank_one_factors_from_dense(v.to_dense(), v.modes)
+def rank_one_factors_from_nested(v):
+    if v.is_batched:
+        raise ValueError("expected unbatched vector")
+
+    if any(r != 1 for r in v.ranks):
+        raise ValueError(
+            f"NestedTTVector is not outer-rank-one: ranks={v.ranks}"
+        )
+
+    factors = []
+
+    for n, bank in zip(v.modes, v.cores):
+        builder = _NetworkBuilder()
+
+        physical = builder.new_label(n)
+        rows = builder.new_labels(bank.row_modes)
+        cols = builder.new_labels(bank.col_modes)
+
+        bank.emit(
+            builder,
+            bank_labels=(physical,),
+            row_labels=rows,
+            col_labels=cols,
+            batch_label=None,
+        )
+
+        # All row/col dimensions have total size one because the
+        # outer TT rank is one.
+        factor = builder.contract((physical,))
+        factors.append(factor.reshape(n))
+
+    return tuple(factors)

@@ -31,7 +31,7 @@ if __name__ == "__main__":
     dtype = torch.float64
     # Primitive 1-D count; TT modes are (n_primitive,) * dim, so n_basis = n_primitive^dim.
     n_primitive = 30
-    rank = 10
+    rank = 20
     # Nested TT hierarchy depth. depth=1 recovers ordinary TT cores as leaves.
     depth = 2
     # Floor Gaussian bandwidths so MLE cannot form Dirac peaks (loss -> -inf).
@@ -40,9 +40,9 @@ if __name__ == "__main__":
     split_seed = 0
     tran_params = {
         "n_epochs_per_group": [5, 5],  # basis, weights
-        "iterations": 10,
-        "lr_basis": 4 * 3e-3,
-        "lr_weights": 1 * 5e-2,
+        "iterations": 20,
+        "lr_basis": 1 * 3e-3,
+        "lr_weights": 1 * 5e-3,
     }
     init_params = {
         "n_epochs_per_group": [10],  # h0 coeffs only
@@ -50,7 +50,7 @@ if __name__ == "__main__":
         "lr_weights": 1e-2,
     }
 
-    batch_size = 512
+    batch_size = 256
     n_timesteps_prop = problem.n_timesteps
 
     ###
@@ -263,6 +263,6 @@ if __name__ == "__main__":
     ll_per_step = []
     for i in range(n_slices):
         data_i = traj_data[i].to(device=analysis_device, dtype=dtype)
-        ll = avg_log_likelihood(belief_seq[i], data_i)
+        ll = avg_log_likelihood(belief_seq[i], data_i, max_chunks=256)
         ll_per_step.append(float(ll.detach().cpu()))
         print(f"Avg log-likelihood at time {i}: {ll_per_step[-1]:.6f}")
