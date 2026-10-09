@@ -7,6 +7,43 @@ from .parameters import Parameters, RowStochasticMatrixParameters
 from .structured_matrices import as_matrix
 from .structured_vectors import as_vector
 
+
+def _is_parameters_like(obj) -> bool:
+    """Duck-type check for Parameters / NestedTT parameter objects."""
+    return callable(obj) and hasattr(obj, "is_trainable") and hasattr(
+        obj, "parameter_modules"
+    )
+
+
+def _is_row_stochastic_matrix_parameters_like(obj) -> bool:
+    if isinstance(obj, RowStochasticMatrixParameters):
+        return True
+    return _is_parameters_like(obj) and type(obj).__name__.startswith("RowStochastic")
+
+
+def _outer_rank_one_factors(v) -> tuple:
+    """Physical factors of an outer-rank-one NestedTTVector."""
+    known = getattr(v, "rank_one_factors", None)
+    if known is not None:
+        return known
+    ranks = getattr(v, "ranks", None)
+    if ranks is None or any(int(r) != 1 for r in ranks):
+        raise ValueError(
+            f"expected outer rank-one NestedTTVector, got ranks={ranks}"
+        )
+    factors = []
+    for core, n in zip(v.materialize_cores(), v.modes):
+        if core.ndim == 3:
+            factors.append(core.reshape(int(n)))
+        elif core.ndim == 4:
+            factors.append(core.reshape(int(core.shape[0]), int(n)))
+        else:
+            raise ValueError(
+                f"unexpected materialized core shape {tuple(core.shape)} for mode {n}"
+            )
+    return tuple(factors)
+
+
 # Linear models #
 
 class LinearForm(DensityModel):
@@ -118,7 +155,7 @@ class SumProdRFF(ConditionalDensityModel):
     def __init__(self, a : Parameters, phi : Basis, psi : Basis, B : Parameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
-        assert isinstance(a, Parameters), "a must be a Parameters"
+        assert _is_parameters_like(a), "a must be a Parameters-like object"
         assert isinstance(phi, Basis), "phi must be a Basis"
         assert isinstance(psi, Basis), "psi must be a Basis"
         a_vals = a()
@@ -146,8 +183,8 @@ class SumProdRFF(ConditionalDensityModel):
         expected_unbatched = (n_basis, n_basis)
 
         B_m = B()
-        assert isinstance(B, RowStochasticMatrixParameters), (
-            "B must be a RowStochasticMatrixParameters"
+        assert _is_row_stochastic_matrix_parameters_like(B), (
+            "B must be a RowStochasticMatrixParameters-like object"
         )
         shape_ok = (
             B_m.shape == expected
@@ -166,7 +203,7 @@ class SumProdRFF(ConditionalDensityModel):
             param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
             coeff_modules = list(coeff_modules)
             seen = {id(c) for c in coeff_modules}
-            if a.is_module() and id(a) not in seen:
+            if getattr(a, "is_module", lambda: False)() and id(a) not in seen:
                 coeff_modules.append(a)
                 seen.add(id(a))
             for module in a.parameter_modules():
@@ -191,24 +228,37 @@ class SumProdRFF(ConditionalDensityModel):
         # f(x, xp) = phi(x)^T Q psi(xp) with Q = diag(a) @ B @ diag(q)^{-1},
         # q = Omega2^T a.  Applied as elementwise scales around B.matvec.
         # Denominator flooring for ``psi / q`` is handled by the vector types'
-        # elementwise division (via ``numerical_tolerance``).
+        # elementwise division (via ``numerical_tolerance`` / ``eps``).
         x = conditioner
         tol = self.numerical_tolerance
 
         a = as_vector(self.a(), numerical_tolerance=tol)
         phi_x = as_vector(self.phi(x), numerical_tolerance=tol)
         phi_xp = as_vector(self.phi(xp), numerical_tolerance=tol)
-        log_g_x = torch.log((a * phi_x).sum() + tol)
-        log_g_xp = torch.log((a * phi_xp).sum() + tol)
-
         psi_xp = as_vector(self.psi(xp), numerical_tolerance=tol)
 
         B = self.B()
-        q = as_vector(
-            as_matrix(self.phi.Omega2(self.psi)).rev_matvec(a),
-            numerical_tolerance=tol,
-        )
+        Omega2 = as_matrix(self.phi.Omega2(self.psi))
+        q = as_vector(Omega2.rev_matvec(a), numerical_tolerance=tol)
 
+        if type(a).__name__ == "NestedTTVector":
+            # NestedTT only supports Hadamard products against rank-one factors.
+            a_factors = _outer_rank_one_factors(a)
+            q_factors = _outer_rank_one_factors(q)
+            log_g_x = torch.log(phi_x.elementwise_multiply(a_factors).sum() + tol)
+            log_g_xp = torch.log(phi_xp.elementwise_multiply(a_factors).sum() + tol)
+            psi_over_q = psi_xp.elementwise_divide(q_factors, eps=tol)
+            Q_psi_xp = B.matvec(psi_over_q).elementwise_multiply(a_factors)
+            phi_factors = getattr(phi_x, "rank_one_factors", None)
+            if phi_factors is None:
+                raise TypeError(
+                    "NestedTT phi(x) must expose rank_one_factors for SumProdRFF"
+                )
+            log_f = torch.log(Q_psi_xp.elementwise_multiply(phi_factors).sum() + tol)
+            return log_g_xp + log_f - log_g_x
+
+        log_g_x = torch.log((a * phi_x).sum() + tol)
+        log_g_xp = torch.log((a * phi_xp).sum() + tol)
         # Q @ psi = a * (B @ (psi / q))
         Q_psi_xp = a * B.matvec(psi_xp / q)
         log_f = torch.log(as_vector(phi_x * Q_psi_xp).sum() + tol)
@@ -499,7 +549,24 @@ class LinearFF(DensityModel):
         if not self._renormalize_h:
             return 0.0
         if Omega2 is None:
-            Omega2 = self.g.Omega2(self.h)
+            g, h = self.g, self.h
+            # NestedTT coefficient-weighted Z = a^T Omega c via structured matvecs.
+            # TTBasis.Omega2 only builds the coefficient-free primitive Gram.
+            if (
+                type(g).__name__ == "TTBasis"
+                and type(h).__name__ == "TTBasis"
+                and type(g.coeffs()).__name__ == "NestedTTVector"
+                and type(h.coeffs()).__name__ == "NestedTTVector"
+            ):
+                g0 = copy.copy(g)
+                h0 = copy.copy(h)
+                g0.set_coeffs_to_one()
+                h0.set_coeffs_to_one()
+                Omega = g0.Omega2(h0)
+                a_factors = _outer_rank_one_factors(g.coeffs())
+                Z = Omega.matvec(h.coeffs()).elementwise_multiply(a_factors).sum()
+                return -torch.log(Z + self.numerical_tolerance)
+            Omega2 = g.Omega2(h)
         return -torch.log(as_matrix(Omega2).sum() + self.numerical_tolerance)
         
     def log_density(self, x : torch.Tensor):

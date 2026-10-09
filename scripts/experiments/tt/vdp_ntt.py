@@ -357,10 +357,11 @@ if __name__ == "__main__":
     n_primitive = 10
     rank = 10
     depth = 2
-    gaussian_std_epsilon = 0.3
+    leaf_separation_rank = 20
+    gaussian_std_epsilon = 0.03
     tran_params = {
-        "n_epochs_per_group": [5, 2],  # basis, weights
-        "iterations": 10,
+        "n_epochs_per_group": [5, 5],  # basis, weights
+        "iterations": 30,
         "lr_basis": 4 * 3e-3,
         "lr_weights": 1 * 5e-2,
     }
@@ -430,36 +431,41 @@ if __name__ == "__main__":
     phi_primitive = GaussianBasis(mean_params=phi_means, std_params=phi_std)
     psi_primitive = GaussianBasis(mean_params=psi_means, std_params=psi_std)
 
-    phi_basis = TTBasis(phi_primitive)
-    psi_basis = TTBasis(psi_primitive)
+    phi_basis = TTBasis(phi_primitive, nested_depth=depth)
+    psi_basis = TTBasis(psi_primitive, nested_depth=depth)
+
+    def positive_leaf_factory(shape, *, mean=1.0, std=1.0, epsilon=0.0):
+        return PositiveParameters.random_init(
+            shape=tuple(shape), mean=mean, std=std, epsilon=epsilon
+        ).to(device, dtype=dtype)
+
+    def trainable_leaf_factory(shape, *, mean=0.0, std=1.0):
+        return TrainableParameters.random_init(
+            shape=tuple(shape), mean=mean, std=std
+        ).to(device, dtype=dtype)
 
     g_coeffs = NestedTTVectorParameters.from_core_spec(
         tt_modes,
         depth=depth,
         ranks=1,
-        mean=1.0,
-        std=1.0,
-        epsilon=1e-3,
-        device=device,
-        dtype=dtype,
+        leaf_factory=lambda shape: positive_leaf_factory(
+            shape, mean=1.0, std=1.0, epsilon=1e-3
+        ),
     )
     h0_coeffs = NestedTTVectorParameters.from_core_spec(
         tt_modes,
         depth=depth,
         ranks=1,
-        mean=1.0,
-        std=1.0,
-        device=device,
-        dtype=dtype,
+        leaf_factory=lambda shape: positive_leaf_factory(shape, mean=1.0, std=1.0),
+        separation_rank=leaf_separation_rank,
     )
+    # Length depth-1 rank tuple → hierarchy (1, r, ..., r) for any depth >= 1.
     B = RowStochasticNestedTTMatrixParameters.from_core_spec(
         tt_modes,
         depth=depth,
-        ranks=rank,
-        mean=0.0,
-        std=1.0,
-        device=device,
-        dtype=dtype,
+        ranks=1 if depth == 1 else (rank,) * (depth - 1),
+        separation_rank=leaf_separation_rank,
+        leaf_factory=lambda shape: trainable_leaf_factory(shape, mean=0.0, std=1.0),
     )
 
     rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
@@ -546,43 +552,43 @@ if __name__ == "__main__":
     box_lows = tuple(problem.plot_bounds_low.tolist())
     box_highs = tuple(problem.plot_bounds_high.tolist())
 
-    phi_out = output_dir / "tt_basis_phi_2d.png"
-    _plot_2d_tt_basis_grid(
-        phi_basis,
-        phi_out,
-        title="VDP NestedTT: 2D phi TTBasis (densified)",
-        max_basis=min(m, 64),
-    )
-    print(f"Saved 2D phi grid to {phi_out}")
+    #phi_out = output_dir / "tt_basis_phi_2d.png"
+    #_plot_2d_tt_basis_grid(
+    #    phi_basis,
+    #    phi_out,
+    #    title="VDP NestedTT: 2D phi TTBasis (densified)",
+    #    max_basis=min(m, 64),
+    #)
+    #print(f"Saved 2D phi grid to {phi_out}")
 
-    psi_out = output_dir / "tt_basis_psi_2d.png"
-    _plot_2d_tt_basis_grid(
-        psi_basis,
-        psi_out,
-        title="VDP NestedTT: 2D psi TTBasis (densified)",
-        max_basis=min(m, 64),
-    )
-    print(f"Saved 2D psi grid to {psi_out}")
+    #psi_out = output_dir / "tt_basis_psi_2d.png"
+    #_plot_2d_tt_basis_grid(
+    #    psi_basis,
+    #    psi_out,
+    #    title="VDP NestedTT: 2D psi TTBasis (densified)",
+    #    max_basis=min(m, 64),
+    #)
+    #print(f"Saved 2D psi grid to {psi_out}")
 
-    cond_slice_out_path = output_dir / "conditional_slices_model_vs_data.png"
-    _plot_conditional_slices_model_vs_data(
-        tran_model,
-        x_k,
-        x_kp1,
-        cond_slice_out_path,
-        x_range=plot_x_range,
-        y_range=plot_y_range,
-        n_random_points=10,
-        n_grid=120,
-        min_points_per_slice=20,
-        bin_width=0.4,
-        random_seed=0,
-        title=(
-            "VDP NestedTT: fixed x1, varied x2 conditional bins — "
-            "empirical vs model vs KDE"
-        ),
-    )
-    print(f"Saved conditional slice comparison to {cond_slice_out_path}")
+    #cond_slice_out_path = output_dir / "conditional_slices_model_vs_data.png"
+    #_plot_conditional_slices_model_vs_data(
+    #    tran_model,
+    #    x_k,
+    #    x_kp1,
+    #    cond_slice_out_path,
+    #    x_range=plot_x_range,
+    #    y_range=plot_y_range,
+    #    n_random_points=10,
+    #    n_grid=120,
+    #    min_points_per_slice=20,
+    #    bin_width=0.4,
+    #    random_seed=0,
+    #    title=(
+    #        "VDP NestedTT: fixed x1, varied x2 conditional bins — "
+    #        "empirical vs model vs KDE"
+    #    ),
+    #)
+    #print(f"Saved conditional slice comparison to {cond_slice_out_path}")
 
     n_slices = n_timesteps_prop + 1
 

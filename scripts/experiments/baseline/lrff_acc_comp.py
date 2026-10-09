@@ -22,7 +22,7 @@ import rational_factor.tools.propagate as propagate
 
 
 if __name__ == "__main__":
-    problem_name = "cartpole"
+    problem_name = "quadcopter"
     problem = FULLY_OBSERVABLE_PROBLEMS[problem_name]
 
     ###

@@ -1981,9 +1981,14 @@ class TTMatrix(Matrix):
         # NestedTT embedding of this MPO (same depth as the vector).
         if type(x).__name__ == "NestedTTVector":
             from rational_factor.models.tt.nested_tt import (
-                nested_tt_matrix_from_tt_matrix,
+                nested_tt_matrix_from_separable_cores,
             )
-            return nested_tt_matrix_from_tt_matrix(self, depth=x.depth).matvec(x)
+            if any(int(c.shape[0]) != 1 or int(c.shape[-1]) != 1 for c in self._cores):
+                raise ValueError(
+                    "TTMatrix.matvec with NestedTTVector requires a rank-1 TTMatrix"
+                )
+            cores = tuple(c.reshape(int(c.shape[1]), int(c.shape[2])) for c in self._cores)
+            return nested_tt_matrix_from_separable_cores(cores, depth=x.depth).matvec(x)
 
         x = as_vector(x)
         if isinstance(x, TTVector):

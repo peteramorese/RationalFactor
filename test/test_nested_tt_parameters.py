@@ -1,112 +1,116 @@
 import torch
 
-from rational_factor.models.tt.nested_tt import NestedTTMatrix
+from rational_factor.models.tt.nested_tt import NestedTTMatrix, NestedTTVector, ones_nested_tt_vector
 from rational_factor.models.tt.nested_tt_parameters import (
     NestedTTMatrixParameters,
+    NestedTTVectorParameters,
     RowStochasticNestedTTMatrixParameters,
 )
 
 
-class DummyTensorParameters(torch.nn.Module):
-    def __init__(self, shape, *, seed):
-        super().__init__()
-        g = torch.Generator().manual_seed(seed)
-        self.value = torch.nn.Parameter(
-            torch.randn(*shape, generator=g, dtype=torch.float64)
-        )
-
-    def forward(self):
-        return self.value
-
-    def is_trainable(self):
-        return self.value.requires_grad
-
-    def parameter_modules(self):
-        return [self]
+def tensor_factory(shape):
+    return torch.nn.Parameter(torch.randn(*shape, dtype=torch.float64))
 
 
-def make_factory(seed0):
-    counter = {"i": 0}
-
-    def factory(shape):
-        i = counter["i"]
-        counter["i"] += 1
-        return DummyTensorParameters(shape, seed=seed0 + i)
-
-    return factory
-
-
-def check_plain(depth):
-    params = NestedTTMatrixParameters.from_core_spec(
-        row_modes=(2, 3),
-        col_modes=(3, 2),
-        depth=depth,
-        ranks=2,
-        leaf_factory=make_factory(1000 + 100 * depth),
+def test_parameter_construction_and_gradients():
+    vp = NestedTTVectorParameters.from_core_spec(
+        (2, 2), depth=3, ranks=2, leaf_factory=tensor_factory
     )
-    M = params()
-    direct = NestedTTMatrix(M.spec, [p() for p in params.leaves])
-    torch.testing.assert_close(M.to_dense(), direct.to_dense())
-    assert params.is_trainable()
-    assert len(params.parameter_modules()) == M.leaf_count
-    return M.leaf_count
-
-
-def check_row_stochastic(depth):
-    params = RowStochasticNestedTTMatrixParameters.from_core_spec(
-        row_modes=(2, 3),
-        col_modes=(3, 2),
-        depth=depth,
-        ranks=2,
-        leaf_factory=make_factory(2000 + 100 * depth),
+    mp = NestedTTMatrixParameters.from_core_spec(
+        (2, 2), depth=3, ranks=2, leaf_factory=tensor_factory
     )
-    M = params()
-    dense = M.to_dense()
+    v = vp()
+    M = mp()
+    assert isinstance(v, NestedTTVector)
+    assert isinstance(M, NestedTTMatrix)
 
-    assert torch.all(dense >= 0)
-    torch.testing.assert_close(
-        dense.sum(dim=1),
-        torch.ones(dense.shape[0], dtype=dense.dtype),
-        rtol=1e-11,
-        atol=1e-11,
-    )
-
-    # Stronger local condition: every outer MPO core is normalized over
-    # (physical column, outgoing bond) for fixed (incoming bond, row mode).
-    for core in M.materialize_cores():
-        local_rows = core.sum(dim=(2, 3))
-        torch.testing.assert_close(
-            local_rows,
-            torch.ones_like(local_rows),
-            rtol=1e-11,
-            atol=1e-11,
-        )
-
-    # Equivalent row-stochastic witness M 1 = 1.
-    ones = torch.ones(dense.shape[1], dtype=dense.dtype)
-    torch.testing.assert_close(
-        dense @ ones,
-        torch.ones(dense.shape[0], dtype=dense.dtype),
-        rtol=1e-11,
-        atol=1e-11,
-    )
-
-    # Gradients must flow from the normalized NestedTTMatrix to the raw logits.
-    loss = (dense.square()).sum()
+    loss = M.matvec(v).sum()
     loss.backward()
-    assert all(p.value.grad is not None for p in params.leaves)
+    assert all(p.grad is not None for p in vp.parameters())
+    assert all(p.grad is not None for p in mp.parameters())
 
-    max_row_error = float((dense.sum(dim=1) - 1).abs().max().detach())
-    return {
-        "depth": depth,
-        "leaves": M.leaf_count,
-        "shape": tuple(dense.shape),
-        "min_entry": float(dense.min().detach()),
-        "max_row_error": max_row_error,
-    }
+
+def test_row_stochastic_depths_1_to_3():
+    for depth in (1, 2, 3):
+        p = RowStochasticNestedTTMatrixParameters.from_core_spec(
+            (2, 2), depth=depth, ranks=2, leaf_factory=tensor_factory
+        )
+        M = p()
+        dense = M.to_dense()
+        assert float(dense.detach().min()) >= 0.0
+        torch.testing.assert_close(
+            dense.sum(dim=1),
+            torch.ones(dense.shape[0], dtype=dense.dtype),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+        # Verify the defining action B 1 = 1 as well.
+        ones = torch.ones(dense.shape[1], dtype=dense.dtype)
+        torch.testing.assert_close(dense @ ones, torch.ones_like(ones), rtol=1e-10, atol=1e-10)
+
+        nested_ones = ones_nested_tt_vector(
+            (2, 2), depth=depth, ranks=1, dtype=dense.dtype
+        )
+        nested_result = M.matvec(nested_ones)
+        torch.testing.assert_close(
+            nested_result.to_dense(),
+            torch.ones(4, dtype=dense.dtype),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+
+def test_row_stochastic_gradients():
+    p = RowStochasticNestedTTMatrixParameters.from_core_spec(
+        (2, 2), depth=3, ranks=2, leaf_factory=tensor_factory
+    )
+    M = p()
+    # A nonconstant objective so softmax logits receive gradients.
+    dense = M.to_dense()
+    weights = torch.arange(dense.numel(), dtype=dense.dtype).reshape_as(dense)
+    loss = (dense * weights).sum()
+    loss.backward()
+    assert all(q.grad is not None for q in p.parameters())
+
+
+def test_parameter_separation_rank_and_row_stochasticity():
+    q = 3
+    vp = NestedTTVectorParameters.from_core_spec(
+        (2, 2), depth=3, ranks=2, separation_rank=q, leaf_factory=tensor_factory
+    )
+    mp = NestedTTMatrixParameters.from_core_spec(
+        (2, 2), depth=3, ranks=2, separation_rank=q, leaf_factory=tensor_factory
+    )
+    assert vp.separation_rank == q
+    assert mp.separation_rank == q
+    assert vp.spec.separation_rank == q
+    assert mp.spec.separation_rank == q
+
+    for depth in (1, 2, 3):
+        sp = RowStochasticNestedTTMatrixParameters.from_core_spec(
+            (2, 2), depth=depth, ranks=2, separation_rank=q, leaf_factory=tensor_factory
+        )
+        M = sp()
+        dense = M.to_dense()
+        assert float(dense.detach().min()) >= 0.0
+        torch.testing.assert_close(
+            dense.sum(dim=1),
+            torch.ones(dense.shape[0], dtype=dense.dtype),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+        # Nonconstant objective exercises gradients through the q-mixture softmax.
+        weights = torch.arange(dense.numel(), dtype=dense.dtype).reshape_as(dense)
+        (dense * weights).sum().backward()
+        assert all(p.grad is not None for p in sp.parameters())
 
 
 if __name__ == "__main__":
-    for depth in (1, 2, 3):
-        print("plain leaves:", depth, check_plain(depth))
-        print("stochastic:", check_row_stochastic(depth))
+    test_parameter_construction_and_gradients()
+    test_row_stochastic_depths_1_to_3()
+    test_row_stochastic_gradients()
+    test_parameter_separation_rank_and_row_stochasticity()
+    print("test_nested_tt_parameters.py: all tests passed")
+

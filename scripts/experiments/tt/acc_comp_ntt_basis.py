@@ -117,40 +117,43 @@ if __name__ == "__main__":
     phi_primitive = GaussianBasis(mean_params=phi_means, std_params=phi_std)
     psi_primitive = GaussianBasis(mean_params=psi_means, std_params=psi_std)
 
-    # Coefficient-free TT bases: tensor-product of 1-D primitives only.
-    phi_basis = TTBasis(phi_primitive)
-    psi_basis = TTBasis(psi_primitive)
+    # Coefficient-free NestedTT bases: tensor-product of 1-D primitives only.
+    phi_basis = TTBasis(phi_primitive, nested_depth=depth)
+    psi_basis = TTBasis(psi_primitive, nested_depth=depth)
+
+    def positive_leaf_factory(shape, *, mean=1.0, std=1.0, epsilon=0.0):
+        return PositiveParameters.random_init(
+            shape=tuple(shape), mean=mean, std=std, epsilon=epsilon
+        ).to(device, dtype=dtype)
+
+    def trainable_leaf_factory(shape, *, mean=0.0, std=1.0):
+        return TrainableParameters.random_init(
+            shape=tuple(shape), mean=mean, std=std
+        ).to(device, dtype=dtype)
 
     # Rank-1 NestedTT coefficient vector a (needed for elementwise psi/q division).
     g_coeffs = NestedTTVectorParameters.from_core_spec(
         tt_modes,
         depth=depth,
         ranks=1,
-        mean=1.0,
-        std=1.0,
-        epsilon=1e-3,
-        device=device,
-        dtype=dtype,
+        leaf_factory=lambda shape: positive_leaf_factory(
+            shape, mean=1.0, std=1.0, epsilon=1e-3
+        ),
     )
     h0_coeffs = NestedTTVectorParameters.from_core_spec(
         tt_modes,
         depth=depth,
         ranks=1,
-        mean=1.0,
-        std=1.0,
-        device=device,
-        dtype=dtype,
+        leaf_factory=lambda shape: positive_leaf_factory(shape, mean=1.0, std=1.0),
     )
 
     # NestedTT-matrix B on the same mode shape / hierarchy depth.
+    # Length depth-1 rank tuple → hierarchy (1, r, ..., r) for any depth >= 1.
     B = RowStochasticNestedTTMatrixParameters.from_core_spec(
         tt_modes,
         depth=depth,
-        ranks=rank,
-        mean=0.0,
-        std=1.0,
-        device=device,
-        dtype=dtype,
+        ranks=1 if depth == 1 else (rank,) * (depth - 1),
+        leaf_factory=lambda shape: trainable_leaf_factory(shape, mean=0.0, std=1.0),
     )
 
     rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)

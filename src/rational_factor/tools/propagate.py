@@ -2,15 +2,7 @@ from rational_factor.models.density_model import DensityModel, ConditionalDensit
 from rational_factor.models.parameters import FixedParameters, TTVectorParameters
 from rational_factor.models.structured_matrices import Matrix, as_matrix
 from rational_factor.models.structured_vectors import TTVector, as_vector
-from rational_factor.models.tt.nested_tt import (
-    NestedTTMatrix,
-    NestedTTVector,
-    _rank_one_factors,
-    nested_tt_matrix_from_tt_matrix,
-    nested_tt_vector_from_factors,
-    rank_one_factors_from_dense,
-    rank_one_factors_from_nested,
-)
+from rational_factor.models.tt.nested_tt import NestedTTMatrix, NestedTTVector
 from rational_factor.models.tt.nested_tt_parameters import FixedNestedTTVectorParameters
 import torch
 import copy 
@@ -28,6 +20,33 @@ def _coeff_params_from_values(values):
         )
     dense = values.to_dense() if hasattr(values, "to_dense") else values
     return FixedParameters(dense.detach().clone() if hasattr(dense, "detach") else dense)
+
+
+def _outer_rank_one_factors(v: NestedTTVector) -> tuple[torch.Tensor, ...]:
+    """Physical factors of an outer-rank-one NestedTTVector.
+
+    Prefer tracked ``rank_one_factors`` when present.  Otherwise materialize the
+    per-mode outer cores (shape ``(1, n_k, 1)``) without forming the full
+    Kronecker product.
+    """
+    known = v.rank_one_factors
+    if known is not None:
+        return known
+    if any(int(r) != 1 for r in v.ranks):
+        raise ValueError(
+            f"expected outer rank-one NestedTTVector, got ranks={tuple(v.ranks)}"
+        )
+    factors = []
+    for core, n in zip(v.materialize_cores(), v.modes):
+        if core.ndim == 3:
+            factors.append(core.reshape(int(n)))
+        elif core.ndim == 4:
+            factors.append(core.reshape(int(core.shape[0]), int(n)))
+        else:
+            raise ValueError(
+                f"unexpected materialized core shape {tuple(core.shape)} for mode {n}"
+            )
+    return tuple(factors)
 
 
 def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
@@ -97,37 +116,28 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
                     "NestedTTVector coefficients require NestedTTMatrix B, got "
                     f"{type(B).__name__}"
                 )
-            depth = a.depth
-            Omega2_0 = (
-                Omega2_0_raw
-                if isinstance(Omega2_0_raw, NestedTTMatrix)
-                else nested_tt_matrix_from_tt_matrix(Omega2_0_raw, depth=depth)
-            )
-            Omega2 = (
-                Omega2_raw
-                if isinstance(Omega2_raw, NestedTTMatrix)
-                else nested_tt_matrix_from_tt_matrix(Omega2_raw, depth=depth)
-            )
+            if not isinstance(Omega2_0_raw, NestedTTMatrix) or not isinstance(
+                Omega2_raw, NestedTTMatrix
+            ):
+                raise TypeError(
+                    "NestedTT coefficients require NestedTT Gram matrices; "
+                    "construct TTBasis with nested_depth matching the "
+                    "coefficient depth"
+                )
+            Omega2_0 = Omega2_0_raw
+            Omega2 = Omega2_raw
+            # NestedTTMatrix has no transpose; use rev_matvec for Q^T actions.
+            a_factors = _outer_rank_one_factors(a)
             q = Omega2.rev_matvec(a)
-            q_factors = rank_one_factors_from_nested(q)
+            q_factors = _outer_rank_one_factors(q)
 
             def _as_nested(c):
                 c_vec = as_vector(c)
                 if isinstance(c_vec, NestedTTVector):
                     return c_vec
-                if isinstance(c_vec, TTVector):
-                    return nested_tt_vector_from_factors(
-                        _rank_one_factors(c_vec, a.modes),
-                        depth=depth,
-                    )
-                dense = (
-                    c_vec.to_dense()
-                    if hasattr(c_vec, "to_dense")
-                    else torch.as_tensor(c_vec)
-                )
-                return nested_tt_vector_from_factors(
-                    rank_one_factors_from_dense(dense, a.modes),
-                    depth=depth,
+                raise TypeError(
+                    "NestedTT propagation expects NestedTTVector coefficients, "
+                    f"got {type(c_vec).__name__}"
                 )
 
             c0_norm_constant = torch.exp(init_belief.log_norm_constant())
@@ -140,7 +150,10 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
             def _Omega2_QT_matmul(c, _Omega2: NestedTTMatrix):
                 c_vec = _as_nested(c)
                 s1 = _Omega2.matvec(c_vec)
-                return B.rev_matvec(a * s1).elementwise_divide(q_factors)
+                # a * s1 via rank-one factors of a (NestedTT has no general Hadamard).
+                return B.rev_matvec(s1.elementwise_multiply(a_factors)).elementwise_divide(
+                    q_factors
+                )
 
             c1 = _Omega2_QT_matmul(c0, Omega2_0)
             h1 = copy.copy(transition_model.psi)
