@@ -1,294 +1,165 @@
+"""Commuting row-stochastic matrix-polynomial leaves.
+
+At physical site k, CP channel q uses P[k,q] = sum_j c[k,q,j] S[k,q]**j.
+Different S[k,q] at one site are permitted only if they commute pairwise.
+The local matrices are finite, dense matrices on *virtual/physical slot* indices;
+no full tensor-product matrix is constructed in production contractions.
+"""
 from __future__ import annotations
-
-from dataclasses import dataclass
-import math
-from typing import Sequence
-
 import torch
 
 
-def _split2(n: int) -> tuple[int, int]:
-    """Deterministically split n=a*b with factors as balanced as possible."""
-    n = int(n)
-    if n < 1:
-        raise ValueError("dimension must be positive")
-    a = int(math.isqrt(n))
-    while a > 1 and n % a:
-        a -= 1
-    return a, n // a
+def _fft_convolve(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Differentiable convolution of polynomial coefficients, trailing dimension."""
+    n = a.shape[-1] + b.shape[-1] - 1
+    size = 1 << (n - 1).bit_length()
+    dtype = torch.promote_types(a.dtype, b.dtype)
+    work = torch.float64 if dtype == torch.float64 else torch.float32
+    fa = torch.fft.rfft(a.to(work), n=size)
+    fb = torch.fft.rfft(b.to(work), n=size)
+    return torch.fft.irfft(fa * fb, n=size)[..., :n].to(dtype)
 
 
-def _joint_softmax(x: torch.Tensor, axes: Sequence[int]) -> torch.Tensor:
-    axes = tuple(sorted(set(int(a) for a in axes)))
-    if not axes:
-        return x
-    keep = tuple(i for i in range(x.ndim) if i not in axes)
-    perm = keep + axes
-    inv = [0] * x.ndim
-    for p, a in enumerate(perm):
-        inv[a] = p
-    xp = x.permute(perm)
-    keep_shape = xp.shape[: len(keep)]
-    norm_shape = xp.shape[len(keep) :]
-    xp = torch.softmax(xp.reshape(*keep_shape, -1), dim=-1)
-    return xp.reshape(*keep_shape, *norm_shape).permute(inv)
+class StochasticPolynomialLeaf:
+    """One site: ``bases`` (n,n) or (Q,n,n); ``coeffs`` (Q,L).
 
-
-@dataclass(frozen=True)
-class NestedTTVectorLeaf:
-    r"""Terminal vector-core bank with fixed separation rank.
-
-    The represented bank is
-
-        g[i] = sum_p X[p, i] kron C[p].
-
-    The latent ``p`` index is never flattened.  Under repeated matrix-vector
-    products it becomes an MPS bond connecting successive terminal transfer
-    blocks, so the number of represented paths may grow exponentially while
-    storage/contraction width remains controlled by ``separation_rank``.
+    Optional leading batch dimension on either argument. Matrix coefficients
+    are probabilities, not logits. They are *not* renormalized after products.
     """
 
-    X: torch.Tensor
-    C: torch.Tensor
-
-    def __post_init__(self) -> None:
-        X = torch.as_tensor(self.X)
-        C = torch.as_tensor(self.C)
-        if X.ndim < 3:
-            raise ValueError("X must have separation and matrix axes")
-        if C.ndim != 3:
-            raise ValueError("C must have shape (separation_rank,row,col)")
-        if int(X.shape[0]) != int(C.shape[0]):
-            raise ValueError("X and C separation ranks must match")
-        if int(X.shape[0]) < 1:
-            raise ValueError("separation rank must be positive")
-        object.__setattr__(self, "X", X)
-        object.__setattr__(self, "C", C)
+    def __init__(self, bases: torch.Tensor, coeffs: torch.Tensor, *, check=True):
+        bases = torch.as_tensor(bases)
+        coeffs = torch.as_tensor(coeffs, dtype=bases.dtype, device=bases.device)
+        if coeffs.ndim == 2:
+            coeffs = coeffs.unsqueeze(0)
+        if coeffs.ndim != 3:
+            raise ValueError('coeffs must be (Q,L) or (B,Q,L)')
+        B, Q, L = coeffs.shape
+        if bases.ndim == 2:
+            bases = bases[None, None]
+        elif bases.ndim == 3:
+            # (Q,n,n) when Q>1; (B,n,n) with a single channel is ambiguous.
+            bases = bases[None] if bases.shape[0] == Q else bases[:, None]
+        if bases.ndim != 4 or bases.shape[-1] != bases.shape[-2]:
+            raise ValueError('bases must be (n,n), (Q,n,n), (B,n,n) or (B,Q,n,n)')
+        if bases.shape[0] not in (1, B) or bases.shape[1] not in (1, Q):
+            raise ValueError('incompatible base/coeff batch and channel axes')
+        bases = bases.expand(B, Q, -1, -1)
+        if check:
+            tol = 1e-6 if bases.dtype == torch.float32 else 1e-10
+            if bool((bases.detach() < -tol).any()) or not torch.allclose(
+                bases.detach().sum(-1), torch.ones_like(bases[..., 0].detach()), atol=tol, rtol=tol
+            ):
+                raise ValueError('bases must be nonnegative and row-stochastic')
+            if bool((coeffs.detach() < -tol).any()) or not torch.allclose(
+                coeffs.detach().sum(-1), torch.ones_like(coeffs[..., 0].detach()), atol=tol, rtol=tol
+            ):
+                raise ValueError('coefficient vectors must be nonnegative and sum to 1')
+            for q in range(Q):
+                for j in range(q):
+                    a, b = bases[:, q].detach(), bases[:, j].detach()
+                    if not torch.allclose(a @ b, b @ a, atol=tol * 10, rtol=tol * 10):
+                        raise ValueError('bases at one slot must commute across channels')
+        self.bases, self.coeffs = bases, coeffs
+        self._powers = None
 
     @property
-    def separation_rank(self) -> int:
-        return int(self.X.shape[0])
+    def n(self):
+        return self.bases.shape[-1]
 
     @property
-    def bank_shape(self) -> tuple[int, ...]:
-        return tuple(int(n) for n in self.X.shape[1:-2])
+    def batch_size(self):
+        return self.coeffs.shape[0]
 
     @property
-    def row_modes(self) -> tuple[int, ...]:
-        return (int(self.X.shape[-2]), int(self.C.shape[-2]))
+    def channels(self):
+        return self.coeffs.shape[-2]
 
     @property
-    def col_modes(self) -> tuple[int, ...]:
-        return (int(self.X.shape[-1]), int(self.C.shape[-1]))
+    def degree(self):
+        return self.coeffs.shape[-1] - 1
 
     @property
-    def row_dim(self) -> int:
-        return math.prod(self.row_modes)
+    def monomials(self):
+        if self._powers is None:
+            I = torch.eye(self.n, dtype=self.bases.dtype, device=self.bases.device)
+            p = I.expand(self.batch_size, self.channels, -1, -1)
+            powers = [p]
+            for _ in range(self.degree):
+                p = p @ self.bases
+                powers.append(p)
+            self._powers = torch.stack(powers, dim=-3)  # (B,Q,L,n,n)
+        return self._powers
 
-    @property
-    def col_dim(self) -> int:
-        return math.prod(self.col_modes)
+    def matrices(self):
+        return torch.einsum('bql,bqlij->bqij', self.coeffs, self.monomials)
 
     @staticmethod
-    def shapes(
-        bank_shape: Sequence[int],
-        row_dim: int,
-        col_dim: int,
-        separation_rank: int = 1,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        q = int(separation_rank)
-        if q < 1:
-            raise ValueError("separation_rank must be positive")
-        xr, cr = _split2(int(row_dim))
-        xc, cc = _split2(int(col_dim))
-        return (
-            (q, *tuple(int(n) for n in bank_shape), xr, xc),
-            (q, cr, cc),
-        )
-
-    @classmethod
-    def from_tensors(
-        cls,
-        bank_shape: Sequence[int],
-        row_dim: int,
-        col_dim: int,
-        X: torch.Tensor,
-        C: torch.Tensor,
-        separation_rank: int = 1,
-    ) -> "NestedTTVectorLeaf":
-        sx, sc = cls.shapes(bank_shape, row_dim, col_dim, separation_rank)
-        if tuple(X.shape) != sx or tuple(C.shape) != sc:
-            raise ValueError(
-                f"vector leaf shapes must be X={sx}, C={sc}; got "
-                f"{tuple(X.shape)}, {tuple(C.shape)}"
-            )
-        return cls(X, C)
-
-    def emit(self, builder, *, bank_labels, row_labels, col_labels) -> None:
-        if len(row_labels) != 2 or len(col_labels) != 2:
-            raise ValueError("vector leaf expects exactly two tensorized modes")
-        p = builder.new_label(self.separation_rank)
-        builder.add(
-            self.X,
-            (p, *tuple(bank_labels), int(row_labels[0]), int(col_labels[0])),
-        )
-        builder.add(self.C, (p, int(row_labels[1]), int(col_labels[1])))
-
-    def tensors(self) -> tuple[torch.Tensor, ...]:
-        return (self.X, self.C)
-
-
-@dataclass(frozen=True)
-class NestedTTMatrixLeaf:
-    r"""Terminal matrix-core bank with fixed separation rank.
-
-    The represented bank is
-
-        A[j,i] = sum_q L[q,j] kron R[q,i].
-
-    ``q`` is an explicit latent/MPS bond.  Repeated matvec therefore produces
-    transfer blocks ``K[q_t,q_{t-1}]`` rather than expanding ``Q**t`` paths.
-    """
-
-    L: torch.Tensor
-    R: torch.Tensor
-    row_bank_shape: tuple[int, ...]
-    col_bank_shape: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        L = torch.as_tensor(self.L)
-        R = torch.as_tensor(self.R)
-        rb = tuple(int(n) for n in self.row_bank_shape)
-        cb = tuple(int(n) for n in self.col_bank_shape)
-        if L.ndim != len(rb) + 3 or tuple(L.shape[1:-2]) != rb:
-            raise ValueError("L bank axes do not match row_bank_shape")
-        if R.ndim != len(cb) + 3 or tuple(R.shape[1:-2]) != cb:
-            raise ValueError("R bank axes do not match col_bank_shape")
-        if int(L.shape[0]) != int(R.shape[0]):
-            raise ValueError("L and R separation ranks must match")
-        if int(L.shape[0]) < 1:
-            raise ValueError("separation rank must be positive")
-        object.__setattr__(self, "L", L)
-        object.__setattr__(self, "R", R)
-        object.__setattr__(self, "row_bank_shape", rb)
-        object.__setattr__(self, "col_bank_shape", cb)
-
-    @property
-    def separation_rank(self) -> int:
-        return int(self.L.shape[0])
-
-    @property
-    def bank_shape(self) -> tuple[int, ...]:
-        return self.row_bank_shape + self.col_bank_shape
-
-    @property
-    def row_modes(self) -> tuple[int, ...]:
-        return (int(self.L.shape[-2]), int(self.R.shape[-2]))
-
-    @property
-    def col_modes(self) -> tuple[int, ...]:
-        return (int(self.L.shape[-1]), int(self.R.shape[-1]))
-
-    @property
-    def row_dim(self) -> int:
-        return math.prod(self.row_modes)
-
-    @property
-    def col_dim(self) -> int:
-        return math.prod(self.col_modes)
+    def multiply_coeffs(a: torch.Tensor, b: torch.Tensor):
+        return _fft_convolve(a, b)
 
     @staticmethod
-    def shapes(
-        row_bank_shape: Sequence[int],
-        col_bank_shape: Sequence[int],
-        row_dim: int,
-        col_dim: int,
-        separation_rank: int = 1,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        q = int(separation_rank)
-        if q < 1:
-            raise ValueError("separation_rank must be positive")
-        lr, rr = _split2(int(row_dim))
-        lc, rc = _split2(int(col_dim))
-        return (
-            (q, *tuple(int(n) for n in row_bank_shape), lr, lc),
-            (q, *tuple(int(n) for n in col_bank_shape), rr, rc),
-        )
+    def power_coeffs(c: torch.Tensor, exponent: int):
+        """Exact polynomial coefficient exponentiation via differentiable FFT."""
+        if exponent < 0:
+            raise ValueError('exponent must be nonnegative')
+        if exponent == 0:
+            return torch.ones((*c.shape[:-1], 1), dtype=c.dtype, device=c.device)
+        if exponent == 1:
+            return c
+        n = exponent * (c.shape[-1] - 1) + 1
+        size = 1 << (n - 1).bit_length()
+        work = torch.float64 if c.dtype == torch.float64 else torch.float32
+        spectrum = torch.fft.rfft(c.to(work), n=size)
+        return torch.fft.irfft(spectrum ** exponent, n=size)[..., :n].to(c.dtype)
 
-    @classmethod
-    def from_tensors(
-        cls,
-        row_bank_shape: Sequence[int],
-        col_bank_shape: Sequence[int],
-        row_dim: int,
-        col_dim: int,
-        L: torch.Tensor,
-        R: torch.Tensor,
-        separation_rank: int = 1,
-    ) -> "NestedTTMatrixLeaf":
-        sl, sr = cls.shapes(
-            row_bank_shape, col_bank_shape, row_dim, col_dim, separation_rank
-        )
-        if tuple(L.shape) != sl or tuple(R.shape) != sr:
-            raise ValueError(
-                f"matrix leaf shapes must be L={sl}, R={sr}; got "
-                f"{tuple(L.shape)}, {tuple(R.shape)}"
-            )
-        return cls(
-            L=L,
-            R=R,
-            row_bank_shape=tuple(int(n) for n in row_bank_shape),
-            col_bank_shape=tuple(int(n) for n in col_bank_shape),
-        )
+    def canonical_coefficients(self, counts: tuple[int, ...]) -> torch.Tensor:
+        """FFT normal form ``prod_q c_q(z)**counts[q]``, if all bases match.
 
-    def emit(
-        self,
-        builder,
-        *,
-        row_bank_labels: Sequence[int],
-        col_bank_labels: Sequence[int],
-        row_labels: Sequence[int],
-        col_labels: Sequence[int],
-    ) -> None:
-        if len(row_labels) != 2 or len(col_labels) != 2:
-            raise ValueError("matrix leaf expects exactly two tensorized modes")
-        q = builder.new_label(self.separation_rank)
-        builder.add(
-            self.L,
-            (q, *tuple(row_bank_labels), int(row_labels[0]), int(col_labels[0])),
-        )
-        builder.add(
-            self.R,
-            (q, *tuple(col_bank_labels), int(row_labels[1]), int(col_labels[1])),
-        )
-
-    def tensors(self) -> tuple[torch.Tensor, ...]:
-        return (self.L, self.R)
-
-    def normalized(
-        self,
-        *,
-        sum_row_bank_axes: Sequence[int] = (),
-        sum_col_bank_axes: Sequence[int] = (),
-    ) -> "NestedTTMatrixLeaf":
-        r"""Return a nonnegative row-stochastic terminal transfer.
-
-        For each fixed ``q``, ``L[q]`` is normalized over the output-side axes
-        owned by this leaf.  ``R`` is normalized jointly over ``q`` and the
-        input-side axes owned by this leaf.  Hence
-
-            sum_q sum_i (L[q,j] kron R[q,i]) 1 = 1,
-
-        while preserving a nontrivial mixture over the ``q`` components.
+        Returns (B, 1 + degree * sum(counts)) coefficient vectors for the
+        common stochastic generator. This is *not* valid for distinct bases,
+        even if those matrices commute: they are different indeterminates.
         """
-        # Axis 0 is q; row/col bank axes begin at 1; matrix row-output axis is
-        # immediately after the bank axes.
-        l_axes = tuple(1 + int(a) for a in sum_row_bank_axes) + (
-            1 + len(self.row_bank_shape),
-        )
-        r_axes = (0,) + tuple(1 + int(a) for a in sum_col_bank_axes) + (
-            1 + len(self.col_bank_shape),
-        )
-        L = _joint_softmax(self.L, l_axes)
-        R = _joint_softmax(self.R, r_axes)
-        return NestedTTMatrixLeaf(L, R, self.row_bank_shape, self.col_bank_shape)
+        if len(counts) != self.channels or min(counts) < 0:
+            raise ValueError('nonnegative count required for every channel')
+        tol=1e-6 if self.coeffs.dtype==torch.float32 else 1e-10
+        if not torch.allclose(self.bases.detach(),
+                              self.bases[:, :1].detach().expand_as(self.bases),
+                              atol=tol,rtol=tol):
+            raise ValueError('one-variable FFT normal form requires a shared base')
+        n=self.degree*sum(counts)+1
+        size=1 << (n-1).bit_length()
+        dtype=torch.float64 if self.coeffs.dtype==torch.float64 else torch.float32
+        spectrum=torch.fft.rfft(self.coeffs.to(dtype),n=size,dim=-1)
+        exponents=torch.as_tensor(counts,device=self.coeffs.device).reshape(1,-1,1)
+        result=torch.fft.irfft(torch.prod(spectrum**exponents,dim=1),n=size,dim=-1)[...,:n]
+        # FFT roundoff can produce tiny negative coefficients at exact zeros.
+        if bool((self.coeffs.detach()>=0).all()):
+            result=result.clamp_min(0)
+            result=result/result.sum(-1,keepdim=True)
+        return result.to(self.coeffs.dtype)
+
+    def accumulated(self, counts: tuple[int, ...], *, transpose: bool = False):
+        """Product of powers of the commuting CP-channel matrices, shape (B,n,n).
+
+        Evaluates powers of the already assembled polynomial matrices with
+        exponentiation by squaring, avoiding unnecessary degree*t monomial
+        storage. ``multiply_coeffs``/``power_coeffs`` expose FFT operations
+        where the polynomial coefficient representation is actually required.
+        """
+        if len(counts) != self.channels:
+            raise ValueError('channel count mismatch')
+        B = self.batch_size
+        result = torch.eye(self.n, dtype=self.coeffs.dtype, device=self.coeffs.device).expand(B, -1, -1)
+        channels = self.matrices()
+        for q, c in enumerate(counts):
+            if c:
+                result = result @ torch.linalg.matrix_power(channels[:, q], int(c))
+        return result.transpose(-2, -1) if transpose else result
+
+    def to_dense(self):
+        return self.matrices()
+
+
+# Descriptive alias for old imports; this is intentionally not a B-spline class.
+CommutingStochasticPolynomialLeaf = StochasticPolynomialLeaf

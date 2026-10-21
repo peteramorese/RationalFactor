@@ -1,132 +1,119 @@
+"""Depth-three commuting-polynomial nested TT/MPO, with batched symbolic API.
+
+Guaranteed polynomial-in-time contractions apply to a fixed number of commuting
+matrix-power blocks, e.g. repeated propagation by one row-stochastic MPO,
+followed by rank-one pointwise evaluation. Arbitrary alternating noncommuting
+maps admit exact symbolic storage but NOT a uniform polynomial-time bound.
+"""
 from __future__ import annotations
-
 from dataclasses import dataclass
+from functools import reduce
+from itertools import product
+from collections.abc import Sequence
 import math
-from typing import Sequence
-
 import torch
-
 try:
-    from .nested_tt_leaf import NestedTTMatrixLeaf, NestedTTVectorLeaf
-except ImportError:  # pragma: no cover - allows standalone tests
-    from rational_factor.models.tt.nested_tt_leaf import NestedTTMatrixLeaf, NestedTTVectorLeaf
+    from rational_factor.models.structured_matrices import Matrix
+except ImportError:
+    class Matrix:  # allows standalone unit tests without installing the repository
+        pass
+try:
+    from .nested_tt_leaf import StochasticPolynomialLeaf
+except ImportError:
+    from nested_tt_leaf import StochasticPolynomialLeaf
 
 
-# =============================================================================
-# Public specifications
-# =============================================================================
+def _batch(*sizes):
+    out = 1
+    for n in sizes:
+        if n not in (1, out) and out != 1:
+            raise ValueError(f'incompatible batch dimensions: {sizes}')
+        out = max(out, n)
+    return out
 
 
-@dataclass(frozen=True)
-class NestedTTVectorSpec:
-    modes: tuple[int, ...]
-    depth: int
-    ranks: tuple[int, ...]
-    separation_rank: int = 1
-
-    def __post_init__(self) -> None:
-        if int(self.depth) < 1:
-            raise ValueError("depth must be >= 1")
-        if not self.modes or any(int(n) < 1 for n in self.modes):
-            raise ValueError("modes must be non-empty and positive")
-        if len(self.ranks) != int(self.depth):
-            raise ValueError("ranks must have one entry per hierarchy level")
-        if any(int(r) < 1 for r in self.ranks):
-            raise ValueError("all hierarchy ranks must be positive")
-        if int(self.separation_rank) < 1:
-            raise ValueError("separation_rank must be positive")
-
-    @property
-    def d(self) -> int:
-        return len(self.modes)
+def _as_factor(x, n, dtype, device):
+    x = torch.as_tensor(x, dtype=dtype, device=device)
+    if x.ndim == 1:
+        x = x[None]
+    if x.ndim != 2 or x.shape[-1] != n:
+        raise ValueError(f'expected (n,) or (B,n), n={n}, got {tuple(x.shape)}')
+    return x
 
 
-@dataclass(frozen=True)
-class NestedTTMatrixSpec:
-    row_modes: tuple[int, ...]
-    col_modes: tuple[int, ...]
-    depth: int
-    ranks: tuple[int, ...]
-    separation_rank: int = 1
-
-    def __post_init__(self) -> None:
-        if int(self.depth) < 1:
-            raise ValueError("depth must be >= 1")
-        if not self.row_modes or len(self.row_modes) != len(self.col_modes):
-            raise ValueError("row_modes and col_modes must be non-empty and equal length")
-        if any(int(n) < 1 for n in self.row_modes + self.col_modes):
-            raise ValueError("all physical modes must be positive")
-        if len(self.ranks) != int(self.depth):
-            raise ValueError("ranks must have one entry per hierarchy level")
-        if any(int(r) < 1 for r in self.ranks):
-            raise ValueError("all hierarchy ranks must be positive")
-        if int(self.separation_rank) < 1:
-            raise ValueError("separation_rank must be positive")
-
-    @property
-    def d(self) -> int:
-        return len(self.row_modes)
+def _count_vectors(t, q):
+    if q == 1:
+        yield (t,)
+    else:
+        for a in range(t + 1):
+            for rest in _count_vectors(t - a, q - 1):
+                yield (a, *rest)
 
 
-# =============================================================================
-# Small helpers
-# =============================================================================
+def _resolve_factors(other, modes):
+    known = getattr(other, 'rank_one_factors', None)
+    if known is not None:
+        return tuple(known)
+    if isinstance(other, (int, float)) or (isinstance(other, torch.Tensor) and other.ndim == 0):
+        out = [torch.ones(n) for n in modes]
+        out[0] = out[0] * other
+        return tuple(out)
+    if isinstance(other, torch.Tensor):
+        if len(modes) == 1:
+            return (other,)
+        raise ValueError('pass one separable factor per physical mode')
+    if isinstance(other, Sequence) and len(other) == len(modes):
+        return tuple(other)
+    raise TypeError('only rank-one/separable physical factors are supported')
 
 
-def _prime_factors(n: int) -> list[int]:
-    ans: list[int] = []
+def _factor_three(n):
+    dims = [1, 1, 1]
     p = 2
     while p * p <= n:
         while n % p == 0:
-            ans.append(p)
+            dims[dims.index(min(dims))] *= p
             n //= p
         p += 1
     if n > 1:
-        ans.append(n)
-    return ans
+        dims[dims.index(min(dims))] *= n
+    return tuple(dims)
 
 
-def _balanced_factor_modes(n: int, d: int) -> tuple[int, ...]:
-    n, d = int(n), int(d)
-    if n < 1 or d < 1:
-        raise ValueError("n and d must be positive")
-    out = [1] * d
-    for p in sorted(_prime_factors(n), reverse=True):
-        j = min(range(d), key=out.__getitem__)
-        out[j] *= p
-    return tuple(out)
+@dataclass(frozen=True)
+class VirtualIndexMPO:
+    """Three-layer exact MPO of a diagonal virtual-index operator."""
+    cores: tuple[torch.Tensor, ...]
+    modes: tuple[int, ...]
 
+    @classmethod
+    def from_diagonal(cls, values):
+        if values.ndim != 1:
+            raise ValueError('one diagonal vector required')
+        modes = _factor_three(values.numel())
+        # Explicit Q-channel CP representation; avoids differentiating an SVD.
+        q = values.numel()
+        cores = []
+        strides = [math.prod(modes[k+1:]) for k in range(3)]
+        # CP chain: bond Q, physical diagonal, first core carries values.
+        for k, n in enumerate(modes):
+            left, right = (1 if k == 0 else q), (1 if k == 2 else q)
+            m = torch.zeros(left, n, n, right, dtype=values.dtype, device=values.device)
+            for z in range(q):
+                l, r = (0 if k == 0 else z), (0 if k == 2 else z)
+                digit = (z // strides[k]) % n
+                m[l, digit, digit, r] = values[z] if k == 0 else 1
+            cores.append(m)
+        return cls(tuple(cores), modes)
 
-def _uniform_bonds(d: int, rank: int) -> tuple[int, ...]:
-    if d == 1:
-        return (1, 1)
-    return (1,) + (int(rank),) * (d - 1) + (1,)
-
-
-
-
-def _broadcast_batch_sizes(*sizes: int) -> int:
-    out = 1
-    for size in sizes:
-        size = int(size)
-        if size < 1:
-            raise ValueError("batch size must be positive")
-        if size != 1:
-            if out not in (1, size):
-                raise ValueError(f"incompatible batch sizes: {sizes}")
-            out = size
-    return out
-
-def _numel_from_labels(labels: Sequence[int], sizes: dict[int, int]) -> int:
-    out = 1
-    for label in labels:
-        out *= int(sizes[int(label)])
-    return out
-
-
-# =============================================================================
-# Local/streaming tensor-network contraction
-# =============================================================================
+    def to_dense(self):
+        x = self.cores[0].squeeze(0)
+        for g in self.cores[1:]:
+            x = torch.einsum('...r,rijs->...ijs', x, g)
+        t = x.squeeze(-1).reshape(*self.modes, *self.modes)
+        # Interleaved physical pair axes become all rows then all columns.
+        perm = tuple(range(0, 2*len(self.modes), 2)) + tuple(range(1, 2*len(self.modes), 2))
+        return t.permute(perm).reshape(math.prod(self.modes), -1)
 
 
 @dataclass(frozen=True)
@@ -137,1524 +124,731 @@ class ContractionStats:
     max_intermediate_ndim: int
 
 
-class _NetworkBuilder:
-    """Integer-labelled local factor graph.
-
-    Unlike the previous implementation, ``contract`` never sends the whole
-    graph to one global einsum.  It greedily combines two factors at a time.
-    Shared labels that still occur elsewhere are retained (Hadamard-style);
-    labels whose final two occurrences meet are summed immediately.
-    """
-
-    def __init__(self) -> None:
-        self.operands: list[tuple[torch.Tensor, tuple[int, ...]]] = []
-        self._next_label = 0
-        self._sizes: dict[int, int] = {}
-        self.last_stats: ContractionStats | None = None
-
-    def new_label(self, size: int) -> int:
-        label = self._next_label
-        self._next_label += 1
-        self._sizes[label] = int(size)
-        return label
-
-    def new_labels(self, sizes: Sequence[int]) -> tuple[int, ...]:
-        return tuple(self.new_label(int(n)) for n in sizes)
-
-    def check_labels(self, labels: Sequence[int], sizes: Sequence[int]) -> None:
-        if len(labels) != len(sizes):
-            raise ValueError("label/mode mismatch")
-        for label, size in zip(labels, sizes):
-            label, size = int(label), int(size)
-            old = self._sizes.get(label)
-            if old is None:
-                self._sizes[label] = size
-            elif old != size:
-                raise ValueError(f"edge {label} has incompatible sizes {old} and {size}")
-
-    def add(self, tensor: torch.Tensor, labels: Sequence[int]) -> None:
-        tensor = torch.as_tensor(tensor)
-        labels = tuple(int(x) for x in labels)
-        if tensor.ndim != len(labels):
-            raise ValueError(
-                f"tensor rank {tensor.ndim} does not match {len(labels)} labels"
-            )
-        self.check_labels(labels, tensor.shape)
-        # Size-one virtual modes are algebraically trivial.  Removing them
-        # eagerly is essential for long histories: otherwise a perfectly
-        # small rank-one network can exceed PyTorch's 64-axis tensor limit
-        # purely because of bookkeeping axes.
-        squeeze_axes = tuple(i for i, n in enumerate(tensor.shape) if int(n) == 1)
-        if squeeze_axes:
-            tensor = tensor.squeeze(dim=squeeze_axes)
-            labels = tuple(x for i, x in enumerate(labels) if i not in squeeze_axes)
-        self.operands.append((tensor, labels))
-
-    @staticmethod
-    def _ordered_union(a: Sequence[int], b: Sequence[int]) -> tuple[int, ...]:
-        seen: set[int] = set()
-        out: list[int] = []
-        for x in (*a, *b):
-            if x not in seen:
-                seen.add(x)
-                out.append(int(x))
-        return tuple(out)
-
-    @staticmethod
-    def _align_tensor(
-        tensor: torch.Tensor,
-        labels: Sequence[int],
-        target_labels: Sequence[int],
-    ) -> torch.Tensor:
-        """Permute/unsqueeze ``tensor`` onto ``target_labels`` axes."""
-        labels = tuple(int(x) for x in labels)
-        target_labels = tuple(int(x) for x in target_labels)
-        if len(set(labels)) != len(labels):
-            raise ValueError("repeated labels inside one factor are unsupported")
-        present = [x for x in target_labels if x in set(labels)]
-        perm = [labels.index(x) for x in present]
-        if perm != list(range(len(labels))):
-            tensor = tensor.permute(perm)
-        shape = []
-        j = 0
-        present_set = set(present)
-        for x in target_labels:
-            if x in present_set:
-                shape.append(int(tensor.shape[j]))
-                j += 1
-            else:
-                shape.append(1)
-        return tensor.reshape(shape)
-
-    def contract(self, output_labels: Sequence[int] = ()) -> torch.Tensor:
-        """Contract by eliminating one index at a time.
-
-        This is a local variable-elimination scheduler, not a global einsum.
-        For each non-output label it gathers only the factors incident to that
-        label, multiplies those small factors with broadcasting, and immediately
-        sums the label.  Choosing the smallest resulting bucket avoids the bad
-        contraction orders that can otherwise turn a bounded-width nested
-        network into exponentially large intermediates (notably for reverse
-        matvec histories).
-        """
-        output_labels = tuple(int(x) for x in output_labels)
-        if not self.operands:
-            raise ValueError("cannot contract an empty graph")
-
-        ops = list(self.operands)
-        initial_operands = len(ops)
-        max_numel = max(int(t.numel()) for t, _ in ops)
-        max_ndim = max(int(t.ndim) for t, _ in ops)
-        pair_steps = 0
-
-        while True:
-            incident: dict[int, list[int]] = {}
-            for idx, (_, labels) in enumerate(ops):
-                for label in labels:
-                    if label not in output_labels:
-                        incident.setdefault(label, []).append(idx)
-            if not incident:
-                break
-
-            best = None
-            for label, idxs in incident.items():
-                union: list[int] = []
-                seen: set[int] = set()
-                for idx in idxs:
-                    for x in ops[idx][1]:
-                        if x not in seen:
-                            seen.add(x)
-                            union.append(int(x))
-                union_t = tuple(union)
-                out_labels = tuple(x for x in union_t if x != label)
-                out_numel = _numel_from_labels(out_labels, self._sizes)
-                joint_numel = _numel_from_labels(union_t, self._sizes)
-                # Minimize the post-elimination factor first.  The remaining
-                # tie breakers favor small temporary products and eliminate
-                # larger buckets when the widths are otherwise equal.
-                key = (out_numel, joint_numel, -len(idxs), len(out_labels))
-                if best is None or key < best[0]:
-                    best = (key, label, tuple(idxs), union_t, out_labels)
-
-            assert best is not None
-            _, label, idxs, union_labels, new_labels = best
-            idx_set = set(idxs)
-
-            product = None
-            for idx in idxs:
-                tensor, labels = ops[idx]
-                aligned = self._align_tensor(tensor, labels, union_labels)
-                if product is None:
-                    product = aligned
-                else:
-                    product = product * aligned
-                    pair_steps += 1
-                max_numel = max(max_numel, int(product.numel()))
-                max_ndim = max(max_ndim, int(product.ndim))
-
-            assert product is not None
-            product = product.sum(dim=union_labels.index(label))
-            max_numel = max(max_numel, int(product.numel()))
-            max_ndim = max(max_ndim, int(product.ndim))
-
-            ops = [op for idx, op in enumerate(ops) if idx not in idx_set]
-            ops.append((product, new_labels))
-
-        # Only requested output labels remain.  Disconnected factors are
-        # multiplied by broadcasting onto the common output axes.
-        result = None
-        for tensor, labels in ops:
-            aligned = self._align_tensor(tensor, labels, output_labels)
-            if result is None:
-                result = aligned
-            else:
-                result = result * aligned
-                pair_steps += 1
-            max_numel = max(max_numel, int(result.numel()))
-            max_ndim = max(max_ndim, int(result.ndim))
-
-        assert result is not None
-        self.last_stats = ContractionStats(
-            operands=initial_operands,
-            pair_contractions=pair_steps,
-            max_intermediate_numel=max_numel,
-            max_intermediate_ndim=max_ndim,
-        )
-        return result
-
-
-# =============================================================================
-# Recursive bank of operators
-# =============================================================================
-
-
-class _MPOBank:
-    bank_shape: tuple[int, ...]
-    row_dim: int
-    col_dim: int
+@dataclass(frozen=True)
+class NestedTTMatrixSpec:
     row_modes: tuple[int, ...]
     col_modes: tuple[int, ...]
-    batch_size: int = 1
+    depth: int = 3
+    channel_rank: int = 2
+    polynomial_degree: int = 2
+
+    def __post_init__(self):
+        if self.depth != 3 or not self.row_modes or self.row_modes != self.col_modes:
+            raise ValueError('only depth=3, square row/column modes supported')
+        if min(self.row_modes) < 1 or self.channel_rank < 1 or self.polynomial_degree < 0:
+            raise ValueError('positive dimensions/ranks and nonnegative polynomial degree required')
 
     @property
-    def leaf_count(self) -> int:
-        raise NotImplementedError
-
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        raise NotImplementedError
-
-    def emit(
-        self,
-        builder: _NetworkBuilder,
-        *,
-        bank_labels,
-        row_labels,
-        col_labels,
-        batch_label: int | None = None,
-    ) -> None:
-        raise NotImplementedError
-
-    def materialize(self) -> torch.Tensor:
-        builder = _NetworkBuilder()
-        batch = builder.new_label(self.batch_size) if self.batch_size > 1 else None
-        b = builder.new_labels(self.bank_shape)
-        r = builder.new_labels(self.row_modes)
-        c = builder.new_labels(self.col_modes)
-        self.emit(
-            builder,
-            bank_labels=b,
-            row_labels=r,
-            col_labels=c,
-            batch_label=batch,
-        )
-        output = ((batch,) if batch is not None else ()) + tuple(b) + tuple(r) + tuple(c)
-        value = builder.contract(output)
-        shape = (*((self.batch_size,) if self.batch_size > 1 else ()), *self.bank_shape, self.row_dim, self.col_dim)
-        return value.reshape(shape)
+    def d(self):
+        return len(self.row_modes)
 
 
-class _LeafCursor:
-    def __init__(self, tensors: Sequence[torch.Tensor]) -> None:
-        self.tensors = tuple(torch.as_tensor(x) for x in tensors)
-        self.i = 0
+@dataclass(frozen=True)
+class NestedTTVectorSpec:
+    modes: tuple[int, ...]
+    depth: int = 3
+    bond_rank: int = 2
 
-    def take(self, shape: Sequence[int]) -> torch.Tensor:
-        if self.i >= len(self.tensors):
-            raise ValueError("not enough leaf tensors")
-        x = self.tensors[self.i]
-        expected = tuple(int(n) for n in shape)
-        if tuple(x.shape) != expected:
-            raise ValueError(
-                f"leaf tensor {self.i} has shape {tuple(x.shape)}, expected {expected}"
-            )
-        self.i += 1
-        return x
+    def __post_init__(self):
+        if self.depth != 3 or not self.modes or min(self.modes) < 1 or self.bond_rank < 1:
+            raise ValueError('invalid depth/modes/bond rank')
 
 
-class _StaticMPOBank(_MPOBank):
-    batch_size = 1
-
-    def __init__(
-        self,
-        *,
-        kind: str,
-        depth: int,
-        d: int,
-        ranks: Sequence[int],
-        bank_shape: Sequence[int],
-        bank_roles: Sequence[str],
-        row_dim: int,
-        col_dim: int,
-        children: Sequence[_MPOBank] | None = None,
-        leaf: NestedTTVectorLeaf | NestedTTMatrixLeaf | None = None,
-    ) -> None:
-        self.kind = str(kind)
-        self.depth = int(depth)
-        self.d = int(d)
-        self.ranks = tuple(int(r) for r in ranks)
-        self.bank_shape = tuple(int(n) for n in bank_shape)
-        self.bank_roles = tuple(str(x) for x in bank_roles)
-        self.row_dim = int(row_dim)
-        self.col_dim = int(col_dim)
-        if len(self.bank_shape) != len(self.bank_roles):
-            raise ValueError("bank_shape/bank_roles mismatch")
-
-        if self.depth == 0:
-            if leaf is None:
-                raise ValueError("terminal bank requires a leaf")
-            self._leaf = leaf
-            self._children = ()
-            self.row_modes = leaf.row_modes
-            self.col_modes = leaf.col_modes
-            if leaf.row_dim != self.row_dim or leaf.col_dim != self.col_dim:
-                raise ValueError("leaf matrix dimensions do not match bank")
-            return
-
-        self._leaf = None
-        self.row_modes = _balanced_factor_modes(self.row_dim, self.d)
-        self.col_modes = _balanced_factor_modes(self.col_dim, self.d)
-        q = self.ranks[self.depth - 1]
-        bonds = _uniform_bonds(self.d, q)
-        if children is None or len(children) != self.d:
-            raise ValueError("recursive bank requires d children")
-        self._children = tuple(children)
-        for k, child in enumerate(self._children):
-            if child.row_dim != bonds[k + 1] or child.col_dim != bonds[k]:
-                raise ValueError("recursive virtual dimensions are inconsistent")
+@dataclass(frozen=True)
+class NestedMPOCore:
+    """Top MPO slice, with a 3-level CP/diagonal virtual-index routing MPO."""
+    parent: 'NestedTTMatrix'
+    site: int
 
     @property
-    def leaf_count(self) -> int:
-        if self.depth == 0:
-            return len(self._leaf.tensors())  # type: ignore[union-attr]
-        return sum(c.leaf_count for c in self._children)
+    def virtual_shape(self):
+        q, d = self.parent.channels, self.parent.d
+        return (1 if self.site == 0 else q, 1 if self.site == d-1 else q)
 
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        if self.depth == 0:
-            return self._leaf.tensors()  # type: ignore[union-attr]
-        return tuple(x for child in self._children for x in child.leaves())
+    def slice(self, row, col):
+        p = self.parent.leaves[self.site].matrices()  # (B,Q,n,n)
+        v = p[..., row, col]  # (B,Q)
+        c = self.parent.channel_weights
+        if self.parent.d == 1:
+            return (v * c).sum(-1)[..., None, None]
+        if self.site == 0:
+            return (v * c)[:, None, :]
+        if self.site == self.parent.d - 1:
+            return v[..., :, None]
+        return torch.diag_embed(v)
 
-    def emit(
-        self,
-        builder: _NetworkBuilder,
-        *,
-        bank_labels,
-        row_labels,
-        col_labels,
-        batch_label: int | None = None,
-    ) -> None:
-        # Static trainable parameters have no batch axis.  ``batch_label`` is
-        # intentionally ignored; batched wrappers attach the shared label.
-        bank_labels = tuple(bank_labels)
-        row_labels = tuple(row_labels)
-        col_labels = tuple(col_labels)
-        builder.check_labels(bank_labels, self.bank_shape)
-        builder.check_labels(row_labels, self.row_modes)
-        builder.check_labels(col_labels, self.col_modes)
+    def virtual_mpo(self, row, col, batch_index=0):
+        qv = self.parent.leaves[self.site].matrices()[batch_index, :, row, col]
+        if self.site == 0:
+            qv = qv * self.parent.channel_weights[batch_index]
+        return VirtualIndexMPO.from_diagonal(qv)
 
-        if self.depth == 0:
-            if self.kind == "vector":
-                assert isinstance(self._leaf, NestedTTVectorLeaf)
-                self._leaf.emit(
-                    builder,
-                    bank_labels=bank_labels,
-                    row_labels=row_labels,
-                    col_labels=col_labels,
-                )
+
+class NestedTTMatrix(Matrix):
+    """Row-stochastic mixture of Kronecker products of commuting polynomials.
+
+    M = sum_q w[q] * kron_k (sum_j c[k,q,j] S[k,q]**j)
+
+    S[k,q] may differ with q, but must commute for each fixed site k.
+    """
+    def __init__(self, spec: NestedTTMatrixSpec, leaves: Sequence[StochasticPolynomialLeaf],
+                 channel_logits: torch.Tensor):
+        self.spec = spec
+        self.leaves = tuple(leaves)
+        if len(leaves) != spec.d or any(a.n != n for a, n in zip(leaves, spec.row_modes)):
+            raise ValueError('one leaf per physical mode, with matching square dimension')
+        logits = torch.as_tensor(channel_logits)
+        if logits.ndim == 1:
+            logits = logits[None]
+        if logits.ndim != 2 or logits.shape[-1] != spec.channel_rank:
+            raise ValueError('channel_logits must have shape (Q,) or (B,Q)')
+        self.channel_logits = logits
+        self._batch_size = _batch(logits.shape[0], *(a.batch_size for a in leaves))
+        if any(a.channels != spec.channel_rank for a in leaves):
+            raise ValueError('leaf CP channel count mismatch')
+
+    @property
+    def channels(self): return self.spec.channel_rank
+    @property
+    def d(self): return self.spec.d
+    @property
+    def row_modes(self): return self.spec.row_modes
+    @property
+    def col_modes(self): return self.spec.col_modes
+    @property
+    def modes(self): return self.row_modes
+    @property
+    def depth(self): return self.spec.depth
+    @property
+    def batch_size(self): return self._batch_size
+    @property
+    def dtype(self): return self.leaves[0].coeffs.dtype
+    @property
+    def device(self): return self.leaves[0].coeffs.device
+    @property
+    def shape(self):
+        n = math.prod(self.row_modes)
+        return torch.Size((n, n) if self.batch_size == 1 else (self.batch_size, n, n))
+    @property
+    def channel_weights(self): return self.channel_logits.softmax(-1).expand(self.batch_size, -1)
+    @property
+    def cores(self): return tuple(NestedMPOCore(self,k) for k in range(self.d))
+    @property
+    def leaf_count(self): return sum(a.channels for a in self.leaves)
+    @property
+    def ranks(self): return (1,) + (self.channels,) * (self.d-1) + (1,)
+    @property
+    def T(self): return _TransposeNestedMatrix(self)
+
+    def matvec(self, x):
+        if isinstance(x, NestedTTVector):
+            if x.modes != self.col_modes:
+                raise ValueError('matrix-vector modes differ')
+            return x._append(('power', self, False, 1), self.row_modes)
+        return torch.matmul(self.to_dense(), torch.as_tensor(x, dtype=self.dtype, device=self.device).unsqueeze(-1)).squeeze(-1)
+
+    def rev_matvec(self, x):
+        if isinstance(x, NestedTTVector):
+            if x.modes != self.row_modes:
+                raise ValueError('matrix-vector modes differ')
+            return x._append(('power', self, True, 1), self.col_modes)
+        return torch.matmul(self.to_dense().transpose(-1,-2), torch.as_tensor(x, dtype=self.dtype, device=self.device).unsqueeze(-1)).squeeze(-1)
+
+    def __matmul__(self, other): return self.matvec(other)
+
+    def to_dense(self, *, max_elements=1_000_000):
+        n = math.prod(self.modes)
+        if n*n*self.batch_size > max_elements:
+            raise ValueError('dense matrix materialization exceeds max_elements')
+        local = [a.matrices().expand(self.batch_size, -1, -1, -1) for a in self.leaves]
+        pieces = []
+        for b in range(self.batch_size):
+            result = torch.zeros(n,n,dtype=self.dtype,device=self.device)
+            for q in range(self.channels):
+                block = local[0][b,q]
+                for x in local[1:]:
+                    block = torch.kron(block, x[b,q])
+                result = result + self.channel_weights[b,q] * block
+            pieces.append(result)
+        out = torch.stack(pieces)
+        return out[0] if self.batch_size == 1 else out
+
+    def sum(self):
+        n = math.prod(self.modes)
+        return self.channel_weights.sum(-1) * n if self.batch_size > 1 else self.channel_weights.sum() * n
+
+    def row_sums(self):
+        """Return the analytic row sum 1, without expanding physical states."""
+        return self.channel_weights.sum(-1)
+
+    def __rmatmul__(self, x):
+        if isinstance(x, NestedTTVector):
+            return self.rev_matvec(x)
+        return torch.as_tensor(x, dtype=self.dtype, device=self.device) @ self.to_dense()
+
+    def diag(self): return self.to_dense().diagonal(dim1=-2,dim2=-1)
+    def elementwise_multiply(self, factors): return _SchurNestedMatrix(self, factors)
+    __mul__ = elementwise_multiply
+    def __rmul__(self, factors): return self.elementwise_multiply(factors)
+    def mul_diag_left(self, a): return _DenseFallbackMatrix(self.to_dense()).mul_diag_left(a)
+    def mul_diag_right(self, a): return _DenseFallbackMatrix(self.to_dense()).mul_diag_right(a)
+    def scale(self, x): return _DenseFallbackMatrix(self.to_dense() * x)
+    def materialize_cores(self):
+        out = []
+        for k, (leaf, core) in enumerate(zip(self.leaves,self.cores)):
+            n = leaf.n
+            v = leaf.matrices().expand(self.batch_size,-1,-1,-1)
+            if self.d == 1:
+                a = (v * self.channel_weights[...,None,None]).sum(1)[:,None,:,: ,None]
+            elif k == 0:
+                a = (v * self.channel_weights[...,None,None])[:,None,:,:,:].permute(0,1,3,4,2)
+            elif k == self.d - 1:
+                a = v.unsqueeze(-1)
             else:
-                assert isinstance(self._leaf, NestedTTMatrixLeaf)
-                row_bank_labels = tuple(
-                    label
-                    for label, role in zip(bank_labels, self.bank_roles)
-                    if role == "out"
-                )
-                col_bank_labels = tuple(
-                    label
-                    for label, role in zip(bank_labels, self.bank_roles)
-                    if role == "in"
-                )
-                self._leaf.emit(
-                    builder,
-                    row_bank_labels=row_bank_labels,
-                    col_bank_labels=col_bank_labels,
-                    row_labels=row_labels,
-                    col_labels=col_labels,
-                )
-            return
-
-        left_virtual = builder.new_labels(self._children[0].col_modes)
-        for k, child in enumerate(self._children):
-            right_virtual = builder.new_labels(child.row_modes)
-            if k < self.d - 1 and tuple(child.row_modes) != tuple(self._children[k + 1].col_modes):
-                raise ValueError("adjacent recursive virtual tensorizations differ")
-            child.emit(
-                builder,
-                bank_labels=(*bank_labels, row_labels[k], col_labels[k]),
-                row_labels=right_virtual,
-                col_labels=left_virtual,
-                batch_label=None,
-            )
-            left_virtual = right_virtual
+                eye = torch.eye(self.channels,dtype=self.dtype,device=self.device)
+                a = torch.einsum('bqij,qr->bqijr',v,eye)
+            out.append(a[0] if self.batch_size == 1 else a)
+        return tuple(out)
 
 
-class _PhysicalScaleBank(_MPOBank):
-    """Multiply an outer vector-core bank by unbatched or batched weights."""
-
-    def __init__(self, base: _MPOBank, weights: torch.Tensor) -> None:
-        if len(base.bank_shape) != 1:
-            raise ValueError("physical scaling is only valid on an outer vector core")
-        weights = torch.as_tensor(weights)
-        if weights.ndim == 2 and int(weights.shape[0]) == 1:
-            weights = weights[0]
-        if weights.ndim not in (1, 2) or int(weights.shape[-1]) != base.bank_shape[0]:
-            raise ValueError(
-                f"basis factor must have shape ({base.bank_shape[0]},) or "
-                f"(batch,{base.bank_shape[0]}), got {tuple(weights.shape)}"
-            )
-        weight_batch = 1 if weights.ndim == 1 else int(weights.shape[0])
-        self.base = base
-        self.weights = weights
-        self.batch_size = _broadcast_batch_sizes(base.batch_size, weight_batch)
-        self.bank_shape = base.bank_shape
-        self.row_dim, self.col_dim = base.row_dim, base.col_dim
-        self.row_modes, self.col_modes = base.row_modes, base.col_modes
-
+class _TransposeNestedMatrix(Matrix):
+    def __init__(self, base): self.base=base
     @property
-    def leaf_count(self) -> int:
-        return self.base.leaf_count
-
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        return self.base.leaves()
-
-    def emit(
-        self,
-        builder: _NetworkBuilder,
-        *,
-        bank_labels,
-        row_labels,
-        col_labels,
-        batch_label: int | None = None,
-    ) -> None:
-        if self.batch_size > 1 and batch_label is None:
-            raise ValueError("batched vector bank requires a batch label")
-        self.base.emit(
-            builder,
-            bank_labels=bank_labels,
-            row_labels=row_labels,
-            col_labels=col_labels,
-            batch_label=batch_label if self.base.batch_size > 1 else None,
-        )
-        leaves = self.base.leaves()
-        w = self.weights
-        if leaves:
-            w = w.to(dtype=leaves[0].dtype, device=leaves[0].device)
-        physical = int(tuple(bank_labels)[0])
-        if w.ndim == 1:
-            builder.add(w, (physical,))
-        else:
-            assert batch_label is not None
-            builder.add(w, (batch_label, physical))
-
-
-class _PhysicalMatrixScaleBank(_MPOBank):
-    """Multiply an outer matrix-core bank by separable matrix weights."""
-
-    def __init__(self, base: _MPOBank, weights: torch.Tensor) -> None:
-        if len(base.bank_shape) != 2:
-            raise ValueError("matrix physical scaling requires a bank (M,N)")
-        weights = torch.as_tensor(weights)
-        if weights.ndim == 3 and int(weights.shape[0]) == 1:
-            weights = weights[0]
-        if weights.ndim not in (2, 3) or tuple(weights.shape[-2:]) != base.bank_shape:
-            raise ValueError(
-                f"matrix factor must have shape {base.bank_shape} or "
-                f"(batch,{base.bank_shape[0]},{base.bank_shape[1]}), got {tuple(weights.shape)}"
-            )
-        weight_batch = 1 if weights.ndim == 2 else int(weights.shape[0])
-        self.base = base
-        self.weights = weights
-        self.batch_size = _broadcast_batch_sizes(base.batch_size, weight_batch)
-        self.bank_shape = base.bank_shape
-        self.row_dim, self.col_dim = base.row_dim, base.col_dim
-        self.row_modes, self.col_modes = base.row_modes, base.col_modes
-
+    def shape(self): return self.base.shape
     @property
-    def leaf_count(self) -> int:
-        return self.base.leaf_count
-
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        return self.base.leaves()
-
-    def emit(
-        self,
-        builder: _NetworkBuilder,
-        *,
-        bank_labels,
-        row_labels,
-        col_labels,
-        batch_label: int | None = None,
-    ) -> None:
-        if self.batch_size > 1 and batch_label is None:
-            raise ValueError("batched matrix bank requires a batch label")
-        self.base.emit(
-            builder,
-            bank_labels=bank_labels,
-            row_labels=row_labels,
-            col_labels=col_labels,
-            batch_label=batch_label if self.base.batch_size > 1 else None,
-        )
-        leaves = self.base.leaves()
-        w = self.weights
-        if leaves:
-            w = w.to(dtype=leaves[0].dtype, device=leaves[0].device)
-        j, i = (int(x) for x in tuple(bank_labels))
-        if w.ndim == 2:
-            builder.add(w, (j, i))
-        else:
-            assert batch_label is not None
-            builder.add(w, (batch_label, j, i))
+    def dtype(self): return self.base.dtype
+    @property
+    def device(self): return self.base.device
+    @property
+    def T(self): return self.base
+    def matvec(self,x): return self.base.rev_matvec(x)
+    def rev_matvec(self,x): return self.base.matvec(x)
+    def to_dense(self): return self.base.to_dense().transpose(-1,-2)
 
 
-class _PhysicalLinearMapBank(_MPOBank):
-    """Apply a rank-one outer MPO core directly to a vector-core bank.
+class _DenseFallbackMatrix(Matrix):
+    def __init__(self, tensor): self.values = tensor
+    @property
+    def shape(self): return self.values.shape
+    @property
+    def dtype(self): return self.values.dtype
+    @property
+    def device(self): return self.values.device
+    @property
+    def T(self): return _DenseFallbackMatrix(self.values.transpose(-1,-2))
+    def to_dense(self): return self.values
+    def matvec(self,x): return self.values @ x
+    def mul_diag_left(self,a): return _DenseFallbackMatrix(torch.as_tensor(a,device=self.device,dtype=self.dtype).unsqueeze(-1)*self.values)
+    def mul_diag_right(self,a): return _DenseFallbackMatrix(self.values*torch.as_tensor(a,device=self.device,dtype=self.dtype).unsqueeze(-2))
 
-    ``H[j] = sum_i weights[j,i] * base[i]``.  Because there is no nontrivial
-    MPO virtual bond, the nested hidden-state modes and ranks are unchanged.
+
+class _WeightedMatrix(_DenseFallbackMatrix):
+    """Schur-product adapter. Dense by design, for small reference operations."""
+    def __init__(self, base, factors):
+        factors = tuple(factors)
+        if len(factors) != base.d:
+            raise ValueError('one matrix factor per site')
+        n = math.prod(base.row_modes)
+        if n*n > 1_000_000:
+            raise NotImplementedError('general Schur-scaled MPO has no guaranteed compact form')
+        factors = [torch.as_tensor(x,dtype=base.dtype,device=base.device) for x in factors]
+        batch = _batch(base.batch_size, *(1 if x.ndim==2 else x.shape[0] for x in factors))
+        rows=[]
+        for b in range(batch):
+            local = [x if x.ndim==2 else x[b if x.shape[0]>1 else 0] for x in factors]
+            f = reduce(torch.kron,local)
+            m = base.to_dense()
+            rows.append((m if m.ndim==2 else m[b if m.shape[0]>1 else 0])*f)
+        super().__init__(torch.stack(rows) if batch>1 else rows[0])
+
+
+class _SchurNestedMatrix(Matrix):
+    """General CP MPO after Schur multiplication by rank-one matrix factors.
+
+    No full spatial tensor product is ever formed by matvec/contraction. Local
+    channel matrices are no longer required to commute or be stochastic.
     """
-
-    def __init__(self, base: _MPOBank, weights: torch.Tensor) -> None:
-        if len(base.bank_shape) != 1:
-            raise ValueError("physical linear map requires a vector bank")
-        weights = torch.as_tensor(weights)
-        if weights.ndim == 3 and int(weights.shape[0]) == 1:
-            weights = weights[0]
-        if weights.ndim not in (2, 3) or int(weights.shape[-1]) != base.bank_shape[0]:
-            raise ValueError("linear-map factor has incompatible shape")
-        weight_batch = 1 if weights.ndim == 2 else int(weights.shape[0])
-        self.base = base
-        self.weights = weights
-        self.batch_size = _broadcast_batch_sizes(base.batch_size, weight_batch)
-        self.bank_shape = (int(weights.shape[-2]),)
-        self.row_dim, self.col_dim = base.row_dim, base.col_dim
-        self.row_modes, self.col_modes = base.row_modes, base.col_modes
-
+    def __init__(self,base, factors):
+        factors=tuple(factors)
+        if len(factors)!=base.d:
+            raise ValueError('one separable matrix factor per physical mode')
+        self.base=base
+        self.factors=tuple(torch.as_tensor(f,dtype=base.dtype,device=base.device) for f in factors)
+        for f,n in zip(self.factors,base.row_modes):
+            if f.ndim not in (2,3) or f.shape[-2:]!=(n,n):
+                raise ValueError('expected (n,n) or (B,n,n) physical factor')
+        self._batch_size=_batch(base.batch_size,*(1 if f.ndim==2 else f.shape[0] for f in self.factors))
     @property
-    def leaf_count(self) -> int:
-        return self.base.leaf_count
-
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        return self.base.leaves()
-
-    def emit(
-        self,
-        builder: _NetworkBuilder,
-        *,
-        bank_labels,
-        row_labels,
-        col_labels,
-        batch_label: int | None = None,
-    ) -> None:
-        if self.batch_size > 1 and batch_label is None:
-            raise ValueError("batched physical map requires a batch label")
-        j = int(tuple(bank_labels)[0])
-        i = builder.new_label(self.base.bank_shape[0])
-        self.base.emit(
-            builder,
-            bank_labels=(i,),
-            row_labels=row_labels,
-            col_labels=col_labels,
-            batch_label=batch_label if self.base.batch_size > 1 else None,
-        )
-        leaves = self.base.leaves()
-        w = self.weights
-        if leaves:
-            w = w.to(dtype=leaves[0].dtype, device=leaves[0].device)
-        if w.ndim == 2:
-            builder.add(w, (j, i))
-        else:
-            assert batch_label is not None
-            builder.add(w, (batch_label, j, i))
-
-
-class _MatvecMPOBank(_MPOBank):
-    """Exact symbolic ``H[j] = sum_i A[j,i] kron G[i]``."""
-
-    def __init__(self, matrix_bank: _MPOBank, vector_bank: _MPOBank) -> None:
-        if len(matrix_bank.bank_shape) != 2 or len(vector_bank.bank_shape) != 1:
-            raise ValueError("matvec expects matrix bank (M,N) and vector bank (N,)")
-        M, N = matrix_bank.bank_shape
-        if vector_bank.bank_shape[0] != N:
-            raise ValueError("physical input mode mismatch")
-        self.matrix_bank = matrix_bank
-        self.vector_bank = vector_bank
-        self.batch_size = _broadcast_batch_sizes(matrix_bank.batch_size, vector_bank.batch_size)
-        self.bank_shape = (M,)
-        self.row_dim = matrix_bank.row_dim * vector_bank.row_dim
-        self.col_dim = matrix_bank.col_dim * vector_bank.col_dim
-        self.row_modes = matrix_bank.row_modes + vector_bank.row_modes
-        self.col_modes = matrix_bank.col_modes + vector_bank.col_modes
-
+    def batch_size(self): return self._batch_size
     @property
-    def leaf_count(self) -> int:
-        return self.matrix_bank.leaf_count + self.vector_bank.leaf_count
-
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        return self.matrix_bank.leaves() + self.vector_bank.leaves()
-
-    def emit(
-        self,
-        builder: _NetworkBuilder,
-        *,
-        bank_labels,
-        row_labels,
-        col_labels,
-        batch_label: int | None = None,
-    ) -> None:
-        if self.batch_size > 1 and batch_label is None:
-            raise ValueError("batched matvec bank requires a batch label")
-        bank_labels = tuple(bank_labels)
-        row_labels = tuple(row_labels)
-        col_labels = tuple(col_labels)
-        nr = len(self.matrix_bank.row_modes)
-        nc = len(self.matrix_bank.col_modes)
-        i = builder.new_label(self.matrix_bank.bank_shape[1])
-        self.matrix_bank.emit(
-            builder,
-            bank_labels=(bank_labels[0], i),
-            row_labels=row_labels[:nr],
-            col_labels=col_labels[:nc],
-            batch_label=batch_label if self.matrix_bank.batch_size > 1 else None,
-        )
-        self.vector_bank.emit(
-            builder,
-            bank_labels=(i,),
-            row_labels=row_labels[nr:],
-            col_labels=col_labels[nc:],
-            batch_label=batch_label if self.vector_bank.batch_size > 1 else None,
-        )
-
-
-class _RevMatvecMPOBank(_MPOBank):
-    """Exact symbolic ``H[i] = sum_j A[j,i] kron G[j]``.
-
-    This is the physical transpose action ``A.T @ G``.  The MPO virtual
-    directions are not transposed: only the physical output/input bank indices
-    are exchanged.  Consequently the tensorized hidden-state modes grow in the
-    same way as forward matvec.
-    """
-
-    def __init__(self, matrix_bank: _MPOBank, vector_bank: _MPOBank) -> None:
-        if len(matrix_bank.bank_shape) != 2 or len(vector_bank.bank_shape) != 1:
-            raise ValueError("reverse matvec expects matrix bank (M,N) and vector bank (M,)")
-        M, N = matrix_bank.bank_shape
-        if vector_bank.bank_shape[0] != M:
-            raise ValueError("physical output mode mismatch")
-        self.matrix_bank = matrix_bank
-        self.vector_bank = vector_bank
-        self.batch_size = _broadcast_batch_sizes(matrix_bank.batch_size, vector_bank.batch_size)
-        self.bank_shape = (N,)
-        self.row_dim = matrix_bank.row_dim * vector_bank.row_dim
-        self.col_dim = matrix_bank.col_dim * vector_bank.col_dim
-        self.row_modes = matrix_bank.row_modes + vector_bank.row_modes
-        self.col_modes = matrix_bank.col_modes + vector_bank.col_modes
-
+    def d(self): return self.base.d
     @property
-    def leaf_count(self) -> int:
-        return self.matrix_bank.leaf_count + self.vector_bank.leaf_count
-
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        return self.matrix_bank.leaves() + self.vector_bank.leaves()
-
-    def emit(
-        self,
-        builder: _NetworkBuilder,
-        *,
-        bank_labels,
-        row_labels,
-        col_labels,
-        batch_label: int | None = None,
-    ) -> None:
-        if self.batch_size > 1 and batch_label is None:
-            raise ValueError("batched reverse-matvec bank requires a batch label")
-        bank_labels = tuple(bank_labels)
-        row_labels = tuple(row_labels)
-        col_labels = tuple(col_labels)
-        nr = len(self.matrix_bank.row_modes)
-        nc = len(self.matrix_bank.col_modes)
-        j = builder.new_label(self.matrix_bank.bank_shape[0])
-        self.matrix_bank.emit(
-            builder,
-            bank_labels=(j, bank_labels[0]),
-            row_labels=row_labels[:nr],
-            col_labels=col_labels[:nc],
-            batch_label=batch_label if self.matrix_bank.batch_size > 1 else None,
-        )
-        self.vector_bank.emit(
-            builder,
-            bank_labels=(j,),
-            row_labels=row_labels[nr:],
-            col_labels=col_labels[nc:],
-            batch_label=batch_label if self.vector_bank.batch_size > 1 else None,
-        )
-
-
-# =============================================================================
-# Static recursive construction
-# =============================================================================
-
-
-def _leaf_shapes(
-    *,
-    kind: str,
-    depth: int,
-    d: int,
-    ranks: Sequence[int],
-    bank_shape: Sequence[int],
-    bank_roles: Sequence[str],
-    row_dim: int,
-    col_dim: int,
-    separation_rank: int,
-) -> list[tuple[int, ...]]:
-    if depth == 0:
-        if kind == "vector":
-            return list(NestedTTVectorLeaf.shapes(bank_shape, row_dim, col_dim, separation_rank))
-        row_bank = tuple(n for n, r in zip(bank_shape, bank_roles) if r == "out")
-        col_bank = tuple(n for n, r in zip(bank_shape, bank_roles) if r == "in")
-        return list(NestedTTMatrixLeaf.shapes(row_bank, col_bank, row_dim, col_dim, separation_rank))
-
-    row_modes = _balanced_factor_modes(row_dim, d)
-    col_modes = _balanced_factor_modes(col_dim, d)
-    q = int(ranks[depth - 1])
-    bonds = _uniform_bonds(d, q)
-    out: list[tuple[int, ...]] = []
-    for k in range(d):
-        out.extend(
-            _leaf_shapes(
-                kind=kind,
-                depth=depth - 1,
-                d=d,
-                ranks=ranks,
-                bank_shape=(*bank_shape, row_modes[k], col_modes[k]),
-                bank_roles=(*bank_roles, "out", "in"),
-                row_dim=bonds[k + 1],
-                col_dim=bonds[k],
-                separation_rank=separation_rank,
-            )
-        )
-    return out
-
-
-def _build_static_bank(
-    *,
-    kind: str,
-    depth: int,
-    d: int,
-    ranks: Sequence[int],
-    bank_shape: Sequence[int],
-    bank_roles: Sequence[str],
-    row_dim: int,
-    col_dim: int,
-    cursor: _LeafCursor,
-    separation_rank: int,
-    normalize_matrix_leaves: bool = False,
-    stochastic_sum_axes: Sequence[int] = (),
-) -> _StaticMPOBank:
-    if depth == 0:
-        if kind == "vector":
-            sx, sc = NestedTTVectorLeaf.shapes(bank_shape, row_dim, col_dim, separation_rank)
-            leaf = NestedTTVectorLeaf.from_tensors(
-                bank_shape,
-                row_dim,
-                col_dim,
-                cursor.take(sx),
-                cursor.take(sc),
-                separation_rank=separation_rank,
-            )
-        else:
-            row_bank = tuple(n for n, r in zip(bank_shape, bank_roles) if r == "out")
-            col_bank = tuple(n for n, r in zip(bank_shape, bank_roles) if r == "in")
-            sl, sr = NestedTTMatrixLeaf.shapes(row_bank, col_bank, row_dim, col_dim, separation_rank)
-            leaf = NestedTTMatrixLeaf.from_tensors(
-                row_bank,
-                col_bank,
-                row_dim,
-                col_dim,
-                cursor.take(sl),
-                cursor.take(sr),
-                separation_rank=separation_rank,
-            )
-            if normalize_matrix_leaves:
-                sum_set = set(int(a) for a in stochastic_sum_axes)
-                out_globals = [i for i, role in enumerate(bank_roles) if role == "out"]
-                in_globals = [i for i, role in enumerate(bank_roles) if role == "in"]
-                sum_row = tuple(k for k, g in enumerate(out_globals) if g in sum_set)
-                sum_col = tuple(k for k, g in enumerate(in_globals) if g in sum_set)
-                leaf = leaf.normalized(
-                    sum_row_bank_axes=sum_row,
-                    sum_col_bank_axes=sum_col,
-                )
-        return _StaticMPOBank(
-            kind=kind,
-            depth=0,
-            d=d,
-            ranks=ranks,
-            bank_shape=bank_shape,
-            bank_roles=bank_roles,
-            row_dim=row_dim,
-            col_dim=col_dim,
-            leaf=leaf,
-        )
-
-    row_modes = _balanced_factor_modes(row_dim, d)
-    col_modes = _balanced_factor_modes(col_dim, d)
-    q = int(ranks[depth - 1])
-    bonds = _uniform_bonds(d, q)
-    children = []
-    for k in range(d):
-        children.append(
-            _build_static_bank(
-                kind=kind,
-                depth=depth - 1,
-                d=d,
-                ranks=ranks,
-                bank_shape=(*bank_shape, row_modes[k], col_modes[k]),
-                bank_roles=(*bank_roles, "out", "in"),
-                row_dim=bonds[k + 1],
-                col_dim=bonds[k],
-                cursor=cursor,
-                separation_rank=separation_rank,
-                normalize_matrix_leaves=normalize_matrix_leaves,
-                stochastic_sum_axes=(
-                    (*tuple(int(a) for a in stochastic_sum_axes), len(tuple(bank_shape)))
-                    if k == 0
-                    else (len(tuple(bank_shape)),)
-                ) if normalize_matrix_leaves else (),
-            )
-        )
-    return _StaticMPOBank(
-        kind=kind,
-        depth=depth,
-        d=d,
-        ranks=ranks,
-        bank_shape=bank_shape,
-        bank_roles=bank_roles,
-        row_dim=row_dim,
-        col_dim=col_dim,
-        children=children,
-    )
-
-
-# =============================================================================
-# Whole-vector / whole-matrix emission
-# =============================================================================
-
-
-def _emit_vector_network(core_banks, modes, *, output_physical: bool):
-    builder = _NetworkBuilder()
-    batch_size = _broadcast_batch_sizes(*(bank.batch_size for bank in core_banks))
-    batch = builder.new_label(batch_size) if batch_size > 1 else None
-    physical = builder.new_labels(modes)
-    output = (
-        (*((batch,) if batch is not None else ()), *physical)
-        if output_physical
-        else ((batch,) if batch is not None else ())
-    )
-
-    left = builder.new_labels(core_banks[0].col_modes)
-    for k, bank in enumerate(core_banks):
-        right = builder.new_labels(bank.row_modes)
-        bank.emit(
-            builder,
-            bank_labels=(physical[k],),
-            row_labels=right,
-            col_labels=left,
-            batch_label=batch if bank.batch_size > 1 else None,
-        )
-        if k < len(core_banks) - 1:
-            if tuple(bank.row_modes) != tuple(core_banks[k + 1].col_modes):
-                raise ValueError("adjacent vector bond tensorizations do not match")
-        left = right
-    return builder, output, batch_size
-
-
-def _emit_matrix_network(core_banks, row_modes, col_modes):
-    builder = _NetworkBuilder()
-    batch_size = _broadcast_batch_sizes(*(bank.batch_size for bank in core_banks))
-    batch = builder.new_label(batch_size) if batch_size > 1 else None
-    rows = builder.new_labels(row_modes)
-    cols = builder.new_labels(col_modes)
-    left = builder.new_labels(core_banks[0].col_modes)
-    for k, bank in enumerate(core_banks):
-        right = builder.new_labels(bank.row_modes)
-        bank.emit(
-            builder,
-            bank_labels=(rows[k], cols[k]),
-            row_labels=right,
-            col_labels=left,
-            batch_label=batch if bank.batch_size > 1 else None,
-        )
-        if k < len(core_banks) - 1:
-            if tuple(bank.row_modes) != tuple(core_banks[k + 1].col_modes):
-                raise ValueError("adjacent matrix bond tensorizations do not match")
-        left = right
-    output = (*((batch,) if batch is not None else ()), *rows, *cols)
-    return builder, output, batch_size
-
-
-# =============================================================================
-# Rank-one physical factors
-# =============================================================================
-
-
-def _rank_one_factors(other, modes: Sequence[int]) -> tuple[torch.Tensor, ...]:
-    """Return one physical factor per TT mode.
-
-    Each factor may be ``(n,)`` or ``(batch,n)``.  Batched factors share one
-    leading batch size and are broadcast against unbatched factors.
-    Known rank-one :class:`NestedTTVector` objects expose these factors
-    directly, so no dense recovery/factorization is ever attempted.
-    """
-    modes = tuple(int(n) for n in modes)
-    known = getattr(other, "rank_one_factors", None)
-    if known is not None:
-        factors = tuple(torch.as_tensor(x) for x in known)
-        if tuple(int(x.shape[-1]) for x in factors) != modes:
-            raise ValueError("rank-one NestedTTVector modes do not match")
-        _broadcast_batch_sizes(*(1 if x.ndim == 1 else int(x.shape[0]) for x in factors))
-        return factors
-    if isinstance(other, (int, float)):
-        factors = [torch.ones(n) for n in modes]
-        factors[0] = factors[0] * float(other)
-        return tuple(factors)
-    if isinstance(other, torch.Tensor):
-        if other.ndim == 0:
-            return _rank_one_factors(float(other), modes)
-        if len(modes) == 1 and other.ndim in (1, 2) and int(other.shape[-1]) == modes[0]:
-            return (other,)
-        raise ValueError(
-            "a dense multi-dimensional divisor/multiplier is intentionally not "
-            "factorized here; pass one factor of shape (n,) or (batch,n) per TT mode"
-        )
-    if isinstance(other, Sequence):
-        factors = tuple(torch.as_tensor(x) for x in other)
-        if len(factors) != len(modes):
-            raise ValueError("expected one rank-one factor per physical mode")
-        batches = []
-        for x, n in zip(factors, modes):
-            if x.ndim not in (1, 2) or int(x.shape[-1]) != n:
-                raise ValueError(
-                    f"factor must have shape ({n},) or (batch,{n}), got {tuple(x.shape)}"
-                )
-            batches.append(1 if x.ndim == 1 else int(x.shape[0]))
-        _broadcast_batch_sizes(*batches)
-        return factors
-    raise TypeError("expected scalar or a sequence of rank-one physical factors")
-
-
-def _safe_reciprocal(x: torch.Tensor, eps: float) -> torch.Tensor:
-    x = torch.as_tensor(x)
-    eps_t = torch.as_tensor(float(eps), dtype=x.dtype, device=x.device)
-    sign = torch.where(x < 0, -torch.ones_like(x), torch.ones_like(x))
-    safe = torch.where(x.abs() < eps_t, sign * eps_t, x)
-    return safe.reciprocal()
-
-
-# =============================================================================
-# Public NestedTTVector
-# =============================================================================
+    def row_modes(self): return self.base.row_modes
+    @property
+    def col_modes(self): return self.base.col_modes
+    @property
+    def dtype(self): return self.base.dtype
+    @property
+    def device(self): return self.base.device
+    @property
+    def channel_weights(self): return self.base.channel_weights.expand(self.batch_size,-1)
+    @property
+    def channels(self): return self.base.channels
+    @property
+    def shape(self):
+        n=math.prod(self.row_modes)
+        return torch.Size((n,n) if self.batch_size==1 else (self.batch_size,n,n))
+    @property
+    def T(self): return _TransposeNestedMatrix(self)
+    def channel_matrices(self):
+        return tuple(leaf.matrices().expand(self.batch_size,-1,-1,-1)
+                     * (f[None] if f.ndim==2 else f).expand(self.batch_size,-1,-1)[:,None]
+                     for leaf,f in zip(self.base.leaves,self.factors))
+    def matvec(self,x):
+        if isinstance(x,NestedTTVector):
+            if x.modes!=self.col_modes: raise ValueError('physical modes differ')
+            return x._append(('cp',self,False),self.row_modes)
+        return torch.matmul(self.to_dense(),torch.as_tensor(x).unsqueeze(-1)).squeeze(-1)
+    def rev_matvec(self,x):
+        if isinstance(x,NestedTTVector):
+            if x.modes!=self.row_modes: raise ValueError('physical modes differ')
+            return x._append(('cp',self,True),self.col_modes)
+        return self.T.matvec(x)
+    def elementwise_multiply(self,factors):
+        return _SchurNestedMatrix(self.base,[a*b for a,b in zip(self.factors,factors)])
+    __mul__=elementwise_multiply
+    def __matmul__(self,x): return self.matvec(x)
+    def to_dense(self,*,max_elements=1_000_000):
+        n=math.prod(self.row_modes)
+        if n*n*self.batch_size>max_elements: raise ValueError('dense matrix limit exceeded')
+        locals=self.channel_matrices()
+        out=[]
+        for b in range(self.batch_size):
+            terms=[]
+            for q in range(self.channels):
+                terms.append(self.channel_weights[b,q]*reduce(torch.kron,[P[b,q] for P in locals]))
+            out.append(sum(terms))
+        return out[0] if self.batch_size==1 else torch.stack(out)
+    def sum(self):
+        locals=self.channel_matrices()
+        z=self.channel_weights
+        for P in locals: z=z*P.sum(dim=(-2,-1))
+        out=z.sum(-1)
+        return out.squeeze(0) if self.batch_size==1 else out
+    def diag(self): return self.to_dense().diagonal(dim1=-2,dim2=-1)
 
 
 class NestedTTVector:
-    def __init__(self, spec: NestedTTVectorSpec, leaves: Sequence[torch.Tensor]) -> None:
-        expected = self.leaf_shapes(spec)
-        if len(leaves) != len(expected):
-            raise ValueError(f"expected {len(expected)} leaf tensors, got {len(leaves)}")
-        cursor = _LeafCursor(leaves)
-        bonds = _uniform_bonds(spec.d, spec.ranks[-1])
-        banks = []
-        for k, n in enumerate(spec.modes):
-            banks.append(
-                _build_static_bank(
-                    kind="vector",
-                    depth=spec.depth - 1,
-                    d=spec.d,
-                    ranks=spec.ranks,
-                    bank_shape=(n,),
-                    bank_roles=("vector",),
-                    row_dim=bonds[k + 1],
-                    col_dim=bonds[k],
-                    cursor=cursor,
-                    separation_rank=spec.separation_rank,
-                )
-            )
-        if cursor.i != len(leaves):
-            raise ValueError("too many vector leaf tensors")
-        self.spec: NestedTTVectorSpec | None = spec
-        self._modes = spec.modes
-        self._depth = spec.depth
-        self._core_banks = tuple(banks)
-        self._history_length = 0
-        self._last_contract_stats: ContractionStats | None = None
-        self._physical_factors: tuple[torch.Tensor, ...] | None = None
-
-    @classmethod
-    def _from_banks(
-        cls,
-        *,
-        modes,
-        depth,
-        core_banks,
-        history_length,
-        physical_factors: Sequence[torch.Tensor] | None = None,
-    ):
-        obj = cls.__new__(cls)
-        obj.spec = None
-        obj._modes = tuple(int(n) for n in modes)
-        obj._depth = int(depth)
-        obj._core_banks = tuple(core_banks)
-        _broadcast_batch_sizes(*(b.batch_size for b in obj._core_banks))
-        obj._history_length = int(history_length)
-        obj._last_contract_stats = None
-        obj._physical_factors = (
-            None if physical_factors is None else tuple(torch.as_tensor(x) for x in physical_factors)
-        )
-        return obj
-
-    @staticmethod
-    def leaf_shapes(spec: NestedTTVectorSpec) -> tuple[tuple[int, ...], ...]:
-        bonds = _uniform_bonds(spec.d, spec.ranks[-1])
-        out: list[tuple[int, ...]] = []
-        for k, n in enumerate(spec.modes):
-            out.extend(
-                _leaf_shapes(
-                    kind="vector",
-                    depth=spec.depth - 1,
-                    d=spec.d,
-                    ranks=spec.ranks,
-                    bank_shape=(n,),
-                    bank_roles=("vector",),
-                    row_dim=bonds[k + 1],
-                    col_dim=bonds[k],
-                    separation_rank=spec.separation_rank,
-                )
-            )
-        return tuple(out)
-
-    @property
-    def cores(self):
-        return self._core_banks
-
-    @property
-    def modes(self) -> tuple[int, ...]:
-        return self._modes
-
-    @property
-    def d(self) -> int:
-        return len(self._modes)
-
-    @property
-    def n(self) -> int:
-        return math.prod(self.modes)
-
-    @property
-    def depth(self) -> int:
-        return self._depth
-
-    @property
-    def batch_size(self) -> int:
-        return _broadcast_batch_sizes(*(b.batch_size for b in self._core_banks))
-
-    @property
-    def history_length(self) -> int:
-        return self._history_length
-
-    @property
-    def ranks(self) -> tuple[int, ...]:
-        return (self._core_banks[0].col_dim,) + tuple(b.row_dim for b in self._core_banks)
-
-    @property
-    def shape(self) -> torch.Size:
-        return torch.Size((self.n,)) if self.batch_size == 1 else torch.Size((self.batch_size, self.n))
-
-    @property
-    def leaf_count(self) -> int:
-        return sum(b.leaf_count for b in self._core_banks)
-
-    @property
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        return tuple(x for b in self._core_banks for x in b.leaves())
-
-    @property
-    def rank_one_factors(self) -> tuple[torch.Tensor, ...] | None:
-        return self._physical_factors
-
-    @property
-    def last_contract_stats(self) -> ContractionStats | None:
-        return self._last_contract_stats
-
-    def materialize_cores(self) -> tuple[torch.Tensor, ...]:
-        out = []
-        for bank in self._core_banks:
-            dense = bank.materialize()
-            if bank.batch_size == 1:  # (n,out,in) -> (in,n,out)
-                out.append(dense.permute(2, 0, 1).contiguous())
-            else:  # (B,n,out,in) -> (B,in,n,out)
-                out.append(dense.permute(0, 3, 1, 2).contiguous())
-        return tuple(out)
-
-    def to_dense(self) -> torch.Tensor:
-        builder, output, batch_size = _emit_vector_network(
-            self._core_banks, self.modes, output_physical=True
-        )
-        value = builder.contract(output)
-        self._last_contract_stats = builder.last_stats
-        return value.reshape(self.n) if batch_size == 1 else value.reshape(batch_size, self.n)
-
-    def elementwise_multiply(self, other) -> "NestedTTVector":
-        factors = _rank_one_factors(other, self.modes)
-        banks = [
-            _PhysicalScaleBank(bank, factor)
-            for bank, factor in zip(self._core_banks, factors)
-        ]
-        physical_factors = None
-        if self._physical_factors is not None:
-            physical_factors = tuple(a * b for a, b in zip(self._physical_factors, factors))
-        return NestedTTVector._from_banks(
-            modes=self.modes,
-            depth=self.depth,
-            core_banks=banks,
-            history_length=self.history_length,
-            physical_factors=physical_factors,
-        )
-
-    def elementwise_divide(self, other, *, eps: float = 1e-12) -> "NestedTTVector":
-        """Divide by a rank-one physical tensor without dense materialization.
-
-        Only the supplied one-dimensional/batched physical factors are
-        inverted.  Denominators with ``abs(x) < eps`` are replaced by a
-        sign-preserving ``eps`` before the reciprocal is taken.
-        """
-        if eps <= 0:
-            raise ValueError("eps must be positive")
-        factors = _rank_one_factors(other, self.modes)
-        inv = tuple(_safe_reciprocal(x, eps) for x in factors)
-        return self.elementwise_multiply(inv)
-
-    def __mul__(self, other) -> "NestedTTVector":
-        return self.elementwise_multiply(other)
-
-    def __rmul__(self, other) -> "NestedTTVector":
-        return self.elementwise_multiply(other)
-
-    def sum(self) -> torch.Tensor:
-        builder, output, batch_size = _emit_vector_network(
-            self._core_banks, self.modes, output_physical=False
-        )
-        value = builder.contract(output)
-        self._last_contract_stats = builder.last_stats
-        return value.reshape(()) if batch_size == 1 else value.reshape(batch_size)
-
-    def __repr__(self) -> str:
-        return (
-            f"NestedTTVector(shape={tuple(self.shape)}, modes={self.modes}, "
-            f"batch_size={self.batch_size}, ranks={self.ranks}, depth={self.depth}, "
-            f"history_length={self.history_length}, leaves={self.leaf_count})"
-        )
-
-
-# =============================================================================
-# Public NestedTTMatrix
-# =============================================================================
-
-
-class NestedTTMatrix:
-    def __init__(
-        self,
-        spec: NestedTTMatrixSpec,
-        leaves: Sequence[torch.Tensor],
-        *,
-        normalize_leaves: bool = False,
-    ) -> None:
-        expected = self.leaf_shapes(spec)
-        if len(leaves) != len(expected):
-            raise ValueError(f"expected {len(expected)} leaf tensors, got {len(leaves)}")
-        cursor = _LeafCursor(leaves)
-        bonds = _uniform_bonds(spec.d, spec.ranks[-1])
-        banks = []
-        for k, (m, n) in enumerate(zip(spec.row_modes, spec.col_modes)):
-            banks.append(
-                _build_static_bank(
-                    kind="matrix",
-                    depth=spec.depth - 1,
-                    d=spec.d,
-                    ranks=spec.ranks,
-                    bank_shape=(m, n),
-                    bank_roles=("out", "in"),
-                    row_dim=bonds[k + 1],
-                    col_dim=bonds[k],
-                    cursor=cursor,
-                    separation_rank=spec.separation_rank,
-                    normalize_matrix_leaves=normalize_leaves,
-                    stochastic_sum_axes=(1,) if normalize_leaves else (),
-                )
-            )
-        if cursor.i != len(leaves):
-            raise ValueError("too many matrix leaf tensors")
-        self.spec = spec
-        self._core_banks = tuple(banks)
-        self._last_contract_stats: ContractionStats | None = None
-        self._separable_cores: tuple[torch.Tensor, ...] | None = None
-
-    @classmethod
-    def _from_banks(
-        cls,
-        *,
-        spec: NestedTTMatrixSpec,
-        core_banks,
-        separable_cores: Sequence[torch.Tensor] | None = None,
-    ) -> "NestedTTMatrix":
-        obj = cls.__new__(cls)
-        obj.spec = spec
-        obj._core_banks = tuple(core_banks)
-        _broadcast_batch_sizes(*(b.batch_size for b in obj._core_banks))
-        obj._last_contract_stats = None
-        obj._separable_cores = (
-            None if separable_cores is None else tuple(torch.as_tensor(x) for x in separable_cores)
-        )
-        return obj
-
-    @staticmethod
-    def leaf_shapes(spec: NestedTTMatrixSpec) -> tuple[tuple[int, ...], ...]:
-        bonds = _uniform_bonds(spec.d, spec.ranks[-1])
-        out: list[tuple[int, ...]] = []
-        for k, (m, n) in enumerate(zip(spec.row_modes, spec.col_modes)):
-            out.extend(
-                _leaf_shapes(
-                    kind="matrix",
-                    depth=spec.depth - 1,
-                    d=spec.d,
-                    ranks=spec.ranks,
-                    bank_shape=(m, n),
-                    bank_roles=("out", "in"),
-                    row_dim=bonds[k + 1],
-                    col_dim=bonds[k],
-                    separation_rank=spec.separation_rank,
-                )
-            )
-        return tuple(out)
-
-    @property
-    def cores(self):
-        return self._core_banks
-
-    @property
-    def row_modes(self) -> tuple[int, ...]:
-        return self.spec.row_modes
-
-    @property
-    def col_modes(self) -> tuple[int, ...]:
-        return self.spec.col_modes
-
-    @property
-    def d(self) -> int:
-        return self.spec.d
-
-    @property
-    def depth(self) -> int:
-        return self.spec.depth
-
-    @property
-    def batch_size(self) -> int:
-        return _broadcast_batch_sizes(*(b.batch_size for b in self._core_banks))
-
-    @property
-    def ranks(self) -> tuple[int, ...]:
-        return (self._core_banks[0].col_dim,) + tuple(b.row_dim for b in self._core_banks)
-
-    @property
-    def shape(self) -> torch.Size:
-        mn = (math.prod(self.row_modes), math.prod(self.col_modes))
-        return torch.Size(mn) if self.batch_size == 1 else torch.Size((self.batch_size, *mn))
-
-    @property
-    def leaf_count(self) -> int:
-        return sum(b.leaf_count for b in self._core_banks)
-
-    @property
-    def leaves(self) -> tuple[torch.Tensor, ...]:
-        return tuple(x for b in self._core_banks for x in b.leaves())
-
-    @property
-    def separable_cores(self) -> tuple[torch.Tensor, ...] | None:
-        return self._separable_cores
-
-    @property
-    def last_contract_stats(self) -> ContractionStats | None:
-        return self._last_contract_stats
-
-    def materialize_cores(self) -> tuple[torch.Tensor, ...]:
-        out = []
-        for bank in self._core_banks:
-            dense = bank.materialize()
-            if bank.batch_size == 1:  # (M,N,out,in) -> (in,M,N,out)
-                out.append(dense.permute(3, 0, 1, 2).contiguous())
-            else:  # (B,M,N,out,in) -> (B,in,M,N,out)
-                out.append(dense.permute(0, 4, 1, 2, 3).contiguous())
-        return tuple(out)
-
-    def to_dense(self) -> torch.Tensor:
-        builder, output, batch_size = _emit_matrix_network(
-            self._core_banks, self.row_modes, self.col_modes
-        )
-        value = builder.contract(output)
-        self._last_contract_stats = builder.last_stats
-        m, n = math.prod(self.row_modes), math.prod(self.col_modes)
-        return value.reshape(m, n) if batch_size == 1 else value.reshape(batch_size, m, n)
-
-    def elementwise_multiply(self, factors: Sequence[torch.Tensor]) -> "NestedTTMatrix":
-        factors = tuple(torch.as_tensor(x) for x in factors)
-        if len(factors) != self.d:
-            raise ValueError("expected one separable matrix factor per physical mode")
-        batches = []
-        for k, (factor, m, n) in enumerate(zip(factors, self.row_modes, self.col_modes)):
-            if factor.ndim not in (2, 3) or tuple(factor.shape[-2:]) != (m, n):
-                raise ValueError(
-                    f"matrix factor {k} must have shape ({m},{n}) or (batch,{m},{n}), "
-                    f"got {tuple(factor.shape)}"
-                )
-            batches.append(1 if factor.ndim == 2 else int(factor.shape[0]))
-        _broadcast_batch_sizes(self.batch_size, *batches)
-        banks = [
-            _PhysicalMatrixScaleBank(bank, factor)
-            for bank, factor in zip(self._core_banks, factors)
-        ]
-        sep = None
-        if self._separable_cores is not None:
-            sep = tuple(a * b for a, b in zip(self._separable_cores, factors))
-        return NestedTTMatrix._from_banks(spec=self.spec, core_banks=banks, separable_cores=sep)
-
-    def matvec(self, x: NestedTTVector) -> NestedTTVector:
-        if not isinstance(x, NestedTTVector):
-            raise TypeError("matvec requires NestedTTVector")
-        if x.modes != self.col_modes:
-            raise ValueError("matrix column modes do not match vector modes")
-        if x.depth != self.depth or x.d != self.d:
-            raise ValueError("matrix/vector nested structures are incompatible")
-        _broadcast_batch_sizes(self.batch_size, x.batch_size)
-
-        # A separable outer MPO has bond rank one, so it acts only on each
-        # physical mode and must not create another nested history/rank mode.
-        if self._separable_cores is not None:
-            banks = [
-                _PhysicalLinearMapBank(g, W)
-                for g, W in zip(x._core_banks, self._separable_cores)
-            ]
-            return NestedTTVector._from_banks(
-                modes=self.row_modes,
-                depth=self.depth,
-                core_banks=banks,
-                history_length=x.history_length,
-            )
-
-        banks = [_MatvecMPOBank(A, g) for A, g in zip(self._core_banks, x._core_banks)]
-        return NestedTTVector._from_banks(
-            modes=self.row_modes,
-            depth=self.depth,
-            core_banks=banks,
-            history_length=x.history_length + 1,
-        )
-
-    def rev_matvec(self, x: NestedTTVector) -> NestedTTVector:
-        """Apply the physical transpose without materializing ``self.T``.
-
-        Computes ``self.T @ x`` directly.  For a general nested matrix this
-        contracts the matrix output bank index with the vector physical index
-        and leaves the matrix input index open.  For a separable/rank-one outer
-        MPO, each local physical map is simply transposed, so no nested history
-        mode is introduced.
-        """
-        if not isinstance(x, NestedTTVector):
-            raise TypeError("rev_matvec requires NestedTTVector")
-        if x.modes != self.row_modes:
-            raise ValueError("matrix row modes do not match vector modes")
-        if x.depth != self.depth or x.d != self.d:
-            raise ValueError("matrix/vector nested structures are incompatible")
-        _broadcast_batch_sizes(self.batch_size, x.batch_size)
-
-        # Physical transpose of a separable outer MPO remains separable:
-        # H[i] = sum_j W[j,i] G[j] = (W.T G)[i].
-        if self._separable_cores is not None:
-            banks = [
-                _PhysicalLinearMapBank(g, W.transpose(-2, -1))
-                for g, W in zip(x._core_banks, self._separable_cores)
-            ]
-            return NestedTTVector._from_banks(
-                modes=self.col_modes,
-                depth=self.depth,
-                core_banks=banks,
-                history_length=x.history_length,
-            )
-
-        banks = [
-            _RevMatvecMPOBank(A, g)
-            for A, g in zip(self._core_banks, x._core_banks)
-        ]
-        return NestedTTVector._from_banks(
-            modes=self.col_modes,
-            depth=self.depth,
-            core_banks=banks,
-            history_length=x.history_length + 1,
-        )
-
-    def __matmul__(self, x: NestedTTVector) -> NestedTTVector:
-        return self.matvec(x)
-
-    def __mul__(self, other) -> "NestedTTMatrix":
-        return self.elementwise_multiply(other)
-
-    def __rmul__(self, other) -> "NestedTTMatrix":
-        return self.elementwise_multiply(other)
-
-    def sum(self) -> torch.Tensor:
-        builder, output, batch_size = _emit_matrix_network(
-            self._core_banks, self.row_modes, self.col_modes
-        )
-        value = builder.contract(output[:1] if batch_size > 1 else ())
-        self._last_contract_stats = builder.last_stats
-        return value.reshape(()) if batch_size == 1 else value.reshape(batch_size)
-
-    def __repr__(self) -> str:
-        return (
-            f"NestedTTMatrix(shape={tuple(self.shape)}, "
-            f"modes={list(zip(self.row_modes, self.col_modes))}, "
-            f"batch_size={self.batch_size}, ranks={self.ranks}, "
-            f"depth={self.depth}, leaves={self.leaf_count})"
-        )
-
-
-# =============================================================================
-# Convenience constructors used by model code
-# =============================================================================
-
-
-def _hierarchy(depth: int, ranks: int | Sequence[int]) -> tuple[int, ...]:
-    if isinstance(ranks, int):
-        return (int(ranks),) * int(depth)
-    values = tuple(int(r) for r in ranks)
-    if len(values) != int(depth):
-        raise ValueError(f"expected {depth} hierarchy ranks, got {values}")
-    return values
-
-
-def ones_nested_tt_vector(
-    modes: Sequence[int],
-    *,
-    depth: int = 1,
-    ranks: int | Sequence[int] = 1,
-    dtype: torch.dtype | None = None,
-    device: torch.device | str | None = None,
-) -> NestedTTVector:
-    modes = tuple(int(n) for n in modes)
-    hierarchy = _hierarchy(depth, ranks)
-    if any(r != 1 for r in hierarchy):
-        raise ValueError("ones_nested_tt_vector requires hierarchy ranks equal to one")
-    spec = NestedTTVectorSpec(modes=modes, depth=int(depth), ranks=hierarchy, separation_rank=1)
-    leaves = [
-        torch.ones(shape, dtype=dtype, device=device)
-        for shape in NestedTTVector.leaf_shapes(spec)
-    ]
-    v = NestedTTVector(spec, leaves)
-    v._physical_factors = tuple(
-        torch.ones(n, dtype=dtype, device=device) for n in modes
-    )
-    return v
-
-
-def nested_tt_vector_from_factors(
-    factors: Sequence[torch.Tensor], *, depth: int = 1
-) -> NestedTTVector:
-    raw = tuple(torch.as_tensor(x) for x in factors)
-    if not raw:
-        raise ValueError("at least one rank-one factor is required")
-    modes = tuple(int(x.shape[-1]) for x in raw)
-    factors = _rank_one_factors(raw, modes)
-    first = factors[0]
-    v = ones_nested_tt_vector(
-        modes,
-        depth=depth,
-        ranks=1,
-        dtype=first.dtype,
-        device=first.device,
-    )
-    return v.elementwise_multiply(factors)
-
-
-def rank_one_factors_from_nested(v: NestedTTVector) -> tuple[torch.Tensor, ...]:
-    """Return known separable physical factors without dense factorization."""
-    if not isinstance(v, NestedTTVector):
-        raise TypeError("expected NestedTTVector")
-    if v.rank_one_factors is None:
-        raise ValueError(
-            "this NestedTTVector is not known to be a rank-one physical tensor; "
-            "refusing to densify/factorize it"
-        )
-    return v.rank_one_factors
-
-
-def nested_tt_matrix_from_separable_cores(
-    cores: Sequence[torch.Tensor], *, depth: int = 1
-) -> NestedTTMatrix:
-    """Create a rank-one outer MPO from local dense matrix factors.
-
-    Each core may be ``(m,n)`` or ``(batch,m,n)``.  The returned nested matrix
-    keeps those factors symbolic; no global Kronecker matrix is materialized.
+    """Initial TT plus symbolic ordered maps, with exact rank-one contraction.
+
+    Consecutive commuting powers of the same operator/direction are collected.
+    Other event sequences remain exact but may have exponentially costly
+    contractions; a branch budget prevents unnoticed exponential expansion.
     """
-    cores = tuple(torch.as_tensor(x) for x in cores)
-    if not cores:
-        raise ValueError("at least one separable matrix core is required")
-    row_modes = tuple(int(x.shape[-2]) for x in cores)
-    col_modes = tuple(int(x.shape[-1]) for x in cores)
-    batches = []
-    for x in cores:
-        if x.ndim not in (2, 3):
-            raise ValueError("separable matrix cores must have shape (m,n) or (batch,m,n)")
-        batches.append(1 if x.ndim == 2 else int(x.shape[0]))
-    _broadcast_batch_sizes(*batches)
-    spec = NestedTTMatrixSpec(
-        row_modes=row_modes,
-        col_modes=col_modes,
-        depth=int(depth),
-        ranks=(1,) * int(depth),
-        separation_rank=1,
-    )
-    first = cores[0]
-    leaves = [
-        torch.ones(shape, dtype=first.dtype, device=first.device)
-        for shape in NestedTTMatrix.leaf_shapes(spec)
-    ]
-    base = NestedTTMatrix(spec, leaves)
-    banks = tuple(
-        _PhysicalMatrixScaleBank(bank, core)
-        for bank, core in zip(base._core_banks, cores)
-    )
-    return NestedTTMatrix._from_banks(spec=spec, core_banks=banks, separable_cores=cores)
+    def __init__(self, cores, *, depth=3, events=(), modes=None, history_length=0):
+        if depth != 3 or not cores:
+            raise ValueError('requires depth=3 and nonempty TT cores')
+        self.initial_cores = tuple(torch.as_tensor(x) for x in cores)
+        self.depth = depth
+        self.events = tuple(events)
+        self._modes = tuple(x.shape[-2] for x in self.initial_cores) if modes is None else tuple(modes)
+        self._history_length = int(history_length)
+        self.spec = None
+        self._last_contract_stats = None
+        if any(c.ndim not in (3,4) for c in self.initial_cores):
+            raise ValueError('TT cores must have (r,n,r) or (B,r,n,r) shape')
+        if self.initial_cores[0].shape[-3] != 1 or self.initial_cores[-1].shape[-1] != 1:
+            raise ValueError('TT boundary ranks must be one')
+        for a,b in zip(self.initial_cores,self.initial_cores[1:]):
+            if a.shape[-1] != b.shape[-3]:
+                raise ValueError('incompatible TT ranks')
 
+    @property
+    def modes(self): return self._modes
+    @property
+    def cores(self): return self.initial_cores
+    @property
+    def leaves(self): return self.initial_cores
+    @property
+    def last_contract_stats(self): return self._last_contract_stats
+    @property
+    def d(self): return len(self.modes)
+    @property
+    def n(self): return math.prod(self.modes)
+    @property
+    def ranks(self): return (1,) + tuple(x.shape[-1] for x in self.initial_cores)
+    @property
+    def history_length(self): return self._history_length
+    @property
+    def leaf_count(self): return sum(x.numel() for x in self.initial_cores)
+    @property
+    def storage_numel(self): return self.leaf_count + sum(1 for _ in self.events)
+    @property
+    def batch_size(self):
+        b = _batch(*(1 if x.ndim==3 else x.shape[0] for x in self.initial_cores))
+        for event in self.events:
+            if event[0] in ('power','cp'): b = _batch(b,event[1].batch_size)
+            else: b = _batch(b,*(1 if t.ndim == (2 if event[0]=='map' else 1) else t.shape[0] for t in event[1]))
+        return b
+    @property
+    def shape(self): return torch.Size((self.n,) if self.batch_size==1 else (self.batch_size,self.n))
+    @property
+    def dtype(self):
+        dtype=self.initial_cores[0].dtype
+        for ev in self.events:
+            tensors=(ev[1].channel_weights,) if ev[0] in ('power','cp') else ev[1]
+            for x in tensors:
+                dtype=torch.promote_types(dtype,x.dtype)
+        return dtype
+    @property
+    def device(self): return self.initial_cores[0].device
+    @property
+    def rank_one_factors(self):
+        """Recover separable factors without constructing a dense basis tensor.
+
+        In particular, TTBasis(coeffs=None).forward(y) has pending
+        pointwise scales, and must remain usable as a rank-one divisor.
+        """
+        if any(c.shape[-3]!=1 or c.shape[-1]!=1 for c in self.initial_cores):
+            return None
+        fs=tuple(c[...,0,:,0] for c in self.initial_cores)
+        for event in self.events:
+            if event[0]=='scale':
+                fs=tuple(a*b for a,b in zip(fs,event[1]))
+            elif event[0]=='map':
+                maps,reverse=event[1:]
+                fs=tuple(torch.matmul(A.transpose(-1,-2) if reverse else A,
+                                      _as_factor(a,A.shape[-2] if reverse else A.shape[-1],self.dtype,self.device).unsqueeze(-1)).squeeze(-1)
+                         for a,A in zip(fs,maps))
+            else:
+                return None
+        return tuple(a.squeeze(0) if a.ndim==2 and a.shape[0]==1 else a for a in fs)
+    @property
+    def normal_form_terms(self):
+        return math.prod(math.comb(ev[3]+ev[1].channels-1, ev[1].channels-1)
+                         if ev[0]=='power' else ev[1].channels if ev[0]=='cp' else 1
+                         for ev in self.events)
+
+    def _append(self,event,modes=None):
+        events=list(self.events)
+        if (event[0]=='power' and events and events[-1][0]=='power'
+            and events[-1][1] is event[1] and events[-1][2]==event[2]):
+            old=events[-1]
+            events[-1]=('power',old[1],old[2],old[3]+event[3])
+        else:
+            events.append(event)
+        return NestedTTVector(self.initial_cores,depth=self.depth,events=events,
+                              modes=self.modes if modes is None else modes,
+                              history_length=self.history_length+(event[3] if event[0]=='power' else 0))
+
+    def elementwise_multiply(self, other):
+        raw=_resolve_factors(other,self.modes)
+        factors=tuple(_as_factor(f,n,self.dtype,self.device) for f,n in zip(raw,self.modes))
+        return self._append(('scale',factors))
+    __mul__ = elementwise_multiply
+    def __rmul__(self,other): return self.elementwise_multiply(other)
+
+    def elementwise_divide(self, other, *, eps=1e-12):
+        if eps<=0: raise ValueError('eps must be positive')
+        raw=_resolve_factors(other,self.modes)
+        inv=[]
+        for f,n in zip(raw,self.modes):
+            x=_as_factor(f,n,self.dtype,self.device)
+            z=torch.where(x.abs()<eps,torch.where(x<0,-eps,eps),x)
+            inv.append(z.reciprocal())
+        return self._append(('scale',tuple(inv)))
+
+    def _dense_state(self, *, end=None, max_elements=4096):
+        """Evaluate an ordered history in the physical state space when it is small.
+
+        Complexity is O(T Q d n_max N) rather than O(Q**T), where
+        N=prod(modes). This is a *small physical dimension* optimization,
+        not a dimension-independent algorithm: N is exponential in d.
+        """
+        events = self.events if end is None else self.events[:end]
+        dims = tuple(int(c.shape[-2]) for c in self.initial_cores)
+        if math.prod(dims) > max_elements:
+            raise ValueError('dense-state contraction would exceed the physical dimension guard')
+        batch = _batch(*(1 if c.ndim == 3 else c.shape[0] for c in self.initial_cores))
+        cores = [(c[None] if c.ndim == 3 else c) for c in self.initial_cores]
+        z = cores[0].expand(batch,-1,-1,-1)[:,0]
+        for core in cores[1:]:
+            z = torch.einsum('b...r,brns->b...ns', z, core.expand(batch,-1,-1,-1))
+        state = z.squeeze(-1)
+
+        def apply_local(state, matrices, *, reverse=False):
+            nonlocal dims
+            # state: (B, n_0, ..., n_{d-1}); matrices[k]: (B, out, in)
+            for k, A in enumerate(matrices):
+                if A.ndim == 2:
+                    A = A[None]
+                if reverse:
+                    A = A.transpose(-1, -2)
+                batch = _batch(int(state.shape[0]), int(A.shape[0]))
+                dtype = torch.promote_types(state.dtype, A.dtype)
+                incoming = state.to(dtype).expand(batch,*state.shape[1:]).movedim(k+1,-1)
+                outer = incoming.shape[1:-1]
+                A = A.to(dtype).expand(batch,-1,-1)
+                result = torch.bmm(incoming.reshape(batch,-1,incoming.shape[-1]), A.transpose(-1,-2))
+                state = result.reshape(batch,*outer,A.shape[-2]).movedim(-1,k+1)
+            dims = tuple(int(state.shape[k+1]) for k in range(self.d))
+            return state
+
+        for event in events:
+            kind, *args = event
+            if kind == 'scale':
+                fs = args[0]
+                for k,f in enumerate(fs):
+                    f = _as_factor(f, dims[k], state.dtype, state.device)
+                    shape = (f.shape[0],) + (1,)*k + (dims[k],) + (1,)*(self.d-k-1)
+                    state = state * f.reshape(shape)
+            elif kind == 'map':
+                matrices, reverse = args
+                state = apply_local(state, matrices, reverse=reverse)
+            else:
+                if kind == 'power':
+                    op, reverse, repetitions = args
+                    mats = tuple(leaf.matrices() for leaf in op.leaves)
+                    weights = op.channel_weights
+                elif kind == 'cp':
+                    op, reverse = args
+                    repetitions = 1
+                    mats = op.channel_matrices()
+                    weights = op.channel_weights
+                else:
+                    raise ValueError(f'unknown history event: {kind!r}')
+                # Contract the CP channel as an *internal batch axis*.
+                # Work remains O(B Q N) and never enumerates channel histories.
+                for _ in range(repetitions):
+                    original_dims = dims
+                    B = _batch(int(state.shape[0]), int(weights.shape[0]), *(int(x.shape[0]) for x in mats))
+                    Q = weights.shape[-1]
+                    z = state[:,None].expand(B,Q,*dims).reshape(B*Q,*dims)
+                    local = [P.expand(B,-1,-1,-1).reshape(B*Q,*P.shape[-2:]) for P in mats]
+                    z = apply_local(z, local, reverse=reverse)
+                    new_dims = dims
+                    z = z.reshape(B,Q,*new_dims)
+                    state = (z * weights.expand(B,Q).reshape(B,Q,*([1]*self.d))).sum(dim=1)
+                    dims = new_dims
+        return state
+
+    def _dense_contract(self, factors, *, max_elements=4096):
+        # Pull final pointwise factors back into the query. In particular,
+        # TTBasis.forward(points).sum() must not propagate one state per point.
+        end = len(self.events)
+        while end and self.events[end-1][0] == 'scale':
+            fs = self.events[end-1][1]
+            factors = tuple(f*z for f,z in zip(factors,fs))
+            end -= 1
+        state = self._dense_state(end=end, max_elements=max_elements)
+        dims = tuple(int(x) for x in state.shape[1:])
+        B = _batch(state.shape[0], *(f.shape[0] for f in factors))
+        state = state.expand(B,*dims)
+        for k,f in enumerate(factors):
+            f=f.expand(B,-1)
+            state = state * f.reshape((B,)+(1,)*k+(dims[k],)+(1,)*(self.d-k-1))
+        result = state.sum(dim=tuple(range(1,self.d+1)))
+        self._last_contract_stats=ContractionStats(
+            operands=len(self.initial_cores)+len(self.events),
+            pair_contractions=len(self.events),
+            max_intermediate_numel=max(state.numel(), *(c.numel() for c in self.initial_cores)),
+            max_intermediate_ndim=self.d+2,
+        )
+        return result.squeeze(0) if B==1 else result
+
+    def contract(self, factors, *, max_terms=100_000):
+        raw=_resolve_factors(factors,self.modes)
+        fs=tuple(_as_factor(f,n,self.dtype,self.device) for f,n in zip(raw,self.modes))
+        # The real VDP experiment has only 10**2=100 physical coefficients.
+        # Ordered dense-state updates avoid exponential CP-history enumeration
+        # while retaining full batched sample evaluation at the output.
+        if self.n <= 4096:
+            return self._dense_contract(fs)
+        if self.normal_form_terms > max_terms:
+            raise RuntimeError(f'contract requires {self.normal_form_terms} normal-form terms; '
+                               f'budget {max_terms}. No polynomial bound for this mixed event sequence.')
+        B=_batch(self.batch_size,*(f.shape[0] for f in fs))
+        fs=tuple(f.expand(B,-1) for f in fs)
+        out=torch.zeros(B,dtype=self.dtype,device=self.device)
+        # Cache within call only so no saved autograd graph becomes stale.
+        matrix_cache={}
+        def recurse(i, factors, weight):
+            if i < 0:
+                return weight * self._initial_contract(factors,B)
+            kind,*args=self.events[i]
+            if kind=='scale':
+                f=args[0]
+                return recurse(i-1,tuple(x*z.expand(B,-1) for x,z in zip(factors,f)),weight)
+            if kind=='map':
+                maps, reverse=args
+                new=[]
+                for x,A in zip(factors,maps):
+                    A=A.expand(B,-1,-1)
+                    new.append(torch.bmm(A if reverse else A.transpose(-1,-2),x.unsqueeze(-1)).squeeze(-1))
+                return recurse(i-1,tuple(new),weight)
+            if kind=='cp':
+                op,reverse=args
+                terms=torch.zeros_like(weight)
+                local=op.channel_matrices()
+                for q in range(op.channels):
+                    pulled=tuple(torch.bmm(P[:,q] if reverse else P[:,q].transpose(-1,-2),
+                                           f.unsqueeze(-1)).squeeze(-1)
+                                 for P,f in zip(local,factors))
+                    terms=terms+recurse(i-1,pulled,weight*op.channel_weights[:,q].expand(B))
+                return terms
+            op, reverse, t=args
+            terms=torch.zeros_like(weight)
+            w=op.channel_weights.expand(B,-1)
+            for alpha in _count_vectors(t,op.channels):
+                # lgamma multinomial avoids incorrect integer division ordering.
+                logm=math.lgamma(t+1)-sum(math.lgamma(a+1) for a in alpha)
+                coef=torch.exp(w.new_full((B,),logm)+sum(a*w[:,q].log() for q,a in enumerate(alpha)))
+                pulled=[]
+                for k,(f,leaf) in enumerate(zip(factors,op.leaves)):
+                    key=(id(op),k,alpha,not reverse)
+                    if key not in matrix_cache:
+                        matrix_cache[key]=leaf.accumulated(alpha,transpose=not reverse).expand(B,-1,-1)
+                    pulled.append(torch.bmm(matrix_cache[key],f.unsqueeze(-1)).squeeze(-1))
+                terms=terms+recurse(i-1,tuple(pulled),weight*coef)
+            return terms
+        result=recurse(len(self.events)-1,fs,torch.ones_like(out))
+        # A useful conservative bound on local workspaces. This is not a proof
+        # of bounded cost for arbitrary mixed noncommuting event histories.
+        local_max=max((leaf.n**2 * B for e in self.events if e[0]=='power'
+                       for leaf in e[1].leaves), default=0)
+        core_max=max(c.numel() for c in self.initial_cores)
+        self._last_contract_stats=ContractionStats(
+            operands=len(self.initial_cores)+len(self.events),
+            pair_contractions=self.normal_form_terms * max(1,len(self.modes)),
+            max_intermediate_numel=max(local_max,core_max),
+            max_intermediate_ndim=4,
+        )
+        return result.squeeze(0) if B==1 else result
+
+    def _initial_contract(self,factors,B):
+        z=torch.ones(B,1,1,dtype=self.dtype,device=self.device)
+        for g,f in zip(self.initial_cores,factors):
+            g=(g.unsqueeze(0) if g.ndim==3 else g).to(dtype=self.dtype).expand(B,-1,-1,-1)
+            z=torch.bmm(z,torch.einsum('brns,bn->brs',g,f))
+        return z.squeeze(-1).squeeze(-1)
+
+    def sum(self):
+        return self.contract(tuple(torch.ones(n,dtype=self.dtype,device=self.device) for n in self.modes))
+
+    def contract_basis(self,basis,points):
+        if getattr(basis,'_default_coeffs',False) is not True:
+            raise ValueError('requires coefficient-free TTBasis')
+        return self.contract(basis._primitive_factors(points))
+
+    def to_dense(self, *, max_elements=1_000_000):
+        B=self.batch_size
+        if B*self.n>max_elements:
+            raise ValueError('dense vector materialization exceeds max_elements')
+        if self.n <= 4096:
+            state=self._dense_state().reshape(self.batch_size,self.n)
+            return state.squeeze(0) if self.batch_size==1 else state
+        onehot=tuple(torch.eye(n,dtype=self.dtype,device=self.device) for n in self.modes)
+        # Debug-only, one coordinate at a time. Production sum/contract does not call this.
+        values=[]
+        for idx in product(*(range(n) for n in self.modes)):
+            factors=tuple(onehot[k][j] for k,j in enumerate(idx))
+            values.append(self.contract(factors))
+        output=torch.stack(values,-1)
+        return output.squeeze(0) if B==1 else output
+
+    def materialize_cores(self, *, max_elements=1_000_000):
+        """Dense TT-SVD reconstruction for small/debug cases only.
+
+        Exact up to floating-point roundoff; it intentionally has a dense
+        materialization guard because exact output TT ranks can be exponential.
+        """
+        if not self.events:
+            return self.initial_cores
+        x=self.to_dense(max_elements=max_elements)
+        if x.ndim==1: x=x[None]
+        B=x.shape[0]
+        all_cores=[]
+        for b in range(B):
+            rem=x[b].reshape(1,-1)
+            left=1
+            pieces=[]
+            for n in self.modes[:-1]:
+                mat=rem.reshape(left*n,-1)
+                U,s,Vh=torch.linalg.svd(mat,full_matrices=False)
+                rank=s.shape[0]
+                pieces.append(U.reshape(left,n,rank).permute(0,1,2))
+                rem=s[:,None]*Vh
+                left=rank
+            pieces.append(rem.reshape(left,self.modes[-1],1))
+            all_cores.append(pieces)
+        return tuple(torch.stack([all_cores[b][k] for b in range(B)]) if B>1
+                     else all_cores[0][k] for k in range(self.d))
+
+    def __repr__(self):
+        return f'NestedTTVector(modes={self.modes}, batch={self.batch_size}, events={len(self.events)}, steps={self.history_length})'
+
+
+class SeparableNestedTTMatrix(Matrix):
+    """Rank-one MPO: exact batch-compatible separable Gram/physical linear map."""
+    def __init__(self,cores,*,depth=3):
+        if depth!=3 or not cores: raise ValueError('depth must be 3')
+        self.cores=tuple(torch.as_tensor(x) for x in cores)
+        if any(x.ndim not in (2,3) for x in self.cores): raise ValueError('matrix factors must be (m,n) or (B,m,n)')
+        self.depth=depth
+        self.row_modes=tuple(x.shape[-2] for x in self.cores)
+        self.col_modes=tuple(x.shape[-1] for x in self.cores)
+        self.batch_size=_batch(*(1 if x.ndim==2 else x.shape[0] for x in self.cores))
+    @property
+    def dtype(self): return self.cores[0].dtype
+    @property
+    def device(self): return self.cores[0].device
+    @property
+    def shape(self):
+        sh=(math.prod(self.row_modes),math.prod(self.col_modes))
+        return torch.Size(sh if self.batch_size==1 else (self.batch_size,*sh))
+    @property
+    def T(self): return SeparableNestedTTMatrix([x.transpose(-1,-2) for x in self.cores])
+    @property
+    def separable_cores(self): return self.cores
+    def matvec(self,x):
+        if not isinstance(x,NestedTTVector):
+            return torch.matmul(self.to_dense(),torch.as_tensor(x).unsqueeze(-1)).squeeze(-1)
+        if x.modes!=self.col_modes: raise ValueError('physical modes do not match')
+        return x._append(('map',tuple(x.unsqueeze(0) if x.ndim==2 else x for x in self.cores),False),self.row_modes)
+    def rev_matvec(self,x):
+        if isinstance(x,NestedTTVector):
+            if x.modes!=self.row_modes: raise ValueError('physical modes do not match')
+            return x._append(('map',tuple(x.unsqueeze(0) if x.ndim==2 else x for x in self.cores),True),self.col_modes)
+        return self.T.matvec(x)
+    def to_dense(self,*,max_elements=1_000_000):
+        n,m=math.prod(self.row_modes),math.prod(self.col_modes)
+        if n*m*self.batch_size>max_elements: raise ValueError('dense matrix limit exceeded')
+        vals=[]
+        for b in range(self.batch_size):
+            a=[x if x.ndim==2 else x[b if x.shape[0]>1 else 0] for x in self.cores]
+            vals.append(reduce(torch.kron,a))
+        return vals[0] if self.batch_size==1 else torch.stack(vals)
+    def sum(self):
+        values=[x.sum(dim=(-2,-1)) for x in self.cores]
+        return reduce(torch.mul,values)
+    def elementwise_multiply(self,factors):
+        return SeparableNestedTTMatrix([a*b for a,b in zip(self.cores,factors)])
+    __mul__=elementwise_multiply
+    def __rmul__(self,factors): return self.elementwise_multiply(factors)
+    def __matmul__(self,x): return self.matvec(x)
+
+
+def nested_tt_matrix_from_separable_cores(cores, *, depth=3):
+    return SeparableNestedTTMatrix(cores,depth=depth)
+
+
+def nested_tt_vector_from_factors(factors, *, depth=3):
+    cores=[]
+    for f in factors:
+        f=torch.as_tensor(f)
+        cores.append(f.reshape(1,-1,1) if f.ndim==1 else f[:,None,:,None])
+    return NestedTTVector(cores,depth=depth)
+
+
+def ones_nested_tt_vector(modes, *, depth=3, dtype=torch.float32,device=None):
+    return nested_tt_vector_from_factors([torch.ones(n,dtype=dtype,device=device) for n in modes],depth=depth)

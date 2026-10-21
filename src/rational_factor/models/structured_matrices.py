@@ -83,7 +83,13 @@ class Matrix(ABC):
         raise ValueError(
             f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
         )
-
+    
+    def matmul(self, other: Matrix) -> Matrix:
+        return self.to_dense() @ other.to_dense()
+    
+    def rmatmul(self, other: Matrix) -> Matrix:
+        return other.to_dense() @ self.to_dense()
+    
     def diag(self) -> torch.Tensor:
         """Main-diagonal vector ``(..., min(n, m))``."""
         return self.to_dense().diagonal(dim1=-2, dim2=-1)
@@ -144,10 +150,15 @@ class Matrix(ABC):
     def expm(self) -> Matrix:
         return DenseMatrix(torch.matrix_exp(self.to_dense()))
 
-    def __matmul__(self, other: torch.Tensor | Vector) -> torch.Tensor | Vector:
-        return self.matvec(other)
+    def __matmul__(self, other: torch.Tensor | Vector | Matrix) -> torch.Tensor | Vector | Matrix:
+        if isinstance(other, Matrix):
+            return self.matmul(other)
+        if isinstance(other, Vector):
+            return self.matvec(other)
 
-    def __rmatmul__(self, other: torch.Tensor | Vector) -> torch.Tensor | Vector:
+    def __rmatmul__(self, other: torch.Tensor | Vector | Matrix) -> torch.Tensor | Vector | Matrix:
+        if isinstance(other, Matrix):
+            return other.rmatmul(self)
         """Row-vector / left multiply: ``x @ M == (Mᵀ @ xᵀ)ᵀ``."""
         if isinstance(other, Vector):
             return self.T.matvec(other)
@@ -460,6 +471,187 @@ class Diagonal(Matrix):
         raise ValueError(
             f"x must have shape (..., {n}) or (..., {n}, k), got {tuple(x.shape)}"
         )
+
+
+class ShiftMatrix(Matrix):
+    """Deterministic 1D shift matrix.
+
+    Represents the square matrix ``S_a`` with
+
+        S_a[i, j] = 1  if j = i + shift
+                    0  otherwise.
+
+    Parameters
+    ----------
+    n:
+        Matrix size.
+    shift:
+        Integer displacement. Positive values move the destination index to
+        the right; negative values move it to the left.
+    dtype:
+        Tensor dtype used by ``to_dense`` and tensor conversions.
+    device:
+        Torch device.
+    circular:
+        If True, wrap shifts modulo ``n``. Otherwise out-of-domain entries
+        are zero.
+    """
+
+    def __init__(self, n: int, shift: int, *, dtype: torch.dtype = torch.float32, device: torch.device | str | None = None, circular: bool = False):
+        if n <= 0:
+            raise ValueError(f"n must be positive, got {n}")
+
+        self._n = int(n)
+        self._shift = int(shift)
+        self._dtype = dtype
+        self._device = torch.device(device) if device is not None else torch.device("cpu")
+        self._circular = bool(circular)
+
+        if self._circular:
+            self._shift %= self._n
+
+    @property
+    def n(self) -> int:
+        return self._n
+
+    @property
+    def shift(self) -> int:
+        return self._shift
+
+    @property
+    def circular(self) -> bool:
+        return self._circular
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size((self._n, self._n))
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def T(self) -> Matrix:
+        return ShiftMatrix(self._n, -self._shift, dtype=self._dtype, device=self._device, circular=self._circular)
+
+    def to_dense(self) -> torch.Tensor:
+        out = torch.zeros((self._n, self._n), dtype=self._dtype, device=self._device)
+
+        rows = torch.arange(self._n, device=self._device)
+
+        if self._circular:
+            cols = (rows + self._shift) % self._n
+            out[rows, cols] = 1
+            return out
+
+        cols = rows + self._shift
+        valid = (cols >= 0) & (cols < self._n)
+
+        out[rows[valid], cols[valid]] = 1
+        return out
+
+    def matvec(
+        self,
+        x: torch.Tensor | Vector,
+    ) -> torch.Tensor | Vector:
+        if isinstance(x, Vector):
+            x = x.to_dense()
+
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.device)
+
+        # Match Matrix.inverse_matvec semantics:
+        #   (..., n)    -> vector
+        #   (..., n, k) -> multiple RHS vectors
+        if x.dim() >= 2 and x.shape[-2] == self._n:
+            axis = -2
+        elif x.shape[-1] == self._n:
+            axis = -1
+        else:
+            raise ValueError(
+                f"x must have shape (..., {self._n}) or "
+                f"(..., {self._n}, k), got {tuple(x.shape)}"
+            )
+
+        if self._circular:
+            # (S_a @ x)[i] = x[i + a].
+            return torch.roll(x, shifts=-self._shift, dims=axis)
+
+        out = torch.zeros_like(x)
+
+        s = self._shift
+        if abs(s) >= self._n:
+            return out
+
+        src = [slice(None)] * x.dim()
+        dst = [slice(None)] * x.dim()
+
+        if s >= 0:
+            # out[i] = x[i + s], i = 0, ..., n-s-1
+            dst[axis] = slice(0, self._n - s)
+            src[axis] = slice(s, self._n)
+        else:
+            # s = -k:
+            # out[i] = x[i-k], i = k, ..., n-1
+            k = -s
+            dst[axis] = slice(k, self._n)
+            src[axis] = slice(0, self._n - k)
+
+        out[tuple(dst)] = x[tuple(src)]
+        return out
+
+    def inverse(self) -> Matrix:
+        if self._circular:
+            return self.T
+
+        if self._shift == 0:
+            return self
+
+        raise RuntimeError(
+            "A non-circular ShiftMatrix with nonzero shift is singular."
+        )
+
+    def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
+        if self._circular:
+            return self.T.matvec(x)
+
+        if self._shift == 0:
+            return torch.as_tensor(x, dtype=self.dtype, device=self.device)
+
+        raise RuntimeError(
+            "A non-circular ShiftMatrix with nonzero shift is singular."
+        )
+
+    def diag(self) -> torch.Tensor:
+        if self._circular:
+            nonzero = (self._shift % self._n) == 0
+        else:
+            nonzero = self._shift == 0
+
+        if nonzero:
+            return torch.ones(self._n, dtype=self.dtype, device=self.device)
+
+        return torch.zeros(self._n, dtype=self.dtype, device=self.device)
+
+    def sum(self) -> torch.Tensor:
+        if self._circular:
+            count = self._n
+        else:
+            count = max(0, self._n - abs(self._shift))
+
+        return torch.tensor(count, dtype=self.dtype, device=self.device)
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"n={self._n}, shift={self._shift}, "
+            f"circular={self._circular}, "
+            f"dtype={self._dtype}, device={self._device})"
+        )
+
 
 
 def _banded_half_bandwidths(offsets: torch.Tensor) -> tuple[int, int]:

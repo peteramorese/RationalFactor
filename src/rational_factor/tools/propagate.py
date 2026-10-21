@@ -2,7 +2,11 @@ from rational_factor.models.density_model import DensityModel, ConditionalDensit
 from rational_factor.models.parameters import FixedParameters, TTVectorParameters
 from rational_factor.models.structured_matrices import Matrix, as_matrix
 from rational_factor.models.structured_vectors import TTVector, as_vector
-from rational_factor.models.tt.nested_tt import NestedTTMatrix, NestedTTVector
+from rational_factor.models.tt.nested_tt import (
+    NestedTTMatrix,
+    NestedTTVector,
+    SeparableNestedTTMatrix,
+)
 from rational_factor.models.tt.nested_tt_parameters import FixedNestedTTVectorParameters
 import torch
 import copy 
@@ -116,9 +120,9 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
                     "NestedTTVector coefficients require NestedTTMatrix B, got "
                     f"{type(B).__name__}"
                 )
-            if not isinstance(Omega2_0_raw, NestedTTMatrix) or not isinstance(
-                Omega2_raw, NestedTTMatrix
-            ):
+            if not isinstance(
+                Omega2_0_raw, (NestedTTMatrix, SeparableNestedTTMatrix)
+            ) or not isinstance(Omega2_raw, (NestedTTMatrix, SeparableNestedTTMatrix)):
                 raise TypeError(
                     "NestedTT coefficients require NestedTT Gram matrices; "
                     "construct TTBasis with nested_depth matching the "

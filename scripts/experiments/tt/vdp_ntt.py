@@ -355,9 +355,14 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
     n_primitive = 10
-    rank = 10
-    depth = 2
-    leaf_separation_rank = 20
+    # Commuting polynomial nested TT implements depth 3.
+    depth = 3
+    # TT bond rank of g and h0. g must stay rank-1 for the rank-one Hadamard.
+    bond_rank = 1
+    # Row-stochastic B: CP channels, each a polynomial in a shared Markov basis.
+    channel_rank = 10
+    polynomial_degree = 3
+    shared_bases = True
     gaussian_std_epsilon = 0.03
     tran_params = {
         "n_epochs_per_group": [5, 5],  # basis, weights
@@ -405,8 +410,10 @@ if __name__ == "__main__":
     )
 
     print(
-        f"n_basis={m}, n_primitive={n_primitive}, dim={d}, rank={rank}, "
-        f"depth={depth}, modes={tt_modes}"
+        f"n_basis={m}, n_primitive={n_primitive}, dim={d}, depth={depth}, "
+        f"bond_rank={bond_rank}, channel_rank={channel_rank}, "
+        f"polynomial_degree={polynomial_degree}, shared_bases={shared_bases}, "
+        f"modes={tt_modes}"
     )
 
     parameter_shape = (1, d, n_primitive)
@@ -434,38 +441,30 @@ if __name__ == "__main__":
     phi_basis = TTBasis(phi_primitive, nested_depth=depth)
     psi_basis = TTBasis(psi_primitive, nested_depth=depth)
 
-    def positive_leaf_factory(shape, *, mean=1.0, std=1.0, epsilon=0.0):
-        return PositiveParameters.random_init(
-            shape=tuple(shape), mean=mean, std=std, epsilon=epsilon
-        ).to(device, dtype=dtype)
-
-    def trainable_leaf_factory(shape, *, mean=0.0, std=1.0):
-        return TrainableParameters.random_init(
-            shape=tuple(shape), mean=mean, std=std
-        ).to(device, dtype=dtype)
-
     g_coeffs = NestedTTVectorParameters.from_core_spec(
         tt_modes,
         depth=depth,
-        ranks=1,
-        leaf_factory=lambda shape: positive_leaf_factory(
-            shape, mean=1.0, std=1.0, epsilon=1e-3
-        ),
+        bond_rank=bond_rank,
+        dtype=dtype,
+        device=device,
+        positive=True,
     )
     h0_coeffs = NestedTTVectorParameters.from_core_spec(
         tt_modes,
         depth=depth,
-        ranks=1,
-        leaf_factory=lambda shape: positive_leaf_factory(shape, mean=1.0, std=1.0),
-        separation_rank=leaf_separation_rank,
+        bond_rank=bond_rank,
+        dtype=dtype,
+        device=device,
+        positive=True,
     )
-    # Length depth-1 rank tuple → hierarchy (1, r, ..., r) for any depth >= 1.
     B = RowStochasticNestedTTMatrixParameters.from_core_spec(
         tt_modes,
         depth=depth,
-        ranks=1 if depth == 1 else (rank,) * (depth - 1),
-        separation_rank=leaf_separation_rank,
-        leaf_factory=lambda shape: trainable_leaf_factory(shape, mean=0.0, std=1.0),
+        channel_rank=channel_rank,
+        polynomial_degree=polynomial_degree,
+        shared_bases=shared_bases,
+        dtype=dtype,
+        device=device,
     )
 
     rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
@@ -479,7 +478,7 @@ if __name__ == "__main__":
             lr=tran_params["lr_basis"],
         ),
         "weights": torch.optim.Adam(
-            param_group_iter((*g_coeffs.leaves, *B.leaves)),
+            (*g_coeffs.parameters(), *B.parameters()),
             lr=tran_params["lr_weights"],
         ),
     }
@@ -497,7 +496,9 @@ if __name__ == "__main__":
     )
     print("Done! \n")
 
-    for p in param_group_iter((phi_means, phi_std, psi_means, psi_std, *g_coeffs.leaves)):
+    for p in param_group_iter((phi_means, phi_std, psi_means, psi_std)):
+        p.requires_grad_(False)
+    for p in g_coeffs.parameters():
         p.requires_grad_(False)
 
     h0_basis = TTBasis(psi_primitive, coeffs=h0_coeffs)
@@ -507,7 +508,7 @@ if __name__ == "__main__":
     mle_loss_fn = loss.mle_loss
     optimizers = {
         "weights": torch.optim.Adam(
-            param_group_iter(h0_coeffs.leaves),
+            h0_coeffs.parameters(),
             lr=init_params["lr_weights"],
         ),
     }

@@ -1,592 +1,279 @@
 import math
-
+import pytest
 import torch
-
-from rational_factor.models.tt.nested_tt import (
-    NestedTTMatrix,
-    NestedTTMatrixSpec,
-    NestedTTVector,
-    NestedTTVectorSpec,
-    nested_tt_matrix_from_separable_cores,
-    nested_tt_vector_from_factors,
-)
+from .nested_tt import (NestedTTVector,NestedTTMatrix,VirtualIndexMPO,
+                        nested_tt_vector_from_factors,nested_tt_matrix_from_separable_cores,
+                        ones_nested_tt_vector)
+from .nested_tt_leaf import StochasticPolynomialLeaf
+from .nested_tt_parameters import (NestedTTVectorParameters,RowStochasticNestedTTMatrixParameters)
 
 
-def make_leaves(shapes, *, seed, requires_grad=False):
-    g = torch.Generator().manual_seed(seed)
-    return [
-        torch.randn(*shape, generator=g, dtype=torch.float64).requires_grad_(requires_grad)
-        for shape in shapes
-    ]
+def setup(d=3,n=3,q=2,degree=2,B=1,independent=False):
+    torch.manual_seed(51)
+    m=RowStochasticNestedTTMatrixParameters.from_core_spec(
+        (n,)*d,channel_rank=q,polynomial_degree=degree,trainable=True,dtype=torch.float64)
+    v=NestedTTVectorParameters.from_core_spec((n,)*d,bond_rank=2,dtype=torch.float64,positive=True)
+    if B>1:
+        m.channel_logits=torch.nn.Parameter(torch.randn(B,q,dtype=torch.float64))
+        m.base_logits=tuple(torch.nn.Parameter(x.expand(B,*x.shape).clone()) for x in m.base_logits)
+        m.coefficient_logits=tuple(torch.nn.Parameter(x.expand(B,*x.shape).clone()) for x in m.coefficient_logits)
+    return m(),v(),m,v
 
 
-def kron_factors(factors):
-    out = factors[0]
-    for factor in factors[1:]:
-        out = torch.kron(out, factor)
-    return out
+def test_dense_row_stochastic_and_virtual_mpo():
+    M,v,_,_=setup(d=3,q=3)
+    a=M.to_dense()
+    assert (a>=0).all()
+    torch.testing.assert_close(a.sum(-1),torch.ones(a.shape[0],dtype=a.dtype))
+    C=M.materialize_cores()
+    for k,c in enumerate(C):
+        assert c.shape==(1 if k==0 else 3,3,3,1 if k==2 else 3)
+    core=M.cores[1]
+    mpo=core.virtual_mpo(0,1)
+    torch.testing.assert_close(mpo.to_dense(),torch.diag(M.leaves[1].matrices()[0,:,0,1]))
 
 
-def make_case(depth: int, d: int = 2, rank: int = 2):
-    modes = (2,) * d
-    ranks = (rank,) * depth
-    vspec = NestedTTVectorSpec(modes=modes, depth=depth, ranks=ranks)
-    mspec = NestedTTMatrixSpec(
-        row_modes=modes,
-        col_modes=modes,
-        depth=depth,
-        ranks=ranks,
-    )
-    v = NestedTTVector(
-        vspec,
-        make_leaves(NestedTTVector.leaf_shapes(vspec), seed=1000 + depth),
-    )
-    M = NestedTTMatrix(
-        mspec,
-        make_leaves(NestedTTMatrix.leaf_shapes(mspec), seed=2000 + depth),
-    )
-    return v, M
+def test_homogeneous_forward_reverse_and_large_t():
+    M,v,_,_=setup(d=2,q=2)
+    a=M.to_dense()
+    ref=v.to_dense().reshape(-1)
+    f=(torch.tensor([.3,.4,.7],dtype=torch.float64),torch.tensor([.1,.9,.4],dtype=torch.float64))
+    phi=torch.kron(*f)
+    for t in range(1,7):
+        v=M.matvec(v)
+        ref=a@ref
+        torch.testing.assert_close(v.to_dense().reshape(-1),ref,atol=1e-11,rtol=1e-11)
+        torch.testing.assert_close(v.contract(f),phi@ref,atol=1e-11,rtol=1e-11)
+        assert v.history_length==t
+        assert len(v.events)==1
+    x=ones_nested_tt_vector((3,3),dtype=torch.float64)
+    torch.testing.assert_close(M.matvec(x).to_dense().reshape(-1),torch.ones(9,dtype=torch.float64))
+    x=M.rev_matvec(x)
+    torch.testing.assert_close(x.to_dense().reshape(-1),a.T@torch.ones(9,dtype=torch.float64))
 
 
-def test_dense_equivalence_depths_1_to_3():
-    for depth in (1, 2, 3):
-        v, M = make_case(depth)
-        vd = v.to_dense()
-        Md = M.to_dense()
-
-        y = M.matvec(v)
-        torch.testing.assert_close(y.to_dense(), Md @ vd, rtol=1e-10, atol=1e-10)
-        torch.testing.assert_close(y.sum(), (Md @ vd).sum(), rtol=1e-10, atol=1e-10)
-        torch.testing.assert_close(v.sum(), vd.sum(), rtol=1e-10, atol=1e-10)
-        torch.testing.assert_close(M.sum(), Md.sum(), rtol=1e-10, atol=1e-10)
-
-
-def test_repeated_matvec_dense_equivalence_and_linear_symbolic_growth():
-    v, M = make_case(depth=3)
-    Md = M.to_dense()
-    ref = v.to_dense()
-    cur = v
-    initial_matrix_leaves = M.leaf_count
-    initial_vector_leaves = v.leaf_count
-
-    max_intermediates = []
-    operand_counts = []
-    for t in range(1, 9):
-        cur = M.matvec(cur)
-        ref = Md @ ref
-        got = cur.sum()
-        torch.testing.assert_close(got, ref.sum(), rtol=1e-9, atol=1e-11)
-
-        assert cur.history_length == t
-        assert cur.leaf_count == initial_vector_leaves + t * initial_matrix_leaves
-        stats = cur.last_contract_stats
-        assert stats is not None
-        max_intermediates.append(stats.max_intermediate_numel)
-        operand_counts.append(stats.operands)
-
-    # The factor graph grows linearly with time, while the largest production
-    # contraction intermediate stays bounded in this fixed-depth case.
-    assert operand_counts == sorted(operand_counts)
-    assert operand_counts[-1] <= operand_counts[0] * 8
-    assert max(max_intermediates) <= 2 * max_intermediates[0]
+def test_pointwise_divide_then_forward_and_reverse_and_gram():
+    M,v,_,_=setup(d=2)
+    phi=(torch.tensor([0.3,1.3,1.8],dtype=torch.float64),torch.tensor([.5,1.5,.9],dtype=torch.float64))
+    x=v.to_dense().reshape(-1)
+    divided=v.elementwise_divide(phi)
+    ref=x/torch.kron(*phi)
+    torch.testing.assert_close(divided.to_dense().reshape(-1),ref)
+    z=M.matvec(divided)
+    torch.testing.assert_close(z.to_dense().reshape(-1),M.to_dense()@ref)
+    z2=M.rev_matvec(divided)
+    torch.testing.assert_close(z2.to_dense().reshape(-1),M.to_dense().T@ref)
+    mats=(torch.randn(3,3,dtype=torch.float64),torch.randn(3,3,dtype=torch.float64))
+    G=nested_tt_matrix_from_separable_cores(mats)
+    x3=M.matvec(G.matvec(divided.elementwise_multiply(phi)))
+    expected=M.to_dense()@torch.kron(*mats)@(ref*torch.kron(*phi))
+    torch.testing.assert_close(x3.to_dense().reshape(-1),expected)
+    y=G.rev_matvec(M.matvec(divided))
+    torch.testing.assert_close(y.to_dense().reshape(-1),torch.kron(*mats).T@M.to_dense()@ref)
 
 
-def test_sum_does_not_materialize_parent_cores():
-    v, M = make_case(depth=3)
-    cur = M.matvec(M.matvec(M.matvec(v)))
+def test_batched_pointwise_divide_and_gram():
+    M,v,_,_=setup(d=2,B=3)
+    a=M.to_dense()
+    vf=(torch.randn(3,3,dtype=torch.float64).abs()+0.2,torch.randn(3,3,dtype=torch.float64).abs()+0.2)
+    vb=v.elementwise_divide(vf)
+    initial=v.to_dense().reshape(-1)
+    ref=torch.stack([initial/torch.kron(vf[0][b],vf[1][b]) for b in range(3)])
+    got=M.matvec(vb)
+    torch.testing.assert_close(got.to_dense(),torch.einsum('bij,bj->bi',a,ref))
+    gram=(torch.randn(3,3,3,dtype=torch.float64),torch.randn(3,3,3,dtype=torch.float64))
+    G=nested_tt_matrix_from_separable_cores(gram)
+    out=G.matvec(got)
+    ref_gram=torch.stack([torch.kron(gram[0][b],gram[1][b])@a[b]@ref[b] for b in range(3)])
+    torch.testing.assert_close(out.to_dense(),ref_gram)
+    assert out.shape==torch.Size((3,9))
 
-    originals = []
+
+def test_polynomial_fft_coefficients_and_differentiability():
+    a=torch.tensor([[.2,.3,.5]],dtype=torch.float64,requires_grad=True)
+    b=torch.tensor([[.6,.4]],dtype=torch.float64,requires_grad=True)
+    c=StochasticPolynomialLeaf.multiply_coeffs(a,b)
+    ref=torch.tensor([[.12,.26,.42,.20]],dtype=torch.float64)
+    torch.testing.assert_close(c,ref,atol=1e-12,rtol=1e-12)
+    p=StochasticPolynomialLeaf.power_coeffs(a,3)
+    assert p.shape[-1]==7
+    (c.square().sum()+p.square().sum()).backward()
+    assert torch.isfinite(a.grad).all() and torch.isfinite(b.grad).all()
+
+
+def test_independent_commuting_bases_per_channel():
+    n=3
+    raw=torch.tensor([[.6,.2,.2],[.1,.7,.2],[.2,.2,.6]],dtype=torch.float64)
+    S=raw
+    S2=0.4*torch.eye(n,dtype=S.dtype)+0.6*S
+    bases=torch.stack((S,S2))
+    c=torch.tensor([[.1,.7,.2],[.3,.4,.3]],dtype=S.dtype)
+    leaf=StochasticPolynomialLeaf(bases,c)
+    torch.testing.assert_close(leaf.accumulated((2,3)),
+        leaf.matrices()[:,0].matrix_power(2)@leaf.matrices()[:,1].matrix_power(3))
+    bad=torch.eye(n,dtype=S.dtype).roll(1,0)
+    with pytest.raises(ValueError,match='commute'):
+        StochasticPolynomialLeaf(torch.stack((S,bad)),c)
+
+
+def test_trainable_gradients_and_no_dense_contract():
+    M,v,mp,vp=setup(d=3,q=2)
+    x=(torch.tensor([0.1,.8,.3],dtype=torch.float64),)*3
+    for _ in range(3): v=M.matvec(v)
+    original=NestedTTMatrix.to_dense
     try:
-        for bank in cur.cores:
-            originals.append((bank, bank.materialize))
-
-            def fail_materialize(*args, **kwargs):
-                raise AssertionError("production sum() attempted dense core materialization")
-
-            bank.materialize = fail_materialize
-        _ = cur.sum()
+        NestedTTMatrix.to_dense=lambda *a,**kw: (_ for _ in ()).throw(AssertionError('no global dense matrix'))
+        val=v.contract(x)
     finally:
-        for bank, original in originals:
-            bank.materialize = original
+        NestedTTMatrix.to_dense=original
+    val.backward()
+    for p in (*mp.parameters(),*vp.parameters()):
+        assert p.grad is not None and torch.isfinite(p.grad).all()
 
 
-def test_rank_one_elementwise_multiply_then_sum():
-    v, M = make_case(depth=3)
-    cur = M.matvec(M.matvec(v))
-    dense = cur.to_dense()
-    factors = [
-        torch.randn(n, generator=torch.Generator().manual_seed(3000 + k), dtype=torch.float64)
-        for k, n in enumerate(cur.modes)
-    ]
-    weighted = cur.elementwise_multiply(factors)
-    expected = (dense * kron_factors(factors)).sum()
-    torch.testing.assert_close(weighted.sum(), expected, rtol=1e-10, atol=1e-10)
+def test_large_dimension_linear_storage_and_polynomial_work():
+    M,v,_,_=setup(d=15,n=2,q=2,degree=1)
+    storage=v.storage_numel
+    for _ in range(18): v=M.matvec(v)
+    assert v.storage_numel==storage+1 and len(v.events)==1
+    f=(torch.tensor([.2,.9],dtype=torch.float64),)*15
+    got=v.contract(f)
+    assert got.ndim==0 and torch.isfinite(got)
+    assert v.normal_form_terms==19
 
 
-def test_elementwise_divide_is_factorwise_and_tolerant():
-    v, M = make_case(depth=2)
-    cur = M.matvec(v)
-    dense = cur.to_dense()
-    eps = 1e-6
-    factors = (
-        torch.tensor([2.0, 1e-20], dtype=torch.float64),
-        torch.tensor([-4.0, 0.5], dtype=torch.float64),
-    )
+def test_normal_form_branch_budget_for_mixed_sequences():
+    M,v,_,_=setup(d=2,q=2)
+    for _ in range(2):v=M.matvec(v)
+    v=v.elementwise_multiply((torch.ones(3),torch.ones(3)))
+    for _ in range(2):v=M.matvec(v)
+    with pytest.raises(RuntimeError,match='budget'):
+        v.contract([torch.ones(3)]*2,max_terms=3)
 
-    # Guard the operation itself against accidental dense conversion.
-    original = NestedTTVector.to_dense
+
+def test_sep_transpose_and_batched_basis():
+    mats=(torch.randn(2,3,3,dtype=torch.float64),torch.randn(2,3,3,dtype=torch.float64))
+    M=nested_tt_matrix_from_separable_cores(mats)
+    v=nested_tt_vector_from_factors((torch.randn(2,3,dtype=torch.float64),torch.randn(2,3,dtype=torch.float64)))
+    got=M.rev_matvec(v).to_dense()
+    ref=torch.stack([torch.kron(mats[0][b],mats[1][b]).T@torch.kron(v.initial_cores[0][b,0,:,0],v.initial_cores[1][b,0,:,0]) for b in range(2)])
+    torch.testing.assert_close(got,ref)
+
+
+
+def test_ttbasis_coeff_free_rankone_division_batched():
+    v=ones_nested_tt_vector((3,3),dtype=torch.float64)
+    f=(torch.tensor([[.2,.4,.8],[.3,.6,.9]],dtype=torch.float64),
+       torch.tensor([[.5,1.2,1.8],[1.5,.7,.6]],dtype=torch.float64))
+    phi=v.elementwise_multiply(f)
+    assert phi.rank_one_factors is not None
+    y=v.elementwise_divide(phi)
+    expected=torch.stack([torch.kron(f[0][b],f[1][b]).reciprocal() for b in range(2)])
+    torch.testing.assert_close(y.to_dense(),expected)
+
+
+def test_nested_mpo_core_reconstruction_batched():
+    M,_,_,_=setup(d=3,n=2,q=3,B=2)
+    cores=M.materialize_cores()
+    for b in range(2):
+        out=[]
+        for rows in __import__('itertools').product(range(2),repeat=3):
+            row=[]
+            for cols in __import__('itertools').product(range(2),repeat=3):
+                acc=cores[0][b,0,rows[0],cols[0],:]
+                for k in range(1,3):
+                    acc=acc @ cores[k][b,:,rows[k],cols[k],:]
+                row.append(acc.squeeze())
+            out.append(torch.stack(row))
+        torch.testing.assert_close(torch.stack(out),M.to_dense()[b])
+
+
+def test_batched_same_size_as_number_of_channels():
+    M,v,_,_=setup(d=2,n=3,q=2,B=2)
+    dense=M.to_dense()
+    ref=v.to_dense()
+    got=M.matvec(v).to_dense()
+    torch.testing.assert_close(got,torch.einsum('bij,j->bi',dense,ref))
+    torch.testing.assert_close(dense.sum(-1),torch.ones(2,9,dtype=torch.float64))
+
+
+def test_rectangular_gram_after_rankone_scaling():
+    mats=(torch.randn(3,2,dtype=torch.float64),torch.randn(4,3,dtype=torch.float64))
+    v=nested_tt_vector_from_factors((torch.tensor([.3,.5]),torch.tensor([.1,.2,.8])))
+    f=(torch.tensor([.4,.8]),torch.tensor([.5,.7,.9]))
+    G=nested_tt_matrix_from_separable_cores(mats)
+    z=G.matvec(v.elementwise_multiply(f))
+    assert z.modes==(3,4)
+    torch.testing.assert_close(z.to_dense().reshape(-1),torch.kron(*mats)@((torch.kron(v.initial_cores[0][0,:,0],v.initial_cores[1][0,:,0])*torch.kron(*f)).double()))
+    z2=G.rev_matvec(z)
+    torch.testing.assert_close(z2.to_dense().reshape(-1),torch.kron(*mats).T@z.to_dense().reshape(-1))
+
+
+def test_schur_product_large_dim_no_dense_and_batched():
+    M,v,_,_=setup(d=3,n=3,q=2,B=2)
+    Fs=tuple(torch.rand(2,3,3,dtype=torch.float64) for _ in range(3))
+    schur=M.elementwise_multiply(Fs)
+    expected=torch.stack([M.to_dense()[b]*torch.kron(torch.kron(Fs[0][b],Fs[1][b]),Fs[2][b]) for b in range(2)])
+    torch.testing.assert_close(schur.to_dense(),expected)
+    result=schur.matvec(v).to_dense()
+    torch.testing.assert_close(result,torch.einsum('bij,j->bi',expected,v.to_dense()))
+    assert len(schur.matvec(v).events)==1
+    assert schur.matvec(v).normal_form_terms==2
+    bigger,vb,_,_=setup(d=15,n=2,q=2)
+    Fs_big=tuple(torch.eye(2,dtype=torch.float64) for _ in range(15))
+    huge=bigger.elementwise_multiply(Fs_big)
+    original=type(huge).to_dense
     try:
-        def fail_dense(self):
-            raise AssertionError("elementwise_divide attempted dense materialization")
-        NestedTTVector.to_dense = fail_dense
-        divided = cur.elementwise_divide(factors, eps=eps)
+        type(huge).to_dense=lambda *a,**kw: (_ for _ in ()).throw(AssertionError('dense conversion'))
+        val=huge.matvec(vb).sum()
     finally:
-        NestedTTVector.to_dense = original
-
-    safe = []
-    for f in factors:
-        sign = torch.where(f < 0, -torch.ones_like(f), torch.ones_like(f))
-        safe.append(torch.where(f.abs() < eps, sign * eps, f))
-    denom = kron_factors(safe)
-    torch.testing.assert_close(divided.to_dense(), dense / denom, rtol=1e-10, atol=1e-10)
-
-
-def test_gradients_through_matvec_weighted_sum():
-    depth = 3
-    modes = (2, 2)
-    ranks = (2,) * depth
-    vspec = NestedTTVectorSpec(modes, depth, ranks)
-    mspec = NestedTTMatrixSpec(modes, modes, depth, ranks)
-    vleaves = make_leaves(
-        NestedTTVector.leaf_shapes(vspec), seed=5001, requires_grad=True
-    )
-    mleaves = make_leaves(
-        NestedTTMatrix.leaf_shapes(mspec), seed=5002, requires_grad=True
-    )
-    v = NestedTTVector(vspec, vleaves)
-    M = NestedTTMatrix(mspec, mleaves)
-    factors = tuple(
-        torch.randn(n, dtype=torch.float64, requires_grad=True) for n in modes
-    )
-
-    loss = M.matvec(v).elementwise_multiply(factors).sum()
-    loss.backward()
-
-    assert all(x.grad is not None for x in vleaves)
-    assert all(x.grad is not None for x in mleaves)
-    assert all(x.grad is not None for x in factors)
-
-
-if __name__ == "__main__":
-    test_dense_equivalence_depths_1_to_3()
-    test_repeated_matvec_dense_equivalence_and_linear_symbolic_growth()
-    test_sum_does_not_materialize_parent_cores()
-    test_rank_one_elementwise_multiply_then_sum()
-    test_elementwise_divide_is_factorwise_and_tolerant()
-    test_gradients_through_matvec_weighted_sum()
-    print("test_nested_tt.py: all tests passed")
-
-
-
-def batched_kron_factors(factors):
-    batch = max(1 if x.ndim == 1 else int(x.shape[0]) for x in factors)
-    rows = []
-    for b in range(batch):
-        local = [x if x.ndim == 1 else x[b] for x in factors]
-        rows.append(kron_factors(local))
-    return torch.stack(rows)
-
-
-def batched_kron_matrices(cores):
-    batch = max(1 if x.ndim == 2 else int(x.shape[0]) for x in cores)
-    rows = []
-    for b in range(batch):
-        local = [x if x.ndim == 2 else x[b] for x in cores]
-        rows.append(kron_factors(local))
-    return torch.stack(rows)
-
-
-def test_batched_rank_one_weighting_and_sum():
-    v, _ = make_case(depth=3)
-    dense = v.to_dense()
-    B = 4
-    factors = tuple(
-        torch.randn(B, n, generator=torch.Generator().manual_seed(7100 + k), dtype=torch.float64)
-        for k, n in enumerate(v.modes)
-    )
-    weighted = v.elementwise_multiply(factors)
-    expected = dense.unsqueeze(0) * batched_kron_factors(factors)
-    assert weighted.batch_size == B
-    assert weighted.shape == (B, dense.numel())
-    torch.testing.assert_close(weighted.to_dense(), expected, rtol=1e-10, atol=1e-10)
-    torch.testing.assert_close(weighted.sum(), expected.sum(dim=1), rtol=1e-10, atol=1e-10)
-
-
-def test_rank_one_nested_vector_multiplier_never_densifies():
-    v, _ = make_case(depth=3)
-    B = 3
-    factors = tuple(
-        torch.randn(B, n, generator=torch.Generator().manual_seed(7200 + k), dtype=torch.float64)
-        for k, n in enumerate(v.modes)
-    )
-    phi = nested_tt_vector_from_factors(factors, depth=v.depth)
-    expected = v.to_dense().unsqueeze(0) * batched_kron_factors(factors)
-
-    original = NestedTTVector.to_dense
-    try:
-        def fail_dense(self):
-            raise AssertionError("rank-one NestedTT multiplier attempted dense materialization")
-        NestedTTVector.to_dense = fail_dense
-        weighted = v.elementwise_multiply(phi)
-        got_sum = weighted.sum()
-    finally:
-        NestedTTVector.to_dense = original
-
-    torch.testing.assert_close(got_sum, expected.sum(dim=1), rtol=1e-10, atol=1e-10)
-    torch.testing.assert_close(weighted.to_dense(), expected, rtol=1e-10, atol=1e-10)
-
-
-def test_unbatched_matrix_times_batched_vector():
-    v, M = make_case(depth=3)
-    B = 3
-    factors = tuple(
-        torch.randn(B, n, generator=torch.Generator().manual_seed(7300 + k), dtype=torch.float64)
-        for k, n in enumerate(v.modes)
-    )
-    vb = v.elementwise_multiply(factors)
-    got = M.matvec(vb)
-    expected = torch.einsum("mn,bn->bm", M.to_dense(), vb.to_dense())
-    assert got.batch_size == B
-    torch.testing.assert_close(got.to_dense(), expected, rtol=1e-9, atol=1e-10)
-    torch.testing.assert_close(got.sum(), expected.sum(dim=1), rtol=1e-9, atol=1e-10)
-
-
-def test_batched_separable_matrix_and_matvec_broadcast():
-    v, _ = make_case(depth=3)
-    B = 3
-    cores = tuple(
-        torch.randn(B, 2, 2, generator=torch.Generator().manual_seed(7400 + k), dtype=torch.float64)
-        for k in range(v.d)
-    )
-    Omega = nested_tt_matrix_from_separable_cores(cores, depth=v.depth)
-    dense_Omega = batched_kron_matrices(cores)
-    torch.testing.assert_close(Omega.to_dense(), dense_Omega, rtol=1e-10, atol=1e-10)
-
-    got = Omega.matvec(v)
-    expected = torch.einsum("bmn,n->bm", dense_Omega, v.to_dense())
-    assert got.batch_size == B
-    torch.testing.assert_close(got.to_dense(), expected, rtol=1e-9, atol=1e-10)
-
-
-def test_basis_weight_then_gram_then_model_matvec_chain():
-    v, M = make_case(depth=3)
-    B = 4
-    basis_factors = tuple(
-        torch.randn(B, n, generator=torch.Generator().manual_seed(7500 + k), dtype=torch.float64)
-        for k, n in enumerate(v.modes)
-    )
-    basis_eval = nested_tt_vector_from_factors(basis_factors, depth=v.depth)
-    gram_cores = tuple(
-        torch.randn(2, 2, generator=torch.Generator().manual_seed(7600 + k), dtype=torch.float64)
-        for k in range(v.d)
-    )
-    Omega = nested_tt_matrix_from_separable_cores(gram_cores, depth=v.depth)
-
-    weighted = v.elementwise_multiply(basis_eval)
-    got = M.matvec(Omega.matvec(weighted))
-
-    dense_weighted = v.to_dense().unsqueeze(0) * batched_kron_factors(basis_factors)
-    dense_omega = batched_kron_matrices(gram_cores)[0]
-    expected = torch.einsum("mn,nk,bk->bm", M.to_dense(), dense_omega, dense_weighted)
-    torch.testing.assert_close(got.to_dense(), expected, rtol=1e-8, atol=1e-9)
-    torch.testing.assert_close(got.sum(), expected.sum(dim=1), rtol=1e-8, atol=1e-9)
-
-
-def test_separable_gram_matvec_preserves_nested_history_and_leaf_count():
-    v, _ = make_case(depth=3)
-    gram_cores = tuple(
-        torch.randn(2, 2, generator=torch.Generator().manual_seed(7700 + k), dtype=torch.float64)
-        for k in range(v.d)
-    )
-    Omega = nested_tt_matrix_from_separable_cores(gram_cores, depth=v.depth)
-    out = Omega.matvec(v)
-    assert out.history_length == v.history_length
-    assert out.leaf_count == v.leaf_count
-    assert out.ranks == v.ranks
-    expected = batched_kron_matrices(gram_cores)[0] @ v.to_dense()
-    torch.testing.assert_close(out.to_dense(), expected, rtol=1e-10, atol=1e-10)
-
-
-def test_batched_separable_matrix_times_batched_vector_same_batch():
-    v, _ = make_case(depth=3)
-    B = 3
-    vf = tuple(
-        torch.randn(B, n, generator=torch.Generator().manual_seed(7800 + k), dtype=torch.float64)
-        for k, n in enumerate(v.modes)
-    )
-    vb = v.elementwise_multiply(vf)
-    cores = tuple(
-        torch.randn(B, 2, 2, generator=torch.Generator().manual_seed(7900 + k), dtype=torch.float64)
-        for k in range(v.d)
-    )
-    Omega = nested_tt_matrix_from_separable_cores(cores, depth=v.depth)
-    got = Omega.matvec(vb)
-    expected = torch.einsum("bmn,bn->bm", Omega.to_dense(), vb.to_dense())
-    torch.testing.assert_close(got.to_dense(), expected, rtol=1e-9, atol=1e-10)
-
-
-def test_general_nested_matrix_supports_leading_batch_via_separable_scaling():
-    v, M = make_case(depth=3)
-    B = 3
-    factors = tuple(
-        torch.randn(B, m, n, generator=torch.Generator().manual_seed(8000 + k), dtype=torch.float64)
-        for k, (m, n) in enumerate(zip(M.row_modes, M.col_modes))
-    )
-    Mb = M.elementwise_multiply(factors)
-    scale = batched_kron_matrices(factors)
-    expected_matrix = M.to_dense().unsqueeze(0) * scale
-    assert Mb.batch_size == B
-    assert Mb.shape == (B, *M.shape)
-    torch.testing.assert_close(Mb.to_dense(), expected_matrix, rtol=1e-10, atol=1e-10)
-    torch.testing.assert_close(Mb.sum(), expected_matrix.sum(dim=(1, 2)), rtol=1e-10, atol=1e-10)
-
-    got = Mb.matvec(v)
-    expected_vec = torch.einsum("bmn,n->bm", expected_matrix, v.to_dense())
-    torch.testing.assert_close(got.to_dense(), expected_vec, rtol=1e-9, atol=1e-10)
-
-
-def test_batched_elementwise_divide_tolerance():
-    v, _ = make_case(depth=2)
-    B = 2
-    factors = (
-        torch.tensor([[2.0, 1e-30], [-3.0, -1e-30]], dtype=torch.float64),
-        torch.tensor([[0.5, -4.0], [1e-30, 2.0]], dtype=torch.float64),
-    )
-    eps = 1e-6
-    got = v.elementwise_divide(factors, eps=eps)
-    safe = []
-    for f in factors:
-        sign = torch.where(f < 0, -torch.ones_like(f), torch.ones_like(f))
-        safe.append(torch.where(f.abs() < eps, sign * eps, f))
-    denom = batched_kron_factors(tuple(safe))
-    expected = v.to_dense().unsqueeze(0) / denom
-    torch.testing.assert_close(got.to_dense(), expected, rtol=1e-10, atol=1e-10)
-
-
-def test_reverse_matvec_dense_equivalence_depths_1_to_3():
-    for depth in (1, 2, 3):
-        v, M = make_case(depth)
-        vd = v.to_dense()
-        Md = M.to_dense()
-
-        y = M.rev_matvec(v)
-        expected = Md.transpose(-2, -1) @ vd
-        torch.testing.assert_close(y.to_dense(), expected, rtol=1e-10, atol=1e-10)
-        torch.testing.assert_close(y.sum(), expected.sum(), rtol=1e-10, atol=1e-10)
-        assert y.modes == M.col_modes
-        assert y.history_length == v.history_length + 1
-        assert y.leaf_count == v.leaf_count + M.leaf_count
-
-
-def test_repeated_reverse_matvec_dense_equivalence_and_linear_symbolic_growth():
-    v, M = make_case(depth=3)
-    MdT = M.to_dense().transpose(-2, -1)
-    ref = v.to_dense()
-    cur = v
-    initial_matrix_leaves = M.leaf_count
-    initial_vector_leaves = v.leaf_count
-
-    max_intermediates = []
-    operand_counts = []
-    for t in range(1, 9):
-        cur = M.rev_matvec(cur)
-        ref = MdT @ ref
-        got = cur.sum()
-        torch.testing.assert_close(got, ref.sum(), rtol=1e-9, atol=1e-11)
-
-        assert cur.history_length == t
-        assert cur.leaf_count == initial_vector_leaves + t * initial_matrix_leaves
-        stats = cur.last_contract_stats
-        assert stats is not None
-        max_intermediates.append(stats.max_intermediate_numel)
-        operand_counts.append(stats.operands)
-
-    assert operand_counts == sorted(operand_counts)
-    assert operand_counts[-1] <= operand_counts[0] * 8
-    assert max(max_intermediates) <= 2 * max_intermediates[0]
-
-
-def test_reverse_matvec_rectangular_modes():
-    depth = 2
-    row_modes = (2, 3)
-    col_modes = (3, 2)
-    ranks = (2, 2)
-    mspec = NestedTTMatrixSpec(
-        row_modes=row_modes,
-        col_modes=col_modes,
-        depth=depth,
-        ranks=ranks,
-    )
-    vspec = NestedTTVectorSpec(modes=row_modes, depth=depth, ranks=ranks)
-    M = NestedTTMatrix(
-        mspec,
-        make_leaves(NestedTTMatrix.leaf_shapes(mspec), seed=8201),
-    )
-    x = NestedTTVector(
-        vspec,
-        make_leaves(NestedTTVector.leaf_shapes(vspec), seed=8202),
-    )
-
-    got = M.rev_matvec(x)
-    expected = M.to_dense().transpose(-2, -1) @ x.to_dense()
-    assert got.modes == col_modes
-    assert got.shape == torch.Size((math.prod(col_modes),))
-    torch.testing.assert_close(got.to_dense(), expected, rtol=1e-10, atol=1e-10)
-
-
-def test_separable_reverse_matvec_preserves_history_and_supports_batch():
-    v, _ = make_case(depth=3)
-    B = 3
-    cores = tuple(
-        torch.randn(B, 2, 2, generator=torch.Generator().manual_seed(8300 + k), dtype=torch.float64)
-        for k in range(v.d)
-    )
-    Omega = nested_tt_matrix_from_separable_cores(cores, depth=v.depth)
-    dense_Omega = batched_kron_matrices(cores)
-
-    got = Omega.rev_matvec(v)
-    expected = torch.einsum("bmn,m->bn", dense_Omega, v.to_dense())
-    assert got.batch_size == B
-    assert got.history_length == v.history_length
-    assert got.leaf_count == v.leaf_count
-    assert got.ranks == v.ranks
-    torch.testing.assert_close(got.to_dense(), expected, rtol=1e-9, atol=1e-10)
-
-
-def test_general_reverse_matvec_batch_broadcast_and_no_dense_fallback():
-    v, M = make_case(depth=3)
-    B = 3
-    vf = tuple(
-        torch.randn(B, n, generator=torch.Generator().manual_seed(8400 + k), dtype=torch.float64)
-        for k, n in enumerate(v.modes)
-    )
-    vb = v.elementwise_multiply(vf)
-    expected = torch.einsum("mn,bm->bn", M.to_dense(), vb.to_dense())
-
-    matrix_to_dense = NestedTTMatrix.to_dense
-    vector_to_dense = NestedTTVector.to_dense
-    try:
-        def fail_matrix_dense(self):
-            raise AssertionError("rev_matvec attempted matrix dense materialization")
-
-        def fail_vector_dense(self):
-            raise AssertionError("rev_matvec attempted vector dense materialization")
-
-        NestedTTMatrix.to_dense = fail_matrix_dense
-        NestedTTVector.to_dense = fail_vector_dense
-        got = M.rev_matvec(vb)
-        got_sum = got.sum()
-    finally:
-        NestedTTMatrix.to_dense = matrix_to_dense
-        NestedTTVector.to_dense = vector_to_dense
-
-    assert got.batch_size == B
-    torch.testing.assert_close(got_sum, expected.sum(dim=1), rtol=1e-9, atol=1e-10)
-    torch.testing.assert_close(got.to_dense(), expected, rtol=1e-9, atol=1e-10)
-
-
-def test_separation_rank_increases_expressivity_and_depth_amplifies_it():
-    """Q is local; depth can compose it into much larger effective rank."""
-    modes = (8, 8)
-    depth = 3
-    hierarchy_rank = 8
-    separation_rank = 2
-    mspec = NestedTTMatrixSpec(
-        row_modes=modes,
-        col_modes=modes,
-        depth=depth,
-        ranks=(hierarchy_rank,) * depth,
-        separation_rank=separation_rank,
-    )
-    M = NestedTTMatrix(
-        mspec,
-        make_leaves(NestedTTMatrix.leaf_shapes(mspec), seed=10),
-    )
-    factors = (
-        torch.randn(8, generator=torch.Generator().manual_seed(1), dtype=torch.float64),
-        torch.randn(8, generator=torch.Generator().manual_seed(2), dtype=torch.float64),
-    )
-    v = nested_tt_vector_from_factors(factors, depth=depth)
-    y = M.matvec(v).to_dense().reshape(*modes)
-    s = torch.linalg.svdvals(y)
-    numerical_rank = int((s > s[0] * 1e-10).sum())
-
-    # The global output rank can exceed the local leaf separation rank because
-    # the nested hierarchy composes many q-indices implicitly.
-    assert numerical_rank > separation_rank
-    assert numerical_rank == 8
-
-
-def test_separation_rank_repeated_matvec_uses_mps_history_without_blowup():
-    modes = (2, 2)
-    depth = 3
-    ranks = (2,) * depth
-    vspec = NestedTTVectorSpec(modes, depth, ranks, separation_rank=1)
-    mspec = NestedTTMatrixSpec(modes, modes, depth, ranks, separation_rank=2)
-    v = NestedTTVector(
-        vspec,
-        make_leaves(NestedTTVector.leaf_shapes(vspec), seed=8101),
-    )
-    M = NestedTTMatrix(
-        mspec,
-        [0.1 * x for x in make_leaves(NestedTTMatrix.leaf_shapes(mspec), seed=8102)],
-    )
-
-    Md = M.to_dense()
-    ref = v.to_dense()
-    cur = v
-    max_intermediates = []
-    operands = []
-    for t in range(1, 9):
-        cur = M.matvec(cur)
-        ref = Md @ ref
-        got = cur.sum()
-        torch.testing.assert_close(got, ref.sum(), rtol=1e-8, atol=1e-10)
-        stats = cur.last_contract_stats
-        assert stats is not None
-        max_intermediates.append(stats.max_intermediate_numel)
-        operands.append(stats.operands)
-        assert cur.history_length == t
-
-    # The symbolic graph grows linearly in time, while q_t is retained as an
-    # MPS bond.  In this fixed-depth Q=2 case, contraction width is constant.
-    assert operands == sorted(operands)
-    assert all(b - a == operands[1] - operands[0] for a, b in zip(operands, operands[1:]))
-    assert max(max_intermediates) == max_intermediates[0]
-    assert max_intermediates[0] <= 32
-
-
-def test_separation_rank_reverse_matvec_dense_and_bounded():
-    modes = (2, 2)
-    depth = 3
-    ranks = (2,) * depth
-    vspec = NestedTTVectorSpec(modes, depth, ranks, separation_rank=1)
-    mspec = NestedTTMatrixSpec(modes, modes, depth, ranks, separation_rank=2)
-    v = NestedTTVector(
-        vspec,
-        make_leaves(NestedTTVector.leaf_shapes(vspec), seed=8201),
-    )
-    M = NestedTTMatrix(
-        mspec,
-        [0.1 * x for x in make_leaves(NestedTTMatrix.leaf_shapes(mspec), seed=8202)],
-    )
-    Md = M.to_dense()
-    ref = v.to_dense()
-    cur = v
-    widths = []
-    for _ in range(6):
-        cur = M.rev_matvec(cur)
-        ref = Md.T @ ref
-        torch.testing.assert_close(cur.sum(), ref.sum(), rtol=1e-8, atol=1e-10)
-        widths.append(cur.last_contract_stats.max_intermediate_numel)
-    assert max(widths) <= 2 * widths[0]
+        type(huge).to_dense=original
+    assert torch.isfinite(val)
+
+
+def test_leaf_fft_normal_form_equal_dense_and_gradient():
+    M,_,mp,_=setup(d=2,n=3,q=2,degree=2)
+    L=M.leaves[0]
+    c=L.canonical_coefficients((2,3))
+    assert c.shape==(1,11)
+    S=L.bases[:,0]
+    eye=torch.eye(L.n,dtype=S.dtype,device=S.device).expand(1,-1,-1)
+    powers=[eye]
+    for _ in range(c.shape[-1]-1): powers.append(powers[-1]@S)
+    polynomial=torch.einsum('bl,blij->bij',c,torch.stack(powers,dim=1))
+    torch.testing.assert_close(polynomial,L.accumulated((2,3)),atol=1e-10,rtol=1e-10)
+    polynomial.sum().backward()
+    for p in (mp.base_logits[0], mp.coefficient_logits[0]):
+        assert p.grad is not None and torch.isfinite(p.grad).all()
+
+
+def test_independent_fixed_commuting_bases_train_coefficients():
+    from .nested_tt_parameters import RowStochasticNestedTTMatrixParameters
+    n=3
+    S=torch.tensor([[.6,.2,.2],[.1,.7,.2],[.2,.2,.6]],dtype=torch.float64)
+    S2=.3*torch.eye(n,dtype=S.dtype)+.7*S
+    params=RowStochasticNestedTTMatrixParameters.from_core_spec(
+        (3,3),channel_rank=2,polynomial_degree=2,
+        base_matrices=[torch.stack((S,S2))]*2,shared_bases=False,
+        dtype=torch.float64,trainable=True)
+    M=params()
+    torch.testing.assert_close(M.to_dense().sum(-1),torch.ones(9,dtype=torch.float64))
+    assert all(not isinstance(p,torch.nn.Parameter) for p in params.base_logits)
+    with pytest.raises(ValueError,match='break commutativity'):
+        RowStochasticNestedTTMatrixParameters.from_core_spec(
+            (3,),channel_rank=2,base_matrices=[torch.stack((S,S2))],
+            shared_bases=False,trainable_bases=True)
+
+
+def test_materialize_small_propagated_tt_debug_and_batch():
+    M,v,_,_=setup(d=3,n=2,q=2,B=2)
+    w=M.matvec(M.matvec(v))
+    cores=w.materialize_cores()
+    assert all(g.ndim==4 for g in cores)
+    recon=[]
+    for b in range(2):
+        x=cores[0][b,0]
+        for g in cores[1:]:
+            x=torch.einsum('pr,rns->pns',x.reshape(-1,x.shape[-1]),g[b])
+        recon.append(x.reshape(-1))
+    torch.testing.assert_close(torch.stack(recon),w.to_dense(),atol=1e-10,rtol=1e-10)

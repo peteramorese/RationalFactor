@@ -4,7 +4,7 @@ import torch
 from abc import abstractmethod
 from numpy.polynomial.legendre import leggauss
 
-from .parameters import Parameters, TrainableParameters, PositiveParameters, OneVectorParameters
+from .parameters import Parameters, FixedParameters, TrainableParameters, PositiveParameters, OneVectorParameters
 from .gram import BetaGram, GaussianGram
 from .structured_matrices import Banded, DenseMatrix
 
@@ -680,11 +680,14 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
 
 
 class BSpline1DBasis(Basis, NonnegativeBasis):
-    """Open-uniform B-splines on ``[0, 1]`` with ``n_cells`` equal spans.
+    """Uniform B-splines on [0, 1].
 
-    There are ``n_basis = n_cells + degree`` cardinal B-splines of degree
-    ``degree``. Each interior basis is supported on ``degree + 1`` cells, so the
-    Gram ``G_ij = ∫ N_i N_j`` is banded with half-bandwidth ``degree``.
+    ``cellwise=False``:
+        Standard open-uniform B-spline basis.
+
+    ``cellwise=True``:
+        Independent degree-p Bernstein basis on every cell.  This is the
+        exact representation used by products/shifts.
     """
 
     def __init__(
@@ -696,6 +699,7 @@ class BSpline1DBasis(Basis, NonnegativeBasis):
         *,
         dtype: torch.dtype = torch.float32,
         device: torch.device | None = None,
+        cellwise: bool = False,
     ):
         if degree < 0:
             raise ValueError("degree must be nonnegative")
@@ -704,194 +708,235 @@ class BSpline1DBasis(Basis, NonnegativeBasis):
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
 
-        n_basis = n_cells + degree
         self._degree = int(degree)
         self._n_cells = int(n_cells)
-        self._n_basis = n_basis  # needed by _cell_gram before Basis.__init__
-        self._knots = self.open_uniform_knots(n_basis, degree, dtype=dtype, device=device)
-        self._breaks = torch.linspace(0.0, 1.0, n_cells + 1, dtype=dtype, device=device)
+        self._cellwise = bool(cellwise)
+
+        if cellwise:
+            self._n_basis = n_cells * (degree + 1)
+            self._knots = self.cellwise_knots(
+                n_cells, degree, dtype=dtype, device=device
+            )
+        else:
+            self._n_basis = n_cells + degree
+            self._knots = self.open_uniform_knots(
+                self._n_basis, degree, dtype=dtype, device=device
+            )
+
+        self._breaks = torch.linspace(
+            0.0, 1.0, n_cells + 1, dtype=dtype, device=device
+        )
         self._mass = self.basis_mass(self._knots, degree)
         self._gram = self._pack_banded(self._cell_gram())
 
-        super().__init__(dim=1, batch_size=batch_size, n_basis=n_basis, params=(), coeffs=coeffs)
+        super().__init__(
+            dim=1,
+            batch_size=batch_size,
+            n_basis=self._n_basis,
+            params=(),
+            coeffs=coeffs,
+        )
 
-    # ------------------------------------------------------------------
-    # Knot / evaluation primitives (shared with BSpline1D densities)
-    # ------------------------------------------------------------------
+    @property
+    def cellwise(self) -> bool:
+        return self._cellwise
 
     @staticmethod
-    def open_uniform_knots(
-        n_basis: int,
+    def cellwise_knots(
+        n_cells: int,
         degree: int,
         *,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype,
         device: torch.device | None = None,
     ) -> torch.Tensor:
-        """Open-uniform knot vector on ``[0, 1]`` with ``n_basis`` degree-``degree`` B-splines."""
-        if degree < 0:
-            raise ValueError("degree must be nonnegative")
-        if n_basis < degree + 1:
-            raise ValueError("n_basis must be at least degree + 1")
-        n_spans = n_basis - degree
-        breaks = torch.linspace(0.0, 1.0, n_spans + 1, dtype=dtype, device=device)
-        return torch.cat(
-            [
-                torch.zeros(degree + 1, dtype=dtype, device=device),
-                breaks[1:-1],
-                torch.ones(degree + 1, dtype=dtype, device=device),
-            ]
+        """Degree-p Bernstein block independently on every cell."""
+        breaks = torch.linspace(
+            0.0, 1.0, n_cells + 1, dtype=dtype, device=device
         )
+        return breaks.repeat_interleave(degree + 1)
+
+    # ------------------------------------------------------------------
+    # Cellwise conversion
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def basis_mass(knots: torch.Tensor, degree: int) -> torch.Tensor:
-        """Exact integrals ``∫ N_{i,p}`` via ``(t_{i+p+1} - t_i) / (p + 1)``."""
-        n_basis = knots.numel() - degree - 1
-        return (knots[degree + 1 : degree + 1 + n_basis] - knots[:n_basis]) / (degree + 1.0)
-
-    @staticmethod
-    def eval_basis(
-        x: torch.Tensor,
-        knots: torch.Tensor,
+    def _bernstein_matrix(
         degree: int,
-        n_basis: int,
-    ) -> torch.Tensor:
-        """Cox–de Boor evaluation of every open-uniform B-spline at ``x``.
-
-        ``x`` has shape ``(n,)``. Returns ``(n, n_basis)``, nonnegative and
-        summing to 1 (partition of unity). Built without in-place writes so
-        gradients w.r.t. ``x`` are well-defined.
-        """
-        x = x.reshape(-1)
-        x = torch.nan_to_num(x, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        t = knots
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Interior interpolation nodes and Bernstein evaluation matrix."""
         p = degree
-        n = n_basis - 1
-
-        span = torch.searchsorted(t, x, right=True) - 1
-        span = torch.where(x >= t[n + 1], torch.full_like(span, n), span)
-        span = span.clamp(p, n)
-
-        N_curr = torch.ones(x.shape[0], 1, dtype=x.dtype, device=x.device)
-        eps = torch.finfo(x.dtype).eps
-        for j in range(1, p + 1):
-            ks = torch.arange(1, j + 1, device=x.device)
-            left = x.unsqueeze(1) - t[span.unsqueeze(1) + 1 - ks]
-            right = t[span.unsqueeze(1) + ks] - x.unsqueeze(1)
-            cols: list[torch.Tensor] = []
-            saved = torch.zeros_like(x)
-            for r in range(j):
-                den = right[:, r] + left[:, j - 1 - r]
-                tmp = torch.where(den.abs() > eps, N_curr[:, r] / den, torch.zeros_like(den))
-                cols.append(saved + right[:, r] * tmp)
-                saved = left[:, j - 1 - r] * tmp
-            cols.append(saved)
-            N_curr = torch.stack(cols, dim=1)
-
-        idx = span.unsqueeze(1) - p + torch.arange(p + 1, device=x.device)
-        idx = idx.clamp(0, n_basis - 1)
-        return x.new_zeros(x.shape[0], n_basis).scatter(1, idx, N_curr)
-
-    # ------------------------------------------------------------------
-    # Properties / evaluation
-    # ------------------------------------------------------------------
-
-    @property
-    def degree(self) -> int:
-        return self._degree
-
-    @property
-    def bandwidth(self) -> int:
-        """Half-bandwidth of the Gram matrix (equal to ``degree``)."""
-        return self._degree
-
-    @property
-    def n_cells(self) -> int:
-        return self._n_cells
-
-    @property
-    def knots(self) -> torch.Tensor:
-        return self._knots
-
-    @property
-    def breakpoints(self) -> torch.Tensor:
-        return self._breaks
-
-    @property
-    def mass(self) -> torch.Tensor:
-        return self._mass
-
-    def dtype_device(self):
-        return self._knots.dtype, self._knots.device
-
-    def eval(self, y: torch.Tensor) -> torch.Tensor:
-        """Evaluate all B-splines. ``y`` is ``(n,)`` or ``(n, 1)``; returns ``(n, n_basis)``."""
-        y = torch.as_tensor(y, dtype=self._knots.dtype, device=self._knots.device)
-        return self.eval_basis(y.reshape(-1), self._knots, self._degree, self._n_basis)
-
-    def __call__(self, y: torch.Tensor) -> torch.Tensor:
-        vals = self.eval(y)  # (n, n_basis)
-        n = vals.shape[0]
-        b = self.batch_size()
-        assert b == n or b == 1, (
-            f"y batch {n} must match parameter batch {b} (or parameter batch must be 1)"
-        )
-        return vals * self.coeffs()
-
-    def _cell_gram(self, lo: float | torch.Tensor = 0.0, hi: float | torch.Tensor = 1.0) -> torch.Tensor:
-        """Dense ``∫_{[lo,hi]} N_i N_j`` via cellwise Gauss–Legendre (exact for degree ``2p``)."""
-        p = self._degree
-        m = self._n_basis
-        dtype, device = self.dtype_device()
-        qx, qw = leggauss(p + 1)
-        qx = torch.as_tensor(qx, dtype=dtype, device=device)
-        qw = torch.as_tensor(qw, dtype=dtype, device=device)
-
-        lo_t = torch.as_tensor(lo, dtype=dtype, device=device).reshape(())
-        hi_t = torch.as_tensor(hi, dtype=dtype, device=device).reshape(())
-        left = torch.maximum(self._breaks[:-1], lo_t)
-        right = torch.minimum(self._breaks[1:], hi_t)
-        half = (0.5 * (right - left)).clamp(min=0.0)
-        mid = 0.5 * (right + left)
-        x = mid[:, None] + half[:, None] * qx[None, :]
-        N = self.eval_basis(x.reshape(-1), self._knots, p, m).reshape(self._n_cells, -1, m)
-        w = (half[:, None] * qw[None, :]).unsqueeze(-1)
-        G = torch.einsum("cqi,cqj->ij", N * w, N)
-        return 0.5 * (G + G.T)
-
-    def _pack_banded(self, G: torch.Tensor) -> Banded:
-        p, m = self._degree, self._n_basis
-        offsets = torch.arange(-p, p + 1, device=G.device)
-        data = G.new_zeros(2 * p + 1, m)
-        for r, off in enumerate(range(-p, p + 1)):
-            diag = G.diagonal(offset=-off)
-            if off >= 0:
-                data[r, : m - off] = diag
-            else:
-                data[r, -off:] = diag
-        return Banded(offsets, data)
-
-    def Omega2(
-        self,
-        other: "BSpline1DBasis",
-        lows: torch.Tensor = None,
-        highs: torch.Tensor = None,
-    ) -> Banded:
-        assert isinstance(other, BSpline1DBasis), "other must be BSpline1DBasis"
-        assert self._n_cells == other._n_cells and self._degree == other._degree, (
-            "BSpline1DBasis Omega2 requires matching n_cells and degree"
-        )
-        assert self.batch_size() == other.batch_size(), "batch sizes must match"
-
-        if lows is None and highs is None:
-            geom = self._gram
+        if p == 0:
+            u = torch.tensor([0.5], dtype=dtype, device=device)
         else:
-            lo = 0.0 if lows is None else lows
-            hi = 1.0 if highs is None else highs
-            geom = self._pack_banded(self._cell_gram(lo, hi))
+            j = torch.arange(p + 1, dtype=dtype, device=device)
+            u = 0.5 * (
+                1.0
+                - torch.cos(torch.pi * (j + 0.5) / (p + 1))
+            )
 
-        data = geom.data.unsqueeze(0).expand(self._batch_size, -1, -1)
-        return (
-            Banded(geom.offsets, data)
-            .mul_diag_left(self.coeffs())
-            .mul_diag_right(other.coeffs())
+        i = torch.arange(p + 1, dtype=dtype, device=device)
+        comb = torch.tensor(
+            [math.comb(p, k) for k in range(p + 1)],
+            dtype=dtype,
+            device=device,
         )
+
+        B = (
+            comb[None, :]
+            * u[:, None] ** i[None, :]
+            * (1.0 - u[:, None]) ** (p - i)[None, :]
+        )
+        return u, B
+
+    def _cell_coeffs(self) -> torch.Tensor:
+        """Return coefficients as ``(batch, n_cells, degree+1)``."""
+        c = self.coeffs()
+        if c.ndim == 1:
+            c = c.unsqueeze(0)
+
+        if self._cellwise:
+            return c.reshape(c.shape[0], self._n_cells, self._degree + 1)
+
+        p = self._degree
+        dtype, device = self.dtype_device()
+
+        u, E = self._bernstein_matrix(
+            p, dtype=dtype, device=device
+        )
+
+        h = 1.0 / self._n_cells
+        x = self._breaks[:-1, None] + h * u[None, :]
+
+        # (cells, p+1, n_basis)
+        B = self.eval_basis(
+            x.reshape(-1),
+            self._knots,
+            p,
+            self._n_basis,
+        ).reshape(self._n_cells, p + 1, self._n_basis)
+
+        # (batch, cells, p+1)
+        values = torch.einsum("bi,cji->bcj", c, B)
+
+        # E @ bernstein_coeffs = sampled_values
+        return torch.linalg.solve(
+            E, values.transpose(-1, -2)
+        ).transpose(-1, -2)
+
+    @classmethod
+    def _from_cells(
+        cls,
+        coeffs: torch.Tensor,
+        n_cells: int,
+        degree: int,
+    ) -> "BSpline1DBasis":
+        """Construct an exact cellwise basis from (..., cells, degree+1)."""
+        coeffs = coeffs.flatten(-2)
+        return cls(
+            n_cells=n_cells,
+            degree=degree,
+            batch_size=coeffs.shape[0],
+            coeffs=FixedParameters(coeffs),
+            dtype=coeffs.dtype,
+            device=coeffs.device,
+            cellwise=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Integer-cell shift
+    # ------------------------------------------------------------------
+
+    def shift_cells(self, shift: int) -> "BSpline1DBasis":
+        """Return ``g(x) = f(x + shift / n_cells)``.
+
+        Values shifted outside [0,1] are exactly zero.
+        """
+        shift = int(shift)
+        c = self._cell_coeffs()
+        n = self._n_cells
+
+        if abs(shift) >= n:
+            out = torch.zeros_like(c)
+
+        elif shift > 0:
+            z = c.new_zeros(c.shape[0], shift, c.shape[-1])
+            out = torch.cat((c[:, shift:], z), dim=1)
+
+        elif shift < 0:
+            s = -shift
+            z = c.new_zeros(c.shape[0], s, c.shape[-1])
+            out = torch.cat((z, c[:, : n - s]), dim=1)
+
+        else:
+            out = c
+
+        return self._from_cells(out, n, self._degree)
+
+    # ------------------------------------------------------------------
+    # Exact product
+    # ------------------------------------------------------------------
+
+    def product(self, other: "BSpline1DBasis") -> "BSpline1DBasis":
+        """Exact pointwise product using FFT Bernstein convolution."""
+        if not isinstance(other, BSpline1DBasis):
+            raise TypeError("other must be BSpline1DBasis")
+        if self._n_cells != other._n_cells:
+            raise ValueError("product requires matching n_cells")
+
+        a = self._cell_coeffs()
+        b = other._cell_coeffs()
+
+        ba, bb = a.shape[0], b.shape[0]
+        if ba != bb and ba != 1 and bb != 1:
+            raise ValueError(
+                f"incompatible batch sizes {ba} and {bb}"
+            )
+
+        p, q = self._degree, other._degree
+        r = p + q
+
+        dtype, device = a.dtype, a.device
+
+        cp = torch.tensor(
+            [math.comb(p, i) for i in range(p + 1)],
+            dtype=dtype,
+            device=device,
+        )
+        cq = torch.tensor(
+            [math.comb(q, i) for i in range(q + 1)],
+            dtype=dtype,
+            device=device,
+        )
+        cr = torch.tensor(
+            [math.comb(r, i) for i in range(r + 1)],
+            dtype=dtype,
+            device=device,
+        )
+
+        # Bernstein multiplication reduces to ordinary convolution after
+        # weighting by binomial coefficients.
+        a = a * cp
+        b = b * cq
+
+        n_out = r + 1
+        n_fft = 1 << (n_out - 1).bit_length()
+
+        work_dtype = (
+            torch.float32
+            if dtype in (torch.float16, torch.bfloat16)
+            else dtype
+        )
+
+        A = torch.fft.rfft(a.to(work_dtype), n=n_fft, dim=-1)
+        B = torch.fft.rfft(b.to(work_dtype), n=n_fft, dim=-1)
+
+        out = torch.fft.irfft(
+            A * B, n=n_fft, dim=-1
+        )[..., :n_out]
+
+        out = (out / cr.to(work_dtype)).to(dtype)
+
+        return self._from_cells(out, self._n_cells, r)

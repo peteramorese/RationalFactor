@@ -35,7 +35,7 @@ class FixedParameters(Parameters):
         return self._p.size()
 
     def is_trainable(self):
-        return False
+        return self._p.requires_grad
 
     def dtype_device(self):
         return self._p.dtype, self._p.device
