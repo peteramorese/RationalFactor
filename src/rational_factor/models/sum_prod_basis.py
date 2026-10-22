@@ -51,12 +51,16 @@ class SumProdBasis(SeparableBasis):
         mixed_dim = torch.einsum("bdl,bdil->bdi", leaf_dim, M)
         return mixed_dim.prod(dim=1) * self.coeffs()
 
-    def log_Omega1_dim(self, lows : torch.Tensor = None, highs : torch.Tensor = None):
-        leaf_Omega1_dim = torch.exp(self.leaf_basis.log_Omega1_dim(lows, highs))  # (batch, dim, n_leaf)
+    def Omega1_dim(self, lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False):
+        # Mixed values can be signed, so combine in linear space and only
+        # take a log if the caller explicitly requests it.
+        leaf_Omega1_dim = self.leaf_basis.Omega1_dim(lows, highs, return_log=False)  # (batch, dim, n_leaf)
         # Per (batch, dim): matrix_coeffs[b,d] @ leaf_Omega1[b,d]
-        return torch.log(torch.einsum("bdij,bdj->bdi", self.matrix_coeffs(), leaf_Omega1_dim))
+        out = torch.einsum("bdij,bdj->bdi", self.matrix_coeffs(), leaf_Omega1_dim)
+        return torch.log(out) if return_log else out
 
-    def log_Omega2_dim(self, other : "SumProdBasis", lows : torch.Tensor = None, highs : torch.Tensor = None):
-        leaf_Omega2_dim = torch.exp(self.leaf_basis.log_Omega2_dim(other.leaf_basis, lows, highs))  # (batch, dim, n_leaf, n_leaf)
+    def Omega2_dim(self, other : "SumProdBasis", lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False):
+        leaf_Omega2_dim = self.leaf_basis.Omega2_dim(other.leaf_basis, lows, highs, return_log=False)  # (batch, dim, n_leaf, n_leaf)
         # Per (batch, dim): A @ Omega @ B^T
-        return torch.log(torch.einsum("bdij,bdjk,bdlk->bdil", self.matrix_coeffs(), leaf_Omega2_dim, other.matrix_coeffs()))
+        out = torch.einsum("bdij,bdjk,bdlk->bdil", self.matrix_coeffs(), leaf_Omega2_dim, other.matrix_coeffs())
+        return torch.log(out) if return_log else out

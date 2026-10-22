@@ -1,4 +1,6 @@
 import torch
+from rational_factor.models.tt.tt import MPO
+from rational_factor.models.big_polynomial import ConditionalBigLegendre
 from .density_model import DensityModel, ConditionalDensityModel
 from .factor_forms import LinearRFF, QuadraticRFF
 #### General ####
@@ -104,3 +106,93 @@ def dtf_data_concentration_loss(dtf, x : torch.Tensor, concentration_point : tor
     distance_from_center = torch.abs(x_transformed - concentration_point.unsqueeze(0))
     outside_distance = torch.relu(distance_from_center - radius)
     return outside_distance.mean()
+
+#### Conditional Big Legendre Polynomial ####
+
+from functools import lru_cache
+from rational_factor.models.basis_functions import legendre_to_bernstein
+
+
+@lru_cache(maxsize=32)
+def _legendre_to_bernstein_tensor(degree: int, dtype: torch.dtype, device: torch.device):
+    return legendre_to_bernstein(degree, dtype=dtype, device=device).to_dense()
+
+
+def cbl_bernstein_mpo(model: ConditionalBigLegendre) -> MPO:
+    """MPO of Bernstein coefficients A=C M C.T, with unchanged bond ranks.
+
+    A[i, j] multiplies b_i(y) b_j(x). Its nonnegative entries suffice for
+    nonnegativity of the conditional polynomial on the unit box.
+    """
+    if not isinstance(model, ConditionalBigLegendre):
+        raise TypeError('model must be ConditionalBigLegendre')
+    M = model.matrix_params()
+    cores = []
+    for G in M.cores:
+        C = _legendre_to_bernstein_tensor(G.shape[1] - 1, M.dtype, M.device)
+        cores.append(torch.einsum('pi,aijb,qj->apqb', C, G, C))
+    return MPO(cores)
+
+
+def cbl_positivity_loss(
+    model: ConditionalBigLegendre, *, method: str = 'cores',
+    n_samples: int = 1024, row_indices: torch.Tensor | None = None,
+    col_indices: torch.Tensor | None = None, reduction: str = 'mean',
+) -> torch.Tensor:
+    """Squared-negative Bernstein penalty for a ConditionalBigLegendre model.
+
+    ``method='cores'`` penalizes negative entries of the transformed MPO cores.
+    Zero loss *certifies* nonnegative Bernstein coefficients, but is conservative
+    and MPO-gauge dependent.
+
+    ``method='coefficients'`` penalizes actual Bernstein coefficients sampled
+    at pairs of tensor-product indices. It is gauge independent, but zero
+    sampled loss does not certify the remaining coefficients. Specify matching
+    ``row_indices``/``col_indices`` of shape (n_samples, dim) for deterministic
+    tests or targeted coefficient checks; otherwise indices are uniform random.
+
+    Neither criterion is necessary for polynomial nonnegativity. ``reduction``
+    is 'mean' or 'sum'. Gradients propagate to all matrix parameters.
+    """
+    if method not in ('cores', 'coefficients'):
+        raise ValueError("method must be 'cores' or 'coefficients'")
+    if reduction not in ('mean', 'sum'):
+        raise ValueError("reduction must be 'mean' or 'sum'")
+    A = cbl_bernstein_mpo(model)
+    if method == 'cores':
+        if row_indices is not None or col_indices is not None:
+            raise ValueError('indices are only supported for method=\'coefficients\'')
+        penalties = [torch.relu(-G).square() for G in A.cores]
+        terms = [p.mean() if reduction == 'mean' else p.sum() for p in penalties]
+        return torch.stack(terms).mean() if reduction == 'mean' else torch.stack(terms).sum()
+
+    if (row_indices is None) != (col_indices is None):
+        raise ValueError('row_indices and col_indices must be supplied together')
+    if row_indices is None:
+        if not isinstance(n_samples, int) or n_samples < 1:
+            raise ValueError('n_samples must be a positive integer')
+        row_indices = torch.stack([
+            torch.randint(n, (n_samples,), device=A.device) for n in A.row_modes
+        ], dim=1)
+        col_indices = torch.stack([
+            torch.randint(n, (n_samples,), device=A.device) for n in A.col_modes
+        ], dim=1)
+    else:
+        row_indices = torch.as_tensor(row_indices, device=A.device)
+        col_indices = torch.as_tensor(col_indices, device=A.device)
+        if (row_indices.ndim != 2 or row_indices.shape != col_indices.shape
+                or row_indices.shape[1] != len(A.cores) or row_indices.shape[0] == 0
+                or row_indices.dtype not in (torch.int32, torch.int64)
+                or col_indices.dtype not in (torch.int32, torch.int64)):
+            raise ValueError('indices must be matching nonempty integer tensors (samples, dim)')
+        for k, (m, n) in enumerate(zip(A.row_modes, A.col_modes)):
+            if ((row_indices[:, k] < 0) | (row_indices[:, k] >= m)
+                    | (col_indices[:, k] < 0) | (col_indices[:, k] >= n)).any():
+                raise ValueError(f'coefficient indices out of range at site {k}')
+
+    state = A.cores[0].new_ones(row_indices.shape[0], 1)
+    for k, G in enumerate(A.cores):
+        selected = G[:, row_indices[:, k].long(), col_indices[:, k].long(), :]
+        state = torch.einsum('sa,asb->sb', state, selected)
+    penalty = torch.relu(-state[:, 0]).square()
+    return penalty.mean() if reduction == 'mean' else penalty.sum()

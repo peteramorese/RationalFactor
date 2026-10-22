@@ -1,0 +1,456 @@
+"""Parameterized TT vectors and MPOs, including exactly invertible MPO layers.
+
+These lightweight wrappers follow ``Parameters``: ``p()`` constructs a fresh
+TT/MPO connected to the current leaf tensors' PyTorch autograd graphs. Parameter
+ownership and optimizer registration remain in the supplied Parameters objects.
+"""
+
+from collections.abc import Sequence
+import math
+import torch
+
+from rational_factor.models.parameters import (
+    Parameters, FixedParameters, TrainableParameters, PositiveParameters,
+)
+from rational_factor.models.tt import (
+    TTVector, MPO, NilpotentMPO, GateLayerMPO, InvertibleMPO,
+    InvertibleMPOProduct,
+)
+
+
+def _bond_ranks(d: int, ranks: int | Sequence[int]) -> tuple[int, ...]:
+    if d < 1:
+        raise ValueError('at least one site is required')
+    if isinstance(ranks, int):
+        result = (1,) + (ranks,) * (d - 1) + (1,)
+    else:
+        r = tuple(int(x) for x in ranks)
+        if len(r) == d - 1:
+            result = (1,) + r + (1,)
+        elif len(r) == d + 1:
+            result = r
+        else:
+            raise ValueError(f'ranks must have {d-1} or {d+1} entries')
+    if result[0] != 1 or result[-1] != 1 or any(x < 1 for x in result):
+        raise ValueError(f'invalid TT boundary/interior ranks: {result}')
+    return result
+
+
+def _random_core(cls, shape, *, trainable, mean, std, epsilon, dtype, device):
+    if not issubclass(cls, TrainableParameters):
+        raise TypeError('param_cls must derive from TrainableParameters')
+    kw = dict(trainable=trainable, mean=mean, std=std)
+    if issubclass(cls, PositiveParameters):
+        kw['epsilon'] = epsilon
+    # PositiveParameters.random_init(trainable=False) samples signed values,
+    # which violates its fixed-value constructor's nonnegativity assertion.
+    if issubclass(cls, PositiveParameters) and not trainable:
+        values = torch.nn.functional.softplus(torch.randn(shape) * std + mean) + epsilon
+        p = cls.from_values(values, trainable=False, epsilon=epsilon)
+    else:
+        p = cls.random_init(shape, **kw)
+    if isinstance(p, torch.nn.Module):
+        p.to(dtype=dtype, device=device)
+    return p
+
+
+def _modules(*providers):
+    seen, result = set(), []
+    for p in providers:
+        if isinstance(p, Parameters):
+            for module in p.parameter_modules():
+                if id(module) not in seen:
+                    seen.add(id(module))
+                    result.append(module)
+    return result
+
+
+class TTVectorParameters(Parameters):
+    """Each core provider returns ``(r_left, n, r_right)`` (or batched)."""
+
+    def __init__(self, cores: Sequence[Parameters]):
+        self._cores = tuple(cores)
+        if not self._cores:
+            raise ValueError('at least one TT vector core is required')
+        self()  # Validate complete core layout.
+
+    @classmethod
+    def from_cores(cls, cores: Sequence[Parameters]):
+        return cls(cores)
+
+    @classmethod
+    def from_core_spec(cls, modes: Sequence[int], ranks: int | Sequence[int] = 1, *,
+                       param_cls: type[TrainableParameters] = TrainableParameters,
+                       trainable=True, mean=0., std=1., epsilon=0.,
+                       dtype=torch.float32, device=None):
+        modes = tuple(int(n) for n in modes)
+        if not modes or any(n < 1 for n in modes):
+            raise ValueError('modes must be nonempty positive integers')
+        r = _bond_ranks(len(modes), ranks)
+        return cls([_random_core(param_cls, (r[i], n, r[i+1]), trainable=trainable,
+                                 mean=mean, std=std, epsilon=epsilon, dtype=dtype,
+                                 device=device) for i, n in enumerate(modes)])
+
+    @property
+    def cores(self):
+        return self._cores
+
+    @property
+    def modes(self):
+        return tuple(int(p.size()[-2]) for p in self._cores)
+
+    @property
+    def ranks(self):
+        return (1,) + tuple(int(p.size()[-1]) for p in self._cores)
+
+    @property
+    def n(self):
+        return math.prod(self.modes)
+
+    def __call__(self) -> TTVector:
+        return TTVector.from_cores([p() for p in self._cores])
+
+    def is_trainable(self):
+        return any(p.is_trainable() for p in self._cores)
+
+    def parameter_modules(self):
+        return _modules(*self._cores)
+
+    def is_module(self):
+        return False
+
+
+class MPOParameters(Parameters):
+    """Each core provider returns ``(r_left, n_row, n_col, r_right)``."""
+
+    def __init__(self, cores: Sequence[Parameters]):
+        self._cores = tuple(cores)
+        if not self._cores:
+            raise ValueError('at least one MPO core is required')
+        self()  # Validate complete core layout.
+
+    @classmethod
+    def from_cores(cls, cores: Sequence[Parameters]):
+        return cls(cores)
+
+    @classmethod
+    def from_core_spec(cls, row_modes: Sequence[int], ranks: int | Sequence[int] = 1,
+                       col_modes: Sequence[int] | None = None, *,
+                       param_cls: type[TrainableParameters] = TrainableParameters,
+                       trainable=True, mean=0., std=1., epsilon=0.,
+                       dtype=torch.float32, device=None):
+        rows = tuple(int(x) for x in row_modes)
+        cols = rows if col_modes is None else tuple(int(x) for x in col_modes)
+        if not rows or len(rows) != len(cols) or any(x < 1 for x in rows + cols):
+            raise ValueError('row_modes and col_modes must have matching, nonempty positive sizes')
+        r = _bond_ranks(len(rows), ranks)
+        return cls([_random_core(param_cls, (r[i], m, n, r[i+1]),
+                                 trainable=trainable, mean=mean, std=std,
+                                 epsilon=epsilon, dtype=dtype, device=device)
+                    for i, (m, n) in enumerate(zip(rows, cols))])
+
+    @property
+    def cores(self):
+        return self._cores
+
+    @property
+    def row_modes(self):
+        return tuple(int(p.size()[-3]) for p in self._cores)
+
+    @property
+    def col_modes(self):
+        return tuple(int(p.size()[-2]) for p in self._cores)
+
+    @property
+    def ranks(self):
+        return (1,) + tuple(int(p.size()[-1]) for p in self._cores)
+
+    def __call__(self) -> MPO:
+        return MPO.from_cores([p() for p in self._cores])
+
+    def is_trainable(self):
+        return any(p.is_trainable() for p in self._cores)
+
+    def parameter_modules(self):
+        return _modules(*self._cores)
+
+    def is_module(self):
+        return False
+
+
+class ConstantModeRank1MPOParameters(Parameters):
+    """Rank-one MPO S with e_0.T @ S == e_0.T, without positivity constraints.
+
+    Each Parameters object supplies the free lower (n_k-1) rows of a local
+    n_k x n_k matrix; the first row [1, 0, ..., 0] is inserted exactly.
+    The resulting S is their Kronecker product, with MPO ranks all equal to 1.
+    """
+
+    def __init__(self, lower_rows: Sequence[Parameters]):
+        self._lower_rows = tuple(lower_rows)
+        if not self._lower_rows:
+            raise ValueError('at least one local matrix is required')
+        for p in self._lower_rows:
+            if not isinstance(p, Parameters):
+                raise TypeError('each local block must be a Parameters object')
+            shape = tuple(p().shape)
+            if len(shape) != 2 or shape[1] != shape[0] + 1:
+                raise ValueError(f'expected local free rows of shape (n-1, n), got {shape}')
+
+    @classmethod
+    def from_cores(cls, lower_rows: Sequence[Parameters]):
+        return cls(lower_rows)
+
+    @classmethod
+    def from_core_spec(cls, row_modes: Sequence[int], ranks: int | Sequence[int] = 1,
+                       col_modes: Sequence[int] | None = None, *,
+                       param_cls: type[TrainableParameters] = TrainableParameters,
+                       trainable=True, mean=0., std=0.1, epsilon=0.,
+                       dtype=torch.float32, device=None):
+        modes = tuple(int(n) for n in row_modes)
+        if not modes or any(n < 1 for n in modes):
+            raise ValueError('row_modes must be nonempty positive integers')
+        if col_modes is not None and tuple(col_modes) != modes:
+            raise ValueError('local matrices must be square (col_modes == row_modes)')
+        if any(r != 1 for r in _bond_ranks(len(modes), ranks)):
+            raise ValueError('ConstantModeRank1MPOParameters requires ranks=1')
+        return cls([FixedParameters(torch.empty((0, 1), dtype=dtype, device=device))
+                   if n == 1 else _random_core(param_cls, (n - 1, n), trainable=trainable,
+                   mean=mean, std=std, epsilon=epsilon, dtype=dtype, device=device)
+                   for n in modes])
+
+    @property
+    def lower_rows(self):
+        return self._lower_rows
+
+    @property
+    def cores(self):
+        """Free lower-row parameter providers (not full four-axis MPO cores)."""
+        return self._lower_rows
+
+    @property
+    def row_modes(self):
+        return tuple(int(p.size()[1]) for p in self._lower_rows)
+
+    @property
+    def col_modes(self):
+        return self.row_modes
+
+    @property
+    def ranks(self):
+        return (1,) * (len(self._lower_rows) + 1)
+
+    def __call__(self) -> MPO:
+        cores = []
+        for p in self._lower_rows:
+            lower = p()
+            n = lower.shape[1]
+            top = torch.cat((lower.new_ones(1, 1), lower.new_zeros(1, n - 1)), dim=1)
+            cores.append(torch.cat((top, lower), dim=0)[None, :, :, None])
+        return MPO(cores)
+
+    def is_trainable(self):
+        return any(p.is_trainable() for p in self._lower_rows)
+
+    def parameter_modules(self):
+        return _modules(*self._lower_rows)
+
+    def is_module(self):
+        return False
+
+
+class NilpotentMPOParameters(Parameters):
+    """Generate ``I + strength * |output><input|_control ⊗ B`` with exact inverse.
+
+    ``block`` is an MPOParameters (or another Parameters returning a square MPO)
+    on all sites except ``control_site``. No normalization constraint on B.
+    """
+
+    def __init__(self, modes: Sequence[int], block: Parameters | None, *,
+                 control_site=0, input_mode=0, output_mode=1,
+                 strength: Parameters | torch.Tensor | float = 1.,
+                 dtype=torch.float32, device=None):
+        self.modes = tuple(int(n) for n in modes)
+        self.block = block
+        self.control_site = int(control_site)
+        self.input_mode, self.output_mode = int(input_mode), int(output_mode)
+        self.strength = strength
+        self.dtype, self.device = dtype, device
+        if not self.modes or not 0 <= self.control_site < len(self.modes):
+            raise ValueError('invalid modes/control_site')
+        if self.modes[self.control_site] < 2 or not (0 <= self.input_mode < self.modes[self.control_site]
+                 and 0 <= self.output_mode < self.modes[self.control_site]
+                 and self.input_mode != self.output_mode):
+            raise ValueError('input and output must be distinct valid control modes')
+        if (block is None) != (len(self.modes) == 1):
+            raise ValueError('block must be supplied exactly when there are other sites')
+        if block is not None and (not isinstance(block, Parameters) or
+                                  not isinstance(block(), MPO)):
+            raise TypeError('block must be a Parameters object returning an MPO')
+        other = self.modes[:self.control_site] + self.modes[self.control_site+1:]
+        if block is not None and (block().row_modes != other or block().col_modes != other):
+            raise ValueError(f'block must have square MPO modes {other}')
+
+    @classmethod
+    def from_core_spec(cls, modes: Sequence[int], ranks: int | Sequence[int] = 1, *,
+                       control_site=0, input_mode=0, output_mode=1, strength=1.,
+                       param_cls: type[TrainableParameters] = TrainableParameters,
+                       trainable=True, mean=0., std=0.1, epsilon=0.,
+                       dtype=torch.float32, device=None):
+        modes = tuple(int(x) for x in modes)
+        if not modes or not 0 <= control_site < len(modes):
+            raise ValueError('invalid modes/control_site')
+        other = modes[:control_site] + modes[control_site+1:]
+        B = MPOParameters.from_core_spec(other, ranks, param_cls=param_cls,
+                    trainable=trainable, mean=mean, std=std, epsilon=epsilon,
+                    dtype=dtype, device=device) if other else None
+        return cls(modes, B, control_site=control_site, input_mode=input_mode,
+                   output_mode=output_mode, strength=strength, dtype=dtype, device=device)
+
+    def __call__(self) -> NilpotentMPO:
+        return NilpotentMPO(self.modes, None if self.block is None else self.block(),
+                             control_site=self.control_site, input_mode=self.input_mode,
+                             output_mode=self.output_mode,
+                             strength=self.strength() if isinstance(self.strength, Parameters)
+                             else self.strength, dtype=self.dtype, device=self.device)
+
+    def is_trainable(self):
+        return ((self.block is not None and self.block.is_trainable()) or
+                (isinstance(self.strength, Parameters) and self.strength.is_trainable()))
+
+    def parameter_modules(self):
+        return _modules(self.block, self.strength)
+
+    def is_module(self):
+        return False
+
+
+class ConstantModeNilpotentMPOParameters(NilpotentMPOParameters):
+    """Preserve ``e0.T @ V == e0.T`` by restricting the control output mode."""
+
+    def __init__(self, *args, output_mode=1, **kwargs):
+        if output_mode == 0:
+            raise ValueError('output_mode=0 does not preserve the constant left mode')
+        super().__init__(*args, output_mode=output_mode, **kwargs)
+
+
+class GateLayerMPOParameters(Parameters):
+    """Parameterize invertible, disjoint, contiguous k-site gates.
+
+    Each ``(sites, raw_parameters)`` provides a square (prod local modes)^2
+    tensor. Default ``parameterization='expm'`` makes each gate ``exp(raw)``,
+    guaranteeing invertibility. ``'direct'`` treats raw as a known-invertible
+    gate and can lose invertibility during unconstrained optimization.
+    """
+
+    def __init__(self, modes: Sequence[int], gates: Sequence[tuple[Sequence[int], Parameters]],
+                 *, parameterization='expm', dtype=torch.float32, device=None):
+        self.modes = tuple(int(n) for n in modes)
+        self.gates = tuple((tuple(int(i) for i in sites), p) for sites, p in gates)
+        self.parameterization, self.dtype, self.device = parameterization, dtype, device
+        if parameterization not in ('expm', 'direct'):
+            raise ValueError('parameterization must be expm or direct')
+        used = set()
+        if not self.modes or any(n < 1 for n in self.modes):
+            raise ValueError('modes must be nonempty positive integers')
+        for sites, p in self.gates:
+            if (not sites or sites != tuple(range(sites[0], sites[0] + len(sites)))
+                    or sites[0] < 0 or sites[-1] >= len(self.modes)
+                    or not used.isdisjoint(sites)):
+                raise ValueError('gate sites must be contiguous, disjoint and in range')
+            used.update(sites)
+            m = math.prod(self.modes[i] for i in sites)
+            if not isinstance(p, Parameters) or tuple(p().shape) != (m, m):
+                raise ValueError(f'gate parameter on {sites} must have shape ({m}, {m})')
+
+    @classmethod
+    def from_gate_spec(cls, modes: Sequence[int], groups: Sequence[Sequence[int]], *,
+                       param_cls: type[TrainableParameters] = TrainableParameters,
+                       trainable=True, mean=0., std=0.1, epsilon=0.,
+                       dtype=torch.float32, device=None, **kwargs):
+        modes = tuple(int(x) for x in modes)
+        gates = []
+        for group in groups:
+            group = tuple(int(i) for i in group)
+            if not group or min(group) < 0 or max(group) >= len(modes):
+                raise ValueError('invalid gate group')
+            size = math.prod(modes[i] for i in group)
+            gates.append((group, _random_core(param_cls, (size, size), trainable=trainable,
+                mean=mean, std=std, epsilon=epsilon, dtype=dtype, device=device)))
+        return cls(modes, gates, dtype=dtype, device=device, **kwargs)
+
+    @classmethod
+    def from_gates(cls, modes: Sequence[int], gates, **kwargs):
+        return cls(modes, gates, **kwargs)
+
+    def _gate_matrix(self, raw: torch.Tensor) -> torch.Tensor:
+        return torch.matrix_exp(raw) if self.parameterization == 'expm' else raw
+
+    def __call__(self) -> GateLayerMPO:
+        gates = [(sites, self._gate_matrix(p())) for sites, p in self.gates]
+        return GateLayerMPO(self.modes, gates, dtype=self.dtype, device=self.device)
+
+    def is_trainable(self):
+        return any(p.is_trainable() for _, p in self.gates)
+
+    def parameter_modules(self):
+        return _modules(*(p for _, p in self.gates))
+
+    def is_module(self):
+        return False
+
+
+class ConstantModeGateLayerMPOParameters(GateLayerMPOParameters):
+    """Invertible gates with first row e_0^T, preserving orthonormal-basis mass.
+
+    Raw gate tensors are converted to ``[[1,0],[b, exp(H)]]``.
+    """
+
+    def _gate_matrix(self, raw: torch.Tensor) -> torch.Tensor:
+        size = raw.shape[-1]
+        if size == 1:
+            return torch.ones_like(raw)
+        bottom = torch.cat((raw[1:, :1], torch.matrix_exp(raw[1:, 1:])), dim=1)
+        top = torch.cat((torch.ones_like(raw[:1, :1]), torch.zeros_like(raw[:1, 1:])), dim=1)
+        return torch.cat((top, bottom), dim=0)
+
+
+class InvertibleMPOProductParameters(Parameters):
+    """Keep invertible MPO parameter providers in right-to-left application order."""
+
+    def __init__(self, layers: Sequence[Parameters]):
+        self.layers = tuple(layers)
+        if not self.layers or not all(isinstance(p, Parameters) for p in self.layers):
+            raise ValueError('layers must be a nonempty sequence of Parameters')
+
+    def __call__(self) -> InvertibleMPOProduct:
+        return compose_invertible_mpo_parameters(*self.layers)
+
+    def is_trainable(self):
+        return any(p.is_trainable() for p in self.layers)
+
+    def parameter_modules(self):
+        return _modules(*self.layers)
+
+    def is_module(self):
+        return False
+
+
+
+
+def compose_invertible_mpo_parameters(*layers: Parameters) -> InvertibleMPOProduct:
+    """Materialize ``L_last @ ... @ L_first`` with a structured exact inverse.
+
+    Accepts either positional layer providers or one sequence of providers.
+    Calling again rebuilds all MPOs and autograd graphs from current values.
+    """
+    if len(layers) == 1 and isinstance(layers[0], (list, tuple)):
+        layers = tuple(layers[0])
+    factors = [layer() for layer in layers]
+    if not factors or any(not isinstance(f, InvertibleMPO) for f in factors):
+        raise TypeError('layers must produce a nonempty sequence of InvertibleMPO objects')
+    return InvertibleMPOProduct(factors)
+
+
+# Friendly names for the layer-based parameter API.
+InvertibleMPOCircuitParameters = InvertibleMPOProductParameters

@@ -1010,10 +1010,11 @@ class TTMutualBasis(torch.nn.Module, MutualPairBasis):
         #   (batch, d, n_phi, n_psi)
         # --------------------------------------------------------------
 
-        log_H = self.phi_primitive.log_Omega2_dim(
+        log_H = self.phi_primitive.Omega2_dim(
             self.psi_primitive,
             lows=lows,
             highs=highs,
+            return_log=True,
         )
 
         expected_tail = (

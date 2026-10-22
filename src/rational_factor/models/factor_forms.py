@@ -21,29 +21,6 @@ def _is_row_stochastic_matrix_parameters_like(obj) -> bool:
     return _is_parameters_like(obj) and type(obj).__name__.startswith("RowStochastic")
 
 
-def _outer_rank_one_factors(v) -> tuple:
-    """Physical factors of an outer-rank-one NestedTTVector."""
-    known = getattr(v, "rank_one_factors", None)
-    if known is not None:
-        return known
-    ranks = getattr(v, "ranks", None)
-    if ranks is None or any(int(r) != 1 for r in ranks):
-        raise ValueError(
-            f"expected outer rank-one NestedTTVector, got ranks={ranks}"
-        )
-    factors = []
-    for core, n in zip(v.materialize_cores(), v.modes):
-        if core.ndim == 3:
-            factors.append(core.reshape(int(n)))
-        elif core.ndim == 4:
-            factors.append(core.reshape(int(core.shape[0]), int(n)))
-        else:
-            raise ValueError(
-                f"unexpected materialized core shape {tuple(core.shape)} for mode {n}"
-            )
-    return tuple(factors)
-
-
 # Linear models #
 
 class LinearForm(DensityModel):
@@ -240,22 +217,6 @@ class SumProdRFF(ConditionalDensityModel):
         B = self.B()
         Omega2 = as_matrix(self.phi.Omega2(self.psi))
         q = as_vector(Omega2.rev_matvec(a), numerical_tolerance=tol)
-
-        if type(a).__name__ == "NestedTTVector":
-            # NestedTT only supports Hadamard products against rank-one factors.
-            a_factors = _outer_rank_one_factors(a)
-            q_factors = _outer_rank_one_factors(q)
-            log_g_x = torch.log(phi_x.elementwise_multiply(a_factors).sum() + tol)
-            log_g_xp = torch.log(phi_xp.elementwise_multiply(a_factors).sum() + tol)
-            psi_over_q = psi_xp.elementwise_divide(q_factors, eps=tol)
-            Q_psi_xp = B.matvec(psi_over_q).elementwise_multiply(a_factors)
-            phi_factors = getattr(phi_x, "rank_one_factors", None)
-            if phi_factors is None:
-                raise TypeError(
-                    "NestedTT phi(x) must expose rank_one_factors for SumProdRFF"
-                )
-            log_f = torch.log(Q_psi_xp.elementwise_multiply(phi_factors).sum() + tol)
-            return log_g_xp + log_f - log_g_x
 
         log_g_x = torch.log((a * phi_x).sum() + tol)
         log_g_xp = torch.log((a * phi_xp).sum() + tol)
@@ -541,31 +502,11 @@ class LinearFF(DensityModel):
         assert isinstance(rff, LinearRFF) or isinstance(rff, SumProdRFF), "rff must be a LinearRFF or SumProdRFF"
         return cls(rff.g_basis(), h, numerical_tolerance=rff.numerical_tolerance, renormalize_h=renormalize_h, register_modules=register_modules)
 
-    #TODO
-    #@classmethod
-    #def from_r2ff(cls, r2ff : LinearR2FF | LinearRFandR2FF, psi0_basis : SeparableBasis):
-
     def log_norm_constant(self, Omega2 : torch.Tensor = None):
         if not self._renormalize_h:
             return 0.0
         if Omega2 is None:
             g, h = self.g, self.h
-            # NestedTT coefficient-weighted Z = a^T Omega c via structured matvecs.
-            # TTBasis.Omega2 only builds the coefficient-free primitive Gram.
-            if (
-                type(g).__name__ == "TTBasis"
-                and type(h).__name__ == "TTBasis"
-                and type(g.coeffs()).__name__ == "NestedTTVector"
-                and type(h.coeffs()).__name__ == "NestedTTVector"
-            ):
-                g0 = copy.copy(g)
-                h0 = copy.copy(h)
-                g0.set_coeffs_to_one()
-                h0.set_coeffs_to_one()
-                Omega = g0.Omega2(h0)
-                a_factors = _outer_rank_one_factors(g.coeffs())
-                Z = Omega.matvec(h.coeffs()).elementwise_multiply(a_factors).sum()
-                return -torch.log(Z + self.numerical_tolerance)
             Omega2 = g.Omega2(h)
         return -torch.log(as_matrix(Omega2).sum() + self.numerical_tolerance)
         

@@ -1,977 +1,724 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-from .density_model import DensityModel, ConditionalDensityModel
-from .basis_functions import GaussianBasis, Parameters, PositiveParameters
-from .factor_forms import LinearForm
+"""Configurable training for torch models with multiple datasets and optimizers.
+
+A training epoch consists of ``n_iterations`` full passes through the training
+loaders for each optimizer, in registration order. Multiple training loaders
+are zipped (the shortest determines the number of gradient steps). Validation
+loaders are evaluated separately, once per outer epoch, without gradients.
+"""
+
+from __future__ import annotations
+
+import math
 import time
+from collections.abc import Callable, Iterable
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from sklearn.mixture import GaussianMixture
+from pathlib import Path
+from collections.abc import Mapping
+import sys
 
-def _is_bad_epoch_loss(loss_value: float, threshold: float) -> bool:
-    return torch.isnan(torch.tensor(loss_value)).item() or loss_value > threshold
+import torch
 
-def _batch_to_device(batch, dev):
-    if isinstance(batch, list):
-        return [b.to(dev) for b in batch]
-    if isinstance(batch, tuple):
-        return tuple(b.to(dev) for b in batch)
-    return batch.to(dev)
-
-
-def _clip_grad_norm(model: torch.nn.Module, max_norm: float) -> None:
-    """Clip gradients for trainable leaf parameters only (avoids frozen/non-leaf warnings)."""
-    params = [p for p in model.parameters() if p.requires_grad and p.is_leaf]
-    if params:
-        torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
-
-@torch.no_grad()
-def _evaluate_labeled_losses(
-    model: DensityModel | ConditionalDensityModel,
-    data_loader: DataLoader,
-    labeled_loss_fns: dict[str, callable],
-) -> dict[str, float]:
-    sums = {label: 0.0 for label in labeled_loss_fns.keys()}
-    n_batches = 0
-    dev = next(model.parameters()).device
-    for batch in data_loader:
-        batch = _batch_to_device(batch, dev)
-        for label, loss_fn in labeled_loss_fns.items():
-            sums[label] += loss_fn(model, *batch).item()
-        n_batches += 1
-
-    if n_batches == 0:
-        raise RuntimeError("validation_data_loader is empty.")
-
-    return {label: loss_sum / n_batches for label, loss_sum in sums.items()}
-
-@torch.no_grad()
-def _evaluate_multiset_labeled_losses(
-    model: DensityModel | ConditionalDensityModel,
-    data_loaders: list[DataLoader],
-    labeled_loss_fns_list: list[dict[str, callable]],
-) -> dict[str, float]:
-    """Average labeled losses over zipped batches (one batch tuple per loader)."""
-    flat_labels: list[str] = []
-    for labeled_loss_fns in labeled_loss_fns_list:
-        flat_labels.extend(labeled_loss_fns.keys())
-    sums = {label: 0.0 for label in flat_labels}
-    n_batches = 0
-    dev = next(model.parameters()).device
-    for batches in zip(*data_loaders):
-        batches = [_batch_to_device(b, dev) for b in batches]
-        for batch, labeled_loss_fns in zip(batches, labeled_loss_fns_list):
-            for label, loss_fn in labeled_loss_fns.items():
-                sums[label] += loss_fn(model, *batch).item()
-        n_batches += 1
-    if n_batches == 0:
-        raise RuntimeError("Multiset validation loaders produced no batches.")
-    return {label: loss_sum / n_batches for label, loss_sum in sums.items()}
-
-    
-class MixedAlignedRandomDataset(Dataset):
-    def __init__(self, fields, randomized_indices):
-        self.fields = tuple(fields)
-        self.randomized_indices = tuple(randomized_indices)
-
-        n_fields = len(self.fields)
-        self.organized_indices = tuple(
-            idx for idx in range(n_fields)
-            if idx not in self.randomized_indices
-        )
-
-        if len(self.organized_indices) == 0:
-            raise ValueError("At least one organized field is required.")
-
-        self.n = len(self.fields[self.organized_indices[0]])
-
-        for idx in self.organized_indices:
-            if len(self.fields[idx]) != self.n:
-                raise ValueError(
-                    f"Organized field {idx} has length {len(self.fields[idx])}, "
-                    f"but expected length {self.n}."
-                )
-
-        for idx in self.randomized_indices:
-            if len(self.fields[idx]) == 0:
-                raise ValueError(f"Randomized field {idx} is empty.")
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, idx):
-        output = []
-
-        organized_set = set(self.organized_indices)
-
-        for field_idx, field in enumerate(self.fields):
-            if field_idx in organized_set:
-                output.append(field[idx])
-            else:
-                j = torch.randint(0, len(field), size=()).item()
-                output.append(field[j])
-
-        return tuple(output)
 
 class TrainingTimer:
-    def __init__(self, n_groups : int, iterations : int, epochs_per_group : int):
+    """Estimate remaining time for repeated groups of full training passes."""
+
+    def __init__(self, n_groups: int, iterations: int, epochs_per_group: int | list[int]):
         self.n_groups = n_groups
         self.iterations = iterations
-        if isinstance(epochs_per_group, list):
-            assert len(epochs_per_group) == n_groups, "epochs_per_group must be a list of the same length as n_groups"
-            self.epochs_per_group = epochs_per_group
-        else:
-            self.epochs_per_group = [epochs_per_group for _ in range(n_groups)]
-
+        self.epochs_per_group = (
+            list(epochs_per_group)
+            if isinstance(epochs_per_group, list)
+            else [epochs_per_group] * n_groups
+        )
+        if len(self.epochs_per_group) != n_groups:
+            raise ValueError("epochs_per_group must contain one entry per optimizer")
         self.total_epochs = iterations * sum(self.epochs_per_group)
 
     def initialize(self):
-        self.times = [0.0 for _ in range(self.n_groups)]
-        self.completed_epochs = [0 for _ in range(self.n_groups)]
+        self.times = [0.0] * self.n_groups
+        self.completed_epochs = [0] * self.n_groups
         self.curr_date_time = time.time()
-        self.curr_iter = 0
-        self.curr_group = 0
-        self.curr_epoch = 0
-    
-    def update_epoch(self, time_taken : float = None):
-        self.curr_epoch += 1
-        if self.curr_epoch > self.epochs_per_group[self.curr_group]:
-            print("Exceeded number of epochs per group (predicted time will be wrong)")
-        
-        self.times[self.curr_group] += time_taken if time_taken is not None else time.time() - self.curr_date_time
+        self.curr_iter = self.curr_group = self.curr_epoch = 0
+
+    def update_epoch(self, time_taken: float | None = None):
+        self.times[self.curr_group] += (
+            time.time() - self.curr_date_time if time_taken is None else time_taken
+        )
         self.completed_epochs[self.curr_group] += 1
+        self.curr_epoch += 1
         self.curr_date_time = time.time()
 
     def update_group(self):
-        assert self.curr_group < self.n_groups, "Exceeded number of groups"
         self.curr_group += 1
         self.curr_epoch = 0
 
     def update_iteration(self):
         self.curr_iter += 1
-        if self.curr_iter > self.iterations:
-            print("Exceeded number of iterations (predicted time will be wrong)")
-        
-        self.curr_epoch = 0
-        self.curr_group = 0
-    
+        self.curr_group = self.curr_epoch = 0
+
     def get_predicted_time(self):
-        avg_times = [
-            elapsed / total_epochs if total_epochs > 0 else 0.0
-            for elapsed, total_epochs in zip(self.times, self.completed_epochs)
-        ]
-        remaining_epochs = [self.iterations * epochs_per_group - total_epochs for total_epochs, epochs_per_group in zip(self.completed_epochs, self.epochs_per_group)]
-        remaining_times = [avg_time * epochs for avg_time, epochs in zip(avg_times, remaining_epochs)]
-        total_remaining_time = sum(remaining_times)
-        etr = timedelta(seconds=total_remaining_time) 
-        eta = datetime.now() + timedelta(seconds=total_remaining_time)
-        return etr, eta 
-    
+        remaining = sum(
+            (self.iterations * n - count) * (elapsed / count)
+            for n, count, elapsed in zip(
+                self.epochs_per_group, self.completed_epochs, self.times
+            )
+            if count > 0
+        )
+        remaining = max(0.0, remaining)
+        return timedelta(seconds=remaining), datetime.now() + timedelta(seconds=remaining)
+
     def get_predicted_etr_str(self):
-        etr, _ = self.get_predicted_time()
-        total = int(etr.total_seconds())
-        h, r = divmod(total, 3600)
-        m, s = divmod(r, 60)
-        return f"{h}:{m:02d}:{s:02d}"
-    
+        remaining, _ = self.get_predicted_time()
+        hours, rest = divmod(int(remaining.total_seconds()), 3600)
+        minutes, seconds = divmod(rest, 60)
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+
     def total_since_start(self):
         return sum(self.times)
 
-def train(model : DensityModel | ConditionalDensityModel, 
-        data_loader : DataLoader, 
-        labeled_loss_fns : dict[str, callable], 
-        optimizer, 
-        labeled_validation_loss_fns : dict[str, callable] = None, 
-        validation_data_loader : DataLoader = None,
-        validation_early_stopping_patience : int = None,
-        epochs=100, 
-        verbose=True, 
-        use_best : str = "total",
-        clip_grad_norm : float = 5.0,
-        restore_loss_threshold : float = 50.0):
-    
-    torch.autograd.set_detect_anomaly(True)
 
-    model.train()
+class LossVisualizer:
+    """Periodically save loss-versus-epoch plots to a PNG file.
 
-    loss_labels = list(labeled_loss_fns.keys())
-    loss_fns = list(labeled_loss_fns.values())
-    validation_loss_labels = list(labeled_validation_loss_fns.keys()) if labeled_validation_loss_fns is not None else []
+    ``update`` caches observations; the figure is written only after
+    ``buffer_size`` new epochs. ``flush`` writes any incomplete final buffer,
+    including when training stops early. The output file is replaced atomically
+    to avoid leaving a partially written figure.
 
-    if (labeled_validation_loss_fns is None) != (validation_data_loader is None):
-        raise ValueError("labeled_validation_loss_fns and validation_data_loader must both be provided together.")
-    if validation_early_stopping_patience is not None:
-        if labeled_validation_loss_fns is None:
-            raise ValueError(
-                "validation_early_stopping_patience requires labeled_validation_loss_fns and validation_data_loader."
-            )
-        if validation_early_stopping_patience <= 0:
-            raise ValueError("validation_early_stopping_patience must be a positive integer.")
-    if validation_loss_labels:
-        overlapping_labels = set(loss_labels).intersection(validation_loss_labels)
-        if overlapping_labels:
-            raise ValueError(
-                f"Training and validation loss labels must be unique. Overlap: {sorted(overlapping_labels)}"
-            )
-    selectable_loss_labels = loss_labels + validation_loss_labels + ["total"]
-    assert use_best in selectable_loss_labels, f"use_best must be one of {selectable_loss_labels}"
+    The first panel contains every training loss and ``total``. If validation
+    losses are registered, a second panel contains every validation loss and
+    ``validation_total``. Plotting uses matplotlib's non-interactive Agg canvas.
+    """
 
-    training_timer = TrainingTimer(n_groups=1, iterations=1, epochs_per_group=epochs)
-    training_timer.initialize()
+    def __init__(
+        self,
+        directory: str | Path,
+        buffer_size: int = 1,
+        *,
+        filename: str = "losses.png",
+        dpi: int = 140,
+    ) -> None:
+        if not isinstance(buffer_size, int) or isinstance(buffer_size, bool) or buffer_size < 1:
+            raise ValueError("buffer_size must be a positive integer")
+        if not isinstance(dpi, int) or dpi < 1:
+            raise ValueError("dpi must be a positive integer")
+        if not isinstance(filename, str) or not filename or Path(filename).name != filename or not filename.lower().endswith(".png"):
+            raise ValueError("filename must be a PNG filename without directories")
+        self.directory = Path(directory)
+        self.path = self.directory / filename
+        self.buffer_size = buffer_size
+        self.dpi = dpi
+        self.history: list[dict[str, float]] = []
+        self._buffer: list[dict[str, float]] = []
+        self.training_labels: tuple[str, ...] = ()
+        self.validation_labels: tuple[str, ...] = ()
+        self.figure = None
+        self.axes: tuple = ()
+        self.save_count = 0
+        self._initialized = False
 
-    def train_step(*args):
-        optimizer.zero_grad()
-        losses = [loss_fn(model, *args) for loss_fn in loss_fns]
-        total_loss = sum(losses)
-        total_loss.backward()
-        _clip_grad_norm(model, clip_grad_norm)
-        optimizer.step()
-        return total_loss.item(), losses
+    def initialize(self, training_labels: Iterable[str], validation_labels: Iterable[str] = ()) -> None:
+        """Start a fresh run after all Trainer loss functions are registered."""
+        self.training_labels = tuple(training_labels)
+        self.validation_labels = tuple(validation_labels)
+        if not self.training_labels:
+            raise ValueError("At least one training loss is required")
+        self.history = []
+        self._buffer = []
+        self.save_count = 0
+        self.figure = None
+        self.axes = ()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        # Do not leave an outdated plot from a previous run masquerading as the
+        # current run's trajectory while the first buffer is accumulating.
+        if self.path.exists():
+            self.path.unlink()
+        self._initialized = True
 
-    best_loss = restore_loss_threshold
-    best_state = None
-    best_tracked_loss = float("inf")
-    early_stopping_counter = 0
-    early_stopping_triggered = False
+    @property
+    def buffered_epochs(self) -> int:
+        return len(self._buffer)
 
-    for epoch in range(epochs):
-        start_time = time.time()
-        total_sum_loss = 0.0
-        sum_losses = [0.0 for _ in loss_fns]
-        for batch in data_loader:
-            dev = next(model.parameters()).device
-            batch = _batch_to_device(batch, dev)
-
-            total_loss, losses = train_step(*batch)
-            total_sum_loss += total_loss
-            for i, loss in enumerate(losses):
-                sum_losses[i] += loss.item()
-
-        end_time = time.time()
-        avg_total_loss = total_sum_loss / len(data_loader)
-        avg_losses = [loss_sum / len(data_loader) for loss_sum in sum_losses]
-        loss_dict = {label: value for label, value in zip(loss_labels, avg_losses)}
-        loss_dict["total"] = avg_total_loss
-        validation_loss_dict = {}
-        if labeled_validation_loss_fns is not None:
-            model.eval()
-            validation_loss_dict = _evaluate_labeled_losses(model, validation_data_loader, labeled_validation_loss_fns)
-            model.train()
-            loss_dict.update(validation_loss_dict)
-
-        epoch_time = end_time - start_time
-
-        valid = model.valid()
-        current_use_best_loss = loss_dict[use_best]
-        if current_use_best_loss < best_tracked_loss:
-            best_tracked_loss = current_use_best_loss
-            early_stopping_counter = 0
-        elif validation_early_stopping_patience is not None:
-            early_stopping_counter += 1
-
-        if valid and current_use_best_loss < best_loss:
-            best_loss = current_use_best_loss
-            best_state = deepcopy(model.state_dict())
-
-        if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
-            if best_state is not None:
-                model.load_state_dict(best_state)
-                print(
-                    f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
-                    f"after unstable epoch loss: {avg_total_loss}"
-                )
-            else:
-                print(f"\n Unstable epoch loss detected ({avg_total_loss}), but no best_state to restore.")
-
-        training_timer.update_epoch()
-
-        if verbose:
-            loss_details = ", ".join(
-                f"{label}:{value:.4f}"
-                for label, value in zip(loss_labels, avg_losses)
-            )
-            if not valid:
-                loss_details += " <invld>"
-            validation_loss_details = ""
-            if validation_loss_dict:
-                validation_loss_details = ", val: " + ", ".join(
-                    f"{label}:{value:.4f}" for label, value in validation_loss_dict.items()
-                )
-            print(
-                f"Epoch {epoch+1}, Time: {epoch_time:.2f}s, Loss: tot:{avg_total_loss:.4f}, "
-                f"{loss_details}{validation_loss_details}, etr: {training_timer.get_predicted_etr_str()}"
-            )
-        else:
-            print(f"Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")
-
-        if (
-            validation_early_stopping_patience is not None
-            and early_stopping_counter >= validation_early_stopping_patience
+    def update(self, epoch: int, metrics: Mapping[str, float]) -> None:
+        """Record one completed epoch, saving only when the buffer fills."""
+        if not self._initialized:
+            raise RuntimeError("Call initialize() before update()")
+        labels = (*self.training_labels, "total")
+        if self.validation_labels:
+            labels += (*self.validation_labels, "validation_total")
+        missing = [label for label in labels if label not in metrics]
+        if missing:
+            raise KeyError(f"Missing loss metrics: {missing}")
+        if (self._buffer or self.history) and epoch <= (
+            self._buffer[-1]["epoch"] if self._buffer else self.history[-1]["epoch"]
         ):
-            early_stopping_triggered = True
-            if best_state is not None:
-                model.load_state_dict(best_state)
-                print(
-                    f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
-                    f"on '{use_best}'. Restored best model ({use_best} loss={best_loss:.4f})."
-                )
-            else:
-                print(
-                    f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
-                    f"on '{use_best}', but no best_state is available to restore."
-                )
-            break
-        
-    if verbose:
-        print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
-    if use_best and best_state is not None and not early_stopping_triggered:
-        model.load_state_dict(best_state)
-        print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
+            raise ValueError("epoch must be strictly increasing")
+        entry = {"epoch": int(epoch)}
+        entry.update({label: float(metrics[label]) for label in labels})
+        self._buffer.append(entry)
+        if len(self._buffer) >= self.buffer_size:
+            self.flush()
 
-    return model, best_loss, training_timer.total_since_start()
+    def flush(self) -> None:
+        """Write the pending epochs, if any (also called after early stopping)."""
+        if not self._buffer:
+            return
+        self.history.extend(self._buffer)
+        self._buffer.clear()
+        self._save_plot()
 
-def train_multiset(model : DensityModel | ConditionalDensityModel,
-        data_loaders : list[DataLoader],
-        labeled_loss_fns_list : list[dict[str, callable]],
-        optimizer, epochs=100,
-        verbose=True,
-        use_best : str = "total",
-        clip_grad_norm : float = 5.0,
-        restore_loss_threshold : float = 50.0):
-    
-    torch.autograd.set_detect_anomaly(True)
+    def _save_plot(self) -> None:
+        # Lazy imports: Trainer itself does not require matplotlib unless a
+        # visualizer is used. FigureCanvasAgg works in headless environments.
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from matplotlib.ticker import MaxNLocator
 
-    model.train()
+        has_validation = bool(self.validation_labels)
+        fig = Figure(figsize=(12, 4.8) if has_validation else (7, 4.8), dpi=self.dpi)
+        FigureCanvasAgg(fig)
+        axes = fig.subplots(1, 2 if has_validation else 1, squeeze=False)[0]
+        epochs = [entry["epoch"] for entry in self.history]
 
-    assert len(data_loaders) > 0, "data_loaders must contain at least one DataLoader"
-    assert len(data_loaders) == len(labeled_loss_fns_list), "data_loaders and labeled_loss_fns_list must have same length"
+        def panel(ax, labels, title, total_label):
+            for label in (*labels, total_label):
+                values = [entry[label] for entry in self.history]
+                ax.plot(epochs, values, label=label,
+                        linewidth=2.2 if label == total_label else 1.35,
+                        linestyle="--" if label == total_label else "-")
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Loss")
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.grid(alpha=0.22)
+            ax.legend(loc="best", fontsize="small")
 
-    loss_labels = []
-    for labeled_loss_fns in labeled_loss_fns_list:
-        for label in labeled_loss_fns.keys():
-            if label not in loss_labels:
-                loss_labels.append(label)
+        panel(axes[0], self.training_labels, "Training losses", "total")
+        if has_validation:
+            panel(axes[1], self.validation_labels, "Validation losses", "validation_total")
+        fig.tight_layout()
+        temporary = self.path.with_name(f".{self.path.stem}.tmp.png")
+        try:
+            fig.savefig(temporary, format="png", dpi=self.dpi)
+            temporary.replace(self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.figure = fig
+        self.axes = tuple(axes)
+        self.save_count += 1
 
-    loss_fns_per_loader = [
-        list(labeled_loss_fns.items()) for labeled_loss_fns in labeled_loss_fns_list
-    ]
-    n_data_loaders = len(data_loaders)
 
-    assert use_best in loss_labels or use_best == "total", f"use_best must be one of {loss_labels + ['total']}"
+class TrainingProgressBar:
+    """Terminal progress indicator backed by TrainingTimer's measured ETA.
 
-    training_timer = TrainingTimer(n_groups=1, iterations=1, epochs_per_group=epochs)
-    training_timer.initialize()
+    Completion counts *optimizer passes* instead of outer epochs, so
+    n_iterations for each optimizer is accounted for. In an interactive
+    terminal it refreshes after each pass; elsewhere it renders in the
+    epoch-level log line to avoid flooding captured logs.
+    """
 
-    def _batch_to_device(batch, dev):
-        if isinstance(batch, list):
-            return [b.to(dev) for b in batch]
-        if isinstance(batch, tuple):
-            return tuple(b.to(dev) for b in batch)
-        return batch.to(dev)
+    def __init__(self, width: int = 24, stream=None) -> None:
+        if not isinstance(width, int) or width < 1:
+            raise ValueError("width must be a positive integer")
+        self.width = width
+        self.stream = stream
+        self._last_length = 0
 
-    def train_step(batches):
-        optimizer.zero_grad()
+    def _stream(self):
+        return sys.stdout if self.stream is None else self.stream
 
-        total_loss = 0.0
-        combined_losses = {label: 0.0 for label in loss_labels}
-        dataset_losses = []
-        for batch, labeled_loss_fns in zip(batches, loss_fns_per_loader):
-            losses = [(label, loss_fn(model, *batch)) for label, loss_fn in labeled_loss_fns]
-            total_loss = total_loss + sum(loss for _, loss in losses)
-            curr_dataset_losses = {}
-            for label, loss in losses:
-                combined_losses[label] = combined_losses[label] + loss
-                curr_dataset_losses[label] = loss
-            dataset_losses.append(curr_dataset_losses)
+    def render(self, timer: TrainingTimer) -> str:
+        completed = sum(timer.completed_epochs)
+        total = timer.total_epochs
+        fraction = min(1.0, completed / total) if total else 1.0
+        filled = min(self.width, int(fraction * self.width))
+        bar = "#" * filled + "-" * (self.width - filled)
+        # Before each optimizer has finished one pass, estimates ignore the
+        # unmeasured groups. Don't present that partial estimate as a real ETA.
+        etr = (timer.get_predicted_etr_str()
+               if all(n > 0 for n in timer.completed_epochs) else "--:--:--")
+        return f"[{bar}] {fraction * 100:5.1f}% ({completed}/{total} passes) ETR {etr}"
 
-        total_loss.backward()
-        _clip_grad_norm(model, clip_grad_norm)
-        optimizer.step()
-        return total_loss.item(), combined_losses, dataset_losses
+    def update(self, timer: TrainingTimer) -> None:
+        stream = self._stream()
+        if not getattr(stream, "isatty", lambda: False)():
+            return
+        msg = self.render(timer)
+        stream.write("\r" + msg + " " * max(0, self._last_length - len(msg)))
+        stream.flush()
+        self._last_length = len(msg)
 
-    best_loss = restore_loss_threshold
-    best_state = None
+    def log_epoch(self, message: str, timer: TrainingTimer) -> None:
+        stream = self._stream()
+        msg = f"{message} | {self.render(timer)}"
+        if getattr(stream, "isatty", lambda: False)():
+            stream.write("\r" + msg + " " * max(0, self._last_length - len(msg)) + "\n")
+        else:
+            stream.write(msg + "\n")
+        stream.flush()
+        self._last_length = 0
 
-    for epoch in range(epochs):
-        start_time = time.time()
-        total_sum_loss = 0.0
-        sum_losses = {label: 0.0 for label in loss_labels}
-        label_counts = {label: 0 for label in loss_labels}
-        dataset_sum_losses = [{label: 0.0 for label in labeled_loss_fns.keys()} for labeled_loss_fns in labeled_loss_fns_list]
-        n_steps = 0
 
-        for batches in zip(*data_loaders):
-            dev = next(model.parameters()).device
-            batches = [_batch_to_device(batch, dev) for batch in batches]
+@dataclass(frozen=True)
+class _OptimizerSpec:
+    optimizer: torch.optim.Optimizer
+    n_iterations: int
 
-            total_loss, losses, per_dataset_losses = train_step(batches)
-            total_sum_loss += total_loss
-            for labeled_loss_fns in labeled_loss_fns_list:
-                for label in labeled_loss_fns.keys():
-                    label_counts[label] += 1
-            for label, loss in losses.items():
-                sum_losses[label] += loss.item()
-            for dataset_idx, curr_dataset_losses in enumerate(per_dataset_losses):
-                for label, loss in curr_dataset_losses.items():
-                    dataset_sum_losses[dataset_idx][label] += loss.item()
-            n_steps += 1
 
-        if n_steps == 0:
-            raise RuntimeError("No training batches available in train_multiset. Ensure all data_loaders are non-empty.")
+@dataclass(frozen=True)
+class _LossSpec:
+    fn: Callable
+    dataset_label: str | None
+    validation: bool
+    feasibility: bool = False
 
-        end_time = time.time()
-        avg_total_loss = total_sum_loss / n_steps
-        avg_losses = {
-            label: (sum_losses[label] / label_counts[label] if label_counts[label] > 0 else 0.0)
-            for label in loss_labels
+
+def _to_device(batch, device: torch.device):
+    if isinstance(batch, dict):
+        return {key: _to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, tuple):
+        return tuple(_to_device(value, device) for value in batch)
+    if isinstance(batch, list):
+        return [_to_device(value, device) for value in batch]
+    return batch.to(device) if hasattr(batch, "to") else batch
+
+
+def _apply_loss(fn: Callable, model: torch.nn.Module, batch):
+    if batch is None:
+        loss = fn(model)
+    elif isinstance(batch, dict):
+        loss = fn(model, **batch)
+    elif isinstance(batch, (tuple, list)):
+        loss = fn(model, *batch)
+    else:
+        loss = fn(model, batch)
+    if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
+        raise ValueError("Each loss function must return a scalar torch.Tensor")
+    return loss.reshape(())
+
+
+class Trainer:
+    """Train a model using labeled datasets, optimizers, and additive losses.
+
+    ``add_loss_function(fn, label, dataset_label)`` expects a callable of the
+    form ``fn(model, *batch)`` (or ``fn(model, **batch)`` for dict batches).
+    ``dataset_label=None`` allows data-independent regularization terms of the
+    form ``fn(model)``; these are evaluated once per gradient step.
+
+    ``feasibility=True`` marks a model-only training penalty as a hard
+    checkpoint constraint. It is still differentiated and included in the
+    total training loss. A checkpoint is eligible only when *every* feasibility
+    loss, reevaluated on the post-epoch model, is finite and exactly zero.
+    An infeasible checkpoint is never saved, even when its training score is
+    better. If none is found, ``train`` returns ``(None, inf, elapsed)`` and
+    prints a warning. Without feasibility losses the original behavior applies.
+
+    Training datasets are zipped at each gradient step and the shortest loader
+    determines the number of steps in a pass. Each optimizer's ``n_iterations``
+    is the number of complete passes it makes per outer epoch. Training losses
+    are added before backward; validation losses are evaluated at the end of
+    each outer epoch, and never participate in backward.
+
+    History stores one dictionary per *outer* epoch. ``total`` is the mean sum
+    of training losses across gradient steps; ``validation_total`` is the sum
+    of per-validation-loss means. Early stopping always monitors
+    ``validation_total`` regardless of the ``use_best`` checkpoint metric.
+    An optional LossVisualizer saves loss plots every ``buffer_size`` epochs.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        validation_early_stopping_patience: int | None = None,
+        *,
+        device: torch.device | str | None = None,
+        loss_visualizer: LossVisualizer | None = None,
+    ):
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError("model must be a torch.nn.Module")
+        self.model = model
+        self.device = torch.device(device) if device is not None else None
+        self.loss_visualizer: LossVisualizer | None = None
+        self.set_loss_visualizer(loss_visualizer)
+        self.datasets: dict[str, Iterable] = {}
+        self.optimizers: dict[str, _OptimizerSpec] = {}
+        self.loss_functions: dict[str, _LossSpec] = {}
+        self.history: list[dict[str, object]] = []
+        self.subiteration_history: list[dict] = []
+        self.best_loss = float("inf")
+        self.best_state: dict | None = None
+        self.best_epoch: int | None = None
+        self.early_stopped = False
+        self.training_timer: TrainingTimer | None = None
+        self.validation_early_stopping_patience = validation_early_stopping_patience
+
+    def set_loss_visualizer(self, visualizer: LossVisualizer | None) -> "Trainer":
+        if visualizer is not None and not isinstance(visualizer, LossVisualizer):
+            raise TypeError("loss_visualizer must be a LossVisualizer or None")
+        self.loss_visualizer = visualizer
+        return self
+
+    @property
+    def validation_early_stopping_patience(self) -> int | None:
+        return self._validation_early_stopping_patience
+
+    @validation_early_stopping_patience.setter
+    def validation_early_stopping_patience(self, patience: int | None):
+        if patience is not None and (not isinstance(patience, int) or patience < 1):
+            raise ValueError("validation_early_stopping_patience must be positive or None")
+        self._validation_early_stopping_patience = patience
+
+    def add_dataset(self, data_loader: Iterable, label: str) -> "Trainer":
+        if label in self.datasets:
+            raise ValueError(f"Dataset label {label!r} is already registered")
+        if not isinstance(label, str) or not label:
+            raise ValueError("Dataset label must be a nonempty string")
+        self.datasets[label] = data_loader
+        return self
+
+    def add_optimizer(
+        self,
+        optimizer: torch.optim.Optimizer,
+        label: str,
+        n_iterations: int = 1,
+    ) -> "Trainer":
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            raise TypeError("optimizer must be a torch.optim.Optimizer")
+        if not isinstance(n_iterations, int) or n_iterations < 1:
+            raise ValueError("n_iterations must be a positive integer")
+        if not isinstance(label, str) or not label or label in self.optimizers:
+            raise ValueError(f"Invalid or duplicate optimizer label {label!r}")
+        self.optimizers[label] = _OptimizerSpec(optimizer, n_iterations)
+        return self
+
+    def add_loss_function(
+        self,
+        fn: Callable,
+        label: str,
+        dataset_label: str | None,
+        validation: bool = False,
+        feasibility: bool = False,
+    ) -> "Trainer":
+        """Register a training or validation loss.
+
+        Feasibility losses must be model-only (``dataset_label=None``) and
+        non-validation. They contribute to the differentiated training total,
+        but a saved checkpoint additionally requires each feasibility loss to
+        be finite and exactly zero when reevaluated after the epoch.
+        """
+        if not callable(fn):
+            raise TypeError("fn must be callable")
+        if not isinstance(label, str) or not label or label in self.loss_functions:
+            raise ValueError(f"Invalid or duplicate loss label {label!r}")
+        if label in {"total", "validation_total"}:
+            raise ValueError("'total' and 'validation_total' are reserved loss labels")
+        if feasibility and dataset_label is not None:
+            raise ValueError("Feasibility losses must have dataset_label=None")
+        if feasibility and validation:
+            raise ValueError("Feasibility losses are training losses, not validation losses")
+        if dataset_label is not None and dataset_label not in self.datasets:
+            raise KeyError(f"Unknown dataset {dataset_label!r}; call add_dataset first")
+        self.loss_functions[label] = _LossSpec(fn, dataset_label, bool(validation), bool(feasibility))
+        return self
+
+    @torch.no_grad()
+    def _check_feasibility(self, constraints: dict[str, _LossSpec]) -> tuple[bool, dict[str, float]]:
+        """Check the actual post-update state, not epoch-average loss values.
+
+        Require each scalar feasibility loss to be finite and exactly zero:
+        summed losses could cancel, and losses averaged during optimization
+        describe earlier parameter states rather than the checkpoint state.
+        """
+        values = {
+            label: float(_apply_loss(spec.fn, self.model, None))
+            for label, spec in constraints.items()
         }
-        avg_losses_per_dataset = [
-            {label: loss_sum / n_steps for label, loss_sum in dataset_losses.items()}
-            for dataset_losses in dataset_sum_losses
-        ]
-        loss_dict = dict(avg_losses)
-        loss_dict["total"] = avg_total_loss
+        return all(math.isfinite(value) and value == 0.0 for value in values.values()), values
 
-        epoch_time = end_time - start_time
+    def _model_device(self) -> torch.device:
+        if self.device is not None:
+            return self.device
+        tensor = next(self.model.parameters(), None)
+        if tensor is None:
+            tensor = next(self.model.buffers(), None)
+        return tensor.device if tensor is not None else torch.device("cpu")
 
-        valid = model.valid()
-        if valid and loss_dict[use_best] < best_loss:
-            best_loss = loss_dict[use_best]
-            best_state = deepcopy(model.state_dict())
+    def _validate_configuration(self, use_best: str):
+        if not self.optimizers:
+            raise ValueError("Register at least one optimizer")
+        if not any(not spec.validation for spec in self.loss_functions.values()):
+            raise ValueError("Register at least one non-validation loss")
+        if self.validation_early_stopping_patience is not None and not any(
+            spec.validation for spec in self.loss_functions.values()
+        ):
+            raise ValueError("Early stopping requires at least one validation loss")
+        selectable = {"total", *self.loss_functions}
+        if any(spec.validation for spec in self.loss_functions.values()):
+            selectable.add("validation_total")
+        if use_best not in selectable:
+            raise ValueError(f"use_best must be one of {sorted(selectable)}")
 
-        if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
-            if best_state is not None:
-                model.load_state_dict(best_state)
-                print(
-                    f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
-                    f"after unstable epoch loss: {avg_total_loss}"
-                )
+    def _train_batches(self):
+        labels = list(dict.fromkeys(
+            spec.dataset_label for spec in self.loss_functions.values()
+            if not spec.validation and spec.dataset_label is not None
+        ))
+        if not labels:
+            yield {}
+            return
+        for batches in zip(*(self.datasets[label] for label in labels)):
+            yield {
+                label: _to_device(batch, self._model_device())
+                for label, batch in zip(labels, batches)
+            }
+
+    def _train_pass(
+        self,
+        optimizer: torch.optim.Optimizer,
+        train_losses: dict[str, _LossSpec],
+        clip_grad_norm: float | None,
+    ) -> tuple[dict[str, float], int]:
+        sums = {label: 0.0 for label in train_losses}
+        sums["total"] = 0.0
+        steps = 0
+        for batches in self._train_batches():
+            # Avoid gradient accumulation in parameters owned by other optimizers.
+            self.model.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
+            components = {
+                label: _apply_loss(spec.fn, self.model, batches.get(spec.dataset_label))
+                for label, spec in train_losses.items()
+            }
+            total = torch.stack(list(components.values())).sum()
+            if not bool(torch.isfinite(total).item()):
+                # Do not take a gradient step with a non-finite loss.
+                for label, loss in components.items():
+                    sums[label] += float(loss.detach())
+                sums["total"] += float(total.detach())
+                steps += 1
+                continue
+            if total.requires_grad:
+                total.backward()
+                if clip_grad_norm is not None:
+                    active_params = [
+                        p for group in optimizer.param_groups for p in group["params"]
+                        if p.requires_grad and p.grad is not None
+                    ]
+                    if active_params:
+                        torch.nn.utils.clip_grad_norm_(active_params, max_norm=clip_grad_norm)
+                optimizer.step()
             else:
-                print(f"\n Unstable epoch loss detected ({avg_total_loss}), but no best_state to restore.")
+                raise RuntimeError("The summed training loss is not connected to trainable parameters")
+            for label, loss in components.items():
+                sums[label] += float(loss.detach())
+            sums["total"] += float(total.detach())
+            steps += 1
+        if steps == 0:
+            raise RuntimeError("Training datasets produced no batches (zip stops at the shortest loader)")
+        return sums, steps
 
-        training_timer.update_epoch()
+    @torch.no_grad()
+    def _validate(self, val_losses: dict[str, _LossSpec]) -> dict[str, float]:
+        if not val_losses:
+            return {}
+        sums = {}
+        # Only the datasets used by validation losses are evaluated. Each is
+        # exhausted independently, so loaders of different lengths work.
+        for dataset_label in dict.fromkeys(spec.dataset_label for spec in val_losses.values()):
+            selected = {
+                label: spec for label, spec in val_losses.items()
+                if spec.dataset_label == dataset_label
+            }
+            if dataset_label is None:
+                sums.update({
+                    label: float(_apply_loss(spec.fn, self.model, None))
+                    for label, spec in selected.items()
+                })
+                continue
+            accum = {label: 0.0 for label in selected}
+            n_batches = 0
+            for batch in self.datasets[dataset_label]:
+                batch = _to_device(batch, self._model_device())
+                for label, spec in selected.items():
+                    accum[label] += float(_apply_loss(spec.fn, self.model, batch))
+                n_batches += 1
+            if not n_batches:
+                raise RuntimeError(f"Validation dataset {dataset_label!r} is empty")
+            sums.update({label: value / n_batches for label, value in accum.items()})
+        sums["validation_total"] = sum(sums.values())
+        return sums
 
-        if verbose:
-            loss_details = ", ".join(
-                f"{label}:{avg_losses[label]:.4f}"
-                for label in loss_labels
-            )
-            dataset_loss_details = "; ".join(
-                f"ds{dataset_idx+1}[{', '.join(f'{label}:{value:.4f}' for label, value in dataset_losses.items())}]"
-                for dataset_idx, dataset_losses in enumerate(avg_losses_per_dataset)
-            )
-            if not valid:
-                loss_details += " <invld>"
-            print(
-                f"Epoch {epoch+1}, Time: {epoch_time:.2f}s, Loss: tot:{avg_total_loss:.4f}, "
-                f"{loss_details}, per_dataset: {dataset_loss_details}, "
-                f"loaders:{n_data_loaders}, etr: {training_timer.get_predicted_etr_str()}"
-            )
-        else:
-            print(f"Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")
-        
-    if verbose:
-        print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
-    if use_best and best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
+    def train(
+        self,
+        epochs: int,
+        use_best: str = "total",
+        verbose: bool = True,
+        clip_grad_norm: float | None = 5.0,
+        restore_loss_threshold: float | None = 50.0,
+    ) -> tuple[torch.nn.Module | None, float, float]:
+        """Train and restore the best eligible checkpoint according to ``use_best``.
 
-    return model, best_loss, training_timer.total_since_start()
+        Feasibility losses are included in the optimization objective, but
+        checkpoint eligibility requires that every such loss evaluate to
+        exactly zero *after* the epoch's optimizer updates. If no feasible
+        checkpoint was saved, return ``None`` in place of the model.
 
-def train_to_valid(model : DensityModel | ConditionalDensityModel, 
-        labeled_loss_fns : dict[str, callable], 
-        optimizer, 
-        epochs=100, 
-        verbose=True, 
-        use_best : str = "total", 
-        restore_loss_threshold : float = 50.0):
-    
-    torch.autograd.set_detect_anomaly(True)
+        Early-stopping patience monitors ``validation_total``. Non-finite or
+        above-threshold training loss restores the best eligible checkpoint
+        when available.
+        """
+        if not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("epochs must be a positive integer")
+        if clip_grad_norm is not None and clip_grad_norm <= 0:
+            raise ValueError("clip_grad_norm must be positive or None")
+        self._validate_configuration(use_best)
+        train_losses = {k: v for k, v in self.loss_functions.items() if not v.validation}
+        val_losses = {k: v for k, v in self.loss_functions.items() if v.validation}
+        feasibility_losses = {k: v for k, v in train_losses.items() if v.feasibility}
+        if self.loss_visualizer is not None:
+            self.loss_visualizer.initialize(train_losses, val_losses)
+        progress_bar = TrainingProgressBar() if verbose else None
+        self.history = []
+        self.subiteration_history = []
+        self.best_loss = float("inf")
+        self.best_state = None
+        self.best_epoch = None
+        self.early_stopped = False
+        best_validation = float("inf")
+        no_improvement = 0
+        start = time.monotonic()
+        previous_training_mode = self.model.training
+        original_grad_flags = {p: p.requires_grad for p in self.model.parameters()}
+        self.training_timer = TrainingTimer(
+            n_groups=len(self.optimizers),
+            iterations=epochs,
+            epochs_per_group=[s.n_iterations for s in self.optimizers.values()],
+        )
+        self.training_timer.initialize()
+        self.model.train()
 
-    model.train()
+        try:
+            for epoch in range(epochs):
+                epoch_start = time.monotonic()
+                sums = {label: 0.0 for label in train_losses}
+                sums["total"] = 0.0
+                steps = 0
+                for opt_label, opt_spec in self.optimizers.items():
+                    optimizer = opt_spec.optimizer
+                    opt_params = {p for g in optimizer.param_groups for p in g["params"]}
+                    for param, initially_trainable in original_grad_flags.items():
+                        param.requires_grad_(initially_trainable and param in opt_params)
+                    for sub_iteration in range(opt_spec.n_iterations):
+                        pass_start = time.monotonic()
+                        part, n_steps = self._train_pass(optimizer, train_losses, clip_grad_norm)
+                        self.subiteration_history.append({
+                            "epoch": epoch + 1,
+                            "optimizer": opt_label,
+                            "sub_iteration": sub_iteration + 1,
+                            **{label: value / n_steps for label, value in part.items()},
+                        })
+                        for label, value in part.items():
+                            sums[label] += value
+                        steps += n_steps
+                        self.training_timer.update_epoch(time.monotonic() - pass_start)
+                        if progress_bar is not None:
+                            progress_bar.update(self.training_timer)
+                    self.training_timer.update_group()
 
-    loss_labels = list(labeled_loss_fns.keys())
-    loss_fns = list(labeled_loss_fns.values())
+                metrics = {label: value / steps for label, value in sums.items()}
+                for param, flag in original_grad_flags.items():
+                    param.requires_grad_(flag)
+                if val_losses:
+                    self.model.eval()
+                    try:
+                        metrics.update(self._validate(val_losses))
+                    finally:
+                        self.model.train()
 
-    assert use_best in loss_labels, f"use_best must be one of {loss_labels}"
-
-    def train_step():
-        optimizer.zero_grad()
-        losses = [loss_fn(model) for loss_fn in loss_fns]
-        total_loss = sum(losses)
-        total_loss.backward()
-        optimizer.step()
-        return total_loss.item(), losses
-
-    best_loss = restore_loss_threshold
-    best_state = None
-
-    for epoch in range(epochs):
-        start_time = time.time()
-        loss = 0.0
-        losses = [0.0 for _ in loss_fns]
-        loss, losses = train_step()
-
-        end_time = time.time()
-        loss_dict = {label: value for label, value in zip(loss_labels, losses)}
-        loss_dict["total"] = loss
-
-        epoch_time = end_time - start_time
-
-        valid = model.valid()
-        if valid:
-            print("Found valid model!")
-            return model
-
-        if use_best and loss_dict[use_best] < best_loss:
-            best_loss = loss_dict[use_best]
-            best_state = deepcopy(model.state_dict())
-
-        if _is_bad_epoch_loss(loss, restore_loss_threshold):
-            if best_state is not None:
-                model.load_state_dict(best_state)
-                print(
-                    f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
-                    f"after unstable epoch loss: {loss}"
+                # A training-pass average is not the loss at the model state
+                # being checkpointed. Recheck all feasibility constraints now.
+                feasible, feasibility_values = self._check_feasibility(feasibility_losses)
+                model_valid = bool(self.model.valid()) if hasattr(self.model, "valid") else True
+                valid = model_valid and feasible
+                score = metrics[use_best]
+                unstable = not math.isfinite(metrics["total"]) or (
+                    restore_loss_threshold is not None
+                    and metrics["total"] > restore_loss_threshold
                 )
-            else:
-                print(f"\n Unstable epoch loss detected ({loss}), but no best_state to restore.")
+                if valid and not unstable and math.isfinite(score) and score < self.best_loss:
+                    self.best_loss = score
+                    self.best_state = deepcopy(self.model.state_dict())
+                    self.best_epoch = epoch + 1
 
-        if verbose:
-            loss_details = ", ".join(
-                f"{label}:{value:.4f}"
-                for label, value in zip(loss_labels, losses)
-            )
-            if not valid:
-                loss_details += " <invld>"
+                if val_losses:
+                    validation_score = metrics["validation_total"]
+                    if math.isfinite(validation_score) and validation_score < best_validation:
+                        best_validation = validation_score
+                        no_improvement = 0
+                    else:
+                        no_improvement += 1
+
+                if unstable and self.best_state is not None:
+                    self.model.load_state_dict(self.best_state)
+
+                metrics["epoch"] = epoch + 1
+                metrics["valid"] = valid
+                if feasibility_losses:
+                    metrics["feasible"] = feasible
+                    # Make the values used for checkpoint eligibility visible
+                    # separately from epoch-averaged training loss trajectories.
+                    metrics["feasibility_values"] = feasibility_values
+                self.history.append(metrics)
+                if self.loss_visualizer is not None:
+                    self.loss_visualizer.update(epoch + 1, metrics)
+                if verbose:
+                    details = ", ".join(
+                        f"{label}:{metrics[label]:.4f}" for label in self.loss_functions
+                    )
+                    validation = (
+                        f", validation_total:{metrics['validation_total']:.4f}"
+                        if val_losses else ""
+                    )
+                    status = " <invalid>" if not valid else ""
+                    if unstable:
+                        status += " <restored>" if self.best_state is not None else " <unstable>"
+                    progress_bar.log_epoch(
+                        f"Epoch {epoch+1}/{epochs}, total:{metrics['total']:.4f}, "
+                        f"{details}{validation}{status}, time:{time.monotonic()-epoch_start:.2f}s",
+                        self.training_timer,
+                    )
+                self.training_timer.update_iteration()
+                if (self.validation_early_stopping_patience is not None
+                        and no_improvement >= self.validation_early_stopping_patience):
+                    self.early_stopped = True
+                    if verbose:
+                        print(f"Early stopping: validation_total did not improve for {no_improvement} epochs")
+                    break
+        finally:
+            # Always restore model state even if writing the visualization fails.
+            for param, flag in original_grad_flags.items():
+                param.requires_grad_(flag)
+            if self.best_state is not None:
+                self.model.load_state_dict(self.best_state)
+            self.model.train(previous_training_mode)
+            if self.loss_visualizer is not None:
+                self.loss_visualizer.flush()
+
+        elapsed = time.monotonic() - start
+        if feasibility_losses and self.best_state is None:
             print(
-                f"Epoch {epoch+1}, Time: {epoch_time:.2f}s, Loss: tot:{loss:.4f}, "
-                f"{loss_details}"
+                "WARNING: No feasible checkpoint was found: every feasibility "
+                "loss must equal exactly zero at an epoch boundary (and the "
+                "model must otherwise be valid). Returning no model."
             )
-        else:
-            print(f"Epoch {epoch+1}, Loss: {loss:.4f}, Time: {epoch_time:.2f}s")
-        
-    if use_best and best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
-
-    return model
-
-def set_requires_grad(params : list[torch.nn.Parameter], requires_grad : bool):
-    for param in params:
-        param.requires_grad_(requires_grad)
-
-def train_iterate(model : DensityModel | ConditionalDensityModel, 
-        data_loader : DataLoader, 
-        labeled_loss_fns : dict[str, callable], 
-        labeled_optimizers : dict[str, torch.optim.Optimizer], 
-        device : torch.device,
-        labeled_validation_loss_fns : dict[str, callable] = None, 
-        validation_data_loader : DataLoader = None,
-        validation_early_stopping_patience : int = None,
-        epochs_per_group=10, 
-        iterations=10, 
-        verbose=True, 
-        use_best : str = "total",
-        clip_grad_norm : float = 0.5,
-        restore_loss_threshold : float = 50.0):
-    
-    torch.autograd.set_detect_anomaly(False)
-
-    model.train()
-
-
-    loss_labels = list(labeled_loss_fns.keys())
-    loss_fns = list(labeled_loss_fns.values())
-    validation_loss_labels = list(labeled_validation_loss_fns.keys()) if labeled_validation_loss_fns is not None else []
-    optimizer_labels = list(labeled_optimizers.keys())
-    optimizers = list(labeled_optimizers.values())
-
-    if (labeled_validation_loss_fns is None) != (validation_data_loader is None):
-        raise ValueError("labeled_validation_loss_fns and validation_data_loader must both be provided together.")
-    if validation_early_stopping_patience is not None:
-        if labeled_validation_loss_fns is None:
-            raise ValueError(
-                "validation_early_stopping_patience requires labeled_validation_loss_fns and validation_data_loader."
-            )
-        if validation_early_stopping_patience <= 0:
-            raise ValueError("validation_early_stopping_patience must be a positive integer.")
-    if validation_loss_labels:
-        overlapping_labels = set(loss_labels).intersection(validation_loss_labels)
-        if overlapping_labels:
-            raise ValueError(
-                f"Training and validation loss labels must be unique. Overlap: {sorted(overlapping_labels)}"
-            )
-    selectable_loss_labels = loss_labels + validation_loss_labels + ["total"]
-    assert use_best in selectable_loss_labels, f"use_best must be one of {selectable_loss_labels}"
-
-    def train_step(*args, optimizer : torch.optim.Optimizer, param_groups : list[list[torch.nn.Parameter]]): 
-        optimizer.zero_grad()
-        losses = [loss_fn(model, *args) for loss_fn in loss_fns]
-        total_loss = sum(losses)
-        total_loss.backward()
-        for params in param_groups:
-            torch.nn.utils.clip_grad_norm_(params, max_norm=clip_grad_norm)
-        optimizer.step()
-        return total_loss.item(), losses
-
-    best_loss = restore_loss_threshold
-    best_state = None
-    best_tracked_loss = float("inf")
-    early_stopping_counter = 0
-    early_stopping_triggered = False
-
-    if isinstance(epochs_per_group, list):
-        assert len(epochs_per_group) == len(labeled_optimizers), "epochs_per_group must be a list of the same length as n_groups"
-    else:
-        epochs_per_group = [epochs_per_group for _ in range(len(labeled_optimizers))]
-
-    training_timer = TrainingTimer(n_groups=len(optimizers), iterations=iterations, epochs_per_group=epochs_per_group)
-    training_timer.initialize()
-
-    for iteration in range(iterations):
-        for optimizer, optimizer_label, epochs in zip(optimizers, optimizer_labels, epochs_per_group):
-
-            # Set the gradient capabilities of current parameters
-            set_requires_grad(model.parameters(), False)
-            param_groups = [g['params'] for g in optimizer.param_groups]
-
-            for params in param_groups:
-                set_requires_grad(params, True)
-
-
-            for epoch in range(epochs):
-                start_time = time.time()
-                total_sum_loss = 0.0
-                sum_losses = [0.0 for _ in loss_fns]
-                
-                for batch in data_loader:
-                    batch = _batch_to_device(batch, device)
-
-                    total_loss, losses = train_step(*batch, optimizer=optimizer, param_groups=param_groups)
-                    total_sum_loss += total_loss
-                    for i, loss in enumerate(losses):
-                        sum_losses[i] += loss.item()
-
-                end_time = time.time()
-                avg_total_loss = total_sum_loss / len(data_loader)
-                avg_losses = [loss_sum / len(data_loader) for loss_sum in sum_losses]
-                loss_dict = {label: value for label, value in zip(loss_labels, avg_losses)}
-                loss_dict["total"] = avg_total_loss
-                validation_loss_dict = {}
-                if labeled_validation_loss_fns is not None:
-                    model.eval()
-                    validation_loss_dict = _evaluate_labeled_losses(model, validation_data_loader, labeled_validation_loss_fns)
-                    model.train()
-                    loss_dict.update(validation_loss_dict)
-
-                epoch_time = end_time - start_time
-
-                valid = model.valid()
-                current_use_best_loss = loss_dict[use_best]
-                if current_use_best_loss < best_tracked_loss:
-                    best_tracked_loss = current_use_best_loss
-                    early_stopping_counter = 0
-                elif validation_early_stopping_patience is not None:
-                    early_stopping_counter += 1
-
-                if valid and current_use_best_loss < best_loss:
-                    best_loss = current_use_best_loss
-                    best_state = deepcopy(model.state_dict())
-
-                if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
-                    if best_state is not None:
-                        model.load_state_dict(best_state)
-                        print(
-                            f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
-                            f"after unstable epoch loss: {avg_total_loss}"
-                        )
-                    else:
-                        print(f"\n Unstable epoch loss detected ({avg_total_loss}), but no best_state to restore.")
-
-                training_timer.update_epoch()
-
-                if verbose:
-                    loss_details = ", ".join(
-                        f"{label}:{value:.4f}"
-                        for label, value in zip(loss_labels, avg_losses)
-                    )
-                    if not valid:
-                        loss_details += " <invld>"
-                    validation_loss_details = ""
-                    if validation_loss_dict:
-                        validation_loss_details = ", val: " + ", ".join(
-                            f"{label}:{value:.4f}" for label, value in validation_loss_dict.items()
-                        )
-                    print(
-                        f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, Time: {epoch_time:.2f}s, Loss: tot:{avg_total_loss:.4f}, "
-                        f"{loss_details}{validation_loss_details}, etr: {training_timer.get_predicted_etr_str()}"
-                    )
-                else:
-                    print(f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s")
-
-                if (
-                    validation_early_stopping_patience is not None
-                    and early_stopping_counter >= validation_early_stopping_patience
-                ):
-                    early_stopping_triggered = True
-                    if best_state is not None:
-                        model.load_state_dict(best_state)
-                        print(
-                            f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
-                            f"on '{use_best}'. Restored best model ({use_best} loss={best_loss:.4f})."
-                        )
-                    else:
-                        print(
-                            f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
-                            f"on '{use_best}', but no best_state is available to restore."
-                        )
-                    break
-
-            if early_stopping_triggered:
-                break
-
-            training_timer.update_group()
-
-        if early_stopping_triggered:
-            break
-            
-        training_timer.update_iteration()
-        
-    if verbose:
-        print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
-    if use_best and best_state is not None and not early_stopping_triggered:
-        model.load_state_dict(best_state)
-        print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
-
-    return model, best_loss, training_timer.total_since_start()
-
-
-def train_iterate_multiset(
-    model: DensityModel | ConditionalDensityModel,
-    data_loaders: list[DataLoader],
-    labeled_loss_fns_list: list[dict[str, callable]],
-    labeled_optimizers: dict[str, torch.optim.Optimizer],
-    labeled_validation_loss_fns_list: list[dict[str, callable]] | None = None,
-    validation_data_loaders: list[DataLoader] | None = None,
-    validation_early_stopping_patience: int | None = None,
-    epochs_per_group=10,
-    iterations=10,
-    verbose=True,
-    use_best: str = "total",
-    clip_grad_norm: float = 0.5,
-    restore_loss_threshold: float = 50.0,
-):
-    """
-    Like ``train_iterate``, but each loss dict is paired with its own ``DataLoader``.
-    Each training step zips one batch from every loader and sums the corresponding losses.
-
-    ``labeled_loss_fns_list[i]`` applies to ``data_loaders[i]``; loss labels must be
-    unique across all dicts.
-    """
-    torch.autograd.set_detect_anomaly(False)
-
-    model.train()
-
-    assert len(data_loaders) == len(labeled_loss_fns_list), (
-        "data_loaders and labeled_loss_fns_list must have the same length"
-    )
-    flat_train_labels: list[str] = []
-    for labeled_loss_fns in labeled_loss_fns_list:
-        flat_train_labels.extend(labeled_loss_fns.keys())
-    if len(flat_train_labels) != len(set(flat_train_labels)):
-        raise ValueError(
-            "Multiset training loss labels must be unique across loaders; "
-            f"got {flat_train_labels}"
-        )
-
-    optimizer_labels = list(labeled_optimizers.keys())
-    optimizers = list(labeled_optimizers.values())
-
-    if (labeled_validation_loss_fns_list is None) != (validation_data_loaders is None):
-        raise ValueError(
-            "labeled_validation_loss_fns_list and validation_data_loaders must both be provided together."
-        )
-    if validation_early_stopping_patience is not None:
-        if labeled_validation_loss_fns_list is None:
-            raise ValueError(
-                "validation_early_stopping_patience requires labeled_validation_loss_fns_list and validation_data_loaders."
-            )
-        if validation_early_stopping_patience <= 0:
-            raise ValueError("validation_early_stopping_patience must be a positive integer.")
-    flat_val_labels: list[str] = []
-    if labeled_validation_loss_fns_list is not None:
-        assert len(labeled_validation_loss_fns_list) == len(validation_data_loaders), (
-            "validation multiset lists must match length"
-        )
-        assert len(labeled_validation_loss_fns_list) == len(labeled_loss_fns_list), (
-            "validation and training multiset lists must have the same length"
-        )
-        for d in labeled_validation_loss_fns_list:
-            flat_val_labels.extend(d.keys())
-        overlap = set(flat_train_labels).intersection(flat_val_labels)
-        if overlap:
-            raise ValueError(
-                f"Training and validation loss labels must be unique. Overlap: {sorted(overlap)}"
-            )
-
-    selectable_loss_labels = flat_train_labels + flat_val_labels + ["total"] if labeled_validation_loss_fns_list else flat_train_labels + ["total"]
-    assert use_best in selectable_loss_labels, f"use_best must be one of {selectable_loss_labels}"
-
-    def train_step(batches_on_dev: list, optimizer: torch.optim.Optimizer, param_groups: list[list[torch.nn.Parameter]]):
-        optimizer.zero_grad()
-        per_label: dict[str, torch.Tensor] = {}
-        total_loss = None
-        for batch, labeled_loss_fns in zip(batches_on_dev, labeled_loss_fns_list):
-            for label, loss_fn in labeled_loss_fns.items():
-                L = loss_fn(model, *batch)
-                per_label[label] = L
-                total_loss = L if total_loss is None else total_loss + L
-        total_loss.backward()
-        for params in param_groups:
-            torch.nn.utils.clip_grad_norm_(params, max_norm=clip_grad_norm)
-        optimizer.step()
-        loss_items = [per_label[label].item() for label in flat_train_labels]
-        return total_loss.item(), loss_items
-
-    best_loss = restore_loss_threshold
-    best_state = None
-    best_tracked_loss = float("inf")
-    early_stopping_counter = 0
-    early_stopping_triggered = False
-
-    if isinstance(epochs_per_group, list):
-        assert len(epochs_per_group) == len(labeled_optimizers), (
-            "epochs_per_group must be a list of the same length as labeled_optimizers"
-        )
-    else:
-        epochs_per_group = [epochs_per_group for _ in range(len(labeled_optimizers))]
-
-    training_timer = TrainingTimer(n_groups=len(optimizers), iterations=iterations, epochs_per_group=epochs_per_group)
-    training_timer.initialize()
-
-    for iteration in range(iterations):
-        for optimizer, optimizer_label, epochs in zip(optimizers, optimizer_labels, epochs_per_group):
-            set_requires_grad(model.parameters(), False)
-            param_groups = [g["params"] for g in optimizer.param_groups]
-            for params in param_groups:
-                set_requires_grad(params, True)
-
-            for epoch in range(epochs):
-                start_time = time.time()
-                total_sum_loss = 0.0
-                sum_losses = [0.0 for _ in flat_train_labels]
-                n_steps = 0
-
-                for batches in zip(*data_loaders):
-                    dev = next(model.parameters()).device
-                    batches_on_dev = [_batch_to_device(b, dev) for b in batches]
-
-                    total_loss, losses = train_step(batches_on_dev, optimizer=optimizer, param_groups=param_groups)
-                    total_sum_loss += total_loss
-                    for i, loss in enumerate(losses):
-                        sum_losses[i] += loss
-                    n_steps += 1
-
-                end_time = time.time()
-                avg_total_loss = total_sum_loss / n_steps if n_steps else float("nan")
-                avg_losses = [loss_sum / n_steps for loss_sum in sum_losses] if n_steps else []
-                loss_dict = {label: value for label, value in zip(flat_train_labels, avg_losses)}
-                loss_dict["total"] = avg_total_loss
-                validation_loss_dict = {}
-                if labeled_validation_loss_fns_list is not None:
-                    model.eval()
-                    validation_loss_dict = _evaluate_multiset_labeled_losses(
-                        model, validation_data_loaders, labeled_validation_loss_fns_list
-                    )
-                    model.train()
-                    loss_dict.update(validation_loss_dict)
-
-                epoch_time = end_time - start_time
-
-                valid = model.valid()
-                current_use_best_loss = loss_dict[use_best]
-                if current_use_best_loss < best_tracked_loss:
-                    best_tracked_loss = current_use_best_loss
-                    early_stopping_counter = 0
-                elif validation_early_stopping_patience is not None:
-                    early_stopping_counter += 1
-
-                if valid and current_use_best_loss < best_loss:
-                    best_loss = current_use_best_loss
-                    best_state = deepcopy(model.state_dict())
-
-                if _is_bad_epoch_loss(avg_total_loss, restore_loss_threshold):
-                    if best_state is not None:
-                        model.load_state_dict(best_state)
-                        print(
-                            f"\n Restored best model ({use_best} loss={best_loss:.4f}) "
-                            f"after unstable epoch loss: {avg_total_loss}"
-                        )
-                    else:
-                        print(
-                            f"\n Unstable epoch loss detected ({avg_total_loss}), but no best_state to restore."
-                        )
-
-                training_timer.update_epoch()
-
-                if verbose:
-                    loss_details = ", ".join(
-                        f"{label}:{value:.4f}" for label, value in zip(flat_train_labels, avg_losses)
-                    )
-                    if not valid:
-                        loss_details += " <invld>"
-                    validation_loss_details = ""
-                    if validation_loss_dict:
-                        validation_loss_details = ", val: " + ", ".join(
-                            f"{label}:{value:.4f}" for label, value in validation_loss_dict.items()
-                        )
-                    print(
-                        f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, "
-                        f"Time: {epoch_time:.2f}s, Loss: tot:{avg_total_loss:.4f}, "
-                        f"{loss_details}{validation_loss_details}, etr: {training_timer.get_predicted_etr_str()}"
-                    )
-                else:
-                    print(
-                        f"Itr: {iteration+1}, Optimizing: {optimizer_label}, Epoch {epoch+1}, "
-                        f"Loss: {avg_total_loss:.4f}, Time: {epoch_time:.2f}s"
-                    )
-
-                if (
-                    validation_early_stopping_patience is not None
-                    and early_stopping_counter >= validation_early_stopping_patience
-                ):
-                    early_stopping_triggered = True
-                    if best_state is not None:
-                        model.load_state_dict(best_state)
-                        print(
-                            f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
-                            f"on '{use_best}'. Restored best model ({use_best} loss={best_loss:.4f})."
-                        )
-                    else:
-                        print(
-                            f"\n Early stopping triggered after {early_stopping_counter} non-improving epochs "
-                            f"on '{use_best}', but no best_state is available to restore."
-                        )
-                    break
-
-            if early_stopping_triggered:
-                break
-
-            training_timer.update_group()
-
-        if early_stopping_triggered:
-            break
-
-        training_timer.update_iteration()
-
-    if verbose:
-        print(f"Completed training in {training_timer.total_since_start():.2f} seconds")
-    if use_best and best_state is not None and not early_stopping_triggered:
-        model.load_state_dict(best_state)
-        print(f"\n Restored best model ({use_best} loss={best_loss:.4f})")
-
-    return model, best_loss, training_timer.total_since_start()
+            if verbose:
+                print(f"Completed in {elapsed:.2f}s; no feasible model")
+            return None, self.best_loss, elapsed
+        if verbose:
+            print(f"Completed in {elapsed:.2f}s; best {use_best}: {self.best_loss:.6g}")
+        return self.model, self.best_loss, elapsed
 
 
 @torch.no_grad()
@@ -982,50 +729,35 @@ def fit_gaussian_lf_em(
     max_iter: int = 100,
     warm_start: bool = False,
 ):
+    """Fit a diagonal Gaussian mixture and wrap it in the existing LinearForm API.
+
+    This independent utility is retained for compatibility; sklearn and the
+    Gaussian/LinearForm dependencies are imported only when it is called.
     """
-    Fit a diagonal-covariance Gaussian mixture with sklearn EM and convert it to
-    a `LinearForm` using `GaussianBasis`.
+    from sklearn.mixture import GaussianMixture
 
-    Args:
-        z: Tensor with shape (N, D).
-        n_components: Number of mixture components.
-        reg_covar: Non-negative regularization added to diagonal covariance.
-        max_iter: Maximum number of EM iterations.
-        warm_start: Whether sklearn should reuse previous fit parameters.
-    """
-    assert z.ndim == 2, "z must have shape (N, D)"
-    assert n_components > 0, "n_components must be positive"
-    assert reg_covar >= 0.0, "reg_covar must be non-negative"
-    assert max_iter > 0, "max_iter must be positive"
+    from .basis_functions import GaussianBasis
+    from .factor_forms import LinearForm
+    from .parameters import FixedParameters, PositiveParameters
 
-    device = z.device
-    dtype = z.dtype
-
-    z_np = z.detach().cpu().numpy()
-
-    sk_gmm = GaussianMixture(
+    if z.ndim != 2 or not z.is_floating_point():
+        raise ValueError("z must be a floating-point tensor of shape (N, D)")
+    if n_components < 1 or reg_covar < 0 or max_iter < 1:
+        raise ValueError("Require n_components >= 1, reg_covar >= 0, max_iter >= 1")
+    mixture = GaussianMixture(
         n_components=n_components,
-        covariance_type='diag',
+        covariance_type="diag",
         reg_covar=reg_covar,
         max_iter=max_iter,
         warm_start=warm_start,
-        init_params="kmeans",
     )
-
-    sk_gmm.fit(z_np)
-
-    weights = torch.as_tensor(sk_gmm.weights_, device=device, dtype=dtype)
-    means = torch.as_tensor(sk_gmm.means_, device=device, dtype=dtype)
-
-    vars = torch.as_tensor(sk_gmm.covariances_, device=device, dtype=dtype)
-    stds = torch.sqrt(vars.clamp_min(torch.finfo(dtype).eps))
-
+    mixture.fit(z.detach().cpu().numpy())
+    means = torch.as_tensor(mixture.means_, dtype=z.dtype, device=z.device).T[None]
+    stds = torch.as_tensor(mixture.covariances_, dtype=z.dtype, device=z.device).sqrt().T[None]
+    weights = torch.as_tensor(mixture.weights_, dtype=z.dtype, device=z.device)[None]
     basis = GaussianBasis(
-        mean_params=Parameters.from_values(means.transpose(0, 1).contiguous(), trainable=False),
-        std_params=PositiveParameters.from_values(stds.transpose(0, 1).contiguous(), trainable=False, normalized=False),
-        coeffs=PositiveParameters.from_values(weights, trainable=False, normalized=True),
+        mean_params=FixedParameters(means),
+        std_params=PositiveParameters.from_values(stds, trainable=False),
+        coeffs=PositiveParameters.from_values(weights, trainable=False),
     )
-
-    lf = LinearForm(w=basis)
-
-    return lf
+    return LinearForm(w=basis)

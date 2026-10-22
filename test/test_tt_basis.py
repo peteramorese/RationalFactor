@@ -129,12 +129,14 @@ class FakePrimitives(SeparableBasis):
             vals.append(torch.stack((1.0 + y[:, k], 2.0 - 0.5 * y[:, k]), dim=-1))
         return torch.stack(vals, dim=1)
 
-    def log_Omega1_dim(self, lows=None, highs=None):
+    def Omega1_dim(self, lows=None, highs=None, return_log=False):
         vals = torch.tensor([[[1.1, 0.7], [0.9, 1.3]]], dtype=self.dtype)
-        return vals[:, : self.d, : self.n].log()
+        vals = vals[:, : self.d, : self.n]
+        return vals.log() if return_log else vals
 
-    def log_Omega2_dim(self, other, lows=None, highs=None):
-        return self._gram[None].log()
+    def Omega2_dim(self, other, lows=None, highs=None, return_log=False):
+        gram = self._gram[None]
+        return gram.log() if return_log else gram
 
 
 def kron_all(xs):
@@ -174,6 +176,6 @@ def test_nested_ttbasis_omega1_is_rank_one_and_batch_compatible():
     primitives = FakePrimitives()
     basis = TTBasis(primitives, nested_depth=2)
     omega1 = basis.Omega1()
-    factors = tuple(torch.exp(primitives.log_Omega1_dim())[0, k] for k in range(primitives.d))
+    factors = tuple(torch.exp(primitives.Omega1_dim(return_log=True))[0, k] for k in range(primitives.d))
     torch.testing.assert_close(omega1.to_dense(), kron_all(factors))
     assert omega1.rank_one_factors is not None
