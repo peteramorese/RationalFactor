@@ -1,56 +1,23 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
-from rational_factor.models.parameters import FixedParameters, TTVectorParameters
+from rational_factor.models.parameters import FixedParameters
+from rational_factor.models.tt.tt_parameters import TTVectorParameters
 from rational_factor.models.structured_matrices import Matrix, as_matrix
-from rational_factor.models.structured_vectors import TTVector, as_vector
-from rational_factor.models.tt.nested_tt import (
-    NestedTTMatrix,
-    NestedTTVector,
-    SeparableNestedTTMatrix,
-)
-from rational_factor.models.tt.nested_tt_parameters import FixedNestedTTVectorParameters
+from rational_factor.models.structured_vectors import as_vector
+from rational_factor.models.tt.tt import TTVector, LowRankFactorizationMPO
 import torch
 import copy 
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
 
 
 def _coeff_params_from_values(values):
-    """Wrap vector values as Fixed / TT / NestedTT coefficient Parameters."""
+    """Freeze coefficients without materializing a high-dimensional TT."""
     values = as_vector(values)
-    if isinstance(values, NestedTTVector):
-        return FixedNestedTTVectorParameters(values)
     if isinstance(values, TTVector):
-        return TTVectorParameters.from_cores(
-            [FixedParameters(core.detach().clone()) for core in values.cores]
-        )
+        return TTVectorParameters.from_cores([
+            FixedParameters(core.detach().clone()) for core in values.cores
+        ])
     dense = values.to_dense() if hasattr(values, "to_dense") else values
-    return FixedParameters(dense.detach().clone() if hasattr(dense, "detach") else dense)
-
-
-def _outer_rank_one_factors(v: NestedTTVector) -> tuple[torch.Tensor, ...]:
-    """Physical factors of an outer-rank-one NestedTTVector.
-
-    Prefer tracked ``rank_one_factors`` when present.  Otherwise materialize the
-    per-mode outer cores (shape ``(1, n_k, 1)``) without forming the full
-    Kronecker product.
-    """
-    known = v.rank_one_factors
-    if known is not None:
-        return known
-    if any(int(r) != 1 for r in v.ranks):
-        raise ValueError(
-            f"expected outer rank-one NestedTTVector, got ranks={tuple(v.ranks)}"
-        )
-    factors = []
-    for core, n in zip(v.materialize_cores(), v.modes):
-        if core.ndim == 3:
-            factors.append(core.reshape(int(n)))
-        elif core.ndim == 4:
-            factors.append(core.reshape(int(core.shape[0]), int(n)))
-        else:
-            raise ValueError(
-                f"unexpected materialized core shape {tuple(core.shape)} for mode {n}"
-            )
-    return tuple(factors)
+    return FixedParameters(dense.detach().clone())
 
 
 def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
@@ -100,116 +67,58 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
     
     ##### SUM PRODUCT RATIONAL FACTOR #####
     elif isinstance(transition_model, SumProdRFF):
-        assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for SumProdRFF transition model"
+        if not isinstance(init_belief, LinearFF):
+            raise TypeError("Belief must be LinearFF for SumProdRFF propagation")
+        if n_steps < 0:
+            raise ValueError("n_steps must be nonnegative")
+
+        B = transition_model.B()
+        if not isinstance(B, LowRankFactorizationMPO):
+            raise TypeError("SumProdRFF propagation requires LowRankFactorizationMPO B")
+
+        a = transition_model.a()
+        if not isinstance(a, TTVector) or not a.is_rank_one or a.is_batched:
+            raise ValueError("a must be an unbatched rank-one TTVector")
 
         phi = transition_model.phi
-
         psi0 = copy.copy(init_belief.h)
         psi0.set_coeffs_to_one()
+        omega0 = phi.Omega2(psi0)
+        omega = phi.Omega2(transition_model.psi)
+        if (not isinstance(omega0, Matrix) or not isinstance(omega, Matrix)):
+            raise TypeError("basis Grams must be MPO matrices")
+        q = omega.rev_matvec(a)
+        if not isinstance(q, TTVector) or not q.is_rank_one:
+            raise ValueError("q = omega.T @ a must be a rank-one TTVector")
 
-        Omega2_0_raw = phi.Omega2(psi0)
-        Omega2_raw = phi.Omega2(transition_model.psi)
-
-        # Q = diag(a) @ B @ diag(q)^{-1}, so Q^T s = (B^T (a * s)) / q.
-        B = transition_model.B()
-        a = as_vector(transition_model.a())
-
-        if isinstance(a, NestedTTVector):
-            if not isinstance(B, NestedTTMatrix):
-                raise TypeError(
-                    "NestedTTVector coefficients require NestedTTMatrix B, got "
-                    f"{type(B).__name__}"
-                )
-            if not isinstance(
-                Omega2_0_raw, (NestedTTMatrix, SeparableNestedTTMatrix)
-            ) or not isinstance(Omega2_raw, (NestedTTMatrix, SeparableNestedTTMatrix)):
-                raise TypeError(
-                    "NestedTT coefficients require NestedTT Gram matrices; "
-                    "construct TTBasis with nested_depth matching the "
-                    "coefficient depth"
-                )
-            Omega2_0 = Omega2_0_raw
-            Omega2 = Omega2_raw
-            # NestedTTMatrix has no transpose; use rev_matvec for Q^T actions.
-            a_factors = _outer_rank_one_factors(a)
-            q = Omega2.rev_matvec(a)
-            q_factors = _outer_rank_one_factors(q)
-
-            def _as_nested(c):
-                c_vec = as_vector(c)
-                if isinstance(c_vec, NestedTTVector):
-                    return c_vec
-                raise TypeError(
-                    "NestedTT propagation expects NestedTTVector coefficients, "
-                    f"got {type(c_vec).__name__}"
-                )
-
-            c0_norm_constant = torch.exp(init_belief.log_norm_constant())
-            c0 = c0_norm_constant * as_vector(init_belief.h.coeffs())
-
-            h0 = copy.copy(init_belief.h)
-            h0.set_coeffs(_coeff_params_from_values(_as_nested(c0)))
-            h_seq = [h0]
-
-            def _Omega2_QT_matmul(c, _Omega2: NestedTTMatrix):
-                c_vec = _as_nested(c)
-                s1 = _Omega2.matvec(c_vec)
-                # a * s1 via rank-one factors of a (NestedTT has no general Hadamard).
-                return B.rev_matvec(s1.elementwise_multiply(a_factors)).elementwise_divide(
-                    q_factors
-                )
-
-            c1 = _Omega2_QT_matmul(c0, Omega2_0)
-            h1 = copy.copy(transition_model.psi)
-            h1.set_coeffs(_coeff_params_from_values(c1))
-            h_seq.append(h1)
-            for _ in range(1, n_steps):
-                ck = _Omega2_QT_matmul(h_seq[-1].coeffs(), Omega2)
-                hk = copy.copy(transition_model.psi)
-                hk.set_coeffs(_coeff_params_from_values(ck))
-                h_seq.append(hk)
-            g = transition_model.g_basis()
-            belief_seq = [
-                LinearFF(
-                    g,
-                    h,
-                    numerical_tolerance=init_belief.numerical_tolerance,
-                    renormalize_h=False,
-                    register_modules=False,
-                )
-                for h in h_seq
-            ]
-            return belief_seq
-
-        Omega2_0 = as_matrix(Omega2_0_raw)
-        Omega2 = as_matrix(Omega2_raw)
-        q = as_vector(Omega2.rev_matvec(a))
-
-        c0_norm_constant = torch.exp(init_belief.log_norm_constant())
-        c0 = c0_norm_constant * as_vector(init_belief.h.coeffs())
-
+        c0 = torch.exp(init_belief.log_norm_constant()) * init_belief.h.coeffs()
+        if not isinstance(c0, TTVector):
+            raise TypeError("initial h coefficients must be a TTVector")
         h0 = copy.copy(init_belief.h)
         h0.set_coeffs(_coeff_params_from_values(c0))
         h_seq = [h0]
-        
-        def _Omega2_QT_matmul(c, _Omega2 : Matrix):
-            c_vec = as_vector(c)
-            s1 = _Omega2.matvec(c_vec)
-            return B.rev_matvec(a * s1) / q
-        
-        c1 = _Omega2_QT_matmul(c0, Omega2_0)
-        h1 = copy.copy(transition_model.psi)
-        h1.set_coeffs(_coeff_params_from_values(c1))
-        h_seq.append(h1)
-        for _ in range(1, n_steps):
-            ck = _Omega2_QT_matmul(h_seq[-1].coeffs(), Omega2)
-            hk = copy.copy(transition_model.psi)
-            hk.set_coeffs(_coeff_params_from_values(ck))
-            h_seq.append(hk)
-        g = transition_model.g_basis()
-        belief_seq = [LinearFF(g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
 
-        return belief_seq
+        if n_steps:
+            # Only the first step depends on the full initial TT coefficient state.
+            # z_t = U.T @ (a * omega @ c_{t-1}) is r-dimensional.
+            z = B.T.project_latent(a * omega0.matvec(c0))
+            # K = U.T @ diag(a) @ omega @ diag(q)^-1 @ V.
+            K = B.latent_kernel(omega, a, q)
+            for t in range(1, n_steps + 1):
+                if t > 1:
+                    z = K @ z
+                # c_t = diag(q)^-1 @ V @ z : TT ranks at most V MPO ranks.
+                c_t = B.T.apply_latent(z) / q
+                h_t = copy.copy(transition_model.psi)
+                h_t.set_coeffs(_coeff_params_from_values(c_t))
+                h_seq.append(h_t)
+
+        g = transition_model.g_basis()
+        return [LinearFF(
+            g if t else init_belief.g, h,
+            numerical_tolerance=init_belief.numerical_tolerance,
+            renormalize_h=False, register_modules=False,
+        ) for t, h in enumerate(h_seq)]
 
     ##### QUADRATIC RATIONAL FACTOR #####
     elif isinstance(transition_model, QuadraticRFF):

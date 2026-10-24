@@ -12,8 +12,8 @@ import torch
 from rational_factor.models.parameters import (
     Parameters, FixedParameters, TrainableParameters, PositiveParameters,
 )
-from rational_factor.models.tt import (
-    TTVector, MPO, NilpotentMPO, GateLayerMPO, InvertibleMPO,
+from rational_factor.models.tt.tt import (
+    TTVector, MPO, LowRankFactorizationMPO, NilpotentMPO, GateLayerMPO, InvertibleMPO,
     InvertibleMPOProduct,
 )
 
@@ -173,6 +173,119 @@ class MPOParameters(Parameters):
 
     def parameter_modules(self):
         return _modules(*self._cores)
+
+    def is_module(self):
+        return False
+
+
+
+class LowRankFactorizationMPOParameters(Parameters):
+    r"""Structured rank-r ``B = U @ V.T`` with rectangular MPO factors.
+
+    Both factors have column modes ``(1, ..., 1, r)`` and physical row modes
+    matching ``row_modes`` / ``col_modes`` respectively. With the default
+    ``row_stochastic=True``, positive local softmax constraints guarantee
+
+        U @ ones(r) = ones(N_row),
+        V.T @ ones(N_col) = ones(r),
+        B >= 0, B @ ones(N_col) = ones(N_row).
+
+    These are exact algebraic constraints (up to roundoff), without expanding
+    exponentially large vectors or matrices. The normalization imposes a
+    particular nonnegative MPO gauge and is not a universal representation of
+    all nonnegative rank-r matrices at fixed MPO bond rank.
+    """
+
+    def __init__(self, U: Parameters, V: Parameters, *, row_stochastic: bool = True):
+        if not isinstance(U, Parameters) or not isinstance(V, Parameters):
+            raise TypeError("U and V must be Parameters objects")
+        self.U, self.V = U, V
+        self.row_stochastic = bool(row_stochastic)
+        # Validate only shape/meta: avoid keeping parameter-dependent graphs.
+        u, v = U(), V()
+        LowRankFactorizationMPO(u, v)
+
+    @classmethod
+    def from_factors(cls, U: Parameters, V: Parameters, *, row_stochastic=True):
+        return cls(U, V, row_stochastic=row_stochastic)
+
+    @classmethod
+    def from_core_spec(
+        cls, row_modes: Sequence[int], rank: int,
+        ranks: int | Sequence[int] = 1,
+        col_modes: Sequence[int] | None = None, *,
+        ranks_u: int | Sequence[int] | None = None,
+        ranks_v: int | Sequence[int] | None = None,
+        row_stochastic: bool = True,
+        param_cls: type[TrainableParameters] = TrainableParameters,
+        trainable=True, mean=0., std=1., epsilon=0.,
+        dtype=torch.float32, device=None,
+    ):
+        rows = tuple(int(m) for m in row_modes)
+        cols = rows if col_modes is None else tuple(int(m) for m in col_modes)
+        if not rows or len(rows) != len(cols) or any(m < 1 for m in rows + cols):
+            raise ValueError("row_modes and col_modes must have matching positive site sizes")
+        if not isinstance(rank, int) or rank < 1:
+            raise ValueError("rank must be a positive integer")
+        latent_modes = (1,) * (len(rows) - 1) + (rank,)
+        U = MPOParameters.from_core_spec(rows, ranks=ranks if ranks_u is None else ranks_u,
+                col_modes=latent_modes, param_cls=param_cls, trainable=trainable,
+                mean=mean, std=std, epsilon=epsilon, dtype=dtype, device=device)
+        V = MPOParameters.from_core_spec(cols, ranks=ranks if ranks_v is None else ranks_v,
+                col_modes=latent_modes, param_cls=param_cls, trainable=trainable,
+                mean=mean, std=std, epsilon=epsilon, dtype=dtype, device=device)
+        return cls(U, V, row_stochastic=row_stochastic)
+
+    @staticmethod
+    def _normalized_u(factor: MPO) -> MPO:
+        result = []
+        for k, core in enumerate(factor.cores):
+            # Intermediate U cores define conditional distributions over
+            # the next bond for every (current bond, row mode).
+            dim = 2 if k == len(factor.cores) - 1 else -1
+            result.append(core.softmax(dim=dim))
+        return MPO(result)
+
+    @staticmethod
+    def _normalized_v(factor: MPO) -> MPO:
+        result = []
+        for k, core in enumerate(factor.cores):
+            if k == len(factor.cores) - 1:
+                # sum_i V[last][bond, i, latent, 1] == 1
+                result.append(core.softmax(dim=1))
+            else:
+                left, n, _, right = core.shape
+                # sum_{i,right} V[k][left,i,1,right] == 1
+                result.append(core.reshape(left, n * right).softmax(dim=-1)
+                              .reshape(left, n, 1, right))
+        return MPO(result)
+
+    def __call__(self) -> LowRankFactorizationMPO:
+        U, V = self.U(), self.V()
+        if self.row_stochastic:
+            U, V = self._normalized_u(U), self._normalized_v(V)
+        return LowRankFactorizationMPO(U, V)
+
+    def is_row_stochastic(self) -> bool:
+        return self.row_stochastic
+
+    @property
+    def row_modes(self):
+        return self.U.row_modes
+
+    @property
+    def col_modes(self):
+        return self.V.row_modes
+
+    @property
+    def rank(self):
+        return self.U.col_modes[-1]
+
+    def is_trainable(self):
+        return self.U.is_trainable() or self.V.is_trainable()
+
+    def parameter_modules(self):
+        return _modules(self.U, self.V)
 
     def is_module(self):
         return False
@@ -436,6 +549,57 @@ class InvertibleMPOProductParameters(Parameters):
         return False
 
 
+
+
+class SimilarityMPOParameters(Parameters):
+    """Build ``M = V @ S @ V.inverse()`` from independently parameterized MPOs.
+
+    ``transform`` must construct an InvertibleMPO (including an
+    InvertibleMPOProduct); ``center`` must construct a square MPO with matching
+    local modes. In particular, use ConstantModeNilpotentMPOParameters (or
+    ConstantModeGateLayerMPOParameters) for V and
+    ConstantModeRank1MPOParameters for S to guarantee ``e0.T @ M == e0.T``.
+
+    Both factors are freshly evaluated on every call, preserving gradients
+    through the exact MPO multiplication and specialized inverse. The MPO
+    product is not compressed: its bond ranks can grow with circuit depth.
+    """
+
+    def __init__(self, transform: Parameters, center: Parameters):
+        if not isinstance(transform, Parameters) or not isinstance(center, Parameters):
+            raise TypeError('transform and center must be Parameters providers')
+        self.transform = transform
+        self.center = center
+        V = transform()
+        S = center()
+        if not isinstance(V, InvertibleMPO):
+            raise TypeError('transform must construct an InvertibleMPO')
+        if not isinstance(S, MPO):
+            raise TypeError('center must construct an MPO')
+        if V.row_modes != V.col_modes or S.row_modes != S.col_modes or V.row_modes != S.row_modes:
+            raise ValueError('transform and center must have identical square local modes')
+
+    @property
+    def row_modes(self):
+        return self.center().row_modes
+
+    @property
+    def col_modes(self):
+        return self.center().col_modes
+
+    def __call__(self) -> MPO:
+        V = self.transform()
+        S = self.center()
+        return V @ S @ V.inverse()
+
+    def is_trainable(self):
+        return self.transform.is_trainable() or self.center.is_trainable()
+
+    def parameter_modules(self):
+        return _modules(self.transform, self.center)
+
+    def is_module(self):
+        return False
 
 
 def compose_invertible_mpo_parameters(*layers: Parameters) -> InvertibleMPOProduct:

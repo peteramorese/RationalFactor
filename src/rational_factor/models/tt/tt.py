@@ -770,6 +770,145 @@ class MPO(Matrix):
             f"device={self.device})"
         )
 
+
+class LowRankFactorizationMPO(Matrix):
+    r"""Ordinary-rank-``r`` matrix ``B = U @ V.T`` with rectangular MPO factors.
+
+    For ``d`` physical sites, both factors have column modes
+    ``(1, ..., 1, r)``. The latent index is stored only at the last site;
+    their row modes may differ. Only ``r``-element latent vectors are ever
+    densified. TT input/output contractions preserve structured storage.
+    """
+
+    def __init__(self, U: MPO, V: MPO):
+        if not isinstance(U, MPO) or not isinstance(V, MPO):
+            raise TypeError("U and V must be MPO instances")
+        if len(U.cores) != len(V.cores):
+            raise ValueError("U and V must have the same number of sites")
+        if U.col_modes != V.col_modes or any(n != 1 for n in U.col_modes[:-1]):
+            raise ValueError("both factor column modes must be (1, ..., 1, r)")
+        if U.dtype != V.dtype or U.device != V.device:
+            raise ValueError("U and V must share a dtype and device")
+        self.U, self.V = U, V
+
+    @property
+    def r(self) -> int:
+        return self.U.col_modes[-1]
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size((self.U.shape[0], self.V.shape[0]))
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.U.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.U.device
+
+    @property
+    def T(self) -> 'LowRankFactorizationMPO':
+        return LowRankFactorizationMPO(self.V, self.U)
+
+    def to_dense(self) -> torch.Tensor:
+        """Only for debugging small systems; exponentially sized output."""
+        return self.U.to_dense() @ self.V.to_dense().T
+
+    def _latent_tt(self, z: torch.Tensor) -> TTVector:
+        """Embed (..., r) in a TT with modes (1, ..., 1, r)."""
+        z = torch.as_tensor(z, device=self.device, dtype=self.dtype)
+        if z.shape[-1] != self.r:
+            raise ValueError(f"latent vector must have size {self.r}, got {tuple(z.shape)}")
+        batch = z.shape[:-1]
+        leading = [z.new_ones(*batch, 1, 1, 1) for _ in range(len(self.U.cores) - 1)]
+        return TTVector([*leading, z.reshape(*batch, 1, self.r, 1)])
+
+    def apply_latent(self, z: torch.Tensor) -> TTVector:
+        """Compute ``U @ z`` as a TT of ranks bounded by U's MPO ranks."""
+        return self.U.matvec(self._latent_tt(z))
+
+    def project_latent(self, x: torch.Tensor | TTVector) -> torch.Tensor:
+        """Compute ``V.T @ x``, densifying only the r-dimensional output."""
+        if isinstance(x, TTVector):
+            out = self.V.T.matvec(x)
+            return out.to_dense()
+        out = self.V.T._matvec_dense(
+            torch.as_tensor(x, device=self.device, dtype=self.dtype)
+        )
+        return out
+
+    def matvec(self, x: torch.Tensor | Vector) -> TTVector:
+        if isinstance(x, Vector) and not isinstance(x, TTVector):
+            x = x.to_dense()
+        return self.apply_latent(self.project_latent(x))
+
+    def rev_matvec(self, x: torch.Tensor | Vector) -> TTVector:
+        return self.T.matvec(x)
+
+    def sum(self) -> torch.Tensor:
+        def column_sums(factor: MPO):
+            x = TTVector([c.new_ones(1, n, 1) for c, n in zip(factor.cores, factor.row_modes)])
+            return factor.T.matvec(x).to_dense()
+        return (column_sums(self.U) * column_sums(self.V)).sum()
+
+    @staticmethod
+    def _scale_rows(factor: MPO, weights: TTVector) -> MPO:
+        if not isinstance(weights, TTVector) or not weights.is_rank_one or weights.is_batched:
+            raise ValueError("diagonal scaling requires an unbatched rank-one TTVector")
+        if factor.row_modes != weights.modes:
+            raise ValueError("diagonal weights must match factor row modes")
+        return MPO([core * w[0, :, 0][None, :, None, None]
+                    for core, w in zip(factor.cores, weights.cores)])
+
+    def mul_diag_left(self, weights: TTVector) -> 'LowRankFactorizationMPO':
+        """Exact diag(weights) @ B, without changing the MPO factor ranks."""
+        return LowRankFactorizationMPO(self._scale_rows(self.U, weights), self.V)
+
+    def mul_diag_right(self, weights: TTVector) -> 'LowRankFactorizationMPO':
+        """Exact B @ diag(weights), without changing the MPO factor ranks."""
+        return LowRankFactorizationMPO(self.U, self._scale_rows(self.V, weights))
+
+    def to(self, *, device=None, dtype=None) -> 'LowRankFactorizationMPO':
+        return LowRankFactorizationMPO(self.U.to(device=device, dtype=dtype),
+                                       self.V.to(device=device, dtype=dtype))
+
+    def clone(self) -> 'LowRankFactorizationMPO':
+        return LowRankFactorizationMPO(self.U.clone(), self.V.clone())
+
+    def latent_kernel(self, omega: MPO, a: TTVector, q: TTVector) -> torch.Tensor:
+        r"""Calculate ``K = U.T @ diag(a) @ omega @ diag(q)^-1 @ V``.
+
+        All contractions use only local cores. The result is a dense r x r
+        matrix. This version requires rank-one a, q, and omega; it never
+        forms an N x r intermediate or a dense N-dimensional vector.
+        """
+        if not isinstance(omega, MPO) or any(rank != 1 for rank in omega.ranks):
+            raise ValueError("omega must be a Kronecker-rank-one MPO")
+        if not (isinstance(a, TTVector) and isinstance(q, TTVector)
+                and a.is_rank_one and q.is_rank_one
+                and not a.is_batched and not q.is_batched):
+            raise ValueError("a and q must be unbatched rank-one TT vectors")
+        if (a.modes != self.U.row_modes or q.modes != self.V.row_modes
+                or omega.row_modes != a.modes or omega.col_modes != q.modes):
+            raise ValueError("factor, gram, and vector local modes are incompatible")
+        env = self.U.cores[0].new_ones(1, 1)
+        for k, (uc, vc, gc, ac, qc) in enumerate(zip(
+                self.U.cores, self.V.cores, omega.cores, a.cores, q.cores)):
+            av = ac[0, :, 0]
+            qv = qc[0, :, 0]
+            if bool((qv == 0).any()):
+                raise ValueError("q contains a zero local factor; cannot invert diag(q)")
+            weighted_g = av[:, None] * gc[0, :, :, 0] / qv[None, :]
+            if k == len(self.U.cores) - 1:
+                # uc: (rU, n, r, 1), vc: (rV, n, r, 1).
+                return torch.einsum('ac,air,ij,cjs->rs', env,
+                                    uc[..., 0], weighted_g, vc[..., 0])
+            # uc: (rU, n, 1, RU), vc: (rV, n, 1, RV).
+            env = torch.einsum('ac,aib,ij,cjd->bd', env,
+                               uc[:, :, 0, :], weighted_g, vc[:, :, 0, :])
+        raise RuntimeError("empty MPO")
+
 # -----------------------------------------------------------------------------
 # Exactly invertible MPO layers (parameter ownership belongs to the caller).
 # -----------------------------------------------------------------------------

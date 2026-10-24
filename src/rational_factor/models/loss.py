@@ -3,6 +3,11 @@ from rational_factor.models.tt.tt import MPO
 from rational_factor.models.big_polynomial import ConditionalBigLegendre
 from .density_model import DensityModel, ConditionalDensityModel
 from .factor_forms import LinearRFF, QuadraticRFF
+from rational_factor.tools.polynomial_conversions import legendre_to_bernstein
+from functools import lru_cache
+
+
+
 #### General ####
 
 def conditional_mle_loss(
@@ -108,10 +113,6 @@ def dtf_data_concentration_loss(dtf, x : torch.Tensor, concentration_point : tor
     return outside_distance.mean()
 
 #### Conditional Big Legendre Polynomial ####
-
-from functools import lru_cache
-from rational_factor.models.basis_functions import legendre_to_bernstein
-
 
 @lru_cache(maxsize=32)
 def _legendre_to_bernstein_tensor(degree: int, dtype: torch.dtype, device: torch.device):

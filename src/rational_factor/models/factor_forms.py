@@ -3,9 +3,10 @@ import copy
 import itertools
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel
-from .parameters import Parameters, RowStochasticMatrixParameters
+from .parameters import Parameters 
 from .structured_matrices import as_matrix
 from .structured_vectors import as_vector
+from rational_factor.models.tt.tt import TTVector
 
 
 def _is_parameters_like(obj) -> bool:
@@ -13,12 +14,6 @@ def _is_parameters_like(obj) -> bool:
     return callable(obj) and hasattr(obj, "is_trainable") and hasattr(
         obj, "parameter_modules"
     )
-
-
-def _is_row_stochastic_matrix_parameters_like(obj) -> bool:
-    if isinstance(obj, RowStochasticMatrixParameters):
-        return True
-    return _is_parameters_like(obj) and type(obj).__name__.startswith("RowStochastic")
 
 
 # Linear models #
@@ -137,6 +132,8 @@ class SumProdRFF(ConditionalDensityModel):
         assert isinstance(psi, Basis), "psi must be a Basis"
         a_vals = a()
         a_shape = tuple(a_vals.shape) if hasattr(a_vals, "shape") else tuple(a_vals.size())
+        if isinstance(a_vals, TTVector) and not a_vals.is_rank_one:
+            raise ValueError("SumProdRFF requires rank-one TT coefficients a for structured q scaling")
         batch_size = phi.batch_size()
         n_basis = phi.n_basis_functions()
         a_ok = a_shape == (batch_size, n_basis) or (
@@ -155,14 +152,11 @@ class SumProdRFF(ConditionalDensityModel):
         self.psi = psi
         
         expected = (batch_size, n_basis, n_basis)
-        # Unbatched structured matrices (e.g. TTMatrix) expose shape (n, n);
+        # Unbatched structured matrices (e.g. LowRankFactorizationMPO) expose shape (n, n);
         # that is accepted when the basis batch size is 1.
         expected_unbatched = (n_basis, n_basis)
 
         B_m = B()
-        assert _is_row_stochastic_matrix_parameters_like(B), (
-            "B must be a RowStochasticMatrixParameters-like object"
-        )
         shape_ok = (
             B_m.shape == expected
             or (batch_size == 1 and B_m.shape == expected_unbatched)
@@ -224,7 +218,7 @@ class SumProdRFF(ConditionalDensityModel):
         Q_psi_xp = a * B.matvec(psi_xp / q)
         log_f = torch.log(as_vector(phi_x * Q_psi_xp).sum() + tol)
 
-        return log_g_xp + log_f - log_g_x
+        return (log_g_xp + log_f - log_g_x).reshape(-1)
 
 
 class LinearRF(ConditionalDensityModel):

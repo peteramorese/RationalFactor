@@ -10,7 +10,13 @@ from rational_factor.models.big_polynomial import BigBernstein, ConditionalBigLe
 from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.parameters import PositiveParameters, TrainableParameters, param_group_iter
 from rational_factor.models.train import LossVisualizer, Trainer
-from rational_factor.models.tt.tt_parameters import MPOParameters, TTVectorParameters
+from rational_factor.models.tt.tt_parameters import (
+    ConstantModeNilpotentMPOParameters,
+    ConstantModeRank1MPOParameters,
+    InvertibleMPOProductParameters,
+    SimilarityMPOParameters,
+    TTVectorParameters,
+)
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 import rational_factor.models.loss as loss
 
@@ -228,13 +234,13 @@ def _plot_conditional_slices_model_vs_data(
 
 
 def _cbl_positivity_loss(model) -> torch.Tensor:
-    """Positivity penalty for a wrapped ``ConditionalBigLegendre``.
+    """High-dimensional, sufficient Bernstein nonnegativity certificate.
 
-    The ``Trainer`` passes the full composite (wrapped) transition model, but
-    ``loss.cbl_positivity_loss`` requires the bare ``ConditionalBigLegendre``,
-    so unwrap ``base_density`` here. ``method='cores'`` is the default: zero
-    loss certifies nonnegative Bernstein coefficients of every MPO core.
+    The penalty operates on the Legendre-to-Bernstein transformed MPO cores,
+    not on dense or sampled coefficient tensors. A zero penalty guarantees
+    nonnegative Bernstein coefficients (although it is gauge-dependent).
     """
+    # The existing positivity loss defaults to its certified core-based mode.
     return loss.cbl_positivity_loss(model.base_density)
 
 
@@ -246,15 +252,21 @@ if __name__ == "__main__":
     # Local (per-dimension) polynomial size: degree = local_basis_size - 1.
     # Both big-polynomial bases require equal local mode sizes, so the TT/MPO
     # modes are (local_basis_size,) * dim.
-    local_basis_size = 8
-    tran_rank = 5
+    local_basis_size = 15
     init_rank = 5
     tran_params = {
-        "epochs": 50,
+        "epochs": 200,
         "wrap_iterations": 1,  # full data passes per epoch for the wrap optimizer
         "matrix_iterations": 1,  # full data passes per epoch for the MPO optimizer
-        "lr_matrix": 1e-2,
+        # Degree-7 Legendre-to-Bernstein coefficients amplify small changes;
+        # use a conservative Adam step when searching for feasible checkpoints.
+        "lr_matrix": 1e-3,
         "lr_wrap": 1e-3,
+        "n_nilpotent_layers": 2,
+        "nilpotent_block_rank": 10,  # In 2D the block spans one site, so its TT rank is 1.
+        "nilpotent_std": 0.00,  # Starts with V=I; the core certificate may still fail due to MPO gauge.
+        "center_std": 0.00,
+        "positivity_weight": 0.001,
     }
     init_params = {
         "epochs": 50,
@@ -288,14 +300,18 @@ if __name__ == "__main__":
     )
 
     print(
-        f"modes={modes}, dim={d}, tran_rank={tran_rank}, init_rank={init_rank}"
+        f"modes={modes}, dim={d}, "
+        f"nilpotent_layers={tran_params['n_nilpotent_layers']}, "
+        f"nilpotent_block_rank={tran_params['nilpotent_block_rank']}, "
+        f"init_rank={init_rank}"
     )
 
-    # Shared by both Trainer runs; the second run re-initializes (and
-    # overwrites) figures/loss_progress.png, which is fine.
-    loss_visualizer = LossVisualizer(
-        Path("figures"), buffer_size=1, filename="loss_progress.png"
-    )
+    output_dir = Path("figures/big_polynomial/vdp")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tran_visualizer = LossVisualizer(output_dir, buffer_size=1,
+                                     filename="transition_losses.png")
+    init_visualizer = LossVisualizer(output_dir, buffer_size=1,
+                                     filename="initial_losses.png")
 
     # ------------------------------------------------------------------
     # Transition model: ConditionalBigLegendre behind a trainable erf wrap.
@@ -305,14 +321,43 @@ if __name__ == "__main__":
     # and the wrap is trained jointly with the transition model. Its
     # parameters form their own optimizer group below.
     # ------------------------------------------------------------------
-    matrix_params = MPOParameters.from_core_spec(
-        modes,
-        ranks=tran_rank,
-        param_cls=TrainableParameters,
-        mean=0.0,
-        std=0.5,
+    # M = V S V^{-1}; each nilpotent layer is I + K with K^2 = 0.
+    # Different control sites give nontrivial cross-layer interactions. Both V
+    # and S preserve the left constant mode, hence so does M.
+    n_layers = tran_params["n_nilpotent_layers"]
+    if not isinstance(n_layers, int) or n_layers < 1:
+        raise ValueError("n_nilpotent_layers must be a positive integer")
+    # In this two-site problem each nilpotent layer has MPO rank <= 2;
+    # without compression, V S V^{-1} has intermediate rank 4**n_layers.
+    # Increasing depth past three becomes very wasteful for local size 8.
+    estimated_rank = 4 ** n_layers
+    if estimated_rank > local_basis_size ** 2:
+        print(
+            f"WARNING: exact similarity MPO may have bond rank {estimated_rank}, "
+            f"above the maximal useful two-site rank {local_basis_size ** 2}; "
+            "MPO multiplication currently does not compress these bonds."
+        )
+    layers = [
+        ConstantModeNilpotentMPOParameters.from_core_spec(
+            modes,
+            ranks=tran_params["nilpotent_block_rank"],
+            control_site=i % d,
+            input_mode=0,
+            output_mode=1,
+            param_cls=TrainableParameters,
+            mean=0.0,
+            std=tran_params["nilpotent_std"],
+            device=device,
+        )
+        for i in range(n_layers)
+    ]
+    v_params = InvertibleMPOProductParameters(layers)
+    s_params = ConstantModeRank1MPOParameters.from_core_spec(
+        modes, param_cls=TrainableParameters, mean=0.0,
+        std=tran_params["center_std"],
         device=device,
     )
+    matrix_params = SimilarityMPOParameters(v_params, s_params)
     tran_base = ConditionalBigLegendre(matrix_params)
     tran_model = CompositeConditionalModel(
         tran_base,
@@ -325,7 +370,7 @@ if __name__ == "__main__":
     wrap_tf = tran_model.transform
 
     print("Training transition model")
-    tran_trainer = Trainer(tran_model, device=device, loss_visualizer=loss_visualizer)
+    tran_trainer = Trainer(tran_model, device=device, loss_visualizer=tran_visualizer)
     tran_trainer.add_dataset(xp_dataloader, "transitions")
     tran_trainer.add_optimizer(
         torch.optim.Adam(wrap_tf.parameters(), lr=tran_params["lr_wrap"]),
@@ -340,15 +385,11 @@ if __name__ == "__main__":
         "matrix",
         n_iterations=tran_params["matrix_iterations"],
     )
-    tran_trainer.add_loss_function(
-        loss.conditional_mle_loss, "mle", dataset_label="transitions"
-    )
-    # Feasibility loss: still differentiated and included in the total, but a
-    # checkpoint is only saved when this re-evaluates to exactly zero after
-    # an epoch (see Trainer). If no epoch is feasible, train() returns None.
-    tran_trainer.add_loss_function(
-        _cbl_positivity_loss, "positivity", dataset_label=None, feasibility=True
-    )
+    tran_trainer.add_loss_function(loss.conditional_mle_loss, "mle", dataset_label="transitions")
+    # Dimension-independent sufficient certificate: transformed MPO cores must
+    # be nonnegative. The trainer rechecks it after EACH optimizer update.
+    # No dense or sampled Bernstein coefficients are formed.
+    tran_trainer.add_loss_function(lambda m: tran_params["positivity_weight"] * _cbl_positivity_loss(m), "pos", dataset_label=None, feasibility=True)
     tran_model, best_loss_tran, training_time_tran = tran_trainer.train(
         epochs=tran_params["epochs"],
         use_best="mle",
@@ -357,9 +398,10 @@ if __name__ == "__main__":
     if tran_model is None:
         raise SystemExit(
             "Transition training found no feasible checkpoint: "
-            "cbl_positivity_loss never reached exactly zero at an epoch "
-            "boundary, so no transition model was saved. Increase the number "
-            "of epochs or the matrix learning rate and rerun."
+            "the Bernstein MPO-core penalty never reached zero after an "
+            "optimizer update. The unreduced similarity MPO may have negative "
+            "cores even when the represented kernel is nonnegative; try a "
+            "different parameterization or initialization."
         )
     print("Done! \n")
 
@@ -388,7 +430,7 @@ if __name__ == "__main__":
     ).to(device)
 
     print("Training initial model")
-    init_trainer = Trainer(init_model, device=device, loss_visualizer=loss_visualizer)
+    init_trainer = Trainer(init_model, device=device, loss_visualizer=init_visualizer)
     init_trainer.add_dataset(x0_dataloader, "initial")
     init_trainer.add_optimizer(
         torch.optim.Adam(
@@ -417,9 +459,6 @@ if __name__ == "__main__":
 
     tran_model = tran_model.to(device).eval()
     init_model = init_model.to(device).eval()
-
-    output_dir = Path("figures/big_polynomial/vdp")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     plot_x_range = (
         float(problem.plot_bounds_low[0]),

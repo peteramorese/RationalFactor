@@ -2,13 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import math
-from typing import Sequence
 
 import torch
 
 from rational_factor.models.structured_vectors import (
-    TTVector,
     Vector,
     as_vector,
 )

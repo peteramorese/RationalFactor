@@ -5,7 +5,7 @@ import torch
 # Tensor-train polynomial densities on [0, 1]^d
 # -----------------------------------------------------------------------------
 
-from rational_factor.models import DensityModel, ConditionalDensityModel
+from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
 from rational_factor.models.basis_functions import BernsteinBasis, ShiftedLegendreBasis
 from rational_factor.models.parameters import Parameters, PositiveParameters
 from rational_factor.models.tt.tt import MPO, TTVector
