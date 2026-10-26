@@ -1,8 +1,8 @@
-"""Van der Pol: low-rank SumProdRFF with unwrapped Gaussian tensor-product bases.
+"""Van der Pol: Kronecker-plus-Kronecker-plus-low-rank SumProdRFF with unwrapped Gaussian tensor-product bases.
 
-B = U V^T is a row-stochastic LowRankFactorizationMPO.  The factor and basis
+B = (1 - mixture_weight) K + mixture_weight U V^T is row-stochastic.  The factor and basis
 coefficient tensor operations, including prediction, remain structured TT/MPO
-operations, and propagate() evolves only an r-dimensional latent vector.
+operations; propagation uses the exact full-TT Kronecker-plus-low-rank recurrence.
 """
 from pathlib import Path
 
@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.tt.tt_basis import TTBasis
-from rational_factor.models.tt.tt_parameters import KroneckerPlusLowRankFactorizationParameters, TTVectorParameters
+from rational_factor.models.tt.tt_parameters import KroneckerPlusLowRankFactorizationMPOParameters, TTVectorParameters
 from rational_factor.models.parameters import PositiveParameters, TrainableParameters, param_group_iter
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.kde import GaussianKDE
@@ -272,7 +272,7 @@ def _new_gaussian_basis(d: int, n_local: int, *, dtype: torch.dtype,
 
 
 def build_transition_model(d: int, *, n_local: int, latent_rank: int,
-                           mpo_rank: int, dtype: torch.dtype, device: torch.device,
+                           mpo_rank: int, dtype: torch.dtype, device: torch.device, mixture_weight: float = 0.5,
                            numerical_tolerance: float):
     """Create transition model and disjoint basis/weight parameter groups."""
     phi, phi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device)
@@ -282,9 +282,10 @@ def build_transition_model(d: int, *, n_local: int, latent_rank: int,
         modes, ranks=1, param_cls=PositiveParameters, mean=1.0, std=0.15,
         epsilon=1e-3, dtype=dtype, device=device,
     )
-    B = LowRankFactorizationMPOParameters.from_core_spec(
+    B = KroneckerPlusLowRankFactorizationMPOParameters.from_core_spec(
         modes, rank=latent_rank, ranks_u=mpo_rank, ranks_v=mpo_rank,
-        row_stochastic=True, mean=0.0, std=0.2, dtype=dtype, device=device,
+        row_stochastic=True, mixture_weight=mixture_weight,
+        mean=0.0, std=0.2, dtype=dtype, device=device,
     )
     rff = SumProdRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
     basis_params = param_group_iter((*phi_modules, *psi_modules))
@@ -311,18 +312,19 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float32
-    # N = n_local ** d: *never* materialize this high-dimensional coefficient space.
-    n_local = 100
-    latent_rank = 200  # ordinary rank of B; propagation is latent_rank x latent_rank
-    mpo_rank = 30     # internal TT/MPO bond ranks of the factors U, V
+    # N = n_local ** d: never materialize the full coefficient space.
+    n_local = 50
+    latent_rank = 200  # ordinary rank of the UV^T correction, not of the full B
+    mpo_rank = 10     # internal TT/MPO bond ranks of the factors U, V
+    mixture_weight = 0.5  # K contribution: 1 - mixture_weight; low-rank: mixture_weight
     tran_params = {
-        "epochs": 100,
+        "epochs": 20,
         "basis_iterations": 5,  # full dataset passes per outer epoch
         "weights_iterations": 5,
         "lr_basis": 1e-2,
         "lr_weights": 5e-2,
     }
-    init_params = {"epochs": 20, "coeff_iterations": 10, "lr_coeffs": 1e-2}
+    init_params = {"epochs": 100, "coeff_iterations": 10, "lr_coeffs": 1e-2}
     batch_size = 256
     n_timesteps_prop = problem.n_timesteps
 
@@ -337,12 +339,12 @@ if __name__ == "__main__":
                            pin_memory=use_gpu)
     transition_loader = DataLoader(TensorDataset(x_kp1, x_k), batch_size=batch_size,
                                    shuffle=True, pin_memory=use_gpu)
-    output_dir = Path("figures/tt/vdp")
+    output_dir = Path("figures/tt/vdp_k1plr")
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"device={device}, modes={(n_local,) * dim}, latent_rank={latent_rank}, MPO rank={mpo_rank}")
 
     rff, a_params, B_params, basis_params, weight_params = build_transition_model(
-        dim, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
+        dim, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank, mixture_weight=mixture_weight,
         dtype=dtype, device=device, numerical_tolerance=problem.numerical_tolerance,
     )
     transition_trainer = Trainer(
@@ -403,11 +405,12 @@ if __name__ == "__main__":
         rff, x_k, x_kp1, output_dir / "conditional_slices_model_vs_data.png",
         x_range=ranges[0], y_range=ranges[1], n_random_points=10,
         n_grid=120, min_points_per_slice=20, bin_width=0.4,
-        random_seed=0, title="VDP low-rank SumProdRFF: conditional slices",
+        random_seed=0, title="VDP Kronecker-plus-Kronecker-plus-low-rank SumProdRFF: conditional slices",
     )
 
-    # propagate() contracts the full N-dimensional first step into an r-vector,
-    # then reuses an r x r latent transfer matrix for all remaining timesteps.
+    # The K term preserves incoming TT ranks, while UV^T adds at most the
+    # bond ranks of V at each step. This is exact full-space propagation,
+    # NOT the fixed-r latent recurrence used by pure low rank.
     with torch.no_grad():
         belief_seq = propagate(init_model, rff, n_steps=n_timesteps_prop)
         belief_seq = [belief.to(device=device, dtype=dtype).eval() for belief in belief_seq]
@@ -428,7 +431,7 @@ if __name__ == "__main__":
             axes[0, i].set_xlim(*ranges[0])
             axes[0, i].set_ylim(*ranges[1])
             axes[0, i].set_title(f"t={i}")
-        fig.suptitle("Van der Pol: propagated low-rank TT beliefs")
+        fig.suptitle("Van der Pol: propagated K1+low-rank TT beliefs")
         fig.tight_layout()
         fig.savefig(output_dir / "beliefs.png", dpi=200, bbox_inches="tight")
         plt.close(fig)

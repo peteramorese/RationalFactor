@@ -176,19 +176,21 @@ class DenseVector(Vector):
             numerical_tolerance=self.numerical_tolerance,
         )
 
-    def __mul__(self, other: torch.Tensor) -> torch.Tensor:
+    def __mul__(self, other: torch.Tensor | Vector) -> "DenseVector":
         if hasattr(other, "to_dense"):
             other = other.to_dense()
-        if other.shape != self.shape:
-            raise ValueError(f"Shape mismatch: {other.shape} != {self.shape}")
-        return other * self._values
+        other = torch.as_tensor(other)
+        try:
+            torch.broadcast_shapes(other.shape, self.shape)
+        except RuntimeError as e:
+            raise ValueError(f"Shape mismatch: {other.shape} vs {self.shape}") from e
+        return DenseVector(
+            other * self._values,
+            numerical_tolerance=self.numerical_tolerance,
+        )
 
-    def __rmul__(self, other: torch.Tensor) -> torch.Tensor:
-        if hasattr(other, "to_dense"):
-            other = other.to_dense()
-        if other.shape != self.shape:
-            raise ValueError(f"Shape mismatch: {other.shape} != {self.shape}")
-        return other * self._values
+    def __rmul__(self, other: torch.Tensor | Vector) -> "DenseVector":
+        return self.__mul__(other)
 
     def sum(self) -> torch.Tensor:
         return self._values.sum(dim=-1)

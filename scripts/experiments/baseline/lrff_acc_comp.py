@@ -1,5 +1,4 @@
 from pathlib import Path
-from math import ceil, sqrt
 
 import matplotlib.pyplot as plt
 import torch
@@ -7,37 +6,37 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
-from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.parameters import (
     PositiveParameters,
     TrainableParameters,
     param_group_iter,
     DenseMatrixParameters,
 )
+from rational_factor.models.train import Trainer
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
-from rational_factor.tools.analysis import avg_log_likelihood, check_pdf_valid
+from rational_factor.tools.analysis import avg_log_likelihood
 import rational_factor.models.loss as loss
-import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 
 
 if __name__ == "__main__":
-    problem_name = "quadcopter"
+    problem_name = "van_der_pol"
     problem = FULLY_OBSERVABLE_PROBLEMS[problem_name]
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 1000
+    n_basis = 100
     tran_params = {
-        "n_epochs_per_group": [3, 3],
-        "iterations": 100,
+        "epochs": 100,
+        "basis_iterations": 3,
+        "weights_iterations": 3,
         "lr_basis": 3e-3,
         "lr_weights": 5e-2,
     }
     init_params = {
-        "n_epochs_per_group": [10],  # h0 coeffs only
-        "iterations": 50,
-        "lr_weights": 1e-2,
+        "epochs": 50,
+        "coeff_iterations": 10,
+        "lr_coeffs": 1e-2,
     }
 
     batch_size = 256
@@ -87,84 +86,79 @@ if __name__ == "__main__":
     psi_stds = PositiveParameters.from_values(
         torch.full((1, dim, n_basis), std_init + 0.1, device=device)
     ).to(device)
-    phi_basis = GaussianBasis(phi_means, phi_stds, coeffs=None)
-    psi_basis = GaussianBasis(psi_means, psi_stds, coeffs=None)
-
+    phi_basis = GaussianBasis(mean_params=phi_means, std_params=phi_stds, coeffs=None)
+    psi_basis = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=None)
 
     g_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0]), epsilon=1e-3
+        shape=(1, n_basis), mean=1.0, std=1.0, epsilon=1e-3
     ).to(device)
     h0_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis), mean=torch.tensor([1.0]), std=torch.tensor([1.0])
+        shape=(1, n_basis), mean=1.0, std=1.0
     ).to(device)
 
     B_coeffs = PositiveParameters.random_init(
         shape=(1, n_basis, n_basis),
-        mean=torch.tensor([1.0]),
-        std=torch.tensor([1.0]),
+        mean=1.0,
+        std=1.0,
         epsilon=0.0,
     ).to(device)
     B = DenseMatrixParameters(B_coeffs)
 
-    tran_model = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    tran_model = SumProdRFF(
+        g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance
+    )
 
     print("Training transition model")
-    mle_loss_fn = loss.conditional_mle_loss
-    optimizers = {
-        "basis": torch.optim.Adam(
-            [
-                {
-                    "params": param_group_iter(
-                        (phi_means, phi_stds, psi_means, psi_stds)
-                    ),
-                    "lr": tran_params["lr_basis"],
-                },
-            ]
+    transition_trainer = Trainer(tran_model, device=device)
+    transition_trainer.add_dataset(xp_dataloader, "transitions")
+    transition_trainer.add_optimizer(
+        torch.optim.Adam(
+            param_group_iter((phi_means, phi_stds, psi_means, psi_stds)),
+            lr=tran_params["lr_basis"],
         ),
-        "weights": torch.optim.Adam(
-            param_group_iter((g_coeffs, B_coeffs)), lr=tran_params["lr_weights"]
-        ),
-    }
-
-    tran_model, best_loss_tran, training_time_tran = train.train_iterate(
-        tran_model,
-        xp_dataloader,
-        {"mle": mle_loss_fn},
-        optimizers,
-        device=device,
-        epochs_per_group=tran_params["n_epochs_per_group"],
-        iterations=tran_params["iterations"],
-        verbose=True,
-        use_best="mle",
+        "basis",
+        n_iterations=tran_params["basis_iterations"],
     )
+    transition_trainer.add_optimizer(
+        torch.optim.Adam(
+            param_group_iter((g_coeffs, B_coeffs)),
+            lr=tran_params["lr_weights"],
+        ),
+        "weights",
+        n_iterations=tran_params["weights_iterations"],
+    )
+    transition_trainer.add_loss_function(loss.conditional_mle_loss, "mle", "transitions")
+    tran_model, best_loss_tran, training_time_tran = transition_trainer.train(
+        epochs=tran_params["epochs"],
+        use_best="mle",
+        verbose=True,
+    )
+    if tran_model is None:
+        raise SystemExit("No stable transition checkpoint was found.")
     print("Done! \n")
 
-    phi_means.set_requires_grad(False)
-    phi_stds.set_requires_grad(False)
-    psi_means.set_requires_grad(False)
-    psi_stds.set_requires_grad(False)
-    g_coeffs.set_requires_grad(False)
+    for parameter in tran_model.parameters():
+        parameter.requires_grad_(False)
 
-    h0_basis = GaussianBasis(psi_means, psi_stds, coeffs=h0_coeffs)
+    h0_basis = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=h0_coeffs)
     init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)
 
     print("Training initial model")
-    mle_loss_fn = loss.mle_loss
-    optimizers = {
-        "weights": torch.optim.Adam(h0_coeffs.parameters(), lr=init_params["lr_weights"]),
-    }
-
-    init_model, best_loss_init, training_time_init = train.train_iterate(
-        init_model,
-        x0_dataloader,
-        {"mle": mle_loss_fn},
-        optimizers,
-        device=device,
-        epochs_per_group=init_params["n_epochs_per_group"],
-        iterations=init_params["iterations"],
-        verbose=True,
-        use_best="mle",
+    initial_trainer = Trainer(init_model, device=device)
+    initial_trainer.add_dataset(x0_dataloader, "initial")
+    initial_trainer.add_optimizer(
+        torch.optim.Adam(h0_coeffs.parameters(), lr=init_params["lr_coeffs"]),
+        "coeffs",
+        n_iterations=init_params["coeff_iterations"],
     )
+    initial_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
+    init_model, best_loss_init, training_time_init = initial_trainer.train(
+        epochs=init_params["epochs"],
+        use_best="mle",
+        verbose=True,
+    )
+    if init_model is None:
+        raise SystemExit("No stable initial-density checkpoint was found.")
     print("Done! \n")
 
     print(
@@ -175,7 +169,6 @@ if __name__ == "__main__":
         f"Initial model loss: {best_loss_init:.4f}, "
         f"training time: {training_time_init:.2f} seconds"
     )
-
 
     n_slices = n_timesteps_prop + 1
 

@@ -1,16 +1,9 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
 from rational_factor.models.parameters import FixedParameters
-# Support both the models.tt package layout and a flat models.tt module.
-try:
-    from rational_factor.models.tt.tt_parameters import TTVectorParameters
-except ModuleNotFoundError as exc:
-    if exc.name not in ("rational_factor.models.tt.tt_parameters", "rational_factor.models.tt"):
-        raise
-    from rational_factor.models.tt_parameters import TTVectorParameters
+from rational_factor.models.tt.tt_parameters import TTVectorParameters
 from rational_factor.models.structured_matrices import Matrix, as_matrix
 from rational_factor.models.structured_vectors import as_vector
-from rational_factor.models.tt import TTVector, LowRankFactorizationMPO
-from rational_factor.models.tt.tt import KroneckerPlusLowRankFactorizationMPO
+from rational_factor.models.tt.tt import TTVector, LowRankFactorizationMPO, KroneckerPlusLowRankFactorizationMPO
 import torch
 import copy 
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF

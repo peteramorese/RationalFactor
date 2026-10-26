@@ -16,11 +16,10 @@ from normalizing_flow.composite_model import CompositeConditionalModel, Composit
 from particle_filter.particle_set import ParticleSet
 from particle_filter.propagate import propagate
 import rational_factor.models.loss as loss
-import rational_factor.models.train as train
 from rational_factor.models.distributions import StandardNormalDensity
+from rational_factor.models.train import Trainer
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
-from rational_factor.tools.visualization import plot_marginal_trajectory_comparison
 
 
 def main() -> None:
@@ -32,9 +31,16 @@ def main() -> None:
 
     n_particles = 4000
     batch_size = 256
-    tran_epochs = 40
-    init_epochs = 40
-    lr = 1e-3
+    tran_params = {
+        "epochs": 40,
+        "iterations": 1,
+        "lr": 1e-3,
+    }
+    init_params = {
+        "epochs": 40,
+        "iterations": 1,
+        "lr": 1e-3,
+    }
     num_layers = 5
     hidden_features = 128
 
@@ -44,8 +50,15 @@ def main() -> None:
     x_k_data, x_kp1_data = problem.train_state_transition_data()
     test_traj = problem.test_data()
 
-    x0_loader = DataLoader(TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    xp_loader = DataLoader(TensorDataset(x_kp1_data, x_k_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
+    x0_loader = DataLoader(
+        TensorDataset(x0_data), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
+    )
+    xp_loader = DataLoader(
+        TensorDataset(x_kp1_data, x_k_data),
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=use_gpu,
+    )
 
     tran_nf = CompositeConditionalModel(
         StandardNormalDensity(features=dim, batch_shape=()),
@@ -63,27 +76,39 @@ def main() -> None:
 
     print(f"Device: {device}")
     print("Training conditional transition NF...")
-    tran_nf, best_loss_tran, time_tran = train.train(
-        tran_nf,
-        xp_loader,
-        {"mle": loss.conditional_mle_loss},
-        torch.optim.Adam(tran_nf.parameters(), lr=lr),
-        epochs=tran_epochs,
-        verbose=True,
-        use_best="mle",
+    transition_trainer = Trainer(tran_nf, device=device)
+    transition_trainer.add_dataset(xp_loader, "transitions")
+    transition_trainer.add_optimizer(
+        torch.optim.Adam(tran_nf.parameters(), lr=tran_params["lr"]),
+        "nf",
+        n_iterations=tran_params["iterations"],
     )
+    transition_trainer.add_loss_function(loss.conditional_mle_loss, "mle", "transitions")
+    tran_nf, best_loss_tran, time_tran = transition_trainer.train(
+        epochs=tran_params["epochs"],
+        use_best="mle",
+        verbose=True,
+    )
+    if tran_nf is None:
+        raise SystemExit("No stable transition checkpoint was found.")
     print(f"Transition NF best mle loss: {best_loss_tran:.6f}, time: {time_tran:.2f}s\n")
 
     print("Training initial-state NF...")
-    init_nf, best_loss_init, time_init = train.train(
-        init_nf,
-        x0_loader,
-        {"mle": loss.mle_loss},
-        torch.optim.Adam(init_nf.parameters(), lr=lr),
-        epochs=init_epochs,
-        verbose=True,
-        use_best="mle",
+    initial_trainer = Trainer(init_nf, device=device)
+    initial_trainer.add_dataset(x0_loader, "initial")
+    initial_trainer.add_optimizer(
+        torch.optim.Adam(init_nf.parameters(), lr=init_params["lr"]),
+        "nf",
+        n_iterations=init_params["iterations"],
     )
+    initial_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
+    init_nf, best_loss_init, time_init = initial_trainer.train(
+        epochs=init_params["epochs"],
+        use_best="mle",
+        verbose=True,
+    )
+    if init_nf is None:
+        raise SystemExit("No stable initial-density checkpoint was found.")
     print(f"Initial NF best mle loss: {best_loss_init:.6f}, time: {time_init:.2f}s\n")
 
     tran_nf.eval()
