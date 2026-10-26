@@ -1,9 +1,16 @@
 from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
 from rational_factor.models.parameters import FixedParameters
-from rational_factor.models.tt.tt_parameters import TTVectorParameters
+# Support both the models.tt package layout and a flat models.tt module.
+try:
+    from rational_factor.models.tt.tt_parameters import TTVectorParameters
+except ModuleNotFoundError as exc:
+    if exc.name not in ("rational_factor.models.tt.tt_parameters", "rational_factor.models.tt"):
+        raise
+    from rational_factor.models.tt_parameters import TTVectorParameters
 from rational_factor.models.structured_matrices import Matrix, as_matrix
 from rational_factor.models.structured_vectors import as_vector
-from rational_factor.models.tt.tt import TTVector, LowRankFactorizationMPO
+from rational_factor.models.tt import TTVector, LowRankFactorizationMPO
+from rational_factor.models.tt.tt import KroneckerPlusLowRankFactorizationMPO
 import torch
 import copy 
 from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
@@ -98,16 +105,25 @@ def propagate(init_belief : DensityModel, transition_model : ConditionalDensityM
         h0.set_coeffs(_coeff_params_from_values(c0))
         h_seq = [h0]
 
-        if n_steps:
-            # Only the first step depends on the full initial TT coefficient state.
-            # z_t = U.T @ (a * omega @ c_{t-1}) is r-dimensional.
+        if isinstance(B, KroneckerPlusLowRankFactorizationMPO):
+            # The Kronecker term carries forward the full previous TT state.
+            # A closed r-dimensional latent recurrence is NOT valid here.
+            # Each step is exact, and internal ranks grow additively:
+            # R(c_next) <= R(c_prev) + R(V), since B.T uses K.T + V U.T.
+            c = c0
+            for t in range(1, n_steps + 1):
+                gram = omega0 if t == 1 else omega
+                c = B.rev_matvec(a * gram.matvec(c)) / q
+                h_t = copy.copy(transition_model.psi)
+                h_t.set_coeffs(_coeff_params_from_values(c))
+                h_seq.append(h_t)
+        elif n_steps:
+            # Pure low-rank case: the full state enters only on the first step.
             z = B.T.project_latent(a * omega0.matvec(c0))
-            # K = U.T @ diag(a) @ omega @ diag(q)^-1 @ V.
             K = B.latent_kernel(omega, a, q)
             for t in range(1, n_steps + 1):
                 if t > 1:
                     z = K @ z
-                # c_t = diag(q)^-1 @ V @ z : TT ranks at most V MPO ranks.
                 c_t = B.T.apply_latent(z) / q
                 h_t = copy.copy(transition_model.psi)
                 h_t.set_coeffs(_coeff_params_from_values(c_t))

@@ -312,11 +312,11 @@ if __name__ == "__main__":
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float32
     # N = n_local ** d: *never* materialize this high-dimensional coefficient space.
-    n_local = 20
-    latent_rank = 20  # ordinary rank of B; propagation is latent_rank x latent_rank
-    mpo_rank = 10     # internal TT/MPO bond ranks of the factors U, V
+    n_local = 100
+    latent_rank = 200  # ordinary rank of B; propagation is latent_rank x latent_rank
+    mpo_rank = 30     # internal TT/MPO bond ranks of the factors U, V
     tran_params = {
-        "epochs": 50,
+        "epochs": 100,
         "basis_iterations": 5,  # full dataset passes per outer epoch
         "weights_iterations": 5,
         "lr_basis": 1e-2,

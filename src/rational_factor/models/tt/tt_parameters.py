@@ -13,7 +13,7 @@ from rational_factor.models.parameters import (
     Parameters, FixedParameters, TrainableParameters, PositiveParameters,
 )
 from rational_factor.models.tt.tt import (
-    TTVector, MPO, LowRankFactorizationMPO, NilpotentMPO, GateLayerMPO, InvertibleMPO,
+    TTVector, MPO, LowRankFactorizationMPO, KroneckerPlusLowRankFactorizationMPO, NilpotentMPO, GateLayerMPO, InvertibleMPO,
     InvertibleMPOProduct,
 )
 
@@ -191,7 +191,10 @@ class LowRankFactorizationMPOParameters(Parameters):
         B >= 0, B @ ones(N_col) = ones(N_row).
 
     These are exact algebraic constraints (up to roundoff), without expanding
-    exponentially large vectors or matrices. The normalization imposes a
+    exponentially large vectors or matrices. The V columns are normalized
+    globally by an r-dimensional contraction, rather than by forcing an
+    identical early-coordinate marginal across latent components.
+    The normalization imposes a
     particular nonnegative MPO gauge and is not a universal representation of
     all nonnegative rank-r matrices at fixed MPO bond rank.
     """
@@ -248,16 +251,20 @@ class LowRankFactorizationMPOParameters(Parameters):
 
     @staticmethod
     def _normalized_v(factor: MPO) -> MPO:
+        # Normalize FULL latent columns, not the last core separately at each
+        # incoming bond. The latter would make the marginal of the first d-1
+        # coordinates identical for all latent components (a severe limitation).
         result = []
-        for k, core in enumerate(factor.cores):
-            if k == len(factor.cores) - 1:
-                # sum_i V[last][bond, i, latent, 1] == 1
-                result.append(core.softmax(dim=1))
-            else:
-                left, n, _, right = core.shape
-                # sum_{i,right} V[k][left,i,1,right] == 1
-                result.append(core.reshape(left, n * right).softmax(dim=-1)
-                              .reshape(left, n, 1, right))
+        for core in factor.cores[:-1]:
+            left, n, _, right = core.shape
+            result.append(core.reshape(left, n * right).softmax(dim=-1)
+                          .reshape(left, n, 1, right))
+        result.append(torch.nn.functional.softplus(factor.cores[-1]))
+        raw = MPO(result)
+        ones = TTVector([core.new_ones(1, n, 1)
+                         for core, n in zip(raw.cores, raw.row_modes)])
+        column_sums = raw.T.matvec(ones).to_dense()
+        result[-1] = result[-1] / column_sums[None, None, :, None]
         return MPO(result)
 
     def __call__(self) -> LowRankFactorizationMPO:
@@ -289,6 +296,108 @@ class LowRankFactorizationMPOParameters(Parameters):
 
     def is_module(self):
         return False
+
+
+class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOParameters):
+    r"""Parameterize ``K + U @ V.T`` with a Kronecker-rank-one MPO ``K``.
+
+    By default ``row_stochastic=True`` constructs a convex combination
+
+        B = (1 - mixture_weight) * K_normalized
+            + mixture_weight * U_normalized @ V_normalized.T
+
+    where ``K_normalized`` is a product of local row-stochastic matrices.
+    This guarantees ``B >= 0`` and ``B @ 1 = 1`` without dense matrices.
+    When ``row_stochastic=False`` this constructs the unscaled sum
+    ``K + U @ V.T``. The mixture weight is unused in that mode.
+
+    ``mixture_weight`` may be a fixed probability in [0, 1] or a scalar
+    Parameters provider whose raw value is mapped through sigmoid, allowing
+    a trainable mixture while preserving the stochastic constraint.
+    """
+
+    def __init__(self, kronecker: Parameters, U: Parameters, V: Parameters, *,
+                 row_stochastic: bool = True,
+                 mixture_weight: float | Parameters = 0.5):
+        super().__init__(U, V, row_stochastic=row_stochastic)
+        if not isinstance(kronecker, Parameters):
+            raise TypeError("kronecker must be a Parameters provider")
+        self.kronecker = kronecker
+        self.mixture_weight = mixture_weight
+        if isinstance(mixture_weight, Parameters):
+            if mixture_weight().numel() != 1:
+                raise ValueError("mixture_weight Parameters must produce a scalar")
+        elif not (0.0 <= float(mixture_weight) <= 1.0):
+            raise ValueError("fixed mixture_weight must be in [0, 1]")
+        KroneckerPlusLowRankFactorizationMPO(kronecker(), self.U(), self.V())
+
+    @classmethod
+    def from_factors(cls, kronecker: Parameters, U: Parameters, V: Parameters, *,
+                     row_stochastic: bool = True,
+                     mixture_weight: float | Parameters = 0.5):
+        return cls(kronecker, U, V, row_stochastic=row_stochastic,
+                   mixture_weight=mixture_weight)
+
+    @classmethod
+    def from_core_spec(
+        cls, row_modes: Sequence[int], rank: int,
+        ranks: int | Sequence[int] = 1,
+        col_modes: Sequence[int] | None = None, *,
+        ranks_u: int | Sequence[int] | None = None,
+        ranks_v: int | Sequence[int] | None = None,
+        row_stochastic: bool = True,
+        mixture_weight: float | Parameters = 0.5,
+        param_cls: type[TrainableParameters] = TrainableParameters,
+        trainable=True, mean=0., std=1., epsilon=0.,
+        dtype=torch.float32, device=None,
+    ):
+        rows = tuple(int(n) for n in row_modes)
+        cols = rows if col_modes is None else tuple(int(n) for n in col_modes)
+        lowrank = LowRankFactorizationMPOParameters.from_core_spec(
+            rows, rank, ranks, cols, ranks_u=ranks_u, ranks_v=ranks_v,
+            row_stochastic=row_stochastic, param_cls=param_cls,
+            trainable=trainable, mean=mean, std=std, epsilon=epsilon,
+            dtype=dtype, device=device,
+        )
+        kronecker = MPOParameters.from_core_spec(
+            rows, ranks=1, col_modes=cols, param_cls=param_cls,
+            trainable=trainable, mean=mean, std=std, epsilon=epsilon,
+            dtype=dtype, device=device,
+        )
+        return cls(kronecker, lowrank.U, lowrank.V,
+                   row_stochastic=row_stochastic, mixture_weight=mixture_weight)
+
+    @staticmethod
+    def _normalized_kronecker(kronecker: MPO) -> MPO:
+        # Row stochasticity factorizes over local row indices.
+        return MPO([core.softmax(dim=2) for core in kronecker.cores])
+
+    def __call__(self) -> KroneckerPlusLowRankFactorizationMPO:
+        K, U, V = self.kronecker(), self.U(), self.V()
+        if self.row_stochastic:
+            K = self._normalized_kronecker(K)
+            U, V = self._normalized_u(U), self._normalized_v(V)
+            if isinstance(self.mixture_weight, Parameters):
+                weight = torch.sigmoid(self.mixture_weight().reshape(()))
+            else:
+                weight = torch.as_tensor(self.mixture_weight, dtype=U.dtype, device=U.device)
+            K = K.scale(1 - weight)
+            # Absorb low-rank mixture scale in the first U core.
+            u_cores = list(U.cores)
+            u_cores[0] = u_cores[0] * weight
+            U = MPO(u_cores)
+        return KroneckerPlusLowRankFactorizationMPO(K, U, V)
+
+    def is_trainable(self):
+        return (super().is_trainable() or self.kronecker.is_trainable() or
+                (isinstance(self.mixture_weight, Parameters) and
+                 self.mixture_weight.is_trainable()))
+
+    def parameter_modules(self):
+        return _modules(self.kronecker, self.U, self.V, self.mixture_weight)
+
+
+KroneckerPlusLowRankFactorizationParameters = KroneckerPlusLowRankFactorizationMPOParameters
 
 
 class ConstantModeRank1MPOParameters(Parameters):

@@ -709,6 +709,10 @@ class MPO(Matrix):
 
     def matmul(self, other: Matrix) -> Matrix:
         """Exact MPO @ MPO with bond ranks multiplied sitewise."""
+        # Multiplying a Kronecker MPO from the left stays in the structured
+        # Kronecker-plus-low-rank class; avoid Matrix's dense fallback.
+        if isinstance(other, KroneckerPlusLowRankFactorizationMPO):
+            return other.rmatmul(self)
         if not isinstance(other, MPO):
             return super().matmul(other)
 
@@ -908,6 +912,201 @@ class LowRankFactorizationMPO(Matrix):
             env = torch.einsum('ac,aib,ij,cjd->bd', env,
                                uc[:, :, 0, :], weighted_g, vc[:, :, 0, :])
         raise RuntimeError("empty MPO")
+
+
+def _concat_rectangular_mpo_columns(first: MPO, second: MPO) -> MPO:
+    """Concatenate the small latent columns of two rectangular MPO factors.
+
+    Both column mode tuples are ``(1, ..., 1, r)``. The new latent size is
+    ``r_first + r_second``, and the internal MPO bond ranks add (not multiply).
+    No high-dimensional column or row is densified.
+    """
+    if (first.row_modes != second.row_modes or
+            first.col_modes[:-1] != second.col_modes[:-1] or
+            any(n != 1 for n in first.col_modes[:-1]) or
+            first.device != second.device):
+        raise ValueError("rectangular MPO concatenation requires compatible row/latent modes")
+    dtype = torch.promote_types(first.dtype, second.dtype)
+    a = [c.to(dtype=dtype) for c in first.cores]
+    b = [c.to(dtype=dtype) for c in second.cores]
+    if len(a) == 1:
+        return MPO([torch.cat((a[0], b[0]), dim=2)])
+    cores = [torch.cat((a[0], b[0]), dim=-1)]
+    for x, y in zip(a[1:-1], b[1:-1]):
+        xa, _, _, xb = x.shape
+        ya, _, _, yb = y.shape
+        cores.append(
+            torch.nn.functional.pad(x, (0, yb, 0, 0, 0, 0, 0, ya))
+            + torch.nn.functional.pad(y, (xb, 0, 0, 0, 0, 0, xa, 0))
+        )
+    # Last core carries the latent columns, so the two blocks occupy disjoint
+    # latent physical indices in addition to disjoint incoming bonds.
+    ra = a[-1].shape[0]
+    rb = b[-1].shape[0]
+    la = a[-1].shape[2]
+    lb = b[-1].shape[2]
+    cores.append(
+        torch.nn.functional.pad(a[-1], (0, 0, 0, lb, 0, 0, 0, rb))
+        + torch.nn.functional.pad(b[-1], (0, 0, la, 0, 0, 0, ra, 0))
+    )
+    return MPO(cores)
+
+
+class KroneckerPlusLowRankFactorizationMPO(LowRankFactorizationMPO):
+    r"""An exact ``B = K + U @ V.T`` operator with a rank-one MPO ``K``.
+
+    ``K`` has MPO bond ranks one, and ``U`` and ``V`` have rectangular
+    column modes ``(1, ..., 1, r)`` as in LowRankFactorizationMPO.
+
+    For a TT input with ranks ``s_k``, ``K @ x`` retains ranks ``s_k``;
+    ``(U @ V.T) @ x`` has ranks at most ``U.ranks[k]``. Thus the exact
+    output sum has internal TT ranks at most ``s_k + U.ranks[k]``.
+
+    This is an *additive one-step* bound, not a uniform-in-time rank bound.
+    In particular, the pure low-rank latent_kernel recurrence is NOT valid
+    for this full-rank-plus-low-rank operator.
+    """
+
+    def __init__(self, kronecker: MPO, U: MPO, V: MPO):
+        super().__init__(U, V)
+        if not isinstance(kronecker, MPO):
+            raise TypeError("kronecker must be an MPO")
+        if any(rank != 1 for rank in kronecker.ranks):
+            raise ValueError("kronecker must have MPO bond rank one")
+        if (kronecker.row_modes != U.row_modes or
+                kronecker.col_modes != V.row_modes):
+            raise ValueError(
+                "kronecker modes must match the low-rank factor row modes: "
+                f"expected {U.row_modes} x {V.row_modes}, got "
+                f"{kronecker.row_modes} x {kronecker.col_modes}"
+            )
+        if kronecker.dtype != self.dtype or kronecker.device != self.device:
+            raise ValueError("kronecker, U, and V must share dtype and device")
+        self.kronecker = kronecker
+
+    @property
+    def row_modes(self) -> tuple[int, ...]:
+        return self.kronecker.row_modes
+
+    @property
+    def col_modes(self) -> tuple[int, ...]:
+        return self.kronecker.col_modes
+
+    @property
+    def T(self) -> 'KroneckerPlusLowRankFactorizationMPO':
+        return type(self)(self.kronecker.T, self.V, self.U)
+
+    def matmul(self, other: Matrix) -> Matrix:
+        r"""Exact composition of two Kronecker-plus-low-rank matrices.
+
+        ``(K1 + U1 V1.T) @ (K2 + U2 V2.T)`` has Kronecker term ``K1@K2``
+        and a low-rank factor with ``r1+r2`` latent columns. Its rectangular
+        MPO bond ranks grow only additively, and the only dense intermediate
+        is the small ``r1 x r2`` cross-contraction ``V1.T @ U2``.
+        """
+        if isinstance(other, MPO) and all(rank == 1 for rank in other.ranks):
+            if self.col_modes != other.row_modes:
+                raise ValueError(
+                    f"incompatible physical modes: {self.col_modes} != {other.row_modes}"
+                )
+            return type(self)(self.kronecker.matmul(other), self.U,
+                              other.T.matmul(self.V))
+        if not isinstance(other, KroneckerPlusLowRankFactorizationMPO):
+            return super().matmul(other)
+        if self.col_modes != other.row_modes:
+            raise ValueError(
+                f"incompatible physical modes: {self.col_modes} != {other.row_modes}"
+            )
+        K = self.kronecker.matmul(other.kronecker)
+        # U_new = [K1 U2, U1].
+        new_u = _concat_rectangular_mpo_columns(
+            self.kronecker.matmul(other.U), self.U
+        )
+        # V_new = [V2, K2.T V1 + V2 (U2.T V1)].
+        cross_mpo = self.V.T.matmul(other.U)
+        cross = cross_mpo.matvec(torch.eye(other.r, dtype=self.dtype, device=self.device)).T
+        v2_cores = list(other.V.cores)
+        v2_cores[-1] = torch.einsum('aicb,cd->aidb', v2_cores[-1], cross)
+        v_coupling = _add_mpos(other.kronecker.T.matmul(self.V), MPO(v2_cores))
+        new_v = _concat_rectangular_mpo_columns(other.V, v_coupling)
+        return type(self)(K, new_u, new_v)
+
+    def rmatmul(self, other: Matrix) -> Matrix:
+        """Support ``MPO(rank=1) @ self`` without materializing either matrix."""
+        if isinstance(other, MPO) and all(rank == 1 for rank in other.ranks):
+            if other.col_modes != self.row_modes:
+                raise ValueError(
+                    f"incompatible physical modes: {other.col_modes} != {self.row_modes}"
+                )
+            return type(self)(other.matmul(self.kronecker),
+                              other.matmul(self.U), self.V)
+        return super().rmatmul(other)
+
+    def matvec(self, x: torch.Tensor | Vector) -> torch.Tensor | TTVector:
+        """Exact action, without forming the full matrix or multiplying TT ranks."""
+        if isinstance(x, TTVector):
+            kx = self.kronecker.matvec(x)
+            lr_x = super().matvec(x)
+            return kx.elementwise_add(lr_x)
+        # A dense input is already O(N): retain the standard dense output.
+        if isinstance(x, Vector):
+            x = x.to_dense()
+        kx = self.kronecker.matvec(x)
+        lr_x = super().matvec(x)
+        return kx + lr_x.to_dense()
+
+    def rev_matvec(self, x: torch.Tensor | Vector) -> torch.Tensor | TTVector:
+        return self.T.matvec(x)
+
+    def to_dense(self) -> torch.Tensor:
+        """Debugging only; do not call for high-dimensional systems."""
+        return self.kronecker.to_dense() + super().to_dense()
+
+    def sum(self) -> torch.Tensor:
+        return self.kronecker.sum() + super().sum()
+
+    def mul_diag_left(self, weights: TTVector) -> 'KroneckerPlusLowRankFactorizationMPO':
+        k_scaled = LowRankFactorizationMPO._scale_rows(self.kronecker, weights)
+        u_scaled = LowRankFactorizationMPO._scale_rows(self.U, weights)
+        return type(self)(k_scaled, u_scaled, self.V)
+
+    def mul_diag_right(self, weights: TTVector) -> 'KroneckerPlusLowRankFactorizationMPO':
+        if not isinstance(weights, TTVector) or not weights.is_rank_one or weights.is_batched:
+            raise ValueError("diagonal scaling requires an unbatched rank-one TTVector")
+        if weights.modes != self.col_modes:
+            raise ValueError("diagonal weights must match operator column modes")
+        k_scaled = MPO([
+            core * w[0, :, 0][None, None, :, None]
+            for core, w in zip(self.kronecker.cores, weights.cores)
+        ])
+        v_scaled = LowRankFactorizationMPO._scale_rows(self.V, weights)
+        return type(self)(k_scaled, self.U, v_scaled)
+
+    def scale(self, s: torch.Tensor | float) -> 'KroneckerPlusLowRankFactorizationMPO':
+        s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
+        if s.numel() != 1:
+            raise ValueError("structured scalar scaling requires one scalar")
+        u_cores = list(self.U.cores)
+        u_cores[0] = s * u_cores[0]
+        return type(self)(self.kronecker.scale(s), MPO(u_cores), self.V)
+
+    def to(self, *, device=None, dtype=None) -> 'KroneckerPlusLowRankFactorizationMPO':
+        return type(self)(self.kronecker.to(device=device, dtype=dtype),
+                          self.U.to(device=device, dtype=dtype),
+                          self.V.to(device=device, dtype=dtype))
+
+    def clone(self) -> 'KroneckerPlusLowRankFactorizationMPO':
+        return type(self)(self.kronecker.clone(), self.U.clone(), self.V.clone())
+
+    def latent_kernel(self, omega: MPO, a: TTVector, q: TTVector) -> torch.Tensor:
+        raise NotImplementedError(
+            "A single r-by-r latent kernel does not capture the Kronecker "
+            "term. Use full TT recurrence via matvec/rev_matvec."
+        )
+
+
+# Short name, consistent with the existing LowRankFactorizationMPO name.
+KroneckerPlusLowRankFactorization = KroneckerPlusLowRankFactorizationMPO
 
 # -----------------------------------------------------------------------------
 # Exactly invertible MPO layers (parameter ownership belongs to the caller).

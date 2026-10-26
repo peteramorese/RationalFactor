@@ -36,18 +36,18 @@ import rational_factor.models.loss as loss
 
 
 def _new_gaussian_basis(d: int, n_local: int, *, dtype: torch.dtype,
-                        device: torch.device, bandwidth_floor: float = 0.3):
+                        device: torch.device, bandwidth_floor: float = 0.01):
     shape = (1, d, n_local)
     means = TrainableParameters.random_init(shape, mean=0.0, std=3.5).to(device=device, dtype=dtype)
     stds = PositiveParameters.random_init(
-        shape, mean=0.8, std=0.5, epsilon=bandwidth_floor,
+        shape, mean=0.8, std=5.5, epsilon=bandwidth_floor,
     ).to(device=device, dtype=dtype)
     return TTBasis(GaussianBasis(means, stds)), (means, stds)
 
 
 def build_transition_model(d: int, *, n_local: int, latent_rank: int,
                            mpo_rank: int, dtype: torch.dtype, device: torch.device,
-                           numerical_tolerance: float = 1e-10, gaussian_std_floor: float = 0.3):
+                           numerical_tolerance: float = 1e-10, gaussian_std_floor: float = 0.01):
     phi, phi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     psi, psi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     modes = (n_local,) * d
@@ -83,10 +83,10 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float64
-    n_local = 6  # 6**4=1296 coefficients, but never materialized
-    latent_rank = 10
-    mpo_rank = 10
-    gaussian_std_epsilon = 0.3
+    n_local = 100  
+    latent_rank = 400
+    mpo_rank = 20
+    gaussian_std_epsilon = 0.1
     test_fraction = 0.15
     split_seed = 0
     tran_params = {
@@ -95,10 +95,10 @@ if __name__ == "__main__":
         "weights_iterations": 2,
         "lr_basis": 1.2e-2,
         "lr_weights": 5e-2,
-        "validation_patience": 20,
+        "validation_patience": 50,
     }
     init_params = {"epochs": 50, "coeff_iterations": 10, "lr_coeffs": 1e-2}
-    batch_size = 512
+    batch_size = 256
     n_timesteps_prop = problem.n_timesteps
     d = problem.system.dim()
 
@@ -143,7 +143,7 @@ if __name__ == "__main__":
         "weights", n_iterations=tran_params["weights_iterations"],
     )
     trainer.add_loss_function(loss.conditional_mle_loss, "mle", "transitions")
-    trainer.add_loss_function(loss.conditional_mle_loss, "validation_mle", "validation", validation=True)
+    trainer.add_loss_function(loss.conditional_mle_loss, "val_mle", "validation", validation=True)
     # use_best='mle' avoids full validation-loader evaluation *after every*
     # optimizer step; validation_mle and early stopping still run per epoch.
     rff, best_loss_tran, training_time_tran = trainer.train(
