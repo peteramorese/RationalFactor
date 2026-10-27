@@ -1,9 +1,10 @@
 import torch
 import copy
 import itertools
+import math
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
-from .density_model import DensityModel, ConditionalDensityModel
-from .parameters import Parameters 
+from .density_model import DensityModel, ConditionalDensityModel, MarkovTransitionModel
+from .parameters import Parameters, FixedParameters
 from .structured_matrices import as_matrix
 from .structured_vectors import as_vector
 from rational_factor.models.tt.tt import TTVector
@@ -14,6 +15,41 @@ def _is_parameters_like(obj) -> bool:
     return callable(obj) and hasattr(obj, "is_trainable") and hasattr(
         obj, "parameter_modules"
     )
+
+
+def _fixed_vector_parameters(values, *, modes=None):
+    """Wrap detached propagated coefficients, preserving structured TT storage.
+
+    A structured Matrix.rev_matvec yields TT coefficients directly. When a
+    *dense* Matrix instead yields a dense vector, tensor-product coefficient
+    storage with ``modes`` requires a TT: convert it via exact TT-SVD.
+    This dense fallback is not intended for exponentially large spaces.
+    """
+    values = as_vector(values)
+    if isinstance(values, TTVector):
+        from rational_factor.models.tt.tt_parameters import TTVectorParameters
+        return TTVectorParameters.from_cores([
+            FixedParameters(core.detach().clone()) for core in values.cores
+        ])
+    dense = values.to_dense().detach().clone()
+    if modes is None:
+        return FixedParameters(dense)
+    modes = tuple(int(n) for n in modes)
+    if dense.ndim != 1 or dense.numel() != math.prod(modes):
+        raise ValueError("dense-to-TT coefficient conversion requires an unbatched vector")
+    from rational_factor.models.tt.tt_parameters import TTVectorParameters
+    cores = []
+    tensor = dense.reshape(*modes)
+    left_rank = 1
+    for n in modes[:-1]:
+        matrix = tensor.reshape(left_rank * n, -1)
+        u, singular, vh = torch.linalg.svd(matrix, full_matrices=False)
+        rank = singular.numel()
+        cores.append(FixedParameters(u.reshape(left_rank, n, rank)))
+        tensor = singular[:, None] * vh
+        left_rank = rank
+    cores.append(FixedParameters(tensor.reshape(left_rank, modes[-1], 1)))
+    return TTVectorParameters.from_cores(cores)
 
 
 # Linear models #
@@ -123,7 +159,7 @@ class LinearRFF(ConditionalDensityModel):
         return a / q
 
 
-class SumProdRFF(ConditionalDensityModel):
+class SumProdRFF(MarkovTransitionModel):
     def __init__(self, a : Parameters, phi : Basis, psi : Basis, B : Parameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
@@ -145,7 +181,7 @@ class SumProdRFF(ConditionalDensityModel):
             + (f" or ({n_basis},)" if batch_size == 1 else "")
             + f", got {a_shape}"
         )
-        super().__init__(phi.dim(), psi.dim())
+        super().__init__(phi.dim())
 
         self.a = a
         self.phi = phi
@@ -220,6 +256,44 @@ class SumProdRFF(ConditionalDensityModel):
 
         return (log_g_xp + log_f - log_g_x).reshape(-1)
 
+
+    def propagate(self, belief: "LinearFF") -> "LinearFF":
+        r"""Propagate a LinearFF for one Markov step using base vector/matrix APIs.
+
+        Omega_current[i,j] = integral phi_i(x) belief.psi_j(x) dx
+        q[k] = sum_i a[i] integral phi_i(x) psi_k(x) dx
+        c_next = (B.T @ (a * (Omega_current @ (c/Z)))) / q
+
+        No coefficient-bearing basis copies are needed. The first propagation
+        naturally uses the initial psi0; subsequent calls use self.psi.
+        The belief's g factor must coincide with the transition's a*phi.
+        """
+        if not isinstance(belief, LinearFF):
+            raise TypeError(
+                "SumProdRFF.propagate expects a LinearFF belief, got "
+                f"{type(belief).__name__}"
+            )
+
+        tol = self.numerical_tolerance
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        B = as_matrix(self.B())
+        omega_current = as_matrix(self.phi.Omega2(belief.psi))
+        omega_next = as_matrix(self.phi.Omega2(self.psi))
+        q = as_vector(omega_next.rev_matvec(a), numerical_tolerance=tol)
+
+        c = as_vector(belief.c(), numerical_tolerance=tol)
+        log_scale = torch.as_tensor(belief.log_norm_constant(), dtype=a.dtype, device=a.device)
+        c = c * torch.exp(log_scale)
+        overlap = as_vector(omega_current.matvec(c), numerical_tolerance=tol)
+        c_next = as_vector(B.rev_matvec(a * overlap), numerical_tolerance=tol) / q
+
+        return LinearFF(
+            self.a, self.phi,
+            _fixed_vector_parameters(c_next, modes=getattr(self.psi, "modes", None)),
+            self.psi,
+            numerical_tolerance=belief.numerical_tolerance,
+            renormalize_h=False, register_modules=False,
+        )
 
 class LinearRF(ConditionalDensityModel):
     """
@@ -465,78 +539,86 @@ class LinearRFandR2FF(LinearR2FF):
 
 
 class LinearFF(DensityModel):
-    """
-    Linear Factor Form
+    def __init__(self, a: Parameters, phi: Basis, c: Parameters, psi: Basis,
+                 numerical_tolerance: float = 1e-20, renormalize_h: bool = True,
+                 register_modules: bool = True):
+        if not isinstance(phi, Basis) or not isinstance(psi, Basis):
+            raise TypeError("phi and psi must be Basis instances")
+        if phi.dim() != psi.dim():
+            raise ValueError("phi and psi must have the same dimension")
+        for name, provider, basis in (("a", a, phi), ("c", c, psi)):
+            if not _is_parameters_like(provider):
+                raise TypeError(f"{name} must be a Parameters-like provider")
+            values = provider()
+            actual = tuple(values.shape)
+            expected = (basis.batch_size(), basis.n_basis_functions())
+            if actual != expected and not (basis.batch_size() == 1 and
+                                           actual == (basis.n_basis_functions(),)):
+                raise ValueError(f"{name} has shape {actual}; expected {expected}"
+                                 + (f" or {(basis.n_basis_functions(),)}"
+                                    if basis.batch_size() == 1 else ""))
 
-    Used for belief representation for propagation only models
-    """
-    def __init__(self, g : Basis, h : Basis, numerical_tolerance : float = 1e-20, renormalize_h : bool = True, register_modules : bool = True):
-        assert g.dim() == h.dim(), "g and h must have the same dimension"
-        assert isinstance(g, Basis), "g must be a Basis"
-        assert isinstance(h, Basis), "h must be a Basis"
-        super().__init__(g.dim())
-
-        self.g = g
-        self.h = h
-        
+        super().__init__(phi.dim())
+        self.a, self.phi = a, phi
+        self.c, self.psi = c, psi
         self.numerical_tolerance = numerical_tolerance
         self._renormalize_h = renormalize_h
 
         if register_modules:
-            # Register the parameter modules to use parameters() and to() methods
-            param_modules, coeff_modules = Basis.get_deduplicated_module_list([g, h])
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
+            # Register every provider (including TTVectorParameters' leaf modules)
+            # exactly once. Bases themselves remain coefficient-free.
+            seen = {id(m) for m in (*param_modules, *coeff_modules)}
+            coeff_modules = list(coeff_modules)
+            for provider in (a, c):
+                if getattr(provider, "is_module", lambda: False)() and id(provider) not in seen:
+                    coeff_modules.append(provider)
+                    seen.add(id(provider))
+                for module in provider.parameter_modules():
+                    if id(module) not in seen:
+                        coeff_modules.append(module)
+                        seen.add(id(module))
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
 
     def dtype_device(self):
-        return self.g.dtype_device()
+        return self.phi.dtype_device()
 
     @classmethod
-    def from_rff(cls, rff : LinearRFF | SumProdRFF, h : Basis, renormalize_h : bool = True, register_modules : bool = True):
-        assert isinstance(rff, LinearRFF) or isinstance(rff, SumProdRFF), "rff must be a LinearRFF or SumProdRFF"
-        return cls(rff.g_basis(), h, numerical_tolerance=rff.numerical_tolerance, renormalize_h=renormalize_h, register_modules=register_modules)
+    def from_rff(cls, rff: LinearRFF | SumProdRFF, c: Parameters, psi: Basis,
+                 renormalize_h: bool = True, register_modules: bool = True):
+        if not isinstance(rff, (LinearRFF, SumProdRFF)):
+            raise TypeError("rff must be a LinearRFF or SumProdRFF")
+        return cls(rff.a, rff.phi, c, psi,
+                   numerical_tolerance=rff.numerical_tolerance,
+                   renormalize_h=renormalize_h,
+                   register_modules=register_modules)
 
-    def log_norm_constant(self, Omega2 : torch.Tensor = None):
+    def log_norm_constant(self, Omega2=None):
         if not self._renormalize_h:
             return 0.0
         if Omega2 is None:
-            g, h = self.g, self.h
-            Omega2 = g.Omega2(h)
-        return -torch.log(as_matrix(Omega2).sum() + self.numerical_tolerance)
-        
-    def log_density(self, x : torch.Tensor):
-        # Use machine tiny for log floors — NOT numerical_tolerance.
-        # SumProdRFF often passes a coarse tol (e.g. 1e-5) that is only meant for
-        # conditional ratios; flooring log(h+tol) while Omega2 uses the true tiny h
-        # makes p(x)=g h/Z appear enormously peaked (bogus large negative NLL).
-        g_vals = self.g(x)
-        h_vals = self.h(x)
-        if isinstance(g_vals, torch.Tensor):
-            g_sum = g_vals.sum(dim=-1).clamp_min(0)
-            h_sum = h_vals.sum(dim=-1).clamp_min(0)
-        else:
-            g_sum = as_vector(g_vals).sum().clamp_min(0)
-            h_sum = as_vector(h_vals).sum().clamp_min(0)
-        log_eps = torch.finfo(g_sum.dtype).tiny
-        log_g_x = torch.log(g_sum + log_eps)
-        log_h_x = torch.log(h_sum + log_eps)
+            Omega2 = self.phi.Omega2(self.psi)
+        tol = self.numerical_tolerance
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        c = as_vector(self.c(), numerical_tolerance=tol)
+        overlap = as_vector(as_matrix(Omega2).matvec(c), numerical_tolerance=tol)
+        return -torch.log((a * overlap).sum() + tol)
 
-        return self.log_norm_constant() + log_g_x + log_h_x
+    def log_density(self, x: torch.Tensor):
+        tol = self.numerical_tolerance
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        c = as_vector(self.c(), numerical_tolerance=tol)
+        phi_x = as_vector(self.phi(x), numerical_tolerance=tol)
+        psi_x = as_vector(self.psi(x), numerical_tolerance=tol)
+        g_sum = (a * phi_x).sum().clamp_min(0)
+        h_sum = (c * psi_x).sum().clamp_min(0)
+        # Avoid a coarse numerical_tolerance floor when taking the logarithm.
+        eps = torch.finfo(g_sum.dtype).tiny
+        return self.log_norm_constant() + torch.log(g_sum + eps) + torch.log(h_sum + eps)
 
-    def marginal(self, marginal_dims : tuple[int, ...]):
-        pass
-        # TODO
-        #g_copy = self.g.freeze_params()
-        #h_copy = self.h.freeze_params()
-        #expanded_basis_marginal = g_copy.product_basis([h_copy]).marginal(marginal_dims)
-        #dtype, device = expanded_basis_marginal.param_dtype_device()
-        #w_fixed = torch.ones(
-        #    expanded_basis_marginal.n_basis_functions(),
-        #    device=device,
-        #    dtype=dtype,
-        #)
-        #return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
-
+    def marginal(self, marginal_dims: tuple[int, ...]):
+        raise NotImplementedError("LinearFF.marginal is not implemented")
 
 class Linear2FF(DensityModel):
     """

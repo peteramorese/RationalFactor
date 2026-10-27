@@ -88,9 +88,11 @@ class ConditionalDensityModel(torch.nn.Module):
 
 
 class MarkovTransitionModel(ConditionalDensityModel):
-    def __init__(self, features : int, batch_shape: tuple[int, ...] = (1,)):
+    """Time-homogeneous conditional density that propagates a belief one step."""
+
+    def __init__(self, features: int, batch_shape: tuple[int, ...] = (1,)):
         super().__init__(features, features, batch_shape)
 
-    def propagate(self, belief : DensityModel):
+    def propagate(self, belief: DensityModel) -> DensityModel:
+        """Return the next-step belief; iterate by calling this again."""
         raise NotImplementedError("propagate not implemented")
-    

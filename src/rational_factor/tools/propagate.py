@@ -1,244 +1,29 @@
-from rational_factor.models.density_model import DensityModel, ConditionalDensityModel
-from rational_factor.models.parameters import FixedParameters
-from rational_factor.models.tt.tt_parameters import TTVectorParameters
-from rational_factor.models.structured_matrices import Matrix, as_matrix
-from rational_factor.models.structured_vectors import as_vector
-from rational_factor.models.tt.tt import TTVector, LowRankFactorizationMPO, KroneckerPlusLowRankFactorizationMPO
+"""Thin compatibility entry point for one-step Markov propagation.
+
+Each MarkovTransitionModel now owns its one-step propagation implementation.
+Use ``belief = transition_model.propagate(belief)`` recursively.
+"""
+from rational_factor.models.density_model import (
+    DensityModel, ConditionalDensityModel, MarkovTransitionModel,
+)
+from rational_factor.models.factor_forms import LinearFF, Linear2FF, LinearRF
 import torch
-import copy 
-from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF, QuadraticFF, QuadraticRFF, Linear2FF, LinearR2FF, LinearRF
 
 
-def _coeff_params_from_values(values):
-    """Freeze coefficients without materializing a high-dimensional TT."""
-    values = as_vector(values)
-    if isinstance(values, TTVector):
-        return TTVectorParameters.from_cores([
-            FixedParameters(core.detach().clone()) for core in values.cores
-        ])
-    dense = values.to_dense() if hasattr(values, "to_dense") else values
-    return FixedParameters(dense.detach().clone())
+def propagate(belief: DensityModel, transition_model: MarkovTransitionModel) -> DensityModel:
+    """Backward-compatible one-step alias; no type dispatch or time loop."""
+    return transition_model.propagate(belief)
 
-
-def propagate(init_belief : DensityModel, transition_model : ConditionalDensityModel, n_steps : int, device : torch.device = None):
-    if device is None:
-        device = init_belief.dtype_device()[1]
-
-    try:
-        from normalizing_flow.composite_model import CompositeConditionalModel
-    except ImportError:
-        CompositeConditionalModel = ()  # type: ignore[misc, assignment]
-
-    if CompositeConditionalModel and isinstance(transition_model, CompositeConditionalModel):
-        return propagate(init_belief, transition_model.conditional_density_model, n_steps, device)
-
-    ##### LINEAR RATIONAL FACTOR #####
-    if isinstance(transition_model, LinearRFF):
-        assert isinstance(init_belief, LinearFF), "Belief must be LinearFF for LinearRFF transition model"
-
-        phi = transition_model.phi
-
-        psi0 = copy.copy(init_belief.h)
-        psi0.set_coeffs_to_one()
-
-        Omega2_0 = phi.Omega2(psi0)
-        Omega2 = phi.Omega2(transition_model.psi)
-
-        b = transition_model.get_b(Omega2=Omega2)
-
-        c0_norm_constant = torch.exp(init_belief.log_norm_constant())
-        c0 = c0_norm_constant * init_belief.h.coeffs()
-
-        h0 = copy.copy(init_belief.h)
-        h0.set_coeffs(_coeff_params_from_values(c0))
-        h_seq = [h0]
-        c1 = b * Omega2_0.matvec(c0)
-        h1 = copy.copy(transition_model.psi)
-        h1.set_coeffs(_coeff_params_from_values(c1))
-        h_seq.append(h1)
-        for _ in range(1, n_steps):
-            ck = b * Omega2.matvec(h_seq[-1].coeffs())
-            hk = copy.copy(transition_model.psi)
-            hk.set_coeffs(_coeff_params_from_values(ck))
-            h_seq.append(hk)
-        
-        belief_seq = [LinearFF(init_belief.g, h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False, register_modules=False) for h in h_seq]
-        return belief_seq
-    
-    ##### SUM PRODUCT RATIONAL FACTOR #####
-    elif isinstance(transition_model, SumProdRFF):
-        if not isinstance(init_belief, LinearFF):
-            raise TypeError("Belief must be LinearFF for SumProdRFF propagation")
-        if n_steps < 0:
-            raise ValueError("n_steps must be nonnegative")
-
-        B = transition_model.B()
-        if not isinstance(B, LowRankFactorizationMPO):
-            raise TypeError("SumProdRFF propagation requires LowRankFactorizationMPO B")
-
-        a = transition_model.a()
-        if not isinstance(a, TTVector) or not a.is_rank_one or a.is_batched:
-            raise ValueError("a must be an unbatched rank-one TTVector")
-
-        phi = transition_model.phi
-        psi0 = copy.copy(init_belief.h)
-        psi0.set_coeffs_to_one()
-        omega0 = phi.Omega2(psi0)
-        omega = phi.Omega2(transition_model.psi)
-        if (not isinstance(omega0, Matrix) or not isinstance(omega, Matrix)):
-            raise TypeError("basis Grams must be MPO matrices")
-        q = omega.rev_matvec(a)
-        if not isinstance(q, TTVector) or not q.is_rank_one:
-            raise ValueError("q = omega.T @ a must be a rank-one TTVector")
-
-        c0 = torch.exp(init_belief.log_norm_constant()) * init_belief.h.coeffs()
-        if not isinstance(c0, TTVector):
-            raise TypeError("initial h coefficients must be a TTVector")
-        h0 = copy.copy(init_belief.h)
-        h0.set_coeffs(_coeff_params_from_values(c0))
-        h_seq = [h0]
-
-        if isinstance(B, KroneckerPlusLowRankFactorizationMPO):
-            # The Kronecker term carries forward the full previous TT state.
-            # A closed r-dimensional latent recurrence is NOT valid here.
-            # Each step is exact, and internal ranks grow additively:
-            # R(c_next) <= R(c_prev) + R(V), since B.T uses K.T + V U.T.
-            c = c0
-            for t in range(1, n_steps + 1):
-                gram = omega0 if t == 1 else omega
-                c = B.rev_matvec(a * gram.matvec(c)) / q
-                h_t = copy.copy(transition_model.psi)
-                h_t.set_coeffs(_coeff_params_from_values(c))
-                h_seq.append(h_t)
-        elif n_steps:
-            # Pure low-rank case: the full state enters only on the first step.
-            z = B.T.project_latent(a * omega0.matvec(c0))
-            K = B.latent_kernel(omega, a, q)
-            for t in range(1, n_steps + 1):
-                if t > 1:
-                    z = K @ z
-                c_t = B.T.apply_latent(z) / q
-                h_t = copy.copy(transition_model.psi)
-                h_t.set_coeffs(_coeff_params_from_values(c_t))
-                h_seq.append(h_t)
-
-        g = transition_model.g_basis()
-        return [LinearFF(
-            g if t else init_belief.g, h,
-            numerical_tolerance=init_belief.numerical_tolerance,
-            renormalize_h=False, register_modules=False,
-        ) for t, h in enumerate(h_seq)]
-
-    ##### QUADRATIC RATIONAL FACTOR #####
-    elif isinstance(transition_model, QuadraticRFF):
-        assert isinstance(init_belief, QuadraticFF), "Belief must be QuadraticFF for QuadraticRFF transition model"
-
-        Omega_0 = init_belief.phi_basis.Omega22(init_belief.psi0_basis)
-        Omega = transition_model.phi_basis.Omega22(transition_model.psi_basis)
-        B = transition_model.get_B(Omega=Omega)
-        #BOmega0 = torch.einsum("ij,klij->klij", B, Omega0)
-        #BOmega = torch.einsum("ij,klij->klij", B, Omega)
-        BOmega_0 = torch.einsum("ij,ijkl->ijkl", B, Omega_0)
-        BOmega = torch.einsum("ij,ijkl->ijkl", B, Omega)
-        
-        C0 = init_belief.get_C0(Omega_0=Omega_0)
-
-        C_seq = [C0]
-        C_seq.append(torch.einsum("ij,klij->kl", C0, BOmega_0))
-        for _ in range(1, n_steps):
-            C_seq.append(torch.einsum("ij,klij->kl", C_seq[-1], BOmega))
-        
-        belief_seq = [QuadraticFF(init_belief.A, init_belief.phi_basis, transition_model.psi_basis, C0_fixed=C_seq[i + 1]).to(device=device) for i in range(n_steps)]
-        belief_seq.insert(0, init_belief) # Add the initial belief
-        return belief_seq
-
-    elif isinstance(transition_model, LinearR2FF):
-        def _prop(curr_belief : LinearFF | Linear2FF):
-            # Compute first belief propagation
-            if isinstance(curr_belief, LinearFF):
-                Omega_0 = curr_belief.phi_basis.Omega2(curr_belief.psi0_basis)
-                b = transition_model.get_b()
-                c0 = curr_belief.get_c0(Omega_0=Omega_0.to_dense())
-                c1 = b * Omega_0.matvec(c0)
-
-            elif isinstance(curr_belief, Linear2FF):
-                b = transition_model.get_b()
-                d = curr_belief.d
-                c0 = curr_belief.get_c0()
-
-                # c1[j] = b[j] * sum_{i,k} d[i] c0[k] Omega3[i,j,k]
-                contracted_j = curr_belief.xi_basis.Omega3_contract(
-                    curr_belief.psi0_basis,
-                    curr_belief.phi_basis,
-                    d,
-                    c0,
-                )
-                c1 = b * contracted_j
-
-            else:
-                raise ValueError(f"Unrecognized belief type '{type(curr_belief)}'")
-
-            return Linear2FF(transition_model.d, transition_model.xi_basis, 
-                transition_model.get_a(), transition_model.phi_basis, 
-                transition_model.psi_basis, c0_fixed=c1, 
-                numerical_tolerance=curr_belief.numerical_tolerance).to(device=device)
-        belief_seq = [init_belief]
-        for _ in range(0, n_steps):
-            belief_seq.append(_prop(belief_seq[-1]))
-        return belief_seq
-    
-    else:
-        raise ValueError(f"Unrecognized transition model type '{type(transition_model)}'")
-
-#def propagate_with_control(init_belief : DensityModel, transition_model : ConditionalDensityModel, controls : list[torch.Tensor]):
-#    if isinstance(transition_model, MLPContextLinearRFF):
-#        assert isinstance(init_belief, MLPContextLinearFF), "Belief must be MLPContextLinearFF for MLPContextLinearRFF transition model"
-#
-#
-#        g_mlp_form = transition_model.g_mlp_form # same g as in init
-#
-#        curr_g = g_mlp_form.instantiate(u=controls[0])
-#        curr_h_inst = init_belief.h_mlp_form.instantiate(up=controls[0])
-#        init_norm_constant = torch.exp(init_belief.log_norm_constant(up=controls[0]))
-#
-#        Omega_curr = curr_g.Omega2(curr_h_inst, ignore_coeffs=True)
-#        c_curr = init_norm_constant * curr_h_inst.get_coeffs()
-#        if c_curr is None:
-#            raise ValueError(
-#                "Initial h0 basis must have coeffs set on the template before propagation "
-#                "(psi_mlp_form uses coeffs=None; h_mlp_form should provide c_curr)."
-#            )
-#
-#        init_belief = LinearFF(curr_g, curr_h_inst, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=True)
-#        belief_seq = [init_belief]
-#
-#        for k, u in enumerate(controls[:-1]):
-#            up = controls[k + 1]
-#
-#            curr_g = g_mlp_form.instantiate(u=up)
-#            curr_psi_inst = transition_model.psi_mlp_form.instantiate(u=u, up=up)
-#            Omega_next = curr_g.Omega2(curr_psi_inst, ignore_coeffs=True)
-#            b_curr = transition_model.get_b(u=u, up=up, Omega=Omega_next)
-#
-#            c_next = torch.einsum("i,ij,j->i", b_curr, Omega_curr, c_curr)
-#            curr_h = curr_psi_inst.shallow_copy_target_module()
-#            curr_h.set_coeffs(c_next)
-#            belief_seq.append(LinearFF(curr_g, curr_h, numerical_tolerance=init_belief.numerical_tolerance, renormalize_h=False))
-#
-#            Omega_curr = Omega_next
-#            c_curr = c_next
-#
-#
-#        return belief_seq
-#    
-#    else:
-#        raise ValueError(f"Unrecognized transition model type '{type(transition_model)}'")
 
 def update(belief : DensityModel, observation_model : ConditionalDensityModel, observation : torch.Tensor, device : torch.device = None):
     if device is None:
         device = belief.dtype_device()[1]
 
-    if isinstance(observation_model, CompositeConditionalModel):
+    try:
+        from normalizing_flow.composite_model import CompositeConditionalModel
+    except ImportError:
+        CompositeConditionalModel = ()
+    if CompositeConditionalModel and isinstance(observation_model, CompositeConditionalModel):
         return update(belief, observation_model.conditional_density_model, observation, device)
 
     if isinstance(observation_model, LinearRF):
@@ -290,7 +75,7 @@ def propagate_and_update(belief : DensityModel, transition_model : ConditionalDe
     for observation in observations:
         
         # Propagate the previous posterior belief to get the prior for the current timestep
-        prior = propagate(posteriors[-1], transition_model, 1)[1]
+        prior = transition_model.propagate(posteriors[-1])
         
         if observation is not None:
             posterior = update(prior, observation_model, observation)

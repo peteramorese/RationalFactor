@@ -8,46 +8,29 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
-try:
-    from rational_factor.models.tt.tt_basis import TTBasis
-except ModuleNotFoundError as exc:
-    if exc.name not in ('rational_factor.models.tt.tt_basis', 'rational_factor.models.tt'):
-        raise
-    from rational_factor.models.tt_basis import TTBasis
-try:
-    from rational_factor.models.tt.tt_parameters import TTVectorParameters, LowRankFactorizationMPOParameters
-except ModuleNotFoundError as exc:
-    if exc.name not in ('rational_factor.models.tt.tt_parameters', 'rational_factor.models.tt'):
-        raise
-    from rational_factor.models.tt_parameters import TTVectorParameters, LowRankFactorizationMPOParameters
+from rational_factor.models.tt.tt_basis import TTBasis
+from rational_factor.models.tt.tt_parameters import TTVectorParameters, LowRankFactorizationMPOParameters
 from rational_factor.models.parameters import PositiveParameters, TrainableParameters, param_group_iter
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.train import Trainer, LossVisualizer
-# The propagation module may live under models/ or tools/ in repository layouts.
-try:
-    from rational_factor.models.propagate import propagate
-except ModuleNotFoundError as exc:
-    if exc.name != 'rational_factor.models.propagate':
-        raise
-    from rational_factor.tools.propagate import propagate
-from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
+from rational_factor.tools.propagate import propagate
 from rational_factor.tools.analysis import avg_log_likelihood
 import rational_factor.models.loss as loss
-
+from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 
 def _new_gaussian_basis(d: int, n_local: int, *, dtype: torch.dtype,
-                        device: torch.device, bandwidth_floor: float = 0.01):
+                        device: torch.device, bandwidth_floor: float = 0.3):
     shape = (1, d, n_local)
     means = TrainableParameters.random_init(shape, mean=0.0, std=3.5).to(device=device, dtype=dtype)
     stds = PositiveParameters.random_init(
-        shape, mean=0.8, std=5.5, epsilon=bandwidth_floor,
+        shape, mean=0.8, std=0.5, epsilon=bandwidth_floor,
     ).to(device=device, dtype=dtype)
     return TTBasis(GaussianBasis(means, stds)), (means, stds)
 
 
 def build_transition_model(d: int, *, n_local: int, latent_rank: int,
                            mpo_rank: int, dtype: torch.dtype, device: torch.device,
-                           numerical_tolerance: float = 1e-10, gaussian_std_floor: float = 0.01):
+                           numerical_tolerance: float = 1e-10, gaussian_std_floor: float = 0.3):
     phi, phi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     psi, psi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     modes = (n_local,) * d
@@ -68,14 +51,19 @@ def build_transition_model(d: int, *, n_local: int, latent_rank: int,
 
 
 def build_initial_model(rff: SumProdRFF, *, n_local: int, dtype: torch.dtype,
-                        device: torch.device):
+                        device: torch.device, init_tt_rank: int = 1,
+                        gaussian_std_floor: float = 0.01):
     coeffs = TTVectorParameters.from_core_spec(
-        (n_local,) * rff.phi.dim(), ranks=1, param_cls=PositiveParameters,
+        (n_local,) * rff.phi.dim(), ranks=init_tt_rank, param_cls=PositiveParameters,
         mean=1.0, std=0.15, epsilon=1e-3, dtype=dtype, device=device,
     )
-    h0_basis = TTBasis(rff.psi.primitives)
-    h0_basis.set_coeffs(coeffs)
-    return LinearFF.from_rff(rff, h0_basis).to(device=device, dtype=dtype), coeffs
+    # Independent initial psi0, not the transition psi.
+    h0_basis, psi0_modules = _new_gaussian_basis(
+        rff.phi.dim(), n_local, dtype=dtype, device=device,
+        bandwidth_floor=gaussian_std_floor,
+    )
+    return (LinearFF.from_rff(rff, coeffs, h0_basis).to(device=device, dtype=dtype),
+            coeffs, psi0_modules)
 
 
 if __name__ == "__main__":
@@ -83,10 +71,10 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float64
-    n_local = 100  
-    latent_rank = 400
-    mpo_rank = 20
-    gaussian_std_epsilon = 0.1
+    n_local = 6  # 6**4=1296 coefficients, but never materialized
+    latent_rank = 10
+    mpo_rank = 10
+    gaussian_std_epsilon = 0.3
     test_fraction = 0.15
     split_seed = 0
     tran_params = {
@@ -95,10 +83,12 @@ if __name__ == "__main__":
         "weights_iterations": 2,
         "lr_basis": 1.2e-2,
         "lr_weights": 5e-2,
-        "validation_patience": 50,
+        "validation_patience": 20,
     }
-    init_params = {"epochs": 50, "coeff_iterations": 10, "lr_coeffs": 1e-2}
-    batch_size = 256
+    init_tt_rank = 4
+    init_params = {"epochs": 50, "coeff_iterations": 10, "lr_coeffs": 1e-2,
+                   "basis_iterations": 2, "lr_basis": 1e-3}
+    batch_size = 512
     n_timesteps_prop = problem.n_timesteps
     d = problem.system.dim()
 
@@ -143,7 +133,7 @@ if __name__ == "__main__":
         "weights", n_iterations=tran_params["weights_iterations"],
     )
     trainer.add_loss_function(loss.conditional_mle_loss, "mle", "transitions")
-    trainer.add_loss_function(loss.conditional_mle_loss, "val_mle", "validation", validation=True)
+    trainer.add_loss_function(loss.conditional_mle_loss, "validation_mle", "validation", validation=True)
     # use_best='mle' avoids full validation-loader evaluation *after every*
     # optimizer step; validation_mle and early stopping still run per epoch.
     rff, best_loss_tran, training_time_tran = trainer.train(
@@ -161,8 +151,9 @@ if __name__ == "__main__":
 
     for parameter in rff.parameters():
         parameter.requires_grad_(False)
-    init_model, h0_params = build_initial_model(
+    init_model, h0_params, psi0_modules = build_initial_model(
         rff, n_local=n_local, dtype=dtype, device=device,
+        init_tt_rank=init_tt_rank, gaussian_std_floor=gaussian_std_epsilon,
     )
     init_trainer = Trainer(
         init_model, device=device,
@@ -173,6 +164,10 @@ if __name__ == "__main__":
         torch.optim.Adam(param_group_iter(tuple(h0_params.parameter_modules())),
                          lr=init_params["lr_coeffs"]),
         "coeffs", n_iterations=init_params["coeff_iterations"],
+    )
+    init_trainer.add_optimizer(
+        torch.optim.Adam(param_group_iter(psi0_modules), lr=init_params["lr_basis"]),
+        "psi0_basis", n_iterations=init_params["basis_iterations"],
     )
     init_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
     init_model, best_loss_init, training_time_init = init_trainer.train(
@@ -186,7 +181,9 @@ if __name__ == "__main__":
     init_model.eval()
     rff.eval()
     with torch.no_grad():
-        beliefs = propagate(init_model, rff, n_steps=n_timesteps_prop)
+        beliefs = [init_model]
+        for _ in range(n_timesteps_prop):
+            beliefs.append(rff.propagate(beliefs[-1]))
         for i, (belief, samples) in enumerate(zip(beliefs, traj_data)):
             loglik = avg_log_likelihood(belief, samples.to(device=device, dtype=dtype))
             print(f"Avg log-likelihood at time {i}: {float(loglik):.6f}")

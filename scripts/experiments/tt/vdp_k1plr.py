@@ -1,4 +1,4 @@
-"""Van der Pol: Kronecker-plus-Kronecker-plus-low-rank SumProdRFF with unwrapped Gaussian tensor-product bases.
+"""Van der Pol: Kronecker-plus-low-rank SumProdRFF with unwrapped Gaussian tensor-product bases.
 
 B = (1 - mixture_weight) K + mixture_weight U V^T is row-stochastic.  The factor and basis
 coefficient tensor operations, including prediction, remain structured TT/MPO
@@ -18,7 +18,6 @@ from rational_factor.models.parameters import PositiveParameters, TrainableParam
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.train import Trainer, LossVisualizer
-from rational_factor.tools.propagate import propagate
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.visualization import plot_belief
@@ -308,16 +307,19 @@ def build_transition_model(d: int, *, n_local: int, latent_rank: int,
 
 
 def build_initial_model(rff: SumProdRFF, *, n_local: int, dtype: torch.dtype,
-                        device: torch.device):
-    """Reuse the trained (frozen) Gaussian primitives; train rank-one h0 only."""
+                        device: torch.device, init_tt_rank: int = 1):
+    """Train an independent initial Gaussian psi0 and arbitrary-rank TT h0."""
     modes = (n_local,) * rff.phi.dim()
     h0 = TTVectorParameters.from_core_spec(
-        modes, ranks=1, param_cls=PositiveParameters, mean=1.0, std=0.15,
+        modes, ranks=init_tt_rank, param_cls=PositiveParameters, mean=1.0, std=0.15,
         epsilon=1e-3, dtype=dtype, device=device,
     )
-    h0_basis = TTBasis(rff.psi.primitives)
-    h0_basis.set_coeffs(h0)
-    return LinearFF.from_rff(rff, h0_basis).to(device=device, dtype=dtype), h0
+    # Initial psi0 has its own Gaussian locations and bandwidths.
+    h0_basis, psi0_modules = _new_gaussian_basis(
+        rff.phi.dim(), n_local, dtype=dtype, device=device,
+    )
+    return (LinearFF.from_rff(rff, h0, h0_basis).to(device=device, dtype=dtype),
+            h0, psi0_modules)
 
 
 if __name__ == "__main__":
@@ -327,19 +329,21 @@ if __name__ == "__main__":
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float32
     # N = n_local ** d: never materialize the full coefficient space.
-    n_local = 50
+    n_local = 100
     latent_rank = 200  # ordinary rank of the UV^T correction, not of the full B
-    mpo_rank = 10     # internal TT/MPO bond ranks of the factors U, V
+    mpo_rank = 20     # internal TT/MPO bond ranks of the factors U, V
     # Initial low-rank mixture; trained as a logit (K share = 1 - sigmoid(logit)).
     mixture_weight_init = 0.5
     tran_params = {
-        "epochs": 20,
+        "epochs": 30,
         "basis_iterations": 5,  # full dataset passes per outer epoch
         "weights_iterations": 5,
         "lr_basis": 1e-2,
         "lr_weights": 5e-2,
     }
-    init_params = {"epochs": 100, "coeff_iterations": 10, "lr_coeffs": 1e-2}
+    init_tt_rank = 8
+    init_params = {"epochs": 20, "coeff_iterations": 10, "lr_coeffs": 1e-2,
+                   "basis_iterations": 2, "lr_basis": 1e-3}
     batch_size = 256
     n_timesteps_prop = problem.n_timesteps
 
@@ -387,8 +391,8 @@ if __name__ == "__main__":
     # Freeze *all* transition parameters, including the Gaussian means/stds.
     for parameter in rff.parameters():
         parameter.requires_grad_(False)
-    init_model, h0_params = build_initial_model(
-        rff, n_local=n_local, dtype=dtype, device=device,
+    init_model, h0_params, psi0_modules = build_initial_model(
+        rff, n_local=n_local, dtype=dtype, device=device, init_tt_rank=init_tt_rank,
     )
     initial_trainer = Trainer(
         init_model, device=device,
@@ -399,6 +403,10 @@ if __name__ == "__main__":
         torch.optim.Adam(param_group_iter(tuple(h0_params.parameter_modules())),
                          lr=init_params["lr_coeffs"]),
         "coeffs", n_iterations=init_params["coeff_iterations"],
+    )
+    initial_trainer.add_optimizer(
+        torch.optim.Adam(param_group_iter(psi0_modules), lr=init_params["lr_basis"]),
+        "psi0_basis", n_iterations=init_params["basis_iterations"],
     )
     initial_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
     init_model, best_loss_init, training_time_init = initial_trainer.train(
@@ -421,18 +429,22 @@ if __name__ == "__main__":
                               ranges, "Phi: local Gaussian factors")
     _plot_gaussian_primitives(rff.psi.primitives, output_dir / "psi_gaussians.png",
                               ranges, "Psi: local Gaussian factors")
+    _plot_gaussian_primitives(init_model.psi.primitives, output_dir / "psi0_gaussians.png",
+                              ranges, "Psi0: independently trained initial Gaussian factors")
     _plot_conditional_slices_model_vs_data(
         rff, x_k, x_kp1, output_dir / "conditional_slices_model_vs_data.png",
         x_range=ranges[0], y_range=ranges[1], n_random_points=10,
         n_grid=120, min_points_per_slice=20, bin_width=0.4,
-        random_seed=0, title="VDP Kronecker-plus-Kronecker-plus-low-rank SumProdRFF: conditional slices",
+        random_seed=0, title="VDP Kronecker-plus-low-rank SumProdRFF: conditional slices",
     )
 
     # The K term preserves incoming TT ranks, while UV^T adds at most the
     # bond ranks of V at each step. This is exact full-space propagation,
     # NOT the fixed-r latent recurrence used by pure low rank.
     with torch.no_grad():
-        belief_seq = propagate(init_model, rff, n_steps=n_timesteps_prop)
+        belief_seq = [init_model]
+        for _ in range(n_timesteps_prop):
+            belief_seq.append(rff.propagate(belief_seq[-1]))
         belief_seq = [belief.to(device=device, dtype=dtype).eval() for belief in belief_seq]
         for i, (belief, samples) in enumerate(zip(belief_seq, traj_data)):
             ll = avg_log_likelihood(belief, samples.to(device=device))
