@@ -167,11 +167,7 @@ if __name__ == "__main__":
     # use_best='mle' avoids full validation-loader evaluation *after every*
     # optimizer step; val_mle and early stopping still run per epoch.
     rff, best_loss_tran, training_time_tran = trainer.train(
-<<<<<<< HEAD
         epochs=tran_params["epochs"], use_best="validation_total", verbose=True,
-=======
-        epochs=tran_params["epochs"], use_best="validation", verbose=True,
->>>>>>> 05baa4a2b2820e85adfa77802eac5c496a99b6d9
     )
     if rff is None:
         raise SystemExit("No stable transition checkpoint was found.")
