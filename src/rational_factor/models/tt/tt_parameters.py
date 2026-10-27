@@ -314,6 +314,8 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
     ``mixture_weight`` may be a fixed probability in [0, 1] or a scalar
     Parameters provider whose raw value is mapped through sigmoid, allowing
     a trainable mixture while preserving the stochastic constraint.
+    ``from_core_spec(..., trainable=True)`` converts a float init into such a
+    logit parameter automatically.
     """
 
     def __init__(self, kronecker: Parameters, U: Parameters, V: Parameters, *,
@@ -337,6 +339,33 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
                      mixture_weight: float | Parameters = 0.5):
         return cls(kronecker, U, V, row_stochastic=row_stochastic,
                    mixture_weight=mixture_weight)
+
+    @staticmethod
+    def _as_mixture_weight_parameters(
+        mixture_weight: float | Parameters, *, trainable: bool,
+        dtype=torch.float32, device=None,
+    ) -> float | Parameters:
+        """Keep an explicit Parameters provider, else turn a probability into a logit.
+
+        When ``trainable=True``, a float in ``[0, 1]`` becomes a scalar
+        ``TrainableParameters`` initialized so ``sigmoid(logit) ≈ mixture_weight``.
+        When ``trainable=False``, the float is left as a fixed probability.
+        """
+        if isinstance(mixture_weight, Parameters):
+            return mixture_weight
+        w = float(mixture_weight)
+        if not (0.0 <= w <= 1.0):
+            raise ValueError("mixture_weight must be in [0, 1]")
+        if not trainable:
+            return w
+        # Avoid ±inf logits at the endpoints while matching the requested init.
+        eps = 1e-4
+        w_c = min(max(w, eps), 1.0 - eps)
+        logit = math.log(w_c / (1.0 - w_c))
+        p = TrainableParameters.from_values(
+            torch.tensor(logit, dtype=dtype, device=device), trainable=True,
+        )
+        return p
 
     @classmethod
     def from_core_spec(
@@ -364,8 +393,11 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
             trainable=trainable, mean=mean, std=std, epsilon=epsilon,
             dtype=dtype, device=device,
         )
+        mw = cls._as_mixture_weight_parameters(
+            mixture_weight, trainable=trainable, dtype=dtype, device=device,
+        )
         return cls(kronecker, lowrank.U, lowrank.V,
-                   row_stochastic=row_stochastic, mixture_weight=mixture_weight)
+                   row_stochastic=row_stochastic, mixture_weight=mw)
 
     @staticmethod
     def _normalized_kronecker(kronecker: MPO) -> MPO:
