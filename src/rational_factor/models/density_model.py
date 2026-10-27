@@ -85,3 +85,12 @@ class ConditionalDensityModel(torch.nn.Module):
         otherwise if conditoner is None, it returns the supremum across all possible conditioners.
         """
         raise NotImplementedError("supremum_bound not implemented")
+
+
+class MarkovTransitionModel(ConditionalDensityModel):
+    def __init__(self, features : int, batch_shape: tuple[int, ...] = (1,)):
+        super().__init__(features, features, batch_shape)
+
+    def propagate(self, belief : DensityModel):
+        raise NotImplementedError("propagate not implemented")
+    

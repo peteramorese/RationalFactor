@@ -9,28 +9,12 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
-try:
-    from rational_factor.models.tt.tt_basis import TTBasis
-except ModuleNotFoundError as exc:
-    if exc.name not in ('rational_factor.models.tt.tt_basis', 'rational_factor.models.tt'):
-        raise
-    from rational_factor.models.tt_basis import TTBasis
-try:
-    from rational_factor.models.tt.tt_parameters import TTVectorParameters, KroneckerPlusLowRankFactorizationMPOParameters
-except ModuleNotFoundError as exc:
-    if exc.name not in ('rational_factor.models.tt.tt_parameters', 'rational_factor.models.tt'):
-        raise
-    from rational_factor.models.tt_parameters import TTVectorParameters, KroneckerPlusLowRankFactorizationMPOParameters
+from rational_factor.models.tt.tt_basis import TTBasis
+from rational_factor.models.tt.tt_parameters import TTVectorParameters, KroneckerPlusLowRankFactorizationMPOParameters
 from rational_factor.models.parameters import PositiveParameters, TrainableParameters, Parameters, param_group_iter
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.train import Trainer, LossVisualizer
-# The propagation module may live under models/ or tools/ in repository layouts.
-try:
-    from rational_factor.models.propagate import propagate
-except ModuleNotFoundError as exc:
-    if exc.name != 'rational_factor.models.propagate':
-        raise
-    from rational_factor.tools.propagate import propagate
+from rational_factor.tools.propagate import propagate
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 import rational_factor.models.loss as loss
@@ -83,10 +67,10 @@ def build_transition_model(d: int, *, n_local: int, latent_rank: int,
     )
 
 
-def build_initial_model(rff: SumProdRFF, *, n_local: int, dtype: torch.dtype,
+def build_initial_model(rff: SumProdRFF, *, n_local: int, mpo_rank: int, dtype: torch.dtype,
                         device: torch.device):
     coeffs = TTVectorParameters.from_core_spec(
-        (n_local,) * rff.phi.dim(), ranks=1, param_cls=PositiveParameters,
+        (n_local,) * rff.phi.dim(), ranks=mpo_rank, param_cls=PositiveParameters,
         mean=1.0, std=0.15, epsilon=1e-3, dtype=dtype, device=device,
     )
     h0_basis = TTBasis(rff.psi.primitives)
@@ -95,28 +79,28 @@ def build_initial_model(rff: SumProdRFF, *, n_local: int, dtype: torch.dtype,
 
 
 if __name__ == "__main__":
-    problem = FULLY_OBSERVABLE_PROBLEMS["cartpole"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["quadcopter"]
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float64
-    n_local = 30  
+    n_local = 20  
     latent_rank = 600
-    mpo_rank = 20
-    gaussian_std_epsilon = 0.3
+    tran_mpo_rank = 10
+    init_mpo_rank = 20
+    gaussian_std_epsilon = 0.9
     test_fraction = 0.15
     split_seed = 0
-    # Initial low-rank mixture; trained as a logit (K share = 1 - sigmoid(logit)).
     mixture_weight_init = 0.5
     tran_params = {
-        "epochs": 80,
+        "epochs": 20,
         "basis_iterations": 5,
         "weights_iterations": 5,
         "lr_basis": 5e-3,
         "lr_weights": 2e-2,
         "validation_patience": 5,
     }
-    init_params = {"epochs": 100, "coeff_iterations": 10, "lr_coeffs": 1e-2}
-    batch_size = 256
+    init_params = {"epochs": 1000, "coeff_iterations": 10, "lr_coeffs": 1e-2}
+    batch_size = 512
     n_timesteps_prop = problem.n_timesteps
     d = problem.system.dim()
 
@@ -138,15 +122,14 @@ if __name__ == "__main__":
                              shuffle=True, pin_memory=use_gpu)
     output_dir = Path("figures/tt/acc_comp_k1plr")
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"device={device}, dtype={dtype}, modes={(n_local,) * d}, latent rank={latent_rank}, MPO rank={mpo_rank}")
+    print(f"device={device}, dtype={dtype}, modes={(n_local,) * d}, latent rank={latent_rank}, transition MPO rank={tran_mpo_rank}")
 
     rff, B_params, basis_params, weight_params = build_transition_model(
-        d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
+        d, n_local=n_local, latent_rank=latent_rank, mpo_rank=tran_mpo_rank,
         mixture_weight=mixture_weight_init,
         dtype=dtype, device=device, numerical_tolerance=1e-10,
         gaussian_std_floor=gaussian_std_epsilon,
     )
-    print(f"trainable mixture_weight init={mixture_weight_init}")
     trainer = Trainer(
         rff, device=device,
         validation_early_stopping_patience=tran_params["validation_patience"],
@@ -167,7 +150,7 @@ if __name__ == "__main__":
     # use_best='mle' avoids full validation-loader evaluation *after every*
     # optimizer step; val_mle and early stopping still run per epoch.
     rff, best_loss_tran, training_time_tran = trainer.train(
-        epochs=tran_params["epochs"], use_best="validation", verbose=True,
+        epochs=tran_params["epochs"], use_best="validation_total", verbose=True,
     )
     if rff is None:
         raise SystemExit("No stable transition checkpoint was found.")
@@ -184,7 +167,7 @@ if __name__ == "__main__":
     for parameter in rff.parameters():
         parameter.requires_grad_(False)
     init_model, h0_params = build_initial_model(
-        rff, n_local=n_local, dtype=dtype, device=device,
+        rff, n_local=n_local, mpo_rank=init_mpo_rank, dtype=dtype, device=device,
     )
     init_trainer = Trainer(
         init_model, device=device,
