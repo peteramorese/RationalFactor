@@ -84,20 +84,20 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float64
-    n_local = 20  
-    latent_rank = 400
-    mpo_rank = 10
-    gaussian_std_epsilon = 0.1
+    n_local = 50  
+    latent_rank = 800
+    mpo_rank = 30
+    gaussian_std_epsilon = 0.3
     test_fraction = 0.15
     split_seed = 0
-    mixture_weight = 0.5  # K contribution: 1 - mixture_weight; low-rank: mixture_weight
+    mixture_weight = 0.1  # K contribution: 1 - mixture_weight; low-rank: mixture_weight
     tran_params = {
-        "epochs": 30,
+        "epochs": 50,
         "basis_iterations": 5,
-        "weights_iterations": 2,
-        "lr_basis": 1.2e-2,
-        "lr_weights": 5e-2,
-        "validation_patience": 50,
+        "weights_iterations": 5,
+        "lr_basis": 1e-2,
+        "lr_weights": 3e-2,
+        "validation_patience": 5,
     }
     init_params = {"epochs": 50, "coeff_iterations": 10, "lr_coeffs": 1e-2}
     batch_size = 256
@@ -149,7 +149,7 @@ if __name__ == "__main__":
     # use_best='mle' avoids full validation-loader evaluation *after every*
     # optimizer step; val_mle and early stopping still run per epoch.
     rff, best_loss_tran, training_time_tran = trainer.train(
-        epochs=tran_params["epochs"], use_best="mle", verbose=True,
+        epochs=tran_params["epochs"], use_best="validation_total", verbose=True,
     )
     if rff is None:
         raise SystemExit("No stable transition checkpoint was found.")
