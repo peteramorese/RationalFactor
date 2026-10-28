@@ -8,31 +8,38 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
+from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 from rational_factor.models.tt.tt_basis import TTBasis
 from rational_factor.models.tt.tt_parameters import TTVectorParameters, LowRankFactorizationMPOParameters
 from rational_factor.models.parameters import PositiveParameters, TrainableParameters, param_group_iter
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.train import Trainer, LossVisualizer
-from rational_factor.tools.propagate import propagate
 from rational_factor.tools.analysis import avg_log_likelihood
 import rational_factor.models.loss as loss
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 
-def _new_gaussian_basis(d: int, n_local: int, *, dtype: torch.dtype,
-                        device: torch.device, bandwidth_floor: float = 0.3):
-    shape = (1, d, n_local)
-    means = TrainableParameters.random_init(shape, mean=0.0, std=3.5).to(device=device, dtype=dtype)
-    stds = PositiveParameters.random_init(
-        shape, mean=0.8, std=0.5, epsilon=bandwidth_floor,
-    ).to(device=device, dtype=dtype)
-    return TTBasis(GaussianBasis(means, stds)), (means, stds)
+def _new_gaussian_basis(
+    data: torch.Tensor, d: int, n_local: int, *,
+    dtype: torch.dtype, device: torch.device,
+    bandwidth_floor: float = 0.0,
+    gmm_reg_covar: float = 1e-5,
+    gmm_max_iter: int = 100,
+    gmm_seed: int = 0,
+):
+    """EM-fit Gaussian primitives to the supplied state distribution."""
+    means, stds = init_gaussian_basis_params_gmm(
+        data, d, n_local,
+        reg_covar=gmm_reg_covar, max_iter=gmm_max_iter,
+        random_state=gmm_seed, epsilon=bandwidth_floor,
+        dtype=dtype, device=device,
+    )
+    return TTBasis(GaussianBasis(mean_params=means, std_params=stds)), (means, stds)
 
-
-def build_transition_model(d: int, *, n_local: int, latent_rank: int,
+def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_local: int, latent_rank: int,
                            mpo_rank: int, dtype: torch.dtype, device: torch.device,
                            numerical_tolerance: float = 1e-10, gaussian_std_floor: float = 0.3):
-    phi, phi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
-    psi, psi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
+    phi, phi_modules = _new_gaussian_basis(x_k, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
+    psi, psi_modules = _new_gaussian_basis(x_kp1, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     modes = (n_local,) * d
     a = TTVectorParameters.from_core_spec(
         modes, ranks=1, param_cls=PositiveParameters,
@@ -50,7 +57,7 @@ def build_transition_model(d: int, *, n_local: int, latent_rank: int,
     )
 
 
-def build_initial_model(rff: SumProdRFF, *, n_local: int, dtype: torch.dtype,
+def build_initial_model(rff: SumProdRFF, x0: torch.Tensor, *, n_local: int, dtype: torch.dtype,
                         device: torch.device, init_tt_rank: int = 1,
                         gaussian_std_floor: float = 0.01):
     coeffs = TTVectorParameters.from_core_spec(
@@ -59,7 +66,7 @@ def build_initial_model(rff: SumProdRFF, *, n_local: int, dtype: torch.dtype,
     )
     # Independent initial psi0, not the transition psi.
     h0_basis, psi0_modules = _new_gaussian_basis(
-        rff.phi.dim(), n_local, dtype=dtype, device=device,
+        x0, rff.phi.dim(), n_local, dtype=dtype, device=device,
         bandwidth_floor=gaussian_std_floor,
     )
     return (LinearFF.from_rff(rff, coeffs, h0_basis).to(device=device, dtype=dtype),
@@ -113,7 +120,7 @@ if __name__ == "__main__":
     print(f"device={device}, dtype={dtype}, modes={(n_local,) * d}, latent rank={latent_rank}, MPO rank={mpo_rank}")
 
     rff, basis_params, weight_params = build_transition_model(
-        d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
+        x_k[train_idx], x_kp1[train_idx], d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
         dtype=dtype, device=device, numerical_tolerance=1e-10,
         gaussian_std_floor=gaussian_std_epsilon,
     )
@@ -152,7 +159,7 @@ if __name__ == "__main__":
     for parameter in rff.parameters():
         parameter.requires_grad_(False)
     init_model, h0_params, psi0_modules = build_initial_model(
-        rff, n_local=n_local, dtype=dtype, device=device,
+        rff, x0, n_local=n_local, dtype=dtype, device=device,
         init_tt_rank=init_tt_rank, gaussian_std_floor=gaussian_std_epsilon,
     )
     init_trainer = Trainer(

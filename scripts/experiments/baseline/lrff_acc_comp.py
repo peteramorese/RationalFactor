@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
+from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.parameters import (
     PositiveParameters,
@@ -16,7 +17,6 @@ from rational_factor.models.train import Trainer
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 import rational_factor.models.loss as loss
-import rational_factor.tools.propagate as propagate
 
 
 if __name__ == "__main__":
@@ -62,30 +62,13 @@ if __name__ == "__main__":
         TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
     )
 
-    box_lows = problem.plot_bounds_low.to(device=device)
-    box_highs = problem.plot_bounds_high.to(device=device)
-
-    t = torch.linspace(0.0, 1.0, n_basis, device=device)
-    means = box_lows.unsqueeze(-1) + (box_highs - box_lows).unsqueeze(-1) * t
-    means = means.unsqueeze(0)  # (1, dim, n_basis)
-    mean_jitter = 0.35
-    std_init = 0.35
-    phi_means = TrainableParameters.from_values(
-        means + mean_jitter * torch.randn_like(means)
-    ).to(device)
-    phi_stds = PositiveParameters.from_values(
-        torch.full((1, dim, n_basis), std_init, device=device)
-    ).to(device)
-    psi_offset = 0.25 * torch.ones(dim, device=device)
-    psi_offset[1::2] = -0.25
-    psi_means = TrainableParameters.from_values(
-        means
-        + psi_offset.view(1, dim, 1)
-        + mean_jitter * torch.randn_like(means)
-    ).to(device)
-    psi_stds = PositiveParameters.from_values(
-        torch.full((1, dim, n_basis), std_init + 0.1, device=device)
-    ).to(device)
+    # Fit independent EM dictionaries to each training marginal.
+    phi_means, phi_stds = init_gaussian_basis_params_gmm(
+        x_k, dim, n_basis, epsilon=0.0, device=device,
+    )
+    psi_means, psi_stds = init_gaussian_basis_params_gmm(
+        x_kp1, dim, n_basis, epsilon=0.0, device=device,
+    )
     phi_basis = GaussianBasis(mean_params=phi_means, std_params=phi_stds, coeffs=None)
     psi_basis = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=None)
 
@@ -140,8 +123,11 @@ if __name__ == "__main__":
     for parameter in tran_model.parameters():
         parameter.requires_grad_(False)
 
-    h0_basis = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=h0_coeffs)
-    init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)
+    psi0_means, psi0_stds = init_gaussian_basis_params_gmm(
+        x0, dim, n_basis, epsilon=0.0, device=device,
+    )
+    psi0_basis = GaussianBasis(mean_params=psi0_means, std_params=psi0_stds, coeffs=None)
+    init_model = LinearFF.from_rff(tran_model, h0_coeffs, psi0_basis).to(device)
 
     print("Training initial model")
     initial_trainer = Trainer(init_model, device=device)
@@ -150,6 +136,10 @@ if __name__ == "__main__":
         torch.optim.Adam(h0_coeffs.parameters(), lr=init_params["lr_coeffs"]),
         "coeffs",
         n_iterations=init_params["coeff_iterations"],
+    )
+    initial_trainer.add_optimizer(
+        torch.optim.Adam(param_group_iter((psi0_means, psi0_stds)), lr=1e-3),
+        "psi0_basis", n_iterations=2,
     )
     initial_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
     init_model, best_loss_init, training_time_init = initial_trainer.train(
@@ -172,12 +162,10 @@ if __name__ == "__main__":
 
     n_slices = n_timesteps_prop + 1
 
-    base_belief_seq = propagate.propagate(
-        init_model,
-        tran_model,
-        n_steps=n_timesteps_prop,
-    )
-    belief_seq = [belief.eval() for belief in base_belief_seq]
+    belief_seq = [init_model]
+    for _ in range(n_timesteps_prop):
+        belief_seq.append(tran_model.propagate(belief_seq[-1]))
+    belief_seq = [belief.eval() for belief in belief_seq]
 
     ll_per_step = []
     for i in range(n_slices):

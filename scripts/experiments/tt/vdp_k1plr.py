@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
+from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 from rational_factor.models.tt.tt_basis import TTBasis
 from rational_factor.models.tt.tt_parameters import KroneckerPlusLowRankFactorizationMPOParameters, TTVectorParameters
 from rational_factor.models.parameters import PositiveParameters, TrainableParameters, Parameters, param_group_iter
@@ -258,18 +259,22 @@ def _plot_gaussian_primitives(primitives: GaussianBasis, out_path: Path,
         plt.close(fig)
 
 
-def _new_gaussian_basis(d: int, n_local: int, *, dtype: torch.dtype,
-                        device: torch.device, mean_scale: float = 3.0,
-                        bandwidth: float = 1.0, bandwidth_floor: float = 0.25):
-    """Independent trainable Gaussian factors in each physical state dimension."""
-    shape = (1, d, n_local)
-    means = TrainableParameters.random_init(shape, mean=0.0, std=mean_scale).to(device=device, dtype=dtype)
-    stds = PositiveParameters.random_init(
-        shape, mean=bandwidth, std=0.3 * bandwidth, epsilon=bandwidth_floor,
-    ).to(device=device, dtype=dtype)
-    primitives = GaussianBasis(mean_params=means, std_params=stds)
-    return TTBasis(primitives), (means, stds)
-
+def _new_gaussian_basis(
+    data: torch.Tensor, d: int, n_local: int, *,
+    dtype: torch.dtype, device: torch.device,
+    bandwidth_floor: float = 0.0,
+    gmm_reg_covar: float = 1e-5,
+    gmm_max_iter: int = 100,
+    gmm_seed: int = 0,
+):
+    """EM-fit Gaussian primitives to the supplied state distribution."""
+    means, stds = init_gaussian_basis_params_gmm(
+        data, d, n_local,
+        reg_covar=gmm_reg_covar, max_iter=gmm_max_iter,
+        random_state=gmm_seed, epsilon=bandwidth_floor,
+        dtype=dtype, device=device,
+    )
+    return TTBasis(GaussianBasis(mean_params=means, std_params=stds)), (means, stds)
 
 def _trainable_mixture_weight(init: float, *, dtype: torch.dtype, device: torch.device) -> TrainableParameters:
     """Scalar logit so sigmoid(logit) ≈ init; trained with the MPO weights."""
@@ -281,13 +286,13 @@ def _trainable_mixture_weight(init: float, *, dtype: torch.dtype, device: torch.
     )
 
 
-def build_transition_model(d: int, *, n_local: int, latent_rank: int,
+def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_local: int, latent_rank: int,
                            mpo_rank: int, dtype: torch.dtype, device: torch.device,
                            mixture_weight: float | Parameters = 0.5,
-                           numerical_tolerance: float):
+                           numerical_tolerance: float, gaussian_std_floor: float = 0.25):
     """Create transition model and disjoint basis/weight parameter groups."""
-    phi, phi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device)
-    psi, psi_modules = _new_gaussian_basis(d, n_local, dtype=dtype, device=device)
+    phi, phi_modules = _new_gaussian_basis(x_k, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
+    psi, psi_modules = _new_gaussian_basis(x_kp1, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     modes = (n_local,) * d
     a = TTVectorParameters.from_core_spec(
         modes, ranks=1, param_cls=PositiveParameters, mean=1.0, std=0.15,
@@ -306,8 +311,9 @@ def build_transition_model(d: int, *, n_local: int, latent_rank: int,
     return rff, a, B, basis_params, weight_params
 
 
-def build_initial_model(rff: SumProdRFF, *, n_local: int, dtype: torch.dtype,
-                        device: torch.device, init_tt_rank: int = 1):
+def build_initial_model(rff: SumProdRFF, x0: torch.Tensor, *, n_local: int, dtype: torch.dtype,
+                        device: torch.device, init_tt_rank: int = 1,
+                        gaussian_std_floor: float = 0.25):
     """Train an independent initial Gaussian psi0 and arbitrary-rank TT h0."""
     modes = (n_local,) * rff.phi.dim()
     h0 = TTVectorParameters.from_core_spec(
@@ -316,7 +322,8 @@ def build_initial_model(rff: SumProdRFF, *, n_local: int, dtype: torch.dtype,
     )
     # Initial psi0 has its own Gaussian locations and bandwidths.
     h0_basis, psi0_modules = _new_gaussian_basis(
-        rff.phi.dim(), n_local, dtype=dtype, device=device,
+        x0, rff.phi.dim(), n_local, dtype=dtype, device=device,
+        bandwidth_floor=gaussian_std_floor,
     )
     return (LinearFF.from_rff(rff, h0, h0_basis).to(device=device, dtype=dtype),
             h0, psi0_modules)
@@ -341,6 +348,7 @@ if __name__ == "__main__":
         "lr_basis": 1e-2,
         "lr_weights": 5e-2,
     }
+    gaussian_std_epsilon = 0.25
     init_tt_rank = 8
     init_params = {"epochs": 20, "coeff_iterations": 10, "lr_coeffs": 1e-2,
                    "basis_iterations": 2, "lr_basis": 1e-3}
@@ -363,9 +371,10 @@ if __name__ == "__main__":
     print(f"device={device}, modes={(n_local,) * dim}, latent_rank={latent_rank}, MPO rank={mpo_rank}")
 
     rff, a_params, B_params, basis_params, weight_params = build_transition_model(
-        dim, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
+        x_k, x_kp1, dim, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
         mixture_weight=mixture_weight_init,
         dtype=dtype, device=device, numerical_tolerance=problem.numerical_tolerance,
+        gaussian_std_floor=gaussian_std_epsilon,
     )
     print(f"trainable mixture_weight init={mixture_weight_init}")
     transition_trainer = Trainer(
@@ -392,7 +401,8 @@ if __name__ == "__main__":
     for parameter in rff.parameters():
         parameter.requires_grad_(False)
     init_model, h0_params, psi0_modules = build_initial_model(
-        rff, n_local=n_local, dtype=dtype, device=device, init_tt_rank=init_tt_rank,
+        rff, x0, n_local=n_local, dtype=dtype, device=device, init_tt_rank=init_tt_rank,
+        gaussian_std_floor=gaussian_std_epsilon,
     )
     initial_trainer = Trainer(
         init_model, device=device,

@@ -101,3 +101,79 @@ def train_test_split(
     if len(arrays) == 1:
         return split[0], split[1]
     return tuple(split)
+
+
+def init_gaussian_basis_params_gmm(
+    data: torch.Tensor,
+    d: int,
+    n_local: int,
+    *,
+    reg_covar: float = 1e-5,
+    max_iter: int = 100,
+    random_state: int | None = 0,
+    epsilon: float = 0.0,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+):
+    r"""Initialize trainable Gaussian basis parameters using diagonal-GMM EM.
+
+    Fit one ``n_local``-component, ``d``-dimensional diagonal-covariance GMM
+    (as in ``train.fit_gaussian_lf_em``) and extract its component means and
+    marginal standard deviations into tensors of shape ``(1, d, n_local)``.
+    These are suitable for ``GaussianBasis`` and for the local primitive basis
+    of a ``TTBasis``; the full tensor-product basis is never constructed.
+
+    Returns
+    -------
+    (TrainableParameters, PositiveParameters)
+        Separate *trainable* mean and std providers, ready to pass to
+        ``GaussianBasis(mean_params=..., std_params=...)``.
+
+    Notes
+    -----
+    PositiveParameters applies ``epsilon + softplus(raw)`` when trainable.
+    Following the requested initialization policy, the EM standard deviations
+    are passed directly via ``from_values(trainable=True)`` WITHOUT applying an
+    inverse softplus. Thus the initial *effective* standard deviations are
+    larger than those returned by EM; the means are initialized exactly.
+
+    GMM mixture weights are intentionally not returned: in a TT basis the
+    coefficients are trained separately, and ``n_local`` specifies the number
+    of 1-D Gaussian factors in every state dimension.
+    """
+    from sklearn.mixture import GaussianMixture
+    from rational_factor.models.parameters import TrainableParameters, PositiveParameters
+
+    x = torch.as_tensor(data)
+    if x.ndim != 2 or not x.is_floating_point() or x.shape[1] != d:
+        raise ValueError(f"data must be a floating tensor of shape (N, {d})")
+    if not isinstance(d, int) or d < 1:
+        raise ValueError("d must be a positive integer")
+    if not isinstance(n_local, int) or n_local < 1:
+        raise ValueError("n_local must be a positive integer")
+    if x.shape[0] < n_local:
+        raise ValueError(f"GMM with {n_local} components needs at least {n_local} samples; got {x.shape[0]}")
+    if not bool(torch.isfinite(x).all()):
+        raise ValueError("data must contain only finite values")
+    if reg_covar < 0 or max_iter < 1 or epsilon < 0:
+        raise ValueError("require reg_covar >= 0, max_iter >= 1, epsilon >= 0")
+
+    out_dtype = x.dtype if dtype is None else dtype
+    out_device = x.device if device is None else torch.device(device)
+    mixture = GaussianMixture(
+        n_components=n_local,
+        covariance_type="diag",
+        reg_covar=reg_covar,
+        max_iter=max_iter,
+        random_state=random_state,
+        init_params="kmeans",
+    )
+    mixture.fit(x.detach().cpu().numpy())
+
+    means = torch.as_tensor(mixture.means_, dtype=out_dtype, device=out_device).T.contiguous().unsqueeze(0)
+    variances = torch.as_tensor(mixture.covariances_, dtype=out_dtype, device=out_device)
+    stds = variances.clamp_min(torch.finfo(out_dtype).eps).sqrt().T.contiguous().unsqueeze(0)
+
+    mean_params = TrainableParameters.from_values(means, trainable=True)
+    std_params = PositiveParameters.from_values(stds, trainable=True, epsilon=epsilon)
+    return mean_params, std_params
