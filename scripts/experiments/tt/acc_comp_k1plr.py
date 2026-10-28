@@ -95,25 +95,25 @@ if __name__ == "__main__":
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float64
-    n_local = 30
-    latent_rank = 400
-    mpo_rank = 15
+    n_local = 50
+    latent_rank = 200
+    mpo_rank = 2
     gaussian_std_epsilon = 0.01
     test_fraction = 0.15
     split_seed = 0
     mixture_weight_init = 0.5
     tran_params = {
         "epochs": 40,
-        "basis_iterations": 5,
+        "basis_iterations": 2,
         "weights_iterations": 5,
-        "lr_basis": 1e-2,
-        "lr_weights": 5e-2,
+        "lr_basis": 5e-2,
+        "lr_weights": 5e-1,
         "validation_patience": 50,
     }
     init_tt_rank = 10
-    init_params = {"epochs": 400, "coeff_iterations": 10, "lr_coeffs": 1e-2,
+    init_params = {"epochs": 100, "coeff_iterations": 10, "lr_coeffs": 1e-2,
                    "basis_iterations": 2, "lr_basis": 1e-3, "validation_patience": 50}
-    batch_size = 512
+    batch_size = 2048 #512
     n_timesteps_prop = problem.n_timesteps
     d = problem.system.dim()
 
@@ -140,7 +140,7 @@ if __name__ == "__main__":
     print(f"device={device}, dtype={dtype}, modes={(n_local,) * d}, latent rank={latent_rank}, MPO rank={mpo_rank}")
 
     rff, B_params, basis_params, weight_params = build_transition_model(
-        x_k[train_idx], x_kp1[train_idx], d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
+        x_k_train, x_kp1_train, d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
         mixture_weight=mixture_weight_init,
         dtype=dtype, device=device, numerical_tolerance=1e-10,
         gaussian_std_floor=gaussian_std_epsilon,
@@ -217,6 +217,6 @@ if __name__ == "__main__":
         for _ in range(n_timesteps_prop):
             beliefs.append(rff.propagate(beliefs[-1]))
         for i, (belief, samples) in enumerate(zip(beliefs, traj_data)):
-            loglik = avg_log_likelihood(belief, samples.to(device=device, dtype=dtype))
+            loglik = avg_log_likelihood(belief, samples.to(device=device, dtype=dtype), max_chunks=128)
             print(f"Avg log-likelihood at time {i}: {float(loglik):.6f}")
     print(f"Saved loss figures in {output_dir}")

@@ -75,28 +75,28 @@ def build_initial_model(rff: SumProdRFF, x0: torch.Tensor, *, n_local: int, dtyp
 
 
 if __name__ == "__main__":
-    problem = FULLY_OBSERVABLE_PROBLEMS["cartpole"]
+    problem = FULLY_OBSERVABLE_PROBLEMS["quadcopter"]
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
     dtype = torch.float64
-    n_local = 6  # 6**4=1296 coefficients, but never materialized
-    latent_rank = 10
+    n_local = 50
+    latent_rank = 200
     mpo_rank = 10
     gaussian_std_epsilon = 0.3
     test_fraction = 0.15
     split_seed = 0
     tran_params = {
         "epochs": 100,
-        "basis_iterations": 5,
-        "weights_iterations": 2,
-        "lr_basis": 1.2e-2,
-        "lr_weights": 5e-2,
+        "basis_iterations": 2,
+        "weights_iterations": 5,
+        "lr_basis": 5e-2,
+        "lr_weights": 5e-1,
         "validation_patience": 20,
     }
-    init_tt_rank = 4
+    init_tt_rank = 10
     init_params = {"epochs": 50, "coeff_iterations": 10, "lr_coeffs": 1e-2,
                    "basis_iterations": 2, "lr_basis": 1e-3, "validation_patience": 20}
-    batch_size = 512
+    batch_size = 2048 #512
     n_timesteps_prop = problem.n_timesteps
     d = problem.system.dim()
 
@@ -123,7 +123,7 @@ if __name__ == "__main__":
     print(f"device={device}, dtype={dtype}, modes={(n_local,) * d}, latent rank={latent_rank}, MPO rank={mpo_rank}")
 
     rff, basis_params, weight_params = build_transition_model(
-        x_k[train_idx], x_kp1[train_idx], d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
+        x_k_train, x_kp1_train, d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
         dtype=dtype, device=device, numerical_tolerance=1e-10,
         gaussian_std_floor=gaussian_std_epsilon,
     )
