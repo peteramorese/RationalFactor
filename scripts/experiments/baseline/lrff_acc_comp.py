@@ -10,13 +10,17 @@ from rational_factor.models.parameters import (
     PositiveParameters,
     TrainableParameters,
     param_group_iter,
-    DenseMatrixParameters,
+    RowStochasticDenseMatrixParameters,
 )
 from rational_factor.models.train import Trainer
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 from rational_factor.tools.analysis import avg_log_likelihood
 import rational_factor.models.loss as loss
-import rational_factor.tools.propagate as propagate
+
+
+def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
+    """Raw value whose softplus equals ``y`` (for PositiveParameters.from_values)."""
+    return torch.log(torch.expm1(y.clamp_min(1e-4)))
 
 
 if __name__ == "__main__":
@@ -25,9 +29,11 @@ if __name__ == "__main__":
 
     ###
     use_gpu = torch.cuda.is_available()
-    n_basis = 1000
+    dtype = torch.float64
+    n_basis = 500
+    gaussian_std_epsilon = 1e-3
     tran_params = {
-        "epochs": 100,
+        "epochs": 20,
         "basis_iterations": 3,
         "weights_iterations": 3,
         "lr_basis": 3e-3,
@@ -37,6 +43,8 @@ if __name__ == "__main__":
         "epochs": 50,
         "coeff_iterations": 10,
         "lr_coeffs": 1e-2,
+        "basis_iterations": 2,
+        "lr_basis": 1e-3,
     }
 
     batch_size = 256
@@ -45,15 +53,15 @@ if __name__ == "__main__":
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
-    print("Using GPU: ", use_gpu)
-    print("Device: ", device)
+    print(f"device={device}, dtype={dtype}")
 
     system = problem.system
     dim = system.dim()
 
-    x0 = problem.train_initial_state_data()
+    x0 = problem.train_initial_state_data().to(dtype=dtype)
     x_k, x_kp1 = problem.train_state_transition_data()
-    traj_data = problem.test_data()
+    x_k, x_kp1 = x_k.to(dtype=dtype), x_kp1.to(dtype=dtype)
+    traj_data = [x.to(dtype=dtype) for x in problem.test_data()]
 
     x0_dataloader = DataLoader(
         TensorDataset(x0), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
@@ -62,47 +70,49 @@ if __name__ == "__main__":
         TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
     )
 
-    box_lows = problem.plot_bounds_low.to(device=device)
-    box_highs = problem.plot_bounds_high.to(device=device)
+    box_lows = problem.plot_bounds_low.to(device=device, dtype=dtype)
+    box_highs = problem.plot_bounds_high.to(device=device, dtype=dtype)
 
-    t = torch.linspace(0.0, 1.0, n_basis, device=device)
+    t = torch.linspace(0.0, 1.0, n_basis, device=device, dtype=dtype)
     means = box_lows.unsqueeze(-1) + (box_highs - box_lows).unsqueeze(-1) * t
     means = means.unsqueeze(0)  # (1, dim, n_basis)
     mean_jitter = 0.35
     std_init = 0.35
     phi_means = TrainableParameters.from_values(
         means + mean_jitter * torch.randn_like(means)
-    ).to(device)
+    ).to(device=device, dtype=dtype)
     phi_stds = PositiveParameters.from_values(
-        torch.full((1, dim, n_basis), std_init, device=device)
-    ).to(device)
-    psi_offset = 0.25 * torch.ones(dim, device=device)
+        _inv_softplus(torch.full((1, dim, n_basis), std_init, device=device, dtype=dtype)),
+        epsilon=gaussian_std_epsilon,
+    ).to(device=device, dtype=dtype)
+    psi_offset = 0.25 * torch.ones(dim, device=device, dtype=dtype)
     psi_offset[1::2] = -0.25
     psi_means = TrainableParameters.from_values(
         means
         + psi_offset.view(1, dim, 1)
         + mean_jitter * torch.randn_like(means)
-    ).to(device)
+    ).to(device=device, dtype=dtype)
     psi_stds = PositiveParameters.from_values(
-        torch.full((1, dim, n_basis), std_init + 0.1, device=device)
-    ).to(device)
+        _inv_softplus(torch.full((1, dim, n_basis), std_init + 0.1, device=device, dtype=dtype)),
+        epsilon=gaussian_std_epsilon,
+    ).to(device=device, dtype=dtype)
     phi_basis = GaussianBasis(mean_params=phi_means, std_params=phi_stds, coeffs=None)
     psi_basis = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=None)
 
     g_coeffs = PositiveParameters.random_init(
         shape=(1, n_basis), mean=1.0, std=1.0, epsilon=1e-3
-    ).to(device)
+    ).to(device=device, dtype=dtype)
     h0_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis), mean=1.0, std=1.0
-    ).to(device)
+        shape=(1, n_basis), mean=1.0, std=1.0, epsilon=1e-3
+    ).to(device=device, dtype=dtype)
 
-    B_coeffs = PositiveParameters.random_init(
+    # SumProdRFF is normalized iff B @ 1 = 1.
+    B_logits = TrainableParameters.random_init(
         shape=(1, n_basis, n_basis),
-        mean=1.0,
-        std=1.0,
-        epsilon=0.0,
-    ).to(device)
-    B = DenseMatrixParameters(B_coeffs)
+        mean=0.0,
+        std=0.1,
+    ).to(device=device, dtype=dtype)
+    B = RowStochasticDenseMatrixParameters(B_logits)
 
     tran_model = SumProdRFF(
         g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance
@@ -121,7 +131,7 @@ if __name__ == "__main__":
     )
     transition_trainer.add_optimizer(
         torch.optim.Adam(
-            param_group_iter((g_coeffs, B_coeffs)),
+            param_group_iter((g_coeffs, B_logits)),
             lr=tran_params["lr_weights"],
         ),
         "weights",
@@ -140,16 +150,36 @@ if __name__ == "__main__":
     for parameter in tran_model.parameters():
         parameter.requires_grad_(False)
 
-    h0_basis = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=h0_coeffs)
-    init_model = LinearFF.from_rff(tran_model, h0_basis).to(device)
+    # Independent initial psi0, not the (now-frozen) transition psi.
+    psi0_means = TrainableParameters.from_values(
+        means + 0.15 * torch.randn_like(means)
+    ).to(device=device, dtype=dtype)
+    psi0_stds = PositiveParameters.from_values(
+        _inv_softplus(torch.full((1, dim, n_basis), std_init, device=device, dtype=dtype)),
+        epsilon=gaussian_std_epsilon,
+    ).to(device=device, dtype=dtype)
+    h0_basis = GaussianBasis(mean_params=psi0_means, std_params=psi0_stds)
+    init_model = LinearFF.from_rff(tran_model, h0_coeffs, h0_basis).to(device=device, dtype=dtype)
 
     print("Training initial model")
     initial_trainer = Trainer(init_model, device=device)
     initial_trainer.add_dataset(x0_dataloader, "initial")
+
     initial_trainer.add_optimizer(
-        torch.optim.Adam(h0_coeffs.parameters(), lr=init_params["lr_coeffs"]),
+        torch.optim.Adam(
+            param_group_iter((h0_coeffs,)),
+            lr=init_params["lr_coeffs"],
+        ),
         "coeffs",
         n_iterations=init_params["coeff_iterations"],
+    )
+    initial_trainer.add_optimizer(
+        torch.optim.Adam(
+            param_group_iter((psi0_means, psi0_stds)),
+            lr=init_params["lr_basis"],
+        ),
+        "psi0_basis",
+        n_iterations=init_params["basis_iterations"],
     )
     initial_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
     init_model, best_loss_init, training_time_init = initial_trainer.train(
@@ -170,21 +200,18 @@ if __name__ == "__main__":
         f"training time: {training_time_init:.2f} seconds"
     )
 
-    n_slices = n_timesteps_prop + 1
-
-    base_belief_seq = propagate.propagate(
-        init_model,
-        tran_model,
-        n_steps=n_timesteps_prop,
-    )
-    belief_seq = [belief.eval() for belief in base_belief_seq]
+    init_model.eval()
+    tran_model.eval()
 
     ll_per_step = []
-    for i in range(n_slices):
-        data_i = traj_data[i]
-        ll = avg_log_likelihood(belief_seq[i], data_i)
-        ll_per_step.append(float(ll.detach().cpu()))
-        print(f"timestep {i}: avg log-likelihood = {ll_per_step[-1]:.6f}")
+    with torch.no_grad():
+        beliefs = [init_model]
+        for _ in range(n_timesteps_prop):
+            beliefs.append(tran_model.propagate(beliefs[-1]))
+        for i, (belief, samples) in enumerate(zip(beliefs, traj_data)):
+            loglik = avg_log_likelihood(belief, samples.to(device=device, dtype=dtype))
+            print(f"Avg log-likelihood at time {i}: {float(loglik):.6f}")
+            ll_per_step.append(float(loglik.detach().cpu()))
 
     out_dir = Path("figures/baseline")
     out_dir.mkdir(parents=True, exist_ok=True)

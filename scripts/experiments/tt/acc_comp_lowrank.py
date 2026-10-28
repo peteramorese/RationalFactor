@@ -15,6 +15,7 @@ from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.train import Trainer, LossVisualizer
 from rational_factor.tools.propagate import propagate
 from rational_factor.tools.analysis import avg_log_likelihood
+from rational_factor.tools.misc import train_test_split
 import rational_factor.models.loss as loss
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
 
@@ -87,7 +88,7 @@ if __name__ == "__main__":
     }
     init_tt_rank = 4
     init_params = {"epochs": 50, "coeff_iterations": 10, "lr_coeffs": 1e-2,
-                   "basis_iterations": 2, "lr_basis": 1e-3}
+                   "basis_iterations": 2, "lr_basis": 1e-3, "validation_patience": 20}
     batch_size = 512
     n_timesteps_prop = problem.n_timesteps
     d = problem.system.dim()
@@ -95,19 +96,21 @@ if __name__ == "__main__":
     x0 = problem.train_initial_state_data().to(dtype=dtype)
     x_k, x_kp1 = problem.train_state_transition_data()
     x_k, x_kp1 = x_k.to(dtype=dtype), x_kp1.to(dtype=dtype)
-    generator = torch.Generator().manual_seed(split_seed)
-    perm = torch.randperm(x_k.shape[0], generator=generator)
-    n_val = max(1, min(x_k.shape[0] - 1, round(test_fraction * x_k.shape[0])))
-    if x_k.shape[0] < 2:
-        raise ValueError("At least two transition samples are needed for holdout validation")
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    x0_train, x0_val = train_test_split(
+        x0, test_size=test_fraction, shuffle=True, seed=split_seed,
+    )
+    x_k_train, x_k_val, x_kp1_train, x_kp1_val = train_test_split(
+        x_k, x_kp1, test_size=test_fraction, shuffle=True, seed=split_seed,
+    )
     traj_data = [x.to(dtype=dtype) for x in problem.test_data()]
-    train_loader = DataLoader(TensorDataset(x_kp1[train_idx], x_k[train_idx]),
+    train_loader = DataLoader(TensorDataset(x_kp1_train, x_k_train),
                               batch_size=batch_size, shuffle=True, pin_memory=use_gpu)
-    val_loader = DataLoader(TensorDataset(x_kp1[val_idx], x_k[val_idx]),
+    val_loader = DataLoader(TensorDataset(x_kp1_val, x_k_val),
                             batch_size=batch_size, shuffle=False, pin_memory=use_gpu)
-    init_loader = DataLoader(TensorDataset(x0), batch_size=batch_size,
+    init_loader = DataLoader(TensorDataset(x0_train), batch_size=batch_size,
                              shuffle=True, pin_memory=use_gpu)
+    init_val_loader = DataLoader(TensorDataset(x0_val), batch_size=batch_size,
+                                 shuffle=False, pin_memory=use_gpu)
     output_dir = Path("figures/tt/acc_comp")
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"device={device}, dtype={dtype}, modes={(n_local,) * d}, latent rank={latent_rank}, MPO rank={mpo_rank}")
@@ -143,11 +146,6 @@ if __name__ == "__main__":
         raise SystemExit("No stable transition checkpoint was found.")
 
     rff.eval()
-    with torch.no_grad():
-        test_loss = loss.conditional_mle_loss(
-            rff, x_kp1[val_idx].to(device), x_k[val_idx].to(device)
-        )
-    print(f"Holdout transition loss: {float(test_loss):.6f}")
 
     for parameter in rff.parameters():
         parameter.requires_grad_(False)
@@ -157,9 +155,11 @@ if __name__ == "__main__":
     )
     init_trainer = Trainer(
         init_model, device=device,
+        validation_early_stopping_patience=init_params["validation_patience"],
         loss_visualizer=LossVisualizer(output_dir, buffer_size=5, filename="initial_losses.png"),
     )
     init_trainer.add_dataset(init_loader, "initial")
+    init_trainer.add_dataset(init_val_loader, "validation")
     init_trainer.add_optimizer(
         torch.optim.Adam(param_group_iter(tuple(h0_params.parameter_modules())),
                          lr=init_params["lr_coeffs"]),
@@ -170,11 +170,17 @@ if __name__ == "__main__":
         "psi0_basis", n_iterations=init_params["basis_iterations"],
     )
     init_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
+    init_trainer.add_loss_function(loss.mle_loss, "val_mle", "validation", validation=True)
     init_model, best_loss_init, training_time_init = init_trainer.train(
         epochs=init_params["epochs"], use_best="mle", verbose=True,
     )
     if init_model is None:
         raise SystemExit("No stable initial-density checkpoint was found.")
+
+    init_model.eval()
+    with torch.no_grad():
+        init_test_loss = loss.mle_loss(init_model, x0_val.to(device))
+    print(f"Holdout initial loss: {float(init_test_loss):.6f}")
 
     print(f"Transition train loss: {best_loss_tran:.5f} ({training_time_tran:.1f}s)")
     print(f"Initial train loss: {best_loss_init:.5f} ({training_time_init:.1f}s)")
