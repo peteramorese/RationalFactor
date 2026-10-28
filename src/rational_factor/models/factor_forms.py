@@ -133,16 +133,17 @@ class LinearRFF(ConditionalDensityModel):
         a = as_vector(self.a(), numerical_tolerance=tol)
         phi_x = as_vector(self.phi(x), numerical_tolerance=tol)
         phi_xp = as_vector(self.phi(xp), numerical_tolerance=tol)
-        log_g_x = torch.log((a * phi_x).sum() + tol)
-        log_g_xp = torch.log((a * phi_xp).sum() + tol)
-
         psi_xp = as_vector(self.psi(xp), numerical_tolerance=tol)
-        
         b = self.get_b(a=a)
 
-        log_f = torch.log(as_vector(phi_x * psi_xp * b).sum() + tol)
-
-        return log_g_xp + log_f - log_g_x
+        # Floor only the combined ratio. Per-term ``+ numerical_tolerance``
+        # floors destroy cancellation when g(x) and f underflow but g(xp) does not
+        # (common in high-d products of peaked Gaussians) and invent huge log-densities.
+        g_x = (a * phi_x).sum().clamp_min(0)
+        g_xp = (a * phi_xp).sum().clamp_min(0)
+        f = as_vector(phi_x * psi_xp * b).sum().clamp_min(0)
+        eps = torch.finfo(g_x.dtype).tiny
+        return torch.log(g_xp * f + eps) - torch.log(g_x + eps)
 
     def get_b(self, a : torch.Tensor = None, Omega2 : torch.Tensor = None):
         tol = self.numerical_tolerance
@@ -248,13 +249,16 @@ class SumProdRFF(MarkovTransitionModel):
         Omega2 = as_matrix(self.phi.Omega2(self.psi))
         q = as_vector(Omega2.rev_matvec(a), numerical_tolerance=tol)
 
-        log_g_x = torch.log((a * phi_x).sum() + tol)
-        log_g_xp = torch.log((a * phi_xp).sum() + tol)
         # Q @ psi = a * (B @ (psi / q))
         Q_psi_xp = a * B.matvec(psi_xp / q)
-        log_f = torch.log(as_vector(phi_x * Q_psi_xp).sum() + tol)
-
-        return (log_g_xp + log_f - log_g_x).reshape(-1)
+        # Floor only the combined ratio. Per-term ``+ numerical_tolerance``
+        # floors destroy cancellation when g(x) and f underflow but g(xp) does not
+        # (common in high-d products of peaked Gaussians) and invent huge log-densities.
+        g_x = (a * phi_x).sum().clamp_min(0)
+        g_xp = (a * phi_xp).sum().clamp_min(0)
+        f = as_vector(phi_x * Q_psi_xp).sum().clamp_min(0)
+        eps = torch.finfo(g_x.dtype).tiny
+        return (torch.log(g_xp * f + eps) - torch.log(g_x + eps)).reshape(-1)
 
 
     def propagate(self, belief: "LinearFF") -> "LinearFF":

@@ -337,8 +337,8 @@ if __name__ == "__main__":
     dtype = torch.float32
     # N = n_local ** d: never materialize the full coefficient space.
     n_local = 100
-    latent_rank = 200  # ordinary rank of the UV^T correction, not of the full B
-    mpo_rank = 20     # internal TT/MPO bond ranks of the factors U, V
+    latent_rank = 400  # ordinary rank of the UV^T correction, not of the full B
+    mpo_rank = 30     # internal TT/MPO bond ranks of the factors U, V
     # Initial low-rank mixture; trained as a logit (K share = 1 - sigmoid(logit)).
     mixture_weight_init = 0.5
     tran_params = {
@@ -350,7 +350,7 @@ if __name__ == "__main__":
     }
     gaussian_std_epsilon = 0.25
     init_tt_rank = 8
-    init_params = {"epochs": 20, "coeff_iterations": 10, "lr_coeffs": 1e-2,
+    init_params = {"epochs": 200, "coeff_iterations": 10, "lr_coeffs": 1e-2,
                    "basis_iterations": 2, "lr_basis": 1e-3}
     batch_size = 256
     n_timesteps_prop = problem.n_timesteps
