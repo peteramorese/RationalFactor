@@ -5,7 +5,7 @@ import math
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel, MarkovTransitionModel
 from .parameters import Parameters, FixedParameters
-from .structured_matrices import as_matrix
+from .structured_matrices import Matrix, DenseMatrix, as_matrix
 from .structured_vectors import as_vector
 from rational_factor.models.tt.tt import TTVector
 
@@ -729,7 +729,7 @@ class Linear2FF(DensityModel):
 
 # Quadratic models #
     
-class QuadraticRFF(ConditionalDensityModel):
+class OldQuadraticRFF(ConditionalDensityModel):
     def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-8):
         assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
@@ -751,7 +751,7 @@ class QuadraticRFF(ConditionalDensityModel):
     
     def get_B(self, A : torch.Tensor = None, Omega : torch.Tensor = None):
         if Omega is None:
-            Omega = self.phi_basis.Omega22(self.psi_basis)
+            Omega = as_matrix(self.phi_basis.Omega22(self.psi_basis)).to_dense()
         
         if A is None:
             A = self.get_A()
@@ -797,7 +797,7 @@ class QuadraticRFF(ConditionalDensityModel):
         return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
 
 
-class QuadraticFF(DensityModel):
+class OldQuadraticFF(DensityModel):
     def __init__(self, A : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis = None, C0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
         assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
         assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
@@ -818,7 +818,7 @@ class QuadraticFF(DensityModel):
         self.numerical_tolerance = numerical_tolerance
 
     @classmethod
-    def from_rff(cls, rff : QuadraticRFF, psi0_basis : SeparableBasis = None):
+    def from_rff(cls, rff : OldQuadraticRFF, psi0_basis : SeparableBasis = None):
         phi_basis = rff.phi_basis.freeze_params()
         A = rff.get_A().detach().clone()
         return cls(A, phi_basis, psi0_basis, numerical_tolerance=rff.numerical_tolerance)
@@ -828,7 +828,7 @@ class QuadraticFF(DensityModel):
             return self.C0_fixed
 
         if Omega_0 is None:
-            Omega_0 = self.phi_basis.Omega22(self.psi0_basis)
+            Omega_0 = as_matrix(self.phi_basis.Omega22(self.psi0_basis)).to_dense()
         
         C0_unnormalized = torch.tanh(self.__LC0u) @ torch.tanh(self.__LC0u).T
         
@@ -876,3 +876,319 @@ class QuadraticFF(DensityModel):
     
     def basis_params(self):
         return self.psi0_basis.parameters()
+
+# Dense SOS quadratic rational factor form.  The old models above remain
+# available as OldQuadraticRFF and OldQuadraticFF.
+
+def _quadratic_parameter_matrix(provider, size: int, batch_size: int, name: str) -> DenseMatrix:
+    """Read a dense matrix parameter provider; retain its autograd graph."""
+    if not _is_parameters_like(provider):
+        raise TypeError(f"{name} must be a Parameters-like matrix provider")
+    value = as_matrix(provider())
+    if not isinstance(value, DenseMatrix):
+        raise TypeError(f"{name} must return a DenseMatrix or a dense torch.Tensor")
+    dense = value.to_dense()
+    if dense.shape == (size, size) and batch_size == 1:
+        return DenseMatrix(dense.unsqueeze(0))
+    if dense.shape != (batch_size, size, size):
+        raise ValueError(
+            f"{name} has shape {tuple(dense.shape)}; expected "
+            f"({batch_size}, {size}, {size})"
+            + (f" or ({size}, {size})" if batch_size == 1 else "")
+        )
+    return value
+
+
+def _quadratic_register_modules(model, bases, providers):
+    param_modules, coeff_modules = Basis.get_deduplicated_module_list(bases)
+    param_modules = list(param_modules)
+    coeff_modules = list(coeff_modules)
+    seen = {id(mod) for mod in (*param_modules, *coeff_modules)}
+    for provider in providers:
+        if provider is None:
+            continue
+        if getattr(provider, 'is_module', lambda: False)() and id(provider) not in seen:
+            coeff_modules.append(provider)
+            seen.add(id(provider))
+        for mod in provider.parameter_modules():
+            if id(mod) not in seen:
+                coeff_modules.append(mod)
+                seen.add(id(mod))
+    model._param_modules = torch.nn.ModuleList(param_modules)
+    model._coeff_modules = torch.nn.ModuleList(coeff_modules)
+
+
+def _quadratic_spd_from_factor(factor: DenseMatrix, jitter: float) -> DenseMatrix:
+    """Make SPD (rather than merely PSD) to ensure the inverse sqrt exists."""
+    x = factor.to_dense()
+    result = factor @ factor.T
+    if jitter:
+        n = x.shape[-1]
+        result = DenseMatrix(
+            result.to_dense() + jitter * torch.eye(n, dtype=x.dtype, device=x.device)
+        )
+    return result
+
+
+def _quadratic_evaluate(basis, x: torch.Tensor):
+    result = basis(x)
+    if hasattr(result, 'to_dense'):
+        result = result.to_dense()
+    return result
+
+
+def _quadratic_form(features: torch.Tensor, coeff: Matrix) -> torch.Tensor:
+    matrix = coeff.to_dense()
+    return torch.einsum('bi,bij,bj->b', features, matrix, features)
+
+
+class QuadraticRFF(MarkovTransitionModel):
+    r"""Normalized, positive quadratic rational Markov transition.
+
+    p(y|x) = g(y)/g(x) * (phi(x) (x) psi(y))^T Q (phi(x) (x) psi(y)).
+
+    LA : trainable dense factor (batch, m, m); A = LA LA^T + jitter I.
+    LQ0: trainable dense factor (batch, m*n, m*n);
+         Q0 = LQ0 LQ0^T + jitter I.
+
+    Omega22(phi, psi) is a Matrix of shape (batch, m, m, n, n).
+    R0 = contract_psi(Q0, C(A)); T = R0^{-1/2} A^{1/2};
+    Q = (T (x) I)^T Q0 (T (x) I).
+
+    Both factors are learned independently.  The principal matrix square roots
+    are exact up to numerical floating-point error, not an approximation/truncation.
+    """
+
+    def __init__(self, LA: Parameters, phi: Basis, psi: Basis, LQ0: Parameters,
+                 numerical_tolerance: float = 1e-20, pd_jitter: float = 1e-6,
+                 register_modules: bool = True):
+        if not isinstance(phi, Basis) or not isinstance(psi, Basis):
+            raise TypeError('phi and psi must be Basis instances')
+        if phi.dim() != psi.dim() or phi.batch_size() != psi.batch_size():
+            raise ValueError('phi and psi must have matching dimensions and parameter batches')
+        if pd_jitter <= 0:
+            raise ValueError('pd_jitter must be strictly positive')
+        m, n, batch = phi.n_basis_functions(), psi.n_basis_functions(), phi.batch_size()
+        _quadratic_parameter_matrix(LA, m, batch, 'LA')
+        _quadratic_parameter_matrix(LQ0, m*n, batch, 'LQ0')
+        super().__init__(phi.dim())
+        self.LA, self.LQ0 = LA, LQ0
+        self.phi, self.psi = phi, psi
+        # Consistency aliases for existing quadratic code.
+        self.phi_basis, self.psi_basis = phi, psi
+        self.numerical_tolerance = numerical_tolerance
+        self.pd_jitter = pd_jitter
+        if register_modules:
+            _quadratic_register_modules(self, (phi, psi), (LA, LQ0))
+
+    def dtype_device(self):
+        return self.phi.dtype_device()
+
+    def get_A(self) -> Matrix:
+        return _quadratic_spd_from_factor(
+            _quadratic_parameter_matrix(self.LA, self.phi.n_basis_functions(),
+                                        self.phi.batch_size(), 'LA'), self.pd_jitter)
+
+    def get_Q0(self) -> Matrix:
+        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
+        return _quadratic_spd_from_factor(
+            _quadratic_parameter_matrix(self.LQ0, m*n, self.phi.batch_size(), 'LQ0'),
+            self.pd_jitter)
+
+    def get_C(self, A: Matrix = None) -> Matrix:
+        """C(A)[a,b] = integral g(y) psi_a(y) psi_b(y) dy."""
+        A = self.get_A() if A is None else as_matrix(A)
+        omega = as_matrix(self.phi.Omega22(self.psi))
+        return omega.contract_batch_matrix(A)
+
+    def get_R0(self, Q0: Matrix = None, C: Matrix = None) -> Matrix:
+        """R0[i,j] = Tr(Q0[i,:,j,:] C)."""
+        Q0 = self.get_Q0() if Q0 is None else as_matrix(Q0)
+        C = self.get_C() if C is None else as_matrix(C)
+        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
+        batch = Q0.to_dense().shape[:-2]
+        blocks = Q0.to_dense().reshape(*batch, m, n, m, n).movedim(-3, -2)
+        return DenseMatrix((blocks * C.to_dense()[..., None, None, :, :]).sum((-2, -1)))
+
+    def get_T(self, A: Matrix = None, R0: Matrix = None) -> Matrix:
+        A = self.get_A() if A is None else as_matrix(A)
+        R0 = self.get_R0(C=self.get_C(A)) if R0 is None else as_matrix(R0)
+        # The order is essential: T^T R0 T = A.
+        return R0.sqrt(inverse=True) @ A.sqrt()
+
+    def get_normalization(self):
+        A = self.get_A()
+        C = self.get_C(A)
+        Q0 = self.get_Q0()
+        R0 = self.get_R0(Q0, C)
+        T = self.get_T(A, R0)
+        return A, C, Q0, R0, T
+
+    def get_Q(self, Q0: Matrix = None, T: Matrix = None) -> Matrix:
+        """Return the normalized SOS Gram Q, without a dense Kronecker matrix."""
+        if Q0 is None or T is None:
+            _, _, q0, _, t = self.get_normalization()
+            Q0 = q0 if Q0 is None else as_matrix(Q0)
+            T = t if T is None else as_matrix(T)
+        else:
+            Q0, T = as_matrix(Q0), as_matrix(T)
+        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
+        v = Q0.to_dense()
+        qb = v.reshape(*v.shape[:-2], m, n, m, n)
+        transformed = torch.einsum(
+            '...ki,...kalb,...lj->...iajb', T.to_dense(), qb, T.to_dense()
+        )
+        return DenseMatrix(transformed.reshape(*v.shape[:-2], m*n, m*n))
+
+    def log_density(self, xp: torch.Tensor, *, conditioner: torch.Tensor, **contexts):
+        A, _, Q0, _, T = self.get_normalization()
+        Q = self.get_Q(Q0, T)
+        phi_x = _quadratic_evaluate(self.phi, conditioner)
+        phi_y = _quadratic_evaluate(self.phi, xp)
+        psi_y = _quadratic_evaluate(self.psi, xp)
+        u = torch.einsum('bi,bj->bij', phi_x, psi_y).reshape(phi_x.shape[0], -1)
+        g_x = _quadratic_form(phi_x, A).clamp_min(torch.finfo(phi_x.dtype).tiny)
+        g_y = _quadratic_form(phi_y, A).clamp_min(torch.finfo(phi_x.dtype).tiny)
+        f = _quadratic_form(u, Q).clamp_min(torch.finfo(phi_x.dtype).tiny)
+        return (torch.log(g_y) + torch.log(f) - torch.log(g_x)).reshape(-1)
+
+    def propagate(self, belief: 'QuadraticFF') -> 'QuadraticFF':
+        """Exact one-step dense SOS propagation, preserving PSD and total mass.
+
+        D(V)[i,j] = integral phi_i(x) phi_j(x) psi0(x)^T V psi0(x) dx.
+        V_next = sum_kl [T D(V) T^T]_kl Q0[k,:,l,:].
+        """
+        if not isinstance(belief, QuadraticFF):
+            raise TypeError(f'QuadraticRFF.propagate expects QuadraticFF, got {type(belief).__name__}')
+        if belief.LA is not self.LA or belief.phi is not self.phi:
+            raise ValueError('belief must share LA and phi with transition (use QuadraticFF.from_rff)')
+        _, _, Q0, _, T = self.get_normalization()
+        V = belief.get_V(normalized=True)
+        omega = as_matrix(self.phi.Omega22(belief.psi))
+        D = DenseMatrix(omega.frobenius_inner(
+            DenseMatrix(V.to_dense()[..., None, None, :, :])
+        ))
+        weighted_D = (T @ D) @ T.T
+        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
+        qb = Q0.to_dense().reshape(self.phi.batch_size(), m, n, m, n)
+        qb = qb.movedim(-3, -2)  # (batch, m, m, n, n)
+        Vnext = DenseMatrix(qb).contract_batch_matrix(weighted_D)
+        # Use the already normalized, positive result, not a newly learned factor.
+        return QuadraticFF(
+            self.LA, self.phi, None, self.psi,
+            V_fixed=Vnext.to_dense().detach().clone(),
+            numerical_tolerance=belief.numerical_tolerance,
+            pd_jitter=self.pd_jitter, renormalize_h=False,
+            register_modules=False,
+        )
+
+    def weight_params(self):
+        return itertools.chain(self.LA.parameter_modules(), self.LQ0.parameter_modules())
+
+    def basis_params(self):
+        return itertools.chain(self.phi.parameters(), self.psi.parameters())
+
+
+class QuadraticFF(DensityModel):
+    r"""SOS belief: p(x) = (phi^T A phi)(psi^T V psi).
+
+    LA is the *same* provider used by QuadraticRFF. LV is a learned dense
+    factor (batch, n, n). For propagated beliefs, pass V_fixed instead.
+    Trainable V is automatically normalized by its exact fourth-order moment.
+    """
+
+    def __init__(self, LA: Parameters, phi: Basis, LV: Parameters | None, psi: Basis,
+                 numerical_tolerance: float = 1e-20, pd_jitter: float = 1e-6,
+                 renormalize_h: bool = True, register_modules: bool = True,
+                 V_fixed: torch.Tensor | Matrix | None = None):
+        if not isinstance(phi, Basis) or not isinstance(psi, Basis):
+            raise TypeError('phi and psi must be Basis instances')
+        if phi.dim() != psi.dim() or phi.batch_size() != psi.batch_size():
+            raise ValueError('phi and psi must have matching dimension and parameter batch')
+        m, n, batch = phi.n_basis_functions(), psi.n_basis_functions(), phi.batch_size()
+        _quadratic_parameter_matrix(LA, m, batch, 'LA')
+        if (LV is None) == (V_fixed is None):
+            raise ValueError('provide exactly one of LV (trainable) or V_fixed')
+        if LV is not None:
+            _quadratic_parameter_matrix(LV, n, batch, 'LV')
+        else:
+            fixed = as_matrix(V_fixed).to_dense()
+            if fixed.shape == (n, n) and batch == 1:
+                fixed = fixed.unsqueeze(0)
+            if fixed.shape != (batch, n, n):
+                raise ValueError(f'V_fixed has shape {tuple(fixed.shape)}, expected {(batch,n,n)}')
+        super().__init__(phi.dim())
+        self.LA, self.LV = LA, LV
+        self.phi, self.psi = phi, psi
+        self.phi_basis, self.psi_basis = phi, psi
+        self.numerical_tolerance = numerical_tolerance
+        self.pd_jitter = pd_jitter
+        self._renormalize_h = renormalize_h
+        if V_fixed is not None:
+            self.register_buffer('V_fixed', fixed)
+        if register_modules:
+            _quadratic_register_modules(self, (phi, psi), (LA, LV))
+
+    @classmethod
+    def from_rff(cls, rff: QuadraticRFF, LV: Parameters, psi0_basis: Basis,
+                 renormalize_h: bool = True, register_modules: bool = True):
+        if not isinstance(rff, QuadraticRFF):
+            raise TypeError('rff must be QuadraticRFF')
+        return cls(
+            rff.LA, rff.phi, LV, psi0_basis,
+            numerical_tolerance=rff.numerical_tolerance, pd_jitter=rff.pd_jitter,
+            renormalize_h=renormalize_h, register_modules=register_modules,
+        )
+
+    def dtype_device(self):
+        return self.phi.dtype_device()
+
+    def get_A(self) -> Matrix:
+        return _quadratic_spd_from_factor(
+            _quadratic_parameter_matrix(self.LA, self.phi.n_basis_functions(),
+                                        self.phi.batch_size(), 'LA'), self.pd_jitter)
+
+    def get_V(self, normalized: bool = False) -> Matrix:
+        if self.LV is None:
+            V = DenseMatrix(self.V_fixed)
+        else:
+            V = _quadratic_spd_from_factor(
+                _quadratic_parameter_matrix(self.LV, self.psi.n_basis_functions(),
+                                            self.psi.batch_size(), 'LV'), self.pd_jitter)
+        if normalized and self._renormalize_h:
+            mass = self._mass(V)
+            if bool((mass <= 0).any()):
+                raise ValueError('belief has zero or negative integral')
+            V = DenseMatrix(V.to_dense() / mass[..., None, None])
+        return V
+
+    def _mass(self, V: Matrix, omega=None):
+        omega = as_matrix(self.phi.Omega22(self.psi)) if omega is None else as_matrix(omega)
+        C = omega.contract_batch_matrix(self.get_A())
+        return C.frobenius_inner(V)
+
+    def log_norm_constant(self, Omega22=None):
+        if not self._renormalize_h:
+            return 0.0
+        mass = self._mass(self.get_V(), omega=Omega22)
+        if bool((mass <= 0).any()):
+            raise ValueError('belief has zero or negative integral')
+        return -torch.log(mass)
+
+    def log_density(self, x: torch.Tensor, **contexts):
+        phi = _quadratic_evaluate(self.phi, x)
+        psi = _quadratic_evaluate(self.psi, x)
+        g = _quadratic_form(phi, self.get_A()).clamp_min(torch.finfo(phi.dtype).tiny)
+        h = _quadratic_form(psi, self.get_V()).clamp_min(torch.finfo(phi.dtype).tiny)
+        return (torch.log(g) + torch.log(h) + self.log_norm_constant()).reshape(-1)
+
+    def weight_params(self):
+        if self.LV is None:
+            return []
+        return self.LV.parameter_modules()
+
+    def basis_params(self):
+        return self.psi.parameters()
+
+    def marginal(self, marginal_dims: tuple[int, ...]):
+        raise NotImplementedError('QuadraticFF.marginal requires a product-basis implementation')

@@ -160,8 +160,9 @@ class Basis:
 
     def Omega22(self, other: 'Basis', v : torch.Tensor = None, lows : torch.Tensor = None, highs : torch.Tensor = None):
         '''
-        Computes the inner product tensor of the basis functions with another basis function vector. 
-        omega[i, j, k, l] = <this_i * this_j, other_k * other_l>
+        Returns a Matrix of shape (batch, n_self, n_self, n_other, n_other),
+        with two leading matrix-batch index axes i,j:
+        omega[..., i, j, k, l] = <this_i * this_j, other_k * other_l>.
 
         Args:
             other : Basis function to compute the inner product with
@@ -330,7 +331,9 @@ class SeparableBasis(Basis):
             core = torch.exp(self.Omega22_dim(other, lows, highs, return_log=True).sum(dim=1))
         else:
             core = self.Omega22_dim(other, lows, highs, return_log=False).prod(dim=1)
-        return (
+        # (batch, self_i, self_j, other_k, other_l): two matrix batch
+        # indices followed by the actual (other_k, other_l) matrix axes.
+        return DenseMatrix(
             core
             * c1[:, :, None, None, None]
             * c1[:, None, :, None, None]

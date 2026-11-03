@@ -59,6 +59,37 @@ class Matrix(ABC):
             )
         return DenseMatrix(torch.linalg.inv(self.to_dense()))
 
+    def sqrt(self, inverse: bool = False) -> Matrix:
+        """Principal symmetric PSD square root, or SPD inverse square root.
+
+        Returns a Matrix with the original batch axes. Structured subclasses can
+        override this dense fallback. A clearly indefinite matrix raises an
+        error instead of silently changing its spectrum.
+        """
+        return DenseMatrix(self.to_dense()).sqrt(inverse=inverse)
+
+    def frobenius_inner(self, other: Matrix | torch.Tensor) -> torch.Tensor:
+        """Tr(M.T @ other), reducing only the final two matrix axes."""
+        other = as_matrix(other)
+        return (self.to_dense() * other.to_dense()).sum(dim=(-2, -1))
+
+    def contract_batch_matrix(self, weights: Matrix | torch.Tensor) -> Matrix:
+        """Contract two *last* batch axes against a coefficient matrix.
+
+        For self.shape = (..., m, m, n, n) and weights.shape = (..., m, m),
+        return a Matrix of shape (..., n, n). The matrix's final two axes
+        are never contracted. Leading parameter batches broadcast.
+        """
+        weights = as_matrix(weights).to_dense()
+        if self.shape[-4:-2] != weights.shape[-2:]:
+            raise ValueError(
+                f"batch index shape {tuple(self.shape[-4:-2])} != "
+                f"weight matrix shape {tuple(weights.shape[-2:])}"
+            )
+        if len(self.shape) < 4:
+            raise ValueError("contract_batch_matrix requires two matrix batch axes")
+        return DenseMatrix(torch.einsum('...ijab,...ij->...ab', self.to_dense(), weights))
+
     def inverse_matvec(self, x: torch.Tensor) -> torch.Tensor:
         """Solve ``A y = x`` for ``y`` (same ``x`` shapes as :meth:`matvec`).
 
@@ -82,10 +113,10 @@ class Matrix(ABC):
         )
     
     def matmul(self, other: Matrix) -> Matrix:
-        return self.to_dense() @ other.to_dense()
-    
+        return DenseMatrix(self.to_dense() @ as_matrix(other).to_dense())
+
     def rmatmul(self, other: Matrix) -> Matrix:
-        return other.to_dense() @ self.to_dense()
+        return DenseMatrix(as_matrix(other).to_dense() @ self.to_dense())
     
     def diag(self) -> torch.Tensor:
         """Main-diagonal vector ``(..., min(n, m))``."""
@@ -222,6 +253,29 @@ class DenseMatrix(Matrix):
         raise ValueError(
             f"x must have shape (..., {n_in}) or (..., {n_in}, k), got {tuple(x.shape)}"
         )
+
+    def sqrt(self, inverse: bool = False) -> DenseMatrix:
+        """Differentiable principal square root for batched symmetric matrices.
+
+        Small negative eigenvalues caused by floating-point roundoff are
+        clamped to zero for sqrt; inverse sqrt requires strict positivity.
+        """
+        a = self._values
+        if a.shape[-1] != a.shape[-2]:
+            raise ValueError("sqrt requires a square matrix")
+        a = 0.5 * (a + a.transpose(-2, -1))
+        eig, u = torch.linalg.eigh(a)
+        tol = (torch.finfo(a.dtype).eps * a.shape[-1] * 10
+               * eig.abs().amax(dim=-1, keepdim=True).clamp_min(1))
+        if bool((eig < -tol).any()):
+            raise ValueError("sqrt requires a positive semidefinite matrix")
+        if inverse:
+            if bool((eig <= 0).any()):
+                raise ValueError("inverse sqrt requires a positive definite matrix")
+            diag = eig.rsqrt()
+        else:
+            diag = eig.clamp_min(0).sqrt()
+        return DenseMatrix((u * diag.unsqueeze(-2)) @ u.transpose(-2, -1))
 
     def inverse(self) -> DenseMatrix:
         n, m = self._values.shape[-2], self._values.shape[-1]
