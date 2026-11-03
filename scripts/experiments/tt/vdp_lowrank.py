@@ -304,7 +304,7 @@ def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_
     )
     B = LowRankFactorizationMPOParameters.from_core_spec(
         modes, rank=latent_rank, ranks_u=mpo_rank, ranks_v=mpo_rank,
-        row_stochastic=True, mean=0.0, std=0.2, dtype=dtype, device=device,
+        row_stochastic=True, mean=0.0, std=1.0, dtype=dtype, device=device,
     )
     rff = SumProdRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
     basis_params = param_group_iter((*phi_modules, *psi_modules))

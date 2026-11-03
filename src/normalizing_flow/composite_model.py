@@ -66,11 +66,11 @@ class CompositeConditionalModel(ConditionalDensityModel):
     """Conditional density ``p(x|c) = p_base(T(x;c)|c') |det J_{T(·;c)}(x)|``.
 
     ``base_density`` may be unconditional (ignores ``c``) or conditional.
-    The transform always receives ``c`` as ``context``.
 
-    If ``transform_conditioner`` is True (e.g. a shared domain wrap into the
-    unit box), the conditioner is mapped with the same transform and the base
-    sees ``c' = T(c)`` instead of raw ``c``:
+    By default the transform is conditional and receives ``c`` as ``context``.
+    If ``transform_conditioner`` is True (shared domain map on both ``x`` and
+    ``c``), the transform is unconditional — it does not take ``c`` as context —
+    and the base sees ``c' = T(c)``:
 
         p(x|c) = p_base(T(x)|T(c)) |det J_T(x)|
     """
@@ -93,17 +93,22 @@ class CompositeConditionalModel(ConditionalDensityModel):
                 )
         self.base_density = base_density
         self.transform_conditioner = bool(transform_conditioner)
+        # Domain wraps must be unconditional; conditional NFs keep context_features.
+        tf_context = None if self.transform_conditioner else context_features
         self.transform = Transforms.make_transform(
             transform,
             features=base_density.features,
-            context_features=context_features,
+            context_features=tf_context,
             **transform_kwargs,
         )
 
     def log_density(
         self, x: torch.Tensor, *, conditioner: torch.Tensor, **contexts: torch.Tensor
     ) -> torch.Tensor:
-        z, ladj = self.transform(x, context=conditioner)
+        if self.transform_conditioner:
+            z, ladj = self.transform(x)
+        else:
+            z, ladj = self.transform(x, context=conditioner)
         if isinstance(self.base_density, ConditionalDensityModel):
             if self.transform_conditioner:
                 conditioner, _ = self.transform(conditioner)
@@ -112,6 +117,8 @@ class CompositeConditionalModel(ConditionalDensityModel):
             )
         else:
             log_base = self.base_density.log_density(z, **contexts)
+        while ladj.ndim < log_base.ndim:
+            ladj = ladj.unsqueeze(-1)
         return self._clip_log_density(log_base + ladj)
 
     def sample(
@@ -142,7 +149,10 @@ class CompositeConditionalModel(ConditionalDensityModel):
             if z.ndim == 3 and z.shape[1] == 1:
                 z = z.squeeze(1)
 
-        x, _ = self.transform.inverse(z, context=conditioner)
+        if self.transform_conditioner:
+            x, _ = self.transform.inverse(z)
+        else:
+            x, _ = self.transform.inverse(z, context=conditioner)
         if num_samples_per > 1:
             x = x.view(n_cond, num_samples_per, self.features)
         return x

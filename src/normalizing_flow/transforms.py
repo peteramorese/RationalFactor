@@ -288,7 +288,16 @@ class Transforms:
     """Static factory for named invertible transforms."""
 
     @staticmethod
-    def make_transform(name: str, features: int, context_features: int | None = None, **kwargs) -> Transform:
+    def make_transform(
+        name: str | Transform | Sequence[Transform],
+        features: int,
+        context_features: int | None = None,
+        **kwargs,
+    ) -> Transform:
+        if isinstance(name, Transform):
+            return name
+        if isinstance(name, Sequence) and not isinstance(name, (str, bytes)):
+            return DimCompositeTransform(list(name), features, context_features)
         key = name.lower().replace("-", "_")
         builders = {
             "identity": Transforms.identity,
@@ -432,8 +441,18 @@ class Transforms:
                 use_batch_norm=False,
             )
             if init_identity:
-                _zero_init_last_linear(maf)
+                _identity_init_masked_affine(maf)
             transforms.append(maf)
+        # Reverse ∘ id ∘ Reverse ∘ id ⋯ is the identity only for an even number of
+        # reverse layers. With odd count, append one more reverse so init_identity
+        # means the full stack starts as T = Id (critical when a frozen base was
+        # trained in the untransformed coordinates).
+        if (
+            init_identity
+            and permutation.lower() == "reverse"
+            and num_layers % 2 == 1
+        ):
+            transforms.append(ReversePermutation(features=features))
         out = DimCompositeTransform(transforms, features, context_features)
         if not trainable:
             for p in out.parameters():
@@ -632,3 +651,33 @@ def _zero_init_last_linear(module: torch.nn.Module) -> None:
         raise RuntimeError("Could not find final Linear layer")
     torch.nn.init.zeros_(last_linear.weight)
     torch.nn.init.zeros_(last_linear.bias)
+
+
+def _identity_init_masked_affine(module: MaskedAffineAutoregressiveTransform) -> None:
+    """Init a MaskedAffineAutoregressiveTransform so forward is exactly identity.
+
+    nflows parameterizes ``y = (softplus(u) + eps) * x + b``. Zeroing the final
+    MADE layer gives ``u = 0`` hence ``scale = softplus(0) + eps ≈ 0.694``, which
+    is *not* the identity and immediately inflates NLL via both the warped
+    coordinates and ``log|det J| = d log(scale)``. Set the final bias so
+    ``softplus(u) + eps = 1`` and ``b = 0`` instead.
+    """
+    last_linear = None
+    for m in module.modules():
+        if isinstance(m, torch.nn.Linear):
+            last_linear = m
+    if last_linear is None:
+        raise RuntimeError("Could not find final Linear layer")
+    if last_linear.out_features != 2 * module.features:
+        raise RuntimeError(
+            "Expected MADE final layer to emit [unconstrained_scale, shift] per "
+            f"feature (out_features={2 * module.features}), got {last_linear.out_features}"
+        )
+    eps = float(getattr(module, "_epsilon", 1e-3))
+    # softplus(u) + eps = 1  =>  u = log(exp(1 - eps) - 1)
+    u_identity = torch.log(torch.expm1(torch.tensor(1.0 - eps)))
+    with torch.no_grad():
+        last_linear.weight.zero_()
+        bias = last_linear.bias.view(module.features, 2)
+        bias[:, 0] = u_identity.to(dtype=bias.dtype, device=bias.device)
+        bias[:, 1] = 0.0

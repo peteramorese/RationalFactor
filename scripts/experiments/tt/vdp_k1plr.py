@@ -5,7 +5,6 @@ coefficient tensor operations, including prediction, remain structured TT/MPO
 operations; propagation uses the exact full-TT Kronecker-plus-low-rank recurrence.
 """
 from pathlib import Path
-import math
 
 import matplotlib.pyplot as plt
 import torch
@@ -15,7 +14,7 @@ from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 from rational_factor.models.tt.tt_basis import TTBasis
 from rational_factor.models.tt.tt_parameters import KroneckerPlusLowRankFactorizationMPOParameters, TTVectorParameters
-from rational_factor.models.parameters import PositiveParameters, TrainableParameters, Parameters, param_group_iter
+from rational_factor.models.parameters import PositiveParameters, Parameters, param_group_iter
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.train import Trainer, LossVisualizer
@@ -276,19 +275,10 @@ def _new_gaussian_basis(
     )
     return TTBasis(GaussianBasis(mean_params=means, std_params=stds)), (means, stds)
 
-def _trainable_mixture_weight(init: float, *, dtype: torch.dtype, device: torch.device) -> TrainableParameters:
-    """Scalar logit so sigmoid(logit) ≈ init; trained with the MPO weights."""
-    eps = 1e-4
-    w = min(max(float(init), eps), 1.0 - eps)
-    logit = math.log(w / (1.0 - w))
-    return TrainableParameters.from_values(
-        torch.tensor(logit, dtype=dtype, device=device), trainable=True,
-    )
-
-
 def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_local: int, latent_rank: int,
                            mpo_rank: int, dtype: torch.dtype, device: torch.device,
                            mixture_weight: float | Parameters = 0.5,
+                           trainable_mixture_weight: bool = True,
                            numerical_tolerance: float, gaussian_std_floor: float = 0.25):
     """Create transition model and disjoint basis/weight parameter groups."""
     phi, phi_modules = _new_gaussian_basis(x_k, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
@@ -298,12 +288,11 @@ def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_
         modes, ranks=1, param_cls=PositiveParameters, mean=1.0, std=0.15,
         epsilon=1e-3, dtype=dtype, device=device,
     )
-    if not isinstance(mixture_weight, Parameters):
-        mixture_weight = _trainable_mixture_weight(mixture_weight, dtype=dtype, device=device)
     B = KroneckerPlusLowRankFactorizationMPOParameters.from_core_spec(
         modes, rank=latent_rank, ranks_u=mpo_rank, ranks_v=mpo_rank,
         row_stochastic=True, mixture_weight=mixture_weight,
-        mean=0.0, std=0.2, dtype=dtype, device=device,
+        trainable_mixture_weight=trainable_mixture_weight,
+        mean=0.0, std=1.0, dtype=dtype, device=device,
     )
     rff = SumProdRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
     basis_params = param_group_iter((*phi_modules, *psi_modules))
@@ -334,18 +323,21 @@ if __name__ == "__main__":
 
     use_gpu = torch.cuda.is_available()
     device = torch.device("cuda" if use_gpu else "cpu")
-    dtype = torch.float32
+    # float32 + large n_local is unstable: GMM can place means far outside the
+    # data support, and Gaussian/TT backward then produces NaNs (loss stuck at nan).
+    dtype = torch.float64
     # N = n_local ** d: never materialize the full coefficient space.
-    n_local = 100
-    latent_rank = 400  # ordinary rank of the UV^T correction, not of the full B
-    mpo_rank = 30     # internal TT/MPO bond ranks of the factors U, V
+    n_local = 40
+    latent_rank = 200  # ordinary rank of the UV^T correction, not of the full B
+    mpo_rank = 20     # internal TT/MPO bond ranks of the factors U, V
     # Initial low-rank mixture; trained as a logit (K share = 1 - sigmoid(logit)).
     mixture_weight_init = 0.5
+    trainable_mixture_weight = True
     tran_params = {
-        "epochs": 30,
+        "epochs": 80,
         "basis_iterations": 5,  # full dataset passes per outer epoch
         "weights_iterations": 5,
-        "lr_basis": 1e-2,
+        "lr_basis": 1e-3,
         "lr_weights": 5e-2,
     }
     gaussian_std_epsilon = 0.25
@@ -373,10 +365,14 @@ if __name__ == "__main__":
     rff, a_params, B_params, basis_params, weight_params = build_transition_model(
         x_k, x_kp1, dim, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
         mixture_weight=mixture_weight_init,
+        trainable_mixture_weight=trainable_mixture_weight,
         dtype=dtype, device=device, numerical_tolerance=problem.numerical_tolerance,
         gaussian_std_floor=gaussian_std_epsilon,
     )
-    print(f"trainable mixture_weight init={mixture_weight_init}")
+    if trainable_mixture_weight:
+        print(f"trainable mixture_weight init={mixture_weight_init}")
+    else:
+        print(f"fixed mixture_weight={mixture_weight_init}")
     transition_trainer = Trainer(
         rff, device=device,
         loss_visualizer=LossVisualizer(output_dir, buffer_size=5, filename="transition_losses.png"),
@@ -426,9 +422,8 @@ if __name__ == "__main__":
         raise SystemExit("No stable initial-density checkpoint was found.")
 
     with torch.no_grad():
-        learned_mw = float(torch.sigmoid(B_params.mixture_weight().reshape(())))
+        print(f"mixture_weight (low-rank share): {B_params.mixture_weight_value():.6f}")
     print(f"Transition loss: {best_loss_tran:.5f} ({training_time_tran:.1f}s)")
-    print(f"Learned mixture_weight (low-rank share): {learned_mw:.6f}")
     print(f"Initial loss: {best_loss_init:.5f} ({training_time_init:.1f}s)")
     rff.eval()
     init_model.eval()

@@ -4,7 +4,6 @@ No ErfSeparableTransform or mutual basis; dimensions correspond directly to
 physical state coordinates. All n_local**dim objects remain TT/MPO-structured.
 """
 from pathlib import Path
-import math
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -12,7 +11,7 @@ from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 from rational_factor.models.tt.tt_basis import TTBasis
 from rational_factor.models.tt.tt_parameters import TTVectorParameters, KroneckerPlusLowRankFactorizationMPOParameters
-from rational_factor.models.parameters import PositiveParameters, TrainableParameters, Parameters, param_group_iter
+from rational_factor.models.parameters import PositiveParameters, Parameters, param_group_iter
 from rational_factor.models.factor_forms import SumProdRFF, LinearFF
 from rational_factor.models.train import Trainer, LossVisualizer
 from rational_factor.tools.analysis import avg_log_likelihood
@@ -37,19 +36,10 @@ def _new_gaussian_basis(
     )
     return TTBasis(GaussianBasis(mean_params=means, std_params=stds)), (means, stds)
 
-def _trainable_mixture_weight(init: float, *, dtype: torch.dtype, device: torch.device) -> TrainableParameters:
-    """Scalar logit so sigmoid(logit) ≈ init; trained with the MPO weights."""
-    eps = 1e-4
-    w = min(max(float(init), eps), 1.0 - eps)
-    logit = math.log(w / (1.0 - w))
-    return TrainableParameters.from_values(
-        torch.tensor(logit, dtype=dtype, device=device), trainable=True,
-    )
-
-
 def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_local: int, latent_rank: int,
                            mpo_rank: int, dtype: torch.dtype, device: torch.device,
                            mixture_weight: float | Parameters = 0.5,
+                           trainable_mixture_weight: bool = True,
                            numerical_tolerance: float = 1e-10, gaussian_std_floor: float = 0.01):
     phi, phi_modules = _new_gaussian_basis(x_k, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     psi, psi_modules = _new_gaussian_basis(x_kp1, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
@@ -58,11 +48,10 @@ def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_
         modes, ranks=1, param_cls=PositiveParameters,
         mean=1.0, std=0.15, epsilon=1e-3, dtype=dtype, device=device,
     )
-    if not isinstance(mixture_weight, Parameters):
-        mixture_weight = _trainable_mixture_weight(mixture_weight, dtype=dtype, device=device)
     B = KroneckerPlusLowRankFactorizationMPOParameters.from_core_spec(
         modes, rank=latent_rank, ranks_u=mpo_rank, ranks_v=mpo_rank,
         row_stochastic=True, mixture_weight=mixture_weight,
+        trainable_mixture_weight=trainable_mixture_weight,
         mean=0.0, std=0.2, dtype=dtype, device=device,
     )
     rff = SumProdRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
@@ -101,19 +90,20 @@ if __name__ == "__main__":
     gaussian_std_epsilon = 0.01
     test_fraction = 0.15
     split_seed = 0
-    mixture_weight_init = 0.5
+    mixture_weight_init = 0.2
+    trainable_mixture_weight = False
     tran_params = {
         "epochs": 40,
         "basis_iterations": 2,
         "weights_iterations": 5,
         "lr_basis": 5e-2,
-        "lr_weights": 5e-1,
+        "lr_weights": 1e-0,
         "validation_patience": 50,
     }
     init_tt_rank = 10
     init_params = {"epochs": 100, "coeff_iterations": 10, "lr_coeffs": 1e-2,
                    "basis_iterations": 2, "lr_basis": 1e-3, "validation_patience": 50}
-    batch_size = 2048 #512
+    batch_size = 512 #512
     n_timesteps_prop = problem.n_timesteps
     d = problem.system.dim()
 
@@ -142,10 +132,14 @@ if __name__ == "__main__":
     rff, B_params, basis_params, weight_params = build_transition_model(
         x_k_train, x_kp1_train, d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,
         mixture_weight=mixture_weight_init,
+        trainable_mixture_weight=trainable_mixture_weight,
         dtype=dtype, device=device, numerical_tolerance=1e-10,
         gaussian_std_floor=gaussian_std_epsilon,
     )
-    print(f"trainable mixture_weight init={mixture_weight_init}")
+    if trainable_mixture_weight:
+        print(f"trainable mixture_weight init={mixture_weight_init}")
+    else:
+        print(f"fixed mixture_weight={mixture_weight_init}")
     trainer = Trainer(
         rff, device=device,
         validation_early_stopping_patience=tran_params["validation_patience"],
@@ -170,8 +164,7 @@ if __name__ == "__main__":
         raise SystemExit("No stable transition checkpoint was found.")
 
     rff.eval()
-    learned_mw = float(torch.sigmoid(B_params.mixture_weight().reshape(())))
-    print(f"Learned mixture_weight (low-rank share): {learned_mw:.6f}")
+    print(f"mixture_weight (low-rank share): {B_params.mixture_weight_value():.6f}")
 
     for parameter in rff.parameters():
         parameter.requires_grad_(False)

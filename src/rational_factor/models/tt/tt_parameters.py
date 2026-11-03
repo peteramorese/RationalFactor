@@ -121,21 +121,33 @@ class TTVectorParameters(Parameters):
 
 
 class MPOParameters(Parameters):
-    """Each core provider returns ``(r_left, n_row, n_col, r_right)``."""
+    r"""Each core provider returns ``(r_left, n_row, n_col, r_right)``.
 
-    def __init__(self, cores: Sequence[Parameters]):
+    With ``row_stochastic=True``, each local core is a conditional probability
+    over ``(output_index, next_bond)`` given ``(previous_bond, input_index)``.
+    Contracting these local conditional kernels produces an entrywise
+    nonnegative, row-stochastic MPO of the original bond ranks, without
+    constructing the exponentially large dense matrix.
+
+    This is a structured stochastic MPO family, not a general row-wise
+    normalization of every possible nonnegative MPO.
+    """
+
+    def __init__(self, cores: Sequence[Parameters], *, row_stochastic: bool = False):
         self._cores = tuple(cores)
         if not self._cores:
             raise ValueError('at least one MPO core is required')
+        self.row_stochastic = bool(row_stochastic)
         self()  # Validate complete core layout.
 
     @classmethod
-    def from_cores(cls, cores: Sequence[Parameters]):
-        return cls(cores)
+    def from_cores(cls, cores: Sequence[Parameters], *, row_stochastic: bool = False):
+        return cls(cores, row_stochastic=row_stochastic)
 
     @classmethod
     def from_core_spec(cls, row_modes: Sequence[int], ranks: int | Sequence[int] = 1,
                        col_modes: Sequence[int] | None = None, *,
+                       row_stochastic: bool = False,
                        param_cls: type[TrainableParameters] = TrainableParameters,
                        trainable=True, mean=0., std=1., epsilon=0.,
                        dtype=torch.float32, device=None):
@@ -147,7 +159,8 @@ class MPOParameters(Parameters):
         return cls([_random_core(param_cls, (r[i], m, n, r[i+1]),
                                  trainable=trainable, mean=mean, std=std,
                                  epsilon=epsilon, dtype=dtype, device=device)
-                    for i, (m, n) in enumerate(zip(rows, cols))])
+                    for i, (m, n) in enumerate(zip(rows, cols))],
+                   row_stochastic=row_stochastic)
 
     @property
     def cores(self):
@@ -166,7 +179,21 @@ class MPOParameters(Parameters):
         return (1,) + tuple(int(p.size()[-1]) for p in self._cores)
 
     def __call__(self) -> MPO:
-        return MPO.from_cores([p() for p in self._cores])
+        cores = [p() for p in self._cores]
+        if self.row_stochastic:
+            # For every (incoming bond, input coordinate), normalize jointly
+            # over (output coordinate, outgoing bond). Normalizing ONLY over
+            # n_col would overcount hidden paths and not normalize MPO rows.
+            cores = [
+                core.reshape(core.shape[0], core.shape[1], -1)
+                    .softmax(dim=-1)
+                    .reshape(core.shape)
+                for core in cores
+            ]
+        return MPO.from_cores(cores)
+
+    def is_row_stochastic(self) -> bool:
+        return self.row_stochastic
 
     def is_trainable(self):
         return any(p.is_trainable() for p in self._cores)
@@ -176,7 +203,6 @@ class MPOParameters(Parameters):
 
     def is_module(self):
         return False
-
 
 
 class LowRankFactorizationMPOParameters(Parameters):
@@ -314,8 +340,8 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
     ``mixture_weight`` may be a fixed probability in [0, 1] or a scalar
     Parameters provider whose raw value is mapped through sigmoid, allowing
     a trainable mixture while preserving the stochastic constraint.
-    ``from_core_spec(..., trainable=True)`` converts a float init into such a
-    logit parameter automatically.
+    ``from_core_spec`` converts a float init into a logit parameter when
+    ``trainable_mixture_weight`` is True (defaulting to ``trainable``).
     """
 
     def __init__(self, kronecker: Parameters, U: Parameters, V: Parameters, *,
@@ -362,10 +388,9 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
         eps = 1e-4
         w_c = min(max(w, eps), 1.0 - eps)
         logit = math.log(w_c / (1.0 - w_c))
-        p = TrainableParameters.from_values(
+        return TrainableParameters.from_values(
             torch.tensor(logit, dtype=dtype, device=device), trainable=True,
         )
-        return p
 
     @classmethod
     def from_core_spec(
@@ -376,6 +401,7 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
         ranks_v: int | Sequence[int] | None = None,
         row_stochastic: bool = True,
         mixture_weight: float | Parameters = 0.5,
+        trainable_mixture_weight: bool | None = None,
         param_cls: type[TrainableParameters] = TrainableParameters,
         trainable=True, mean=0., std=1., epsilon=0.,
         dtype=torch.float32, device=None,
@@ -393,8 +419,9 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
             trainable=trainable, mean=mean, std=std, epsilon=epsilon,
             dtype=dtype, device=device,
         )
+        mw_trainable = trainable if trainable_mixture_weight is None else bool(trainable_mixture_weight)
         mw = cls._as_mixture_weight_parameters(
-            mixture_weight, trainable=trainable, dtype=dtype, device=device,
+            mixture_weight, trainable=mw_trainable, dtype=dtype, device=device,
         )
         return cls(kronecker, lowrank.U, lowrank.V,
                    row_stochastic=row_stochastic, mixture_weight=mw)
@@ -419,6 +446,12 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
             u_cores[0] = u_cores[0] * weight
             U = MPO(u_cores)
         return KroneckerPlusLowRankFactorizationMPO(K, U, V)
+
+    def mixture_weight_value(self) -> float:
+        """Effective low-rank mixture probability in ``[0, 1]``."""
+        if isinstance(self.mixture_weight, Parameters):
+            return float(torch.sigmoid(self.mixture_weight().reshape(())))
+        return float(self.mixture_weight)
 
     def is_trainable(self):
         return (super().is_trainable() or self.kronecker.is_trainable() or
