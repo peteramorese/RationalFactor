@@ -8,7 +8,7 @@ from normalizing_flow.composite_model import CompositeConditionalModel, Composit
 from normalizing_flow.transforms import Transforms
 from rational_factor.models.autoregressive_basis import AutoregressiveConeLayerBasis
 from rational_factor.models.basis_functions import BSpline1DBasis
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.mlp import MaskedInputMLP
 from rational_factor.models.parameters import (
     PositiveParameters,
@@ -189,7 +189,7 @@ if __name__ == "__main__":
     psi_basis = phi_psi_mutual.get_basis(1)
 
     # cartpole default tolerance (1e-20) is too tight once basis values are O(1e-6).
-    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
+    rff = LinearRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
     tran_model = CompositeConditionalModel(
         rff,
         context_features=dim,

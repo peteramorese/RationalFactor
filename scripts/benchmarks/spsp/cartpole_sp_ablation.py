@@ -1,10 +1,10 @@
-"""Ablation of SumProd basis / SumProd RFF on CartPole belief propagation LL.
+"""Ablation of SumProd basis / LinearRFF on CartPole belief propagation LL.
 
 Contexts:
   - baseline:       plain Gaussian leaves + LinearRFF (n_leaf = 500)
   - sp_basis:       SumProdBasis (n_leaf ≈ 80, n_output = 500) + LinearRFF
-  - sp_model:       plain Gaussian leaves + SumProdRFF (n_leaf = 500)
-  - sp_basis_model: SumProdBasis + SumProdRFF (n_leaf ≈ 80, n_output = 500)
+  - sp_model:       plain Gaussian leaves + LinearRFF (n_leaf = 500)
+  - sp_basis_model: SumProdBasis + LinearRFF (n_leaf ≈ 80, n_output = 500)
 
 Uses e2e Adam with separate basis / weight (/ B,P) learning rates, train/val
 split, and validation early stopping so each model can express itself without
@@ -21,7 +21,7 @@ import rational_factor.models.loss as loss
 import rational_factor.models.train as train
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF
+from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.models.parameters import PositiveParameters, TrainableParameters, param_group_iter, DenseMatrixFactorization
 from rational_factor.models.sum_prod_basis import SumProdBasis
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
@@ -226,7 +226,7 @@ def main() -> None:
             ).to(device)
             B = DenseMatrixFactorization(B_params)
             P = DenseMatrixFactorization(P_params)
-            tran_model = SumProdRFF(g_basis, psi_basis, B, P).to(device)
+            tran_model = LinearRFF(g_basis, psi_basis, B, P).to(device)
         else:
             tran_model = LinearRFF(g_basis, psi_basis).to(device)
 

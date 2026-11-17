@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.parameters import (
     PositiveParameters,
@@ -773,7 +773,7 @@ if __name__ == "__main__":
     phi_basis = phi_psi_mutual.get_basis(0)
     psi_basis = phi_psi_mutual.get_basis(1)
 
-    tran_model = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    tran_model = LinearRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss

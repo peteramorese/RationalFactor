@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.factor_forms import SumProdRFF
+from rational_factor.models.factor_forms import LinearRFF
 from rational_factor.models.parameters import (
     PositiveParameters,
     R1PDFactorizationParameters,
@@ -101,7 +101,7 @@ def main() -> None:
         atol=1e-5,
     )
 
-    # SumProdRFF sees only the outer batch axis, and owns the factor modules.
+    # LinearRFF sees only the outer batch axis, and owns the factor modules.
     basis_shape = (1, 1, N)
     means = TrainableParameters.random_init(basis_shape)
     stds = PositiveParameters.set_init(basis_shape, 1.0)
@@ -112,7 +112,7 @@ def main() -> None:
     factor_shape = (1, n_factors, N)
     b_params = tuple(TrainableParameters.random_init(factor_shape, std=0.1) for _ in range(3))
     B = R1PDFactorizationParameters(*b_params, seq_dim=1)
-    model = SumProdRFF(g, psi, B)
+    model = LinearRFF(g, psi, B)
     assert isinstance(B(), R1PDFactorization)
     assert B().shape == (1, N, N)
     model_param_ids = {id(param) for param in model.parameters()}

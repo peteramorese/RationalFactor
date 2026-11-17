@@ -11,7 +11,7 @@ from normalizing_flow.normalizing_flow import ConditionalNormalizingFlow
 from normalizing_flow.vp_flow import ConditionalVolumePreservingFlow
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from normalizing_flow.transforms import ErfSeparableTransform, IdentityTransform, StackedTransform
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.mutual_bases import (
     LocalBSplineMutualBasis,
     NormalizedProductPairBasis,
@@ -33,7 +33,7 @@ def _make_qs_B(n_basis: int, order: int, device: torch.device) -> Quasiseparable
     """Order-``order`` quasiseparable ``B = L D U`` with nonnegative factors.
 
     Zero LDU generators are a critical point (off-diagonal grads vanish), and
-    signed generators make ``B`` indefinite — both break SumProdRFF. Use small
+    signed generators make ``B`` indefinite — both break LinearRFF. Use small
     positive random generators; ``transition_bound`` keeps ``a, b ∈ (0, 1)``.
     """
     gen_shape = (1, n_basis, order)
@@ -416,7 +416,7 @@ if __name__ == "__main__":
     wrap_tf = _make_wrap_tf(
         x_k, dim=dim, sacrificial_index=sacrificial_index, trainable=True
     ).to(device)
-    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    rff = LinearRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
     print("Training transition model")

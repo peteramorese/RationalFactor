@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.tt.tt_basis import TTBasis
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.parameters import (
@@ -155,7 +155,7 @@ if __name__ == "__main__":
         device=device,
     )
 
-    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
+    rff = LinearRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=1e-10)
 
     print("Training transition model")
     mle_loss_fn = loss.conditional_mle_loss

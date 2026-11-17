@@ -85,82 +85,7 @@ class LinearForm(DensityModel):
         return LinearForm(w_marginal, numerical_tolerance=self.numerical_tolerance)
 
 
-class LinearRFF(ConditionalDensityModel):
-    """
-    Linear Rational Factor Form
-
-    Used for Markov transition distribution for propagation only models.
-    """
-    def __init__(self, a : Parameters, phi : Basis, psi : Basis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
-        assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
-        assert isinstance(a, Parameters), "a must be a Parameters"
-        assert isinstance(phi, Basis), "phi must be a Basis"
-        assert isinstance(psi, Basis), "psi must be a Basis"
-        a_vals = a()
-        a_shape = a_vals.shape if hasattr(a_vals, "shape") else a_vals.size()
-        assert tuple(a_shape) == (phi.batch_size(), phi.n_basis_functions()), (
-            "a must have shape (batch_size, n_basis) matching phi"
-        )
-        super().__init__(phi.dim(), psi.dim())
-
-        self.a = a
-        self.phi = phi
-        self.psi = psi
-        self.numerical_tolerance = numerical_tolerance
-
-        if register_modules:
-            # Register the parameter modules to use parameters() and to() methods
-            param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
-            coeff_modules = list(coeff_modules)
-            if a.is_module() and id(a) not in {id(c) for c in coeff_modules}:
-                coeff_modules.append(a)
-            self._param_modules = torch.nn.ModuleList(param_modules)
-            self._coeff_modules = torch.nn.ModuleList(coeff_modules)
-
-    def dtype_device(self):
-        return self.phi.dtype_device()
-
-    def g_basis(self) -> Basis:
-        """Return a Basis view of ``g = a * phi`` (phi shallow-copied with coeffs ``a``)."""
-        g = copy.copy(self.phi)
-        g.set_coeffs(self.a)
-        return g
-
-    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
-        x = conditioner
-        tol = self.numerical_tolerance
-
-        a = as_vector(self.a(), numerical_tolerance=tol)
-        phi_x = as_vector(self.phi(x), numerical_tolerance=tol)
-        phi_xp = as_vector(self.phi(xp), numerical_tolerance=tol)
-        psi_xp = as_vector(self.psi(xp), numerical_tolerance=tol)
-        b = self.get_b(a=a)
-
-        # Floor only the combined ratio. Per-term ``+ numerical_tolerance``
-        # floors destroy cancellation when g(x) and f underflow but g(xp) does not
-        # (common in high-d products of peaked Gaussians) and invent huge log-densities.
-        g_x = (a * phi_x).sum().clamp_min(0)
-        g_xp = (a * phi_xp).sum().clamp_min(0)
-        f = as_vector(phi_x * psi_xp * b).sum().clamp_min(0)
-        eps = torch.finfo(g_x.dtype).tiny
-        return torch.log(g_xp * f + eps) - torch.log(g_x + eps)
-
-    def get_b(self, a : torch.Tensor = None, Omega2 : torch.Tensor = None):
-        tol = self.numerical_tolerance
-        if a is None:
-            a = as_vector(self.a(), numerical_tolerance=tol)
-        else:
-            a = as_vector(a, numerical_tolerance=tol)
-
-        if Omega2 is None:
-            Omega2 = self.phi.Omega2(self.psi)
-
-        # Denominator floor lives on the vector's elementwise division.
-        q = as_vector(as_matrix(Omega2).rev_matvec(a), numerical_tolerance=tol)
-        return a / q
-
-
-class SumProdRFF(MarkovTransitionModel):
+class LinearRFF(MarkovTransitionModel):
     def __init__(self, a : Parameters, phi : Basis, psi : Basis, B : Parameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
@@ -170,7 +95,7 @@ class SumProdRFF(MarkovTransitionModel):
         a_vals = a()
         a_shape = tuple(a_vals.shape) if hasattr(a_vals, "shape") else tuple(a_vals.size())
         if isinstance(a_vals, TTVector) and not a_vals.is_rank_one:
-            raise ValueError("SumProdRFF requires rank-one TT coefficients a for structured q scaling")
+            raise ValueError("LinearRFF requires rank-one TT coefficients a for structured q scaling")
         batch_size = phi.batch_size()
         n_basis = phi.n_basis_functions()
         a_ok = a_shape == (batch_size, n_basis) or (
@@ -274,7 +199,7 @@ class SumProdRFF(MarkovTransitionModel):
         """
         if not isinstance(belief, LinearFF):
             raise TypeError(
-                "SumProdRFF.propagate expects a LinearFF belief, got "
+                "LinearRFF.propagate expects a LinearFF belief, got "
                 f"{type(belief).__name__}"
             )
 
@@ -439,108 +364,6 @@ class LinearR2FF(ConditionalDensityModel):
     def basis_params(self):
         return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
 
-class LinearRFandR2FF(LinearR2FF):
-    """
-    Linear Rational Form and Two-Factor Form 
-
-    Used for combined Markov transition distribution and observation distribution for filtering models
-
-    Treated as state transition conditional distribution with special observation methods
-    """
-    def __init__(self, xi_basis : SeparableBasis, zeta_basis : Basis, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-20):
-        assert phi_basis.dim() == psi_basis.dim(), "Input bases must have the same dimension"
-        assert phi_basis.dim() == xi_basis.dim(), "Input bases must have the same dimension"
-        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
-        assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
-        assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
-        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
-        assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
-        assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
-        ConditionalDensityModel.__init__(self, phi_basis.dim(), psi_basis.dim())
-
-
-        assert phi_basis.n_basis_functions() == psi_basis.n_basis_functions(), "phi_basis and psi_basis must have the same number of basis functions"
-        assert xi_basis.n_basis_functions() == zeta_basis.n_basis_functions(), "xi_basis and zeta_basis must have the same number of basis functions"
-
-        self.xi_basis = xi_basis
-        self.zeta_basis = zeta_basis
-        self.phi_basis = phi_basis
-        self.psi_basis = psi_basis
-
-        self.__du = torch.nn.Parameter(torch.ones(xi_basis.n_basis_functions())) # d
-        self._LinearR2FF__au = torch.nn.Parameter(torch.ones(phi_basis.n_basis_functions()))  # g TODO FIX THIS
-
-        self.numerical_tolerance = numerical_tolerance
-
-    def get_d(self):
-        return torch.nn.functional.softmax(self.__du, dim=0)
-    
-    def get_e(self, d : torch.Tensor = None):
-        if d is None:
-            d = self.get_d()
-
-        if not self.zeta_basis.normalized():
-            Omega = self.zeta_basis.Omega1()
-            return d / (Omega + self.numerical_tolerance)
-        return d
-
-    def log_observation_density(self, o : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
-        x = conditioner
-        xi_x = self.xi_basis(x)
-        zeta_o = self.zeta_basis(o)
-
-        d = self.get_d()
-        e = self.get_e(d=d)
-
-        log_r_x = torch.log(xi_x @ d + self.numerical_tolerance) # (n_data)
-        log_l_o_x = torch.log((zeta_o * xi_x) @ e + self.numerical_tolerance) # (n_data)
-
-        #print("log_r_x min: ", log_r_x.min(), "max: ", log_r_x.max())
-        #print("log_l_o_x min: ", log_l_o_x.min(), "max: ", log_l_o_x.max())
-
-        if torch.abs(log_l_o_x - log_r_x).max() < 1e-8:
-            _, xi_stds = self.xi_basis.means_stds()
-            _, zeta_stds = self.zeta_basis.means_stds()
-            print(
-                "obs basis scales | "
-                f"xi std min/max: {xi_stds.min().item():.3e}/{xi_stds.max().item():.3e}, "
-                f"zeta std min/max: {zeta_stds.min().item():.3e}/{zeta_stds.max().item():.3e}"
-            )
-            print("x min: ", x.min(), "max: ", x.max())
-            print("o min: ", o.min(), "max: ", o.max())
-
-        return log_l_o_x - log_r_x
-
-    def weight_params(self):
-        return [self._LinearR2FF__au]
-    
-    def basis_params(self):
-        return itertools.chain(self.xi_basis.parameters(), self.zeta_basis.parameters(), self.phi_basis.parameters(), self.psi_basis.parameters())
-    
-    def tran_weight_params(self):
-        return [self._LinearR2FF__au]
-    
-    def obs_weight_params(self):
-        return [self.__du]
-    
-    def tran_basis_params(self):
-        return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
-    
-    def obs_basis_params(self):
-        return itertools.chain(self.xi_basis.parameters(), self.zeta_basis.parameters())
-
-    def rf(self):
-        return LinearRF(self.xi_basis, self.zeta_basis, numerical_tolerance=self.numerical_tolerance)
-
-    def r2ff(self):
-        return LinearR2FF(
-            self.get_d().detach().clone(),
-            self.xi_basis,
-            self.phi_basis,
-            self.psi_basis,
-            numerical_tolerance=self.numerical_tolerance,
-        )
-
 
 class LinearFF(DensityModel):
     def __init__(self, a: Parameters, phi: Basis, c: Parameters, psi: Basis,
@@ -589,10 +412,10 @@ class LinearFF(DensityModel):
         return self.phi.dtype_device()
 
     @classmethod
-    def from_rff(cls, rff: LinearRFF | SumProdRFF, c: Parameters, psi: Basis,
+    def from_rff(cls, rff: "LinearRFF", c: Parameters, psi: Basis,
                  renormalize_h: bool = True, register_modules: bool = True):
-        if not isinstance(rff, (LinearRFF, SumProdRFF)):
-            raise TypeError("rff must be a LinearRFF or SumProdRFF")
+        if not isinstance(rff, LinearRFF):
+            raise TypeError("rff must be a LinearRFF")
         return cls(rff.a, rff.phi, c, psi,
                    numerical_tolerance=rff.numerical_tolerance,
                    renormalize_h=renormalize_h,
@@ -661,7 +484,7 @@ class Linear2FF(DensityModel):
             self.__c0u = torch.nn.Parameter(torch.ones(psi0_basis.n_basis_functions()))
     
     @classmethod
-    def from_r2ff(cls, r2ff : LinearR2FF | LinearRFandR2FF, psi0_basis : SeparableBasis):
+    def from_r2ff(cls, r2ff : "LinearR2FF", psi0_basis : SeparableBasis):
         # g(x)
         phi_basis = r2ff.phi_basis.freeze_params()
         a = r2ff.get_a().detach().clone()

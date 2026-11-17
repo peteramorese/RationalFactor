@@ -1,4 +1,4 @@
-"""Quadcopter/acc_comp: SumProdRFF with a full row-stochastic MPO transition matrix.
+"""Quadcopter/acc_comp: LinearRFF with a full row-stochastic MPO transition matrix.
 
 Same unwrapped Gaussian TT bases as the k1plr/lowrank scripts, but B is an
 ``MPOParameters`` with ``row_stochastic=True`` (local softmax over
@@ -13,7 +13,7 @@ from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 from rational_factor.models.tt.tt_basis import TTBasis
 from rational_factor.models.tt.tt_parameters import TTVectorParameters, MPOParameters
 from rational_factor.models.parameters import PositiveParameters, param_group_iter
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.train import Trainer, LossVisualizer
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.misc import train_test_split
@@ -52,7 +52,7 @@ def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_
         modes, ranks=mpo_rank, row_stochastic=True,
         mean=0.0, std=0.2, dtype=dtype, device=device,
     )
-    rff = SumProdRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
+    rff = LinearRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
     return (
         rff,
         param_group_iter((*phi_modules, *psi_modules)),
@@ -60,7 +60,7 @@ def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_
     )
 
 
-def build_initial_model(rff: SumProdRFF, x0: torch.Tensor, *, n_local: int, dtype: torch.dtype,
+def build_initial_model(rff: LinearRFF, x0: torch.Tensor, *, n_local: int, dtype: torch.dtype,
                         device: torch.device, init_tt_rank: int = 1,
                         gaussian_std_floor: float = 0.01):
     coeffs = TTVectorParameters.from_core_spec(

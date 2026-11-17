@@ -6,7 +6,7 @@ import numpy as np
 from pathlib import Path
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.models.sum_prod_basis import SumProdBasis
-from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF, SumProdRFF
+from rational_factor.models.factor_forms import QuadraticRFF, QuadraticFF, LinearRFF, LinearFF
 import rational_factor.models.train as train
 import rational_factor.models.loss as loss
 import rational_factor.tools.propagate as propagate
@@ -127,7 +127,7 @@ if __name__ == "__main__":
         P = DenseMatrixFactorization(P_params)
 
         # Create and train the transition model
-        tran_model = SumProdRFF(g_basis, psi_basis, B, P)
+        tran_model = LinearRFF(g_basis, psi_basis, B, P)
     else:
         tran_model = LinearRFF(g_basis, psi_basis)
 

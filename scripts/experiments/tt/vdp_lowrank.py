@@ -1,4 +1,4 @@
-"""Van der Pol: low-rank SumProdRFF with unwrapped Gaussian tensor-product bases.
+"""Van der Pol: low-rank LinearRFF with unwrapped Gaussian tensor-product bases.
 
 B = U V^T is a row-stochastic LowRankFactorizationMPO.  The factor and basis
 coefficient tensor operations, including prediction, remain structured TT/MPO
@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
 from rational_factor.models.parameters import (
     PositiveParameters, TrainableParameters, param_group_iter,
 )
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.train import Trainer, LossVisualizer
 from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
@@ -306,13 +306,13 @@ def build_transition_model(x_k: torch.Tensor, x_kp1: torch.Tensor, d: int, *, n_
         modes, rank=latent_rank, ranks_u=mpo_rank, ranks_v=mpo_rank,
         row_stochastic=True, mean=0.0, std=1.0, dtype=dtype, device=device,
     )
-    rff = SumProdRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
+    rff = LinearRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
     basis_params = param_group_iter((*phi_modules, *psi_modules))
     weight_params = param_group_iter((*a.parameter_modules(), *B.parameter_modules()))
     return rff, a, B, basis_params, weight_params
 
 
-def build_initial_model(rff: SumProdRFF, x0: torch.Tensor, *, n_local: int, dtype: torch.dtype,
+def build_initial_model(rff: LinearRFF, x0: torch.Tensor, *, n_local: int, dtype: torch.dtype,
                         device: torch.device, init_tt_rank: int = 1,
                         gaussian_std_floor: float = 0.25):
     """Train an independent initial Gaussian psi0 and arbitrary-rank TT h0."""
@@ -439,7 +439,7 @@ if __name__ == "__main__":
         rff, x_k, x_kp1, output_dir / "conditional_slices_model_vs_data.png",
         x_range=ranges[0], y_range=ranges[1], n_random_points=10,
         n_grid=120, min_points_per_slice=20, bin_width=0.4,
-        random_seed=0, title="VDP low-rank SumProdRFF: conditional slices",
+        random_seed=0, title="VDP low-rank LinearRFF: conditional slices",
     )
 
     # One-step transition propagation automatically uses the current h basis

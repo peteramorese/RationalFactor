@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.models.factor_forms import LinearFF, LinearRFF, SumProdRFF
+from rational_factor.models.factor_forms import LinearFF, LinearRFF
 from rational_factor.models.parameters import FixedParameters, PositiveParameters, DenseMatrixParameters
 import rational_factor.tools.propagate as propagate
 from rational_factor.models.structured_matrices import DenseMatrix, Rank1PlusDiagonal, as_matrix
@@ -111,12 +111,12 @@ def main() -> None:
     c_old = torch.einsum("...ij,...i->...j", M, c)
     assert torch.allclose(c_next, c_old)
 
-    # SumProdRFF with a dense B matrix.
+    # LinearRFF with a dense B matrix.
     n = n_basis
     B = DenseMatrixParameters(
         PositiveParameters.random_init((1, n, n), mean=1.0, std=0.1, epsilon=1e-3)
     )
-    sp = SumProdRFF(a_params, phi, psi, B, register_modules=False)
+    sp = LinearRFF(a_params, phi, psi, B, register_modules=False)
     assert sp.B().shape == (1, n, n)
     seq_sp = propagate.propagate(init, sp, n_steps=2)
     assert len(seq_sp) == 3

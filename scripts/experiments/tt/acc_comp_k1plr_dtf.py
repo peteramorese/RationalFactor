@@ -1,4 +1,4 @@
-"""Quadcopter/acc_comp: two-stage K1+LR SumProdRFF + MAF domain transform.
+"""Quadcopter/acc_comp: two-stage K1+LR LinearRFF + MAF domain transform.
 
 Stage 1 — train the bare transition RFF p_base(x'|x) on physical states
 (basis + weights groups).
@@ -21,7 +21,7 @@ from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 from rational_factor.models.tt.tt_basis import TTBasis
 from rational_factor.models.tt.tt_parameters import TTVectorParameters, KroneckerPlusLowRankFactorizationMPOParameters
 from rational_factor.models.parameters import PositiveParameters, Parameters, param_group_iter
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.train import Trainer, LossVisualizer
 from rational_factor.tools.analysis import avg_log_likelihood
 from rational_factor.tools.misc import train_test_split
@@ -52,7 +52,7 @@ def build_transition_base(
     trainable_mixture_weight: bool = True,
     numerical_tolerance: float = 1e-10, gaussian_std_floor: float = 0.01,
 ):
-    """Build the SumProdRFF transition kernel."""
+    """Build the LinearRFF transition kernel."""
     phi, phi_modules = _new_gaussian_basis(x_k, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     psi, psi_modules = _new_gaussian_basis(x_kp1, d, n_local, dtype=dtype, device=device, bandwidth_floor=gaussian_std_floor)
     modes = (n_local,) * d
@@ -66,7 +66,7 @@ def build_transition_base(
         trainable_mixture_weight=trainable_mixture_weight,
         mean=0.0, std=0.2, dtype=dtype, device=device,
     )
-    rff = SumProdRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
+    rff = LinearRFF(a, phi, psi, B, numerical_tolerance=numerical_tolerance)
     return (
         rff,
         B,
@@ -76,7 +76,7 @@ def build_transition_base(
 
 
 def build_initial_model(
-    rff: SumProdRFF, x0_latent: torch.Tensor, *, n_local: int, dtype: torch.dtype,
+    rff: LinearRFF, x0_latent: torch.Tensor, *, n_local: int, dtype: torch.dtype,
     device: torch.device, init_tt_rank: int = 1,
     gaussian_std_floor: float = 0.01,
 ):
@@ -155,7 +155,7 @@ if __name__ == "__main__":
     print(f"dtf=maf layers={dtf_num_layers}, hidden={dtf_hidden_features}")
 
     # ------------------------------------------------------------------
-    # Stage 1: train bare SumProdRFF on physical (x, x').
+    # Stage 1: train bare LinearRFF on physical (x, x').
     # ------------------------------------------------------------------
     rff, B_params, basis_params, weight_params = build_transition_base(
         x_k_train, x_kp1_train, d, n_local=n_local, latent_rank=latent_rank, mpo_rank=mpo_rank,

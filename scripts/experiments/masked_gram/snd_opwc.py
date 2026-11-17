@@ -13,7 +13,7 @@ from rational_factor.models.parameters import DenseMatrixFactorization
 from rational_factor.models.composite_model import CompositeConditionalModel, CompositeDensityModel
 from normalizing_flow.transforms import ErfSeparableTransform
 from rational_factor.models.mlp import MLP
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.mutual_bases import (
     Orthogonal1DPWCBasis,
     PositiveMaskedGramMutualBasis,
@@ -369,7 +369,7 @@ if __name__ == "__main__":
     psi_basis = phi_psi_mutual.get_basis(1)
 
     wrap_tf = ErfSeparableTransform.from_data(x_k, trainable=True).to(device)
-    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    rff = LinearRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel([wrap_tf], rff).to(device)
 
     print("Training transition model")

@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from rational_factor.models.basis_functions import GaussianBasis
 from rational_factor.tools.misc import init_gaussian_basis_params_gmm
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.parameters import (
     PositiveParameters,
     TrainableParameters,
@@ -83,7 +83,7 @@ if __name__ == "__main__":
         shape=(1, n_basis), mean=1.0, std=1.0, epsilon=1e-3
     ).to(device=device, dtype=dtype)
 
-    # SumProdRFF is normalized iff B @ 1 = 1.
+    # LinearRFF is normalized iff B @ 1 = 1.
     B_logits = TrainableParameters.random_init(
         shape=(1, n_basis, n_basis),
         mean=0.0,
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     ).to(device=device, dtype=dtype)
     B = RowStochasticDenseMatrixParameters(B_logits)
 
-    tran_model = SumProdRFF(
+    tran_model = LinearRFF(
         g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance
     )
 

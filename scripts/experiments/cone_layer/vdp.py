@@ -9,7 +9,7 @@ from normalizing_flow.composite_model import CompositeConditionalModel, Composit
 from normalizing_flow.transforms import Transforms
 from rational_factor.models.autoregressive_basis import AutoregressiveConeLayerBasis
 from rational_factor.models.basis_functions import BSpline1DBasis
-from rational_factor.models.factor_forms import SumProdRFF, LinearFF
+from rational_factor.models.factor_forms import LinearRFF, LinearFF
 from rational_factor.models.kde import GaussianKDE
 from rational_factor.models.mlp import MaskedInputMLP
 from rational_factor.models.parameters import (
@@ -791,7 +791,7 @@ if __name__ == "__main__":
     phi_basis = phi_psi_mutual.get_basis(0)
     psi_basis = phi_psi_mutual.get_basis(1)
 
-    rff = SumProdRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
+    rff = LinearRFF(g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance)
     tran_model = CompositeConditionalModel(
         rff,
         context_features=dim,
