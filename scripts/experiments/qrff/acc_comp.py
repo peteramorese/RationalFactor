@@ -21,18 +21,18 @@ import rational_factor.models.loss as loss
 
 
 if __name__ == '__main__':
-    problem_name = 'cartpole'
+    problem_name = 'quadcopter'
     problem = FULLY_OBSERVABLE_PROBLEMS[problem_name]
 
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    n_basis = 12  # Q0 is (n_basis**2, n_basis**2); NOT 500 as for linear RFF.
+    n_basis = 34  # Q0 is (n_basis**2, n_basis**2); NOT 500 as for linear RFF.
     pd_jitter = 1e-8
-    tran_params = dict(epochs=20, basis_iterations=3, weights_iterations=3,
-                       lr_basis=3e-3, lr_weights=5e-3)
-    init_params = dict(epochs=50, coeff_iterations=10,
+    tran_params = dict(epochs=100, basis_iterations=3, weights_iterations=3,
+                       lr_basis=1e-2, lr_weights=1e-2)
+    init_params = dict(epochs=80, coeff_iterations=10,
                        lr_coeffs=1e-2, basis_iterations=2, lr_basis=1e-3)
-    batch_size = 256
+    batch_size = 128
     n_timesteps_prop = problem.n_timesteps
 
     device = torch.device('cuda' if use_gpu else 'cpu')
