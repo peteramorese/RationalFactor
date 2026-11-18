@@ -13,6 +13,7 @@ from rational_factor.models.parameters import (
     param_group_iter,
 )
 from rational_factor.models.train import Trainer
+from rational_factor.systems.base import sample_trajectories
 from rational_factor.systems.problems import OPEN_LOOP_OBSERVABLE_PROBLEMS
 from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 import rational_factor.models.loss as loss
@@ -30,9 +31,10 @@ def _plot_control_slices(
     *,
     n_slices: int = 20,
     u_bandwidth: float = 0.2,
-    grid_n: int = 80,
+    grid_n: int = 160,
     out_path: Path,
     title: str,
+    dpi: int = 400,
 ):
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -64,22 +66,13 @@ def _plot_control_slices(
 
     ncols = 5
     nrows = (n_slices + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.0 * nrows), squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 3.4 * nrows), squeeze=False)
 
     model.eval()
     with torch.no_grad():
         for ax, u_s in zip(axes.ravel(), selected):
             dist = (u_cpu - u_s).norm(dim=-1)
             mask = dist <= u_bandwidth
-            ax.scatter(
-                x_cpu[mask, 0],
-                xp_cpu[mask, 0],
-                s=4,
-                c="k",
-                alpha=0.35,
-                linewidths=0,
-                zorder=2,
-            )
 
             u_flat = u_s.to(device=device, dtype=dtype).reshape(1, -1).expand(x_flat.shape[0], -1)
             log_p = model.log_density(xp_flat, conditioner=x_flat, action=u_flat)
@@ -91,6 +84,16 @@ def _plot_control_slices(
                 shading="auto",
                 cmap="viridis",
                 zorder=1,
+            )
+            ax.scatter(
+                x_cpu[mask, 0],
+                xp_cpu[mask, 0],
+                s=0.8,
+                c="C1",
+                alpha=0.55,
+                linewidths=0,
+                rasterized=True,
+                zorder=2,
             )
             ax.set_xlim(lo, hi)
             ax.set_ylim(lo, hi)
@@ -105,59 +108,64 @@ def _plot_control_slices(
     fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=160)
+    fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
     print(f"Saved plot to {out_path}")
 
 
-def _plot_belief_vs_particles(
-    beliefs: list,
-    traj_data: list[torch.Tensor],
-    controls: list[torch.Tensor],
+def _plot_multi_controller_beliefs(
+    rollouts: list[dict],
     *,
     x_range: tuple[float, float],
     out_path: Path,
     title: str,
-    n_grid: int = 400,
+    n_grid: int = 500,
+    dpi: int = 400,
 ):
-    """Two rows: particle histograms (top) and propagated beliefs (bottom)."""
-    n_slices = len(beliefs)
-    assert len(traj_data) == n_slices
+    """One row per controller: belief curve over MC particle histogram at each t."""
+    n_ctrl = len(rollouts)
+    n_slices = len(rollouts[0]["beliefs"])
     lo, hi = x_range
-    dtype, device = beliefs[0].dtype_device()
+    dtype, device = rollouts[0]["beliefs"][0].dtype_device()
     x_grid = torch.linspace(lo, hi, n_grid, dtype=dtype, device=device).unsqueeze(1)
+    x_np = x_grid.squeeze(1).detach().cpu().numpy()
 
-    fig, axes = plt.subplots(2, n_slices, figsize=(2.6 * n_slices, 5.5), squeeze=False)
-    for t in range(n_slices):
-        samples = traj_data[t][:, 0].detach().cpu().numpy()
-        axes[0, t].hist(samples, bins=50, density=True, color="C1", alpha=0.55)
-        axes[0, t].set_xlim(lo, hi)
-        axes[0, t].set_title(f"t={t} particles", fontsize=9)
-        axes[0, t].grid(True, alpha=0.25)
-        if t == 0:
-            axes[0, t].set_ylabel("density")
-
-        with torch.no_grad():
-            beliefs[t].eval()
-            pdf = beliefs[t](x_grid).detach().cpu().numpy()
-        axes[1, t].plot(x_grid.squeeze(1).cpu().numpy(), pdf, color="C0", lw=2.0)
-        axes[1, t].hist(samples, bins=50, density=True, color="C1", alpha=0.3)
-        axes[1, t].set_xlim(lo, hi)
-        u_label = (
-            f"u={float(controls[t - 1].reshape(-1)[0]):.2f}"
-            if t > 0
-            else "init"
-        )
-        axes[1, t].set_title(f"t={t} belief ({u_label})", fontsize=9)
-        axes[1, t].grid(True, alpha=0.25)
-        axes[1, t].set_xlabel("x")
-        if t == 0:
-            axes[1, t].set_ylabel("density")
+    fig, axes = plt.subplots(
+        n_ctrl,
+        n_slices,
+        figsize=(2.4 * n_slices, 2.3 * n_ctrl),
+        squeeze=False,
+        sharex=True,
+    )
+    for r, rollout in enumerate(rollouts):
+        beliefs = rollout["beliefs"]
+        traj_data = rollout["traj"]
+        controls = rollout["controls"]
+        for t in range(n_slices):
+            ax = axes[r, t]
+            samples = traj_data[t][:, 0].detach().cpu().numpy()
+            ax.hist(samples, bins=60, density=True, color="C1", alpha=0.35, zorder=1)
+            with torch.no_grad():
+                beliefs[t].eval()
+                pdf = beliefs[t](x_grid).detach().cpu().numpy()
+            ax.plot(x_np, pdf, color="C0", lw=1.6, zorder=2)
+            ax.set_xlim(lo, hi)
+            ax.grid(True, alpha=0.25)
+            u_label = (
+                f"u={float(controls[t - 1].reshape(-1)[0]):.2f}"
+                if t > 0
+                else "init"
+            )
+            ax.set_title(f"t={t} ({u_label})", fontsize=7)
+            if t == 0:
+                ax.set_ylabel(f"ctrl {r}\ndensity", fontsize=8)
+            if r == n_ctrl - 1:
+                ax.set_xlabel("x", fontsize=8)
 
     fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=160)
+    fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
     print(f"Saved plot to {out_path}")
 
@@ -193,6 +201,8 @@ if __name__ == "__main__":
     batch_size = 256
     u_bandwidth = 0.25
     n_plot_slices = 20
+    n_controllers = 5
+    figure_dpi = 400
 
     device = torch.device("cuda" if use_gpu else "cpu")
     print(f"device={device}, dtype={dtype}, n_basis={n_basis}")
@@ -291,6 +301,7 @@ if __name__ == "__main__":
         x_kp1,
         n_slices=n_plot_slices,
         u_bandwidth=u_bandwidth,
+        dpi=figure_dpi,
         out_path=out_dir / f"{problem_name}_neural_action_lrff_slices.png",
         title=(
             f"{problem_name} — NeuralActionLRFF  "
@@ -337,46 +348,60 @@ if __name__ == "__main__":
         raise SystemExit("No stable initial-density checkpoint was found.")
     print(f"Done. best init mle={best_loss_init:.4f}, time={train_time_init:.1f}s")
 
-    # Fixed open-loop control sequence (same u_k for every particle at step k).
-    with torch.random.fork_rng():
-        torch.manual_seed(problem.seed + 17)
-        controls = [
-            problem.control_sampler(1).reshape(-1).to(dtype=dtype)
-            for _ in range(problem.n_timesteps)
-        ]
-    controller = lambda k: controls[k]
-
-    traj_data = [
-        x.to(dtype=dtype) for x in problem.test_data(controller)
-    ]
-    print(f"test traj slices={[tuple(x.shape) for x in traj_data]}")
-    print("controls: " + ", ".join(f"{float(c.reshape(-1)[0]):.3f}" for c in controls))
-
-    # Propagate beliefs under the same controller.
-    belief_seq = [init_model.eval()]
-    with torch.no_grad():
-        belief = init_model
-        for u_k in controls:
-            belief = tran_model.propagate(belief, u_k.to(device=device))
-            belief_seq.append(belief.eval())
-
+    # Several fixed open-loop controllers; same u_k for every particle at step k.
+    rollouts = []
     lo = float(problem.plot_bounds_low[0])
     hi = float(problem.plot_bounds_high[0])
-    # Expand plot range if particles leave the nominal box.
-    for slice_x in traj_data:
-        lo = min(lo, float(slice_x.min()))
-        hi = max(hi, float(slice_x.max()))
+    for ctrl_i in range(n_controllers):
+        with torch.random.fork_rng():
+            torch.manual_seed(problem.seed + 17 + 101 * ctrl_i)
+            controls = [
+                problem.control_sampler(1).reshape(-1).to(dtype=dtype)
+                for _ in range(problem.n_timesteps)
+            ]
+        controller = lambda k, controls=controls: controls[k]
+        # Distinct seed per controller so particle noise differs across rows.
+        with torch.random.fork_rng():
+            torch.manual_seed(problem.seed + 1 + 101 * ctrl_i)
+            traj_data = [
+                x.to(dtype=dtype)
+                for x in sample_trajectories(
+                    system,
+                    problem.initial_state_sampler,
+                    controller=controller,
+                    n_timesteps=problem.n_timesteps,
+                    n_trajectories=problem.n_trajectories_test,
+                )
+            ]
+        print(
+            f"controller {ctrl_i}: "
+            + ", ".join(f"{float(c.reshape(-1)[0]):.3f}" for c in controls)
+        )
+
+        belief_seq = [init_model.eval()]
+        with torch.no_grad():
+            belief = init_model
+            for u_k in controls:
+                belief = tran_model.propagate(belief, u_k.to(device=device))
+                belief_seq.append(belief.eval())
+
+        for slice_x in traj_data:
+            lo = min(lo, float(slice_x.min()))
+            hi = max(hi, float(slice_x.max()))
+        rollouts.append(
+            {"beliefs": belief_seq, "traj": traj_data, "controls": controls}
+        )
+
     pad = 0.05 * (hi - lo + 1e-6)
     lo, hi = lo - pad, hi + pad
 
-    _plot_belief_vs_particles(
-        belief_seq,
-        traj_data,
-        controls,
+    _plot_multi_controller_beliefs(
+        rollouts,
         x_range=(lo, hi),
+        dpi=figure_dpi,
         out_path=out_dir / f"{problem_name}_neural_action_lrff_beliefs.png",
         title=(
-            f"{problem_name} — open-loop belief propagation  "
+            f"{problem_name} — open-loop belief propagation ({n_controllers} controllers)  "
             f"tran={best_loss:.3f}, init={best_loss_init:.3f}"
         ),
     )
