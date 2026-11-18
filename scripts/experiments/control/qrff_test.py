@@ -354,8 +354,10 @@ if __name__ == "__main__":
 
     # Several fixed open-loop controllers; same u_k for every particle at step k.
     rollouts = []
-    lo = float(problem.plot_bounds_low[0])
-    hi = float(problem.plot_bounds_high[0])
+    x_range = (
+        float(problem.plot_bounds_low[0]),
+        float(problem.plot_bounds_high[0]),
+    )
     for ctrl_i in range(n_controllers):
         with torch.random.fork_rng():
             torch.manual_seed(problem.seed + 17 + 101 * ctrl_i)
@@ -388,19 +390,13 @@ if __name__ == "__main__":
                 belief = tran_model.propagate(belief, u_k.to(device=device))
                 belief_seq.append(belief.eval())
 
-        for slice_x in traj_data:
-            lo = min(lo, float(slice_x.min()))
-            hi = max(hi, float(slice_x.max()))
         rollouts.append(
             {"beliefs": belief_seq, "traj": traj_data, "controls": controls}
         )
 
-    pad = 0.05 * (hi - lo + 1e-6)
-    lo, hi = lo - pad, hi + pad
-
     _plot_multi_controller_beliefs(
         rollouts,
-        x_range=(lo, hi),
+        x_range=x_range,
         dpi=figure_dpi,
         out_path=out_dir / f"{problem_name}_neural_action_qrff_beliefs.png",
         title=(
