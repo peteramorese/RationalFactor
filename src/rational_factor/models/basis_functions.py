@@ -73,8 +73,11 @@ class Basis:
                         params_seen[id(module)] = module
         return unique_params, unique_coeffs
 
-    def forward(self, y : torch.Tensor):
+    def forward(self, y : torch.Tensor, **context : torch.Tensor):
         raise NotImplementedError("__call__ is not implemented for this basis function")
+
+    def __call__(self, y : torch.Tensor, **context : torch.Tensor):
+        return self.forward(y, **context)
 
     def set_coeffs(self, coeffs : Parameters):
         assert isinstance(coeffs, Parameters), "coeffs must be a Parameters object"
@@ -97,7 +100,7 @@ class Basis:
     
     def set_coeffs_to_one(self):
         dtype, device = self.dtype_device()
-        self.set_coeffs(OneVectorParameters(self._n_basis, (self._batch_size,), dtype, device))
+        self.set_coeffs(OneVectorParameters(self._n_basis, dtype=dtype, device=device))
     
     @staticmethod
     def _coeff_tensor(coeffs_vals):
@@ -205,13 +208,17 @@ class SeparableBasis(Basis):
         
         param_tensor = params[0]()
         #assert param_tensor.dim() == 3, "Each parameter tensor must have shape (batch_size, dim, n_basis)"
-        batch_size = param_tensor.size()[0]
-        dim = param_tensor.size()[1]
-        n_basis = param_tensor.size()[2]
+        batch_size = param_tensor.shape[0]
+        dim = param_tensor.shape[1]
+        n_basis = param_tensor.shape[2]
         super().__init__(dim=dim, batch_size=batch_size, n_basis=n_basis, params=params, coeffs=coeffs)
 
         for param_set in self._params:
-            assert param_set.size() == (batch_size, dim, n_basis), "Each parameter tensor must have shape (batch_size, dim, n_basis)"
+            vals = param_set()
+            assert tuple(vals.shape) == (batch_size, dim, n_basis), (
+                "Each parameter tensor must have shape "
+                f"({batch_size}, {dim}, {n_basis}), got {tuple(vals.shape)}"
+            )
 
     def n_params_per_basis(self):
         return len(self._params)
@@ -233,7 +240,7 @@ class SeparableBasis(Basis):
             highs_b = highs_b[(None,) * (axes.dim() - 2) + (slice(None),) + (None,)].squeeze(-1)
         return lows_b, highs_b
 
-    def Omega1_dim(self, lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False):
+    def Omega1_dim(self, lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False, **context : torch.Tensor):
         '''
         Per-coordinate integrals of each basis function.
 
@@ -242,7 +249,7 @@ class SeparableBasis(Basis):
         '''
         raise NotImplementedError("Omega1_dim is not implemented for this basis function")
     
-    def Omega2_dim(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False):
+    def Omega2_dim(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False, **context : torch.Tensor):
         '''
         Per-coordinate inner-product matrices.
 
@@ -253,7 +260,7 @@ class SeparableBasis(Basis):
         '''
         raise NotImplementedError("Omega2_dim is not implemented for this basis function")
 
-    def Omega3_dim(self, other1 : 'Basis', other2 : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False):
+    def Omega3_dim(self, other1 : 'Basis', other2 : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False, **context : torch.Tensor):
         '''
         Per-coordinate triple-product tensors.
 
@@ -262,7 +269,7 @@ class SeparableBasis(Basis):
         '''
         raise NotImplementedError("Omega3_dim is not implemented for this basis function")
 
-    def Omega22_dim(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False):
+    def Omega22_dim(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, return_log : bool = False, **context : torch.Tensor):
         '''
         Per-coordinate grams for ``<this_i * this_j, other_k * other_l>``.
 
@@ -271,52 +278,60 @@ class SeparableBasis(Basis):
         '''
         raise NotImplementedError("Omega22_dim is not implemented for this basis function")
 
-    def eval_dim(self, y : torch.Tensor):
+    def eval_dim(self, y : torch.Tensor, **context : torch.Tensor):
         '''
         Per-coordinate factor values (no product over dims, no coeffs).
 
         ``y`` has shape ``(batch, dim)``. Parameter tensors have leading size
         ``batch_size``; that axis is the same batch as ``y`` when parameters are
-        functions of ``x``. If ``batch_size == 1``, shared parameters broadcast
-        over ``y``.
+        functions of context. If the parameter leading size is ``1``, shared
+        parameters broadcast over ``y``. Context is forwarded to every
+        ``Parameters`` provider (static providers ignore it).
 
         Returns:
-            ``(batch, dim, n_basis)``
+            ``(batch, dim, n_basis)`` (or broadcast-compatible with param batch)
         '''
         raise NotImplementedError("eval_dim is not implemented for this basis function")
 
-    def _check_eval_batch(self, y : torch.Tensor):
+    def _check_eval_batch(self, y : torch.Tensor, param_leading: int | None = None):
         assert y.dim() == 2 and y.shape[1] == self.dim(), "y must have shape (batch, dim)"
-        n, b = y.shape[0], self.batch_size()
+        n = y.shape[0]
+        b = self.batch_size() if param_leading is None else param_leading
         assert b == n or b == 1, (
             f"y batch {n} must match parameter batch {b} (or parameter batch must be 1 for shared params)"
         )
         return n, b
 
-    def Omega1(self, lows : torch.Tensor = None, highs : torch.Tensor = None):
-        if isinstance(self, NonnegativeBasis):
-            return torch.exp(self.Omega1_dim(lows, highs, return_log=True).sum(dim=1)) * self.coeffs()
-        else:
-            return self.Omega1_dim(lows, highs, return_log=False).prod(dim=1) * self.coeffs()
+    @staticmethod
+    def _align_param_tensors(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Broadcast leading dims before the trailing ``(dim, n_basis[, ...])`` axes."""
+        batch = torch.broadcast_shapes(*(t.shape[:-2] for t in tensors))
+        return tuple(t.expand(*batch, *t.shape[-2:]) for t in tensors)
 
-    def Omega2(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
+    def Omega1(self, lows : torch.Tensor = None, highs : torch.Tensor = None, **context : torch.Tensor):
         if isinstance(self, NonnegativeBasis):
-            raw = torch.exp(self.Omega2_dim(other, lows, highs, return_log=True).sum(dim=1))
+            return torch.exp(self.Omega1_dim(lows, highs, return_log=True, **context).sum(dim=1)) * self.coeffs(**context)
         else:
-            raw = self.Omega2_dim(other, lows, highs, return_log=False).prod(dim=1)
+            return self.Omega1_dim(lows, highs, return_log=False, **context).prod(dim=1) * self.coeffs(**context)
+
+    def Omega2(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, **context : torch.Tensor):
+        if isinstance(self, NonnegativeBasis):
+            raw = torch.exp(self.Omega2_dim(other, lows, highs, return_log=True, **context).sum(dim=1))
+        else:
+            raw = self.Omega2_dim(other, lows, highs, return_log=False, **context).prod(dim=1)
         base = DenseMatrix(raw)
-        return base.mul_diag_left(Basis._coeff_tensor(self.coeffs())).mul_diag_right(
-            Basis._coeff_tensor(other.coeffs())
+        return base.mul_diag_left(Basis._coeff_tensor(self.coeffs(**context))).mul_diag_right(
+            Basis._coeff_tensor(other.coeffs(**context))
         )
 
-    def Omega3(self, other1 : 'Basis', other2 : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
-        c0 = Basis._coeff_tensor(self.coeffs())
-        c1 = Basis._coeff_tensor(other1.coeffs())
-        c2 = Basis._coeff_tensor(other2.coeffs())
+    def Omega3(self, other1 : 'Basis', other2 : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, **context : torch.Tensor):
+        c0 = Basis._coeff_tensor(self.coeffs(**context))
+        c1 = Basis._coeff_tensor(other1.coeffs(**context))
+        c2 = Basis._coeff_tensor(other2.coeffs(**context))
         if isinstance(self, NonnegativeBasis):
-            core = torch.exp(self.Omega3_dim(other1, other2, lows, highs, return_log=True).sum(dim=1))
+            core = torch.exp(self.Omega3_dim(other1, other2, lows, highs, return_log=True, **context).sum(dim=1))
         else:
-            core = self.Omega3_dim(other1, other2, lows, highs, return_log=False).prod(dim=1)
+            core = self.Omega3_dim(other1, other2, lows, highs, return_log=False, **context).prod(dim=1)
         return (
             core
             * c0[:, :, None, None]
@@ -324,13 +339,13 @@ class SeparableBasis(Basis):
             * c2[:, None, None, :]
         )
 
-    def Omega22(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None):
-        c1 = Basis._coeff_tensor(self.coeffs())
-        c2 = Basis._coeff_tensor(other.coeffs())
+    def Omega22(self, other : 'Basis', lows : torch.Tensor = None, highs : torch.Tensor = None, **context : torch.Tensor):
+        c1 = Basis._coeff_tensor(self.coeffs(**context))
+        c2 = Basis._coeff_tensor(other.coeffs(**context))
         if isinstance(self, NonnegativeBasis):
-            core = torch.exp(self.Omega22_dim(other, lows, highs, return_log=True).sum(dim=1))
+            core = torch.exp(self.Omega22_dim(other, lows, highs, return_log=True, **context).sum(dim=1))
         else:
-            core = self.Omega22_dim(other, lows, highs, return_log=False).prod(dim=1)
+            core = self.Omega22_dim(other, lows, highs, return_log=False, **context).prod(dim=1)
         # (batch, self_i, self_j, other_k, other_l): two matrix batch
         # indices followed by the actual (other_k, other_l) matrix axes.
         return DenseMatrix(
@@ -353,48 +368,48 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
     ):
         super().__init__(params=(mean_params, std_params), coeffs=coeffs)
 
-    def means_stds(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._params[0](), self._params[1]()
+    def means_stds(self, **context : torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._params[0](**context), self._params[1](**context)
 
-    def __call__(self, y: torch.Tensor):
-        out = self.eval_dim(y).prod(dim=1)  # (batch, n_basis)
-        return out * self.coeffs()
+    def forward(self, y: torch.Tensor, **context : torch.Tensor):
+        out = self.eval_dim(y, **context).prod(dim=1)  # (batch, n_basis)
+        return out * self.coeffs(**context)
 
-    def eval_dim(self, y: torch.Tensor):
-        self._check_eval_batch(y)
-        mu, std = self.means_stds()  # (batch_size, dim, n_basis)
+    def eval_dim(self, y: torch.Tensor, **context : torch.Tensor):
+        mu, std = self.means_stds(**context)  # (param_batch, dim, n_basis)
+        self._check_eval_batch(y, param_leading=mu.shape[0])
         y_e = y[:, :, None]  # (batch, dim, 1)
         std = std.clamp_min(torch.finfo(y.dtype).eps)
         log_two_pi = y.new_tensor(2.0 * math.pi).log()
-        # batch_size==1 broadcasts shared params over y's batch
+        # param_batch==1 broadcasts shared params over y's batch
         log_dim = -0.5 * (log_two_pi + 2.0 * torch.log(std) + ((y_e - mu) / std).square())
         return torch.exp(log_dim)  # (batch, dim, n_basis)
 
-    def supremum_bound(self) -> torch.Tensor:
+    def supremum_bound(self, **context : torch.Tensor) -> torch.Tensor:
         """Product of per-coordinate Gaussian PDF maxima, shape ``(batch, n_basis)``.
 
         Each 1-D factor ``N(x | μ, σ²)`` peaks at ``x = μ`` with height
         ``(2π σ²)^{-1/2}``, so the separable product peaks at the mean with
         height ``∏_d (2π σ_d²)^{-1/2}``.
         """
-        _, std = self.means_stds()
+        _, std = self.means_stds(**context)
         std = std.clamp_min(torch.finfo(std.dtype).eps)
         log_two_pi = std.new_tensor(2.0 * math.pi).log()
         log_sup = (-0.5 * (log_two_pi + 2.0 * torch.log(std))).sum(dim=1)
-        return log_sup.exp() * self.coeffs()
+        return log_sup.exp() * self.coeffs(**context)
 
-    def Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
-        mu, std = self.means_stds()
+    def Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
+        mu, std = self.means_stds(**context)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu)
         log_val = GaussianGram.log_gram((mu,), (std,), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
 
-    def Omega2_dim(self, other: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
+    def Omega2_dim(self, other: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
         assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
-        mu1, std1 = self.means_stds()
-        mu2, std2 = other.means_stds()
+        mu1, std1 = self.means_stds(**context)
+        mu2, std2 = other.means_stds(**context)
+        mu1, std1, mu2, std2 = self._align_param_tensors(mu1, std1, mu2, std2)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu1)
         log_val = GaussianGram.log_gram((mu1, mu2), (std1, std2), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
@@ -406,24 +421,25 @@ class GaussianBasis(SeparableBasis, NonnegativeBasis):
         lows: torch.Tensor = None,
         highs: torch.Tensor = None,
         return_log: bool = False,
+        **context : torch.Tensor,
     ):
         assert isinstance(other1, GaussianBasis), "other1 must be GaussianBasis"
         assert isinstance(other2, GaussianBasis), "other2 must be GaussianBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other1.batch_size() == other2.batch_size(), "Basis functions must have the same batch size"
-        mu1, std1 = self.means_stds()
-        mu2, std2 = other1.means_stds()
-        mu3, std3 = other2.means_stds()
+        mu1, std1 = self.means_stds(**context)
+        mu2, std2 = other1.means_stds(**context)
+        mu3, std3 = other2.means_stds(**context)
+        mu1, std1, mu2, std2, mu3, std3 = self._align_param_tensors(mu1, std1, mu2, std2, mu3, std3)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu1)
         log_val = GaussianGram.log_gram((mu1, mu2, mu3), (std1, std2, std3), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
 
-    def Omega22_dim(self, other: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
+    def Omega22_dim(self, other: "GaussianBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
         assert isinstance(other, GaussianBasis), "other must be GaussianBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
-        mu1, std1 = self.means_stds()
-        mu2, std2 = other.means_stds()
+        mu1, std1 = self.means_stds(**context)
+        mu2, std2 = other.means_stds(**context)
+        mu1, std1, mu2, std2 = self._align_param_tensors(mu1, std1, mu2, std2)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu1)
         log_val = GaussianGram.log_gram((mu1, mu1, mu2, mu2), (std1, std1, std2, std2), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
@@ -537,16 +553,16 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         super().__init__(params=(alpha_params, beta_params), coeffs=coeffs)
         self.eps = eps
 
-    def alphas_betas(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._params[0](), self._params[1]()
+    def alphas_betas(self, **context : torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._params[0](**context), self._params[1](**context)
 
-    def __call__(self, y: torch.Tensor):
-        out = self.eval_dim(y).prod(dim=1)  # (batch, n_basis)
-        return out * self.coeffs()
+    def forward(self, y: torch.Tensor, **context : torch.Tensor):
+        out = self.eval_dim(y, **context).prod(dim=1)  # (batch, n_basis)
+        return out * self.coeffs(**context)
 
-    def eval_dim(self, y: torch.Tensor):
-        self._check_eval_batch(y)
-        alpha, beta = self.alphas_betas()  # (batch_size, dim, n_basis)
+    def eval_dim(self, y: torch.Tensor, **context : torch.Tensor):
+        alpha, beta = self.alphas_betas(**context)  # (param_batch, dim, n_basis)
+        self._check_eval_batch(y, param_leading=alpha.shape[0])
         y_c = y.clamp(self.eps, 1.0 - self.eps)[:, :, None]  # (batch, dim, 1)
         log_dim = (
             (alpha - 1.0) * torch.log(y_c)
@@ -555,9 +571,9 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         )
         return torch.exp(log_dim)  # (batch, dim, n_basis)
 
-    def supremum_bound(self) -> torch.Tensor:
+    def supremum_bound(self, **context : torch.Tensor) -> torch.Tensor:
         """Product of per-coordinate Beta PDF suprema, shape ``(batch, n_basis)``."""
-        alpha, beta = self.alphas_betas()
+        alpha, beta = self.alphas_betas(**context)
         a1 = (alpha - 1.0).clamp(min=0.0)
         b1 = (beta - 1.0).clamp(min=0.0)
         s = a1 + b1
@@ -570,20 +586,20 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         log_sup = _xlogx(a1) + _xlogx(b1) - _xlogx(s) - BetaGram.log_beta(alpha, beta)
         finite = (alpha >= 1.0) & (beta >= 1.0)
         log_sup = torch.where(finite, log_sup, torch.full_like(log_sup, math.inf))
-        return log_sup.sum(dim=1).exp() * self.coeffs()
+        return log_sup.sum(dim=1).exp() * self.coeffs(**context)
 
-    def Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
-        alpha, beta = self.alphas_betas()
+    def Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
+        alpha, beta = self.alphas_betas(**context)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, alpha)
         log_val = BetaGram.log_gram((alpha,), (beta,), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
 
-    def Omega2_dim(self, other: "BetaBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
+    def Omega2_dim(self, other: "BetaBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
-        a1, b1 = self.alphas_betas()
-        a2, b2 = other.alphas_betas()
+        a1, b1 = self.alphas_betas(**context)
+        a2, b2 = other.alphas_betas(**context)
+        a1, b1, a2, b2 = self._align_param_tensors(a1, b1, a2, b2)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, a1)
         log_val = BetaGram.log_gram((a1, a2), (b1, b2), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
@@ -595,24 +611,25 @@ class BetaBasis(SeparableBasis, NonnegativeBasis):
         lows: torch.Tensor = None,
         highs: torch.Tensor = None,
         return_log: bool = False,
+        **context : torch.Tensor,
     ):
         assert isinstance(other1, BetaBasis), "other1 must be BetaBasis"
         assert isinstance(other2, BetaBasis), "other2 must be BetaBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other1.batch_size() == other2.batch_size(), "Basis functions must have the same batch size"
-        a1, b1 = self.alphas_betas()
-        a2, b2 = other1.alphas_betas()
-        a3, b3 = other2.alphas_betas()
+        a1, b1 = self.alphas_betas(**context)
+        a2, b2 = other1.alphas_betas(**context)
+        a3, b3 = other2.alphas_betas(**context)
+        a1, b1, a2, b2, a3, b3 = self._align_param_tensors(a1, b1, a2, b2, a3, b3)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, a1)
         log_val = BetaGram.log_gram((a1, a2, a3), (b1, b2, b3), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
 
-    def Omega22_dim(self, other: "BetaBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
+    def Omega22_dim(self, other: "BetaBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
         assert isinstance(other, BetaBasis), "other must be BetaBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
-        a1, b1 = self.alphas_betas()
-        a2, b2 = other.alphas_betas()
+        a1, b1 = self.alphas_betas(**context)
+        a2, b2 = other.alphas_betas(**context)
+        a1, b1, a2, b2 = self._align_param_tensors(a1, b1, a2, b2)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, a1)
         log_val = BetaGram.log_gram((a1, a1, a2, a2), (b1, b1, b2, b2), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
@@ -640,36 +657,36 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
     ):
         super().__init__(params=(mean_params, std_params), coeffs=coeffs)
 
-    def means_stds(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._params[0](), self._params[1]()
+    def means_stds(self, **context : torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._params[0](**context), self._params[1](**context)
 
-    def forward(self, y: torch.Tensor, ignore_coeffs: bool = False):
-        out = self.eval_dim(y).prod(dim=1)  # (batch, n_basis)
+    def forward(self, y: torch.Tensor, ignore_coeffs: bool = False, **context : torch.Tensor):
+        out = self.eval_dim(y, **context).prod(dim=1)  # (batch, n_basis)
         if not ignore_coeffs:
-            out = out * self.coeffs()
+            out = out * self.coeffs(**context)
         return out
 
-    def eval_dim(self, y: torch.Tensor):
-        self._check_eval_batch(y)
-        mu, std = self.means_stds()  # (batch_size, dim, n_basis)
+    def eval_dim(self, y: torch.Tensor, **context : torch.Tensor):
+        mu, std = self.means_stds(**context)  # (param_batch, dim, n_basis)
+        self._check_eval_batch(y, param_leading=mu.shape[0])
         y_e = y[:, :, None]  # (batch, dim, 1)
         std = std.clamp_min(torch.finfo(y.dtype).eps)
         log_two_pi = y.new_tensor(2.0 * math.pi).log()
         log_dim = -0.5 * (log_two_pi + 2.0 * torch.log(std) + ((y_e - mu) / std).square())
         return torch.exp(log_dim)  # (batch, dim, n_basis)
 
-    def Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
-        mu, std = self.means_stds()
+    def Omega1_dim(self, lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
+        mu, std = self.means_stds(**context)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu)
         log_val = GaussianGram.log_gram((mu,), (std,), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
 
-    def Omega2_dim(self, other: "GaussianKernelBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
+    def Omega2_dim(self, other: "GaussianKernelBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
         assert isinstance(other, GaussianKernelBasis), "other must be GaussianKernelBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
-        mu1, std1 = self.means_stds()
-        mu2, std2 = other.means_stds()
+        mu1, std1 = self.means_stds(**context)
+        mu2, std2 = other.means_stds(**context)
+        mu1, std1, mu2, std2 = self._align_param_tensors(mu1, std1, mu2, std2)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu1)
         log_val = GaussianGram.log_gram((mu1, mu2), (std1, std2), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
@@ -681,24 +698,25 @@ class GaussianKernelBasis(SeparableBasis, NonnegativeBasis):
         lows: torch.Tensor = None,
         highs: torch.Tensor = None,
         return_log: bool = False,
+        **context : torch.Tensor,
     ):
         assert isinstance(other1, GaussianKernelBasis), "other1 must be GaussianKernelBasis"
         assert isinstance(other2, GaussianKernelBasis), "other2 must be GaussianKernelBasis"
         assert self.dim() == other1.dim() == other2.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other1.batch_size() == other2.batch_size(), "Basis functions must have the same batch size"
-        mu1, std1 = self.means_stds()
-        mu2, std2 = other1.means_stds()
-        mu3, std3 = other2.means_stds()
+        mu1, std1 = self.means_stds(**context)
+        mu2, std2 = other1.means_stds(**context)
+        mu3, std3 = other2.means_stds(**context)
+        mu1, std1, mu2, std2, mu3, std3 = self._align_param_tensors(mu1, std1, mu2, std2, mu3, std3)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu1)
         log_val = GaussianGram.log_gram((mu1, mu2, mu3), (std1, std2, std3), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
 
-    def Omega22_dim(self, other: "GaussianKernelBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False):
+    def Omega22_dim(self, other: "GaussianKernelBasis", lows: torch.Tensor = None, highs: torch.Tensor = None, return_log: bool = False, **context : torch.Tensor):
         assert isinstance(other, GaussianKernelBasis), "other must be GaussianKernelBasis"
         assert self.dim() == other.dim(), "Basis functions must have the same dimension"
-        assert self.batch_size() == other.batch_size(), "Basis functions must have the same batch size"
-        mu1, std1 = self.means_stds()
-        mu2, std2 = other.means_stds()
+        mu1, std1 = self.means_stds(**context)
+        mu2, std2 = other.means_stds(**context)
+        mu1, std1, mu2, std2 = self._align_param_tensors(mu1, std1, mu2, std2)
         lows_b, highs_b = self._gram_domain_bounds(lows, highs, mu1)
         log_val = GaussianGram.log_gram((mu1, mu1, mu2, mu2), (std1, std1, std2, std2), lows=lows_b, highs=highs_b)
         return log_val if return_log else torch.exp(log_val)
@@ -1028,9 +1046,13 @@ class UnitBoxPolynomialBasis(SeparableBasis):
         g = torch.einsum('kdi,kd->di', self._eval_local(x), w)
         return g.unsqueeze(0).expand(self.batch_size(), -1, -1)
 
-    def eval_dim(self, y: torch.Tensor):
+    def eval_dim(self, y: torch.Tensor, **context : torch.Tensor):
         self._check_eval_batch(y)
         return self._eval_local(y)
+
+    def forward(self, y: torch.Tensor, **context : torch.Tensor):
+        out = self.eval_dim(y, **context).prod(dim=1)
+        return out * self.coeffs(**context)
 
     @staticmethod
     def _maybe_log(values, return_log: bool):
@@ -1049,13 +1071,13 @@ class UnitBoxPolynomialBasis(SeparableBasis):
         if type(self) is not type(other) or self.dim() != other.dim() or self.batch_size() != other.batch_size():
             raise ValueError("Gram requires the same basis type, dimension, and batch size")
 
-    def Omega1_dim(self, lows=None, highs=None, return_log: bool = False):
+    def Omega1_dim(self, lows=None, highs=None, return_log: bool = False, **context):
         return self._maybe_log(self._integrals_dim(lows, highs), return_log)
 
-    def Omega2_dim(self, other, lows=None, highs=None, return_log: bool = False):
+    def Omega2_dim(self, other, lows=None, highs=None, return_log: bool = False, **context):
         return self._maybe_log(self.gram_dim(other, lows, highs), return_log)
 
-    def Omega3_dim(self, other1, other2, lows=None, highs=None, return_log: bool = False):
+    def Omega3_dim(self, other1, other2, lows=None, highs=None, return_log: bool = False, **context):
         self._check_polynomial_other(other1)
         self._check_polynomial_other(other2)
         degree = (
@@ -1071,7 +1093,7 @@ class UnitBoxPolynomialBasis(SeparableBasis):
         g = g.unsqueeze(0).expand(self.batch_size(), -1, -1, -1, -1)
         return self._maybe_log(g, return_log)
 
-    def Omega22_dim(self, other, lows=None, highs=None, return_log: bool = False):
+    def Omega22_dim(self, other, lows=None, highs=None, return_log: bool = False, **context):
         self._check_polynomial_other(other)
         degree = 2 * (self.n_basis_functions() - 1) + 2 * (other.n_basis_functions() - 1)
         x, w = self._quadrature(degree, lows, highs)
@@ -1141,10 +1163,10 @@ class BernsteinBasis(UnitBoxPolynomialBasis, NonnegativeBasis):
         return torch.full((1, 1, self.n_basis_functions()), 1 / self.n_basis_functions(),
                           dtype=dtype, device=device)
 
-    def Omega2_dim(self, other, lows=None, highs=None, return_log: bool = False):
+    def Omega2_dim(self, other, lows=None, highs=None, return_log: bool = False, **context):
         if lows is None and highs is None:
             # Analytic log-gram avoids an exp/log round-trip on the full box.
             self._check_polynomial_other(other)
             log_g = self._full_log_gram(other)[None, None].expand(self.batch_size(), self.dim(), -1, -1)
             return log_g if return_log else torch.exp(log_g)
-        return super().Omega2_dim(other, lows, highs, return_log=return_log)
+        return super().Omega2_dim(other, lows, highs, return_log=return_log, **context)

@@ -73,6 +73,7 @@ class TTVectorParameters(Parameters):
         if not self._cores:
             raise ValueError('at least one TT vector core is required')
         self()  # Validate complete core layout.
+        super().__init__(shape=(self.n,))
 
     @classmethod
     def from_cores(cls, cores: Sequence[Parameters]):
@@ -97,18 +98,18 @@ class TTVectorParameters(Parameters):
 
     @property
     def modes(self):
-        return tuple(int(p.size()[-2]) for p in self._cores)
+        return tuple(int(p.shape()[-2]) for p in self._cores)
 
     @property
     def ranks(self):
-        return (1,) + tuple(int(p.size()[-1]) for p in self._cores)
+        return (1,) + tuple(int(p.shape()[-1]) for p in self._cores)
 
     @property
     def n(self):
         return math.prod(self.modes)
 
-    def __call__(self) -> TTVector:
-        return TTVector.from_cores([p() for p in self._cores])
+    def __call__(self, **context) -> TTVector:
+        return TTVector.from_cores([p(**context) for p in self._cores])
 
     def is_trainable(self):
         return any(p.is_trainable() for p in self._cores)
@@ -139,6 +140,7 @@ class MPOParameters(Parameters):
             raise ValueError('at least one MPO core is required')
         self.row_stochastic = bool(row_stochastic)
         self()  # Validate complete core layout.
+        super().__init__(shape=(math.prod(self.row_modes), math.prod(self.col_modes)))
 
     @classmethod
     def from_cores(cls, cores: Sequence[Parameters], *, row_stochastic: bool = False):
@@ -168,18 +170,18 @@ class MPOParameters(Parameters):
 
     @property
     def row_modes(self):
-        return tuple(int(p.size()[-3]) for p in self._cores)
+        return tuple(int(p.shape()[-3]) for p in self._cores)
 
     @property
     def col_modes(self):
-        return tuple(int(p.size()[-2]) for p in self._cores)
+        return tuple(int(p.shape()[-2]) for p in self._cores)
 
     @property
     def ranks(self):
-        return (1,) + tuple(int(p.size()[-1]) for p in self._cores)
+        return (1,) + tuple(int(p.shape()[-1]) for p in self._cores)
 
-    def __call__(self) -> MPO:
-        cores = [p() for p in self._cores]
+    def __call__(self, **context) -> MPO:
+        cores = [p(**context) for p in self._cores]
         if self.row_stochastic:
             # For every (incoming bond, input coordinate), normalize jointly
             # over (output coordinate, outgoing bond). Normalizing ONLY over
@@ -233,6 +235,7 @@ class LowRankFactorizationMPOParameters(Parameters):
         # Validate only shape/meta: avoid keeping parameter-dependent graphs.
         u, v = U(), V()
         LowRankFactorizationMPO(u, v)
+        super().__init__(shape=(math.prod(self.row_modes), math.prod(self.col_modes)))
 
     @classmethod
     def from_factors(cls, U: Parameters, V: Parameters, *, row_stochastic=True):
@@ -293,8 +296,8 @@ class LowRankFactorizationMPOParameters(Parameters):
         result[-1] = result[-1] / column_sums[None, None, :, None]
         return MPO(result)
 
-    def __call__(self) -> LowRankFactorizationMPO:
-        U, V = self.U(), self.V()
+    def __call__(self, **context) -> LowRankFactorizationMPO:
+        U, V = self.U(**context), self.V(**context)
         if self.row_stochastic:
             U, V = self._normalized_u(U), self._normalized_v(V)
         return LowRankFactorizationMPO(U, V)
@@ -431,13 +434,13 @@ class KroneckerPlusLowRankFactorizationMPOParameters(LowRankFactorizationMPOPara
         # Row stochasticity factorizes over local row indices.
         return MPO([core.softmax(dim=2) for core in kronecker.cores])
 
-    def __call__(self) -> KroneckerPlusLowRankFactorizationMPO:
-        K, U, V = self.kronecker(), self.U(), self.V()
+    def __call__(self, **context) -> KroneckerPlusLowRankFactorizationMPO:
+        K, U, V = self.kronecker(**context), self.U(**context), self.V(**context)
         if self.row_stochastic:
             K = self._normalized_kronecker(K)
             U, V = self._normalized_u(U), self._normalized_v(V)
             if isinstance(self.mixture_weight, Parameters):
-                weight = torch.sigmoid(self.mixture_weight().reshape(()))
+                weight = torch.sigmoid(self.mixture_weight(**context).reshape(()))
             else:
                 weight = torch.as_tensor(self.mixture_weight, dtype=U.dtype, device=U.device)
             K = K.scale(1 - weight)
@@ -480,9 +483,11 @@ class ConstantModeRank1MPOParameters(Parameters):
         for p in self._lower_rows:
             if not isinstance(p, Parameters):
                 raise TypeError('each local block must be a Parameters object')
-            shape = tuple(p().shape)
+            shape = tuple(p.shape())
             if len(shape) != 2 or shape[1] != shape[0] + 1:
                 raise ValueError(f'expected local free rows of shape (n-1, n), got {shape}')
+        n = math.prod(self.row_modes)
+        super().__init__(shape=(n, n))
 
     @classmethod
     def from_cores(cls, lower_rows: Sequence[Parameters]):
@@ -517,7 +522,7 @@ class ConstantModeRank1MPOParameters(Parameters):
 
     @property
     def row_modes(self):
-        return tuple(int(p.size()[1]) for p in self._lower_rows)
+        return tuple(int(p.shape()[1]) for p in self._lower_rows)
 
     @property
     def col_modes(self):
@@ -527,10 +532,10 @@ class ConstantModeRank1MPOParameters(Parameters):
     def ranks(self):
         return (1,) * (len(self._lower_rows) + 1)
 
-    def __call__(self) -> MPO:
+    def __call__(self, **context) -> MPO:
         cores = []
         for p in self._lower_rows:
-            lower = p()
+            lower = p(**context)
             n = lower.shape[1]
             top = torch.cat((lower.new_ones(1, 1), lower.new_zeros(1, n - 1)), dim=1)
             cores.append(torch.cat((top, lower), dim=0)[None, :, :, None])
@@ -577,6 +582,8 @@ class NilpotentMPOParameters(Parameters):
         other = self.modes[:self.control_site] + self.modes[self.control_site+1:]
         if block is not None and (block().row_modes != other or block().col_modes != other):
             raise ValueError(f'block must have square MPO modes {other}')
+        n = math.prod(self.modes)
+        super().__init__(shape=(n, n))
 
     @classmethod
     def from_core_spec(cls, modes: Sequence[int], ranks: int | Sequence[int] = 1, *,
@@ -594,11 +601,11 @@ class NilpotentMPOParameters(Parameters):
         return cls(modes, B, control_site=control_site, input_mode=input_mode,
                    output_mode=output_mode, strength=strength, dtype=dtype, device=device)
 
-    def __call__(self) -> NilpotentMPO:
-        return NilpotentMPO(self.modes, None if self.block is None else self.block(),
+    def __call__(self, **context) -> NilpotentMPO:
+        return NilpotentMPO(self.modes, None if self.block is None else self.block(**context),
                              control_site=self.control_site, input_mode=self.input_mode,
                              output_mode=self.output_mode,
-                             strength=self.strength() if isinstance(self.strength, Parameters)
+                             strength=self.strength(**context) if isinstance(self.strength, Parameters)
                              else self.strength, dtype=self.dtype, device=self.device)
 
     def is_trainable(self):
@@ -647,8 +654,10 @@ class GateLayerMPOParameters(Parameters):
                 raise ValueError('gate sites must be contiguous, disjoint and in range')
             used.update(sites)
             m = math.prod(self.modes[i] for i in sites)
-            if not isinstance(p, Parameters) or tuple(p().shape) != (m, m):
+            if not isinstance(p, Parameters) or tuple(p.shape()) != (m, m):
                 raise ValueError(f'gate parameter on {sites} must have shape ({m}, {m})')
+        n = math.prod(self.modes)
+        super().__init__(shape=(n, n))
 
     @classmethod
     def from_gate_spec(cls, modes: Sequence[int], groups: Sequence[Sequence[int]], *,
@@ -673,8 +682,8 @@ class GateLayerMPOParameters(Parameters):
     def _gate_matrix(self, raw: torch.Tensor) -> torch.Tensor:
         return torch.matrix_exp(raw) if self.parameterization == 'expm' else raw
 
-    def __call__(self) -> GateLayerMPO:
-        gates = [(sites, self._gate_matrix(p())) for sites, p in self.gates]
+    def __call__(self, **context) -> GateLayerMPO:
+        gates = [(sites, self._gate_matrix(p(**context))) for sites, p in self.gates]
         return GateLayerMPO(self.modes, gates, dtype=self.dtype, device=self.device)
 
     def is_trainable(self):
@@ -709,9 +718,10 @@ class InvertibleMPOProductParameters(Parameters):
         self.layers = tuple(layers)
         if not self.layers or not all(isinstance(p, Parameters) for p in self.layers):
             raise ValueError('layers must be a nonempty sequence of Parameters')
+        super().__init__(shape=self.layers[0].shape())
 
-    def __call__(self) -> InvertibleMPOProduct:
-        return compose_invertible_mpo_parameters(*self.layers)
+    def __call__(self, **context) -> InvertibleMPOProduct:
+        return compose_invertible_mpo_parameters(*self.layers, **context)
 
     def is_trainable(self):
         return any(p.is_trainable() for p in self.layers)
@@ -752,6 +762,7 @@ class SimilarityMPOParameters(Parameters):
             raise TypeError('center must construct an MPO')
         if V.row_modes != V.col_modes or S.row_modes != S.col_modes or V.row_modes != S.row_modes:
             raise ValueError('transform and center must have identical square local modes')
+        super().__init__(shape=center.shape())
 
     @property
     def row_modes(self):
@@ -761,9 +772,9 @@ class SimilarityMPOParameters(Parameters):
     def col_modes(self):
         return self.center().col_modes
 
-    def __call__(self) -> MPO:
-        V = self.transform()
-        S = self.center()
+    def __call__(self, **context) -> MPO:
+        V = self.transform(**context)
+        S = self.center(**context)
         return V @ S @ V.inverse()
 
     def is_trainable(self):
@@ -776,7 +787,7 @@ class SimilarityMPOParameters(Parameters):
         return False
 
 
-def compose_invertible_mpo_parameters(*layers: Parameters) -> InvertibleMPOProduct:
+def compose_invertible_mpo_parameters(*layers: Parameters, **context) -> InvertibleMPOProduct:
     """Materialize ``L_last @ ... @ L_first`` with a structured exact inverse.
 
     Accepts either positional layer providers or one sequence of providers.
@@ -784,7 +795,7 @@ def compose_invertible_mpo_parameters(*layers: Parameters) -> InvertibleMPOProdu
     """
     if len(layers) == 1 and isinstance(layers[0], (list, tuple)):
         layers = tuple(layers[0])
-    factors = [layer() for layer in layers]
+    factors = [layer(**context) for layer in layers]
     if not factors or any(not isinstance(f, InvertibleMPO) for f in factors):
         raise TypeError('layers must produce a nonempty sequence of InvertibleMPO objects')
     return InvertibleMPOProduct(factors)

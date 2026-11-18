@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -15,23 +16,25 @@ from rational_factor.models.structured_matrices import (
 class MLP(torch.nn.Module):
     def __init__(
         self,
-        in_features: int,
-        out_features: int,
+        in_features: int | Sequence[int],
+        out_features: int | Sequence[int],
         hidden_features: int = 128,
         num_hidden_layers: int = 2,
         activation=torch.nn.Tanh,
         zero_init_last: bool = True,
     ):
         super().__init__()
+        self.in_shape = (in_features,) if isinstance(in_features, int) else tuple(in_features)
+        self.out_shape = (out_features,) if isinstance(out_features, int) else tuple(out_features)
 
         layers = []
-        last = in_features
+        last = math.prod(self.in_shape)
         for _ in range(num_hidden_layers):
             layers.append(torch.nn.Linear(last, hidden_features))
             layers.append(activation())
             last = hidden_features
 
-        layers.append(torch.nn.Linear(last, out_features))
+        layers.append(torch.nn.Linear(last, math.prod(self.out_shape)))
         self.net = torch.nn.Sequential(*layers)
 
         if zero_init_last:
@@ -40,13 +43,15 @@ class MLP(torch.nn.Module):
             torch.nn.init.zeros_(final.bias)
 
     def in_features(self):
-        return self.net[0].in_features
+        return self.in_shape[0] if len(self.in_shape) == 1 else self.in_shape
 
     def out_features(self):
-        return self.net[-1].out_features
+        return self.out_shape[0] if len(self.out_shape) == 1 else self.out_shape
 
     def forward(self, x):
-        return self.net(x)
+        n = len(self.in_shape)
+        batch = x.shape[:-n]
+        return self.net(x.reshape(*batch, -1)).reshape(*batch, *self.out_shape)
 
 
 class MaskedInputMLP(MLP):

@@ -32,7 +32,7 @@ class TTBasis(Basis):
     def set_coeffs_to_one(self) -> None:
         """Use implicit all-ones tensor until coefficients are actually supplied."""
         dtype, device = self.dtype_device()
-        self.coeffs = OneVectorParameters(self._n_basis, (1,), dtype, device)
+        self.coeffs = OneVectorParameters(self._n_basis, dtype=dtype, device=device)
         self._tt_has_coeffs = False
 
     def set_coeffs(self, coeffs) -> None:
@@ -74,11 +74,13 @@ class TTBasis(Basis):
             return TTVector([v[:, None, :, None] for v in values.unbind(dim=1)])
         return TTVector([v[None, :, None] for v in values[0].unbind(dim=0)])
 
-    def forward(self, y: torch.Tensor) -> TTVector:
+    def forward(self, y: torch.Tensor, **context: torch.Tensor) -> TTVector:
         """Return a rank-one TT of shape (batch, n_basis) (unbatched when batch=1)."""
-        values = self._primitives.eval_dim(y)  # (batch, dim, n_local)
+        values = self._primitives.eval_dim(y, **context)  # (batch, dim, n_local)
         out = self._tt_factors(values, batched=values.shape[0] != 1)
-        return out * self._coeff_tt() if self._tt_has_coeffs else out
+        if not self._tt_has_coeffs:
+            return out
+        return out * self.coeffs(**context)
 
     __call__ = forward
 

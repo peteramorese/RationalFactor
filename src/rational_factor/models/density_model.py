@@ -4,7 +4,6 @@ class DensityModel(torch.nn.Module):
     def __init__(self, features: int, batch_shape: tuple[int, ...] | int = 1):
         super().__init__()
         self.features = features
-        self.batch_shape = batch_shape
         self.min_log_density = -30
         if isinstance(batch_shape, int):
             batch_shape = (batch_shape,)
@@ -23,6 +22,12 @@ class DensityModel(torch.nn.Module):
     
     def forward(self, x : torch.Tensor, **contexts : torch.Tensor):
         assert x.shape[1] == self.features, "x must have shape (n_data, features)"
+        if contexts:
+            n = x.shape[0]
+            for name, ctx in contexts.items():
+                assert ctx.shape[0] == n, (
+                    f"context '{name}' leading dim must match n_data={n}, got {ctx.shape[0]}"
+                )
         return torch.exp(self.log_density(x, **contexts))
 
     def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
@@ -44,12 +49,22 @@ class DensityModel(torch.nn.Module):
         raise NotImplementedError("supremum_bound not implemented")
 
 class ConditionalDensityModel(torch.nn.Module):
-    def __init__(self, features : int, context_features : int, batch_shape: tuple[int, ...] = (1,)):
+    def __init__(self, features : int, context_features : int, batch_shape: tuple[int, ...] | int = (1,)):
         super().__init__()
         self.features = features
         self.context_features = context_features
         self.min_log_density = -30
+        if isinstance(batch_shape, int):
+            batch_shape = (batch_shape,)
+        else:
+            batch_shape = tuple(batch_shape)
+        if any(s < 1 for s in batch_shape):
+            raise ValueError(f"batch_shape entries must be positive, got {batch_shape}")
         self.batch_shape = batch_shape
+
+    def _expand_data(self, x : torch.Tensor) -> torch.Tensor:
+        """``(n, d)`` → ``(n, *ones(batch_ndim), d)`` for broadcasting against batched params."""
+        return x.reshape(x.shape[0], *([1] * len(self.batch_shape)), x.shape[-1])
 
     def _clip_log_density(self, log_density : torch.Tensor):
         return torch.nan_to_num(log_density, nan=self.min_log_density, neginf=self.min_log_density)
@@ -61,6 +76,12 @@ class ConditionalDensityModel(torch.nn.Module):
         assert x.shape[1] == self.features, "x must have shape (n_data, features)"
         assert conditioner.shape[1] == self.context_features, "conditioner must have shape (n_data, context_features)"
         assert x.shape[0] == conditioner.shape[0], "x and conditioner must have the same number of data points"
+        if contexts:
+            n = x.shape[0]
+            for name, ctx in contexts.items():
+                assert ctx.shape[0] == n, (
+                    f"context '{name}' leading dim must match n_data={n}, got {ctx.shape[0]}"
+                )
         
         return torch.exp(self.log_density(x, conditioner=conditioner, **contexts))
 
@@ -94,5 +115,15 @@ class MarkovTransitionModel(ConditionalDensityModel):
         super().__init__(features, features, batch_shape)
 
     def propagate(self, belief: DensityModel) -> DensityModel:
+        """Return the next-step belief; iterate by calling this again."""
+        raise NotImplementedError("propagate not implemented")
+
+
+class MarkovDecisionProcess(MarkovTransitionModel):
+    def __init__(self, features: int, action_features: int, batch_shape: tuple[int, ...] = (1,)):
+        super().__init__(features, batch_shape)
+        self.action_features = action_features
+
+    def propagate(self, belief: DensityModel, action: torch.Tensor) -> DensityModel:
         """Return the next-step belief; iterate by calling this again."""
         raise NotImplementedError("propagate not implemented")

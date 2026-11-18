@@ -157,28 +157,23 @@ class LinearRFF(MarkovTransitionModel):
         g.set_coeffs(self.a)
         return g
 
-    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor):
+    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **context : torch.Tensor):
         # f(x, xp) = phi(x)^T Q psi(xp) with Q = diag(a) @ B @ diag(q)^{-1},
         # q = Omega2^T a.  Applied as elementwise scales around B.matvec.
-        # Denominator flooring for ``psi / q`` is handled by the vector types'
-        # elementwise division (via ``numerical_tolerance`` / ``eps``).
         x = conditioner
         tol = self.numerical_tolerance
 
-        a = as_vector(self.a(), numerical_tolerance=tol)
-        phi_x = as_vector(self.phi(x), numerical_tolerance=tol)
-        phi_xp = as_vector(self.phi(xp), numerical_tolerance=tol)
-        psi_xp = as_vector(self.psi(xp), numerical_tolerance=tol)
+        a = as_vector(self.a(**context), numerical_tolerance=tol)
+        phi_x = as_vector(self.phi(x, **context), numerical_tolerance=tol)
+        phi_xp = as_vector(self.phi(xp, **context), numerical_tolerance=tol)
+        psi_xp = as_vector(self.psi(xp, **context), numerical_tolerance=tol)
 
-        B = self.B()
-        Omega2 = as_matrix(self.phi.Omega2(self.psi))
+        B = self.B(**context)
+        Omega2 = as_matrix(self.phi.Omega2(self.psi, **context))
         q = as_vector(Omega2.rev_matvec(a), numerical_tolerance=tol)
 
         # Q @ psi = a * (B @ (psi / q))
         Q_psi_xp = a * B.matvec(psi_xp / q)
-        # Floor only the combined ratio. Per-term ``+ numerical_tolerance``
-        # floors destroy cancellation when g(x) and f underflow but g(xp) does not
-        # (common in high-d products of peaked Gaussians) and invent huge log-densities.
         g_x = (a * phi_x).sum().clamp_min(0)
         g_xp = (a * phi_xp).sum().clamp_min(0)
         f = as_vector(phi_x * Q_psi_xp).sum().clamp_min(0)
@@ -700,25 +695,32 @@ class OldQuadraticFF(DensityModel):
     def basis_params(self):
         return self.psi0_basis.parameters()
 
-# Dense SOS quadratic rational factor form.  The old models above remain
-# available as OldQuadraticRFF and OldQuadraticFF.
+# New QRFF
 
-def _quadratic_parameter_matrix(provider, size: int, batch_size: int, name: str) -> DenseMatrix:
-    """Read a dense matrix parameter provider; retain its autograd graph."""
+def _quadratic_parameter_matrix(provider, size: int, batch_size: int, name: str, **context) -> DenseMatrix:
+    """Read a dense matrix parameter provider; retain its autograd graph.
+
+    ``batch_size`` is the static ensemble size used at construction. At
+    evaluation, any leading batch ``dense.shape[:-2]`` is accepted as long as
+    the trailing block is ``(size, size)`` (context may prepend a data batch).
+    """
     if not _is_parameters_like(provider):
         raise TypeError(f"{name} must be a Parameters-like matrix provider")
-    value = as_matrix(provider())
+    value = as_matrix(provider(**context))
     if not isinstance(value, DenseMatrix):
         raise TypeError(f"{name} must return a DenseMatrix or a dense torch.Tensor")
     dense = value.to_dense()
-    if dense.shape == (size, size) and batch_size == 1:
-        return DenseMatrix(dense.unsqueeze(0))
-    if dense.shape != (batch_size, size, size):
+    if dense.shape[-2:] != (size, size):
         raise ValueError(
-            f"{name} has shape {tuple(dense.shape)}; expected "
-            f"({batch_size}, {size}, {size})"
-            + (f" or ({size}, {size})" if batch_size == 1 else "")
+            f"{name} trailing shape must be ({size}, {size}), got {tuple(dense.shape)}"
         )
+    if dense.dim() == 2:
+        if batch_size != 1 and not context:
+            raise ValueError(
+                f"{name} has shape {tuple(dense.shape)}; expected "
+                f"({batch_size}, {size}, {size})"
+            )
+        return DenseMatrix(dense.unsqueeze(0))
     return value
 
 
@@ -753,8 +755,8 @@ def _quadratic_spd_from_factor(factor: DenseMatrix, jitter: float) -> DenseMatri
     return result
 
 
-def _quadratic_evaluate(basis, x: torch.Tensor):
-    result = basis(x)
+def _quadratic_evaluate(basis, x: torch.Tensor, **context):
+    result = basis(x, **context)
     if hasattr(result, 'to_dense'):
         result = result.to_dense()
     return result
@@ -762,7 +764,7 @@ def _quadratic_evaluate(basis, x: torch.Tensor):
 
 def _quadratic_form(features: torch.Tensor, coeff: Matrix) -> torch.Tensor:
     matrix = coeff.to_dense()
-    return torch.einsum('bi,bij,bj->b', features, matrix, features)
+    return torch.einsum('...i,...ij,...j->...', features, matrix, features)
 
 
 class QuadraticRFF(MarkovTransitionModel):
@@ -807,50 +809,50 @@ class QuadraticRFF(MarkovTransitionModel):
     def dtype_device(self):
         return self.phi.dtype_device()
 
-    def get_A(self) -> Matrix:
+    def get_A(self, **context) -> Matrix:
         return _quadratic_spd_from_factor(
             _quadratic_parameter_matrix(self.LA, self.phi.n_basis_functions(),
-                                        self.phi.batch_size(), 'LA'), self.pd_jitter)
+                                        self.phi.batch_size(), 'LA', **context), self.pd_jitter)
 
-    def get_Q0(self) -> Matrix:
+    def get_Q0(self, **context) -> Matrix:
         m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
         return _quadratic_spd_from_factor(
-            _quadratic_parameter_matrix(self.LQ0, m*n, self.phi.batch_size(), 'LQ0'),
+            _quadratic_parameter_matrix(self.LQ0, m*n, self.phi.batch_size(), 'LQ0', **context),
             self.pd_jitter)
 
-    def get_C(self, A: Matrix = None) -> Matrix:
+    def get_C(self, A: Matrix = None, **context) -> Matrix:
         """C(A)[a,b] = integral g(y) psi_a(y) psi_b(y) dy."""
-        A = self.get_A() if A is None else as_matrix(A)
-        omega = as_matrix(self.phi.Omega22(self.psi))
+        A = self.get_A(**context) if A is None else as_matrix(A)
+        omega = as_matrix(self.phi.Omega22(self.psi, **context))
         return omega.contract_batch_matrix(A)
 
-    def get_R0(self, Q0: Matrix = None, C: Matrix = None) -> Matrix:
+    def get_R0(self, Q0: Matrix = None, C: Matrix = None, **context) -> Matrix:
         """R0[i,j] = Tr(Q0[i,:,j,:] C)."""
-        Q0 = self.get_Q0() if Q0 is None else as_matrix(Q0)
-        C = self.get_C() if C is None else as_matrix(C)
+        Q0 = self.get_Q0(**context) if Q0 is None else as_matrix(Q0)
+        C = self.get_C(**context) if C is None else as_matrix(C)
         m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
         batch = Q0.to_dense().shape[:-2]
         blocks = Q0.to_dense().reshape(*batch, m, n, m, n).movedim(-3, -2)
         return DenseMatrix((blocks * C.to_dense()[..., None, None, :, :]).sum((-2, -1)))
 
-    def get_T(self, A: Matrix = None, R0: Matrix = None) -> Matrix:
-        A = self.get_A() if A is None else as_matrix(A)
-        R0 = self.get_R0(C=self.get_C(A)) if R0 is None else as_matrix(R0)
+    def get_T(self, A: Matrix = None, R0: Matrix = None, **context) -> Matrix:
+        A = self.get_A(**context) if A is None else as_matrix(A)
+        R0 = self.get_R0(C=self.get_C(A, **context), **context) if R0 is None else as_matrix(R0)
         # The order is essential: T^T R0 T = A.
         return R0.sqrt(inverse=True) @ A.sqrt()
 
-    def get_normalization(self):
-        A = self.get_A()
-        C = self.get_C(A)
-        Q0 = self.get_Q0()
-        R0 = self.get_R0(Q0, C)
-        T = self.get_T(A, R0)
+    def get_normalization(self, **context):
+        A = self.get_A(**context)
+        C = self.get_C(A, **context)
+        Q0 = self.get_Q0(**context)
+        R0 = self.get_R0(Q0, C, **context)
+        T = self.get_T(A, R0, **context)
         return A, C, Q0, R0, T
 
-    def get_Q(self, Q0: Matrix = None, T: Matrix = None) -> Matrix:
+    def get_Q(self, Q0: Matrix = None, T: Matrix = None, **context) -> Matrix:
         """Return the normalized SOS Gram Q, without a dense Kronecker matrix."""
         if Q0 is None or T is None:
-            _, _, q0, _, t = self.get_normalization()
+            _, _, q0, _, t = self.get_normalization(**context)
             Q0 = q0 if Q0 is None else as_matrix(Q0)
             T = t if T is None else as_matrix(T)
         else:
@@ -863,12 +865,12 @@ class QuadraticRFF(MarkovTransitionModel):
         )
         return DenseMatrix(transformed.reshape(*v.shape[:-2], m*n, m*n))
 
-    def log_density(self, xp: torch.Tensor, *, conditioner: torch.Tensor, **contexts):
-        A, _, Q0, _, T = self.get_normalization()
+    def log_density(self, xp: torch.Tensor, *, conditioner: torch.Tensor, **context : torch.Tensor):
+        A, _, Q0, _, T = self.get_normalization(**context)
         Q = self.get_Q(Q0, T)
-        phi_x = _quadratic_evaluate(self.phi, conditioner)
-        phi_y = _quadratic_evaluate(self.phi, xp)
-        psi_y = _quadratic_evaluate(self.psi, xp)
+        phi_x = _quadratic_evaluate(self.phi, conditioner, **context)
+        phi_y = _quadratic_evaluate(self.phi, xp, **context)
+        psi_y = _quadratic_evaluate(self.psi, xp, **context)
         u = torch.einsum('bi,bj->bij', phi_x, psi_y).reshape(phi_x.shape[0], -1)
         g_x = _quadratic_form(phi_x, A).clamp_min(torch.finfo(phi_x.dtype).tiny)
         g_y = _quadratic_form(phi_y, A).clamp_min(torch.finfo(phi_x.dtype).tiny)
