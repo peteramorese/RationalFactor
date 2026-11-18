@@ -110,14 +110,14 @@ if __name__ == "__main__":
 
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    n_basis = 100
+    n_basis = 60
     gaussian_std_epsilon = 1e-5
     action_features = problem.system.control_dim()
     hidden_features = 32
     num_hidden_layers = 2
 
     tran_params = {
-        "epochs": 30,
+        "epochs": 100,
         "basis_iterations": 2,
         "neural_iterations": 3,
         "weights_iterations": 3,
