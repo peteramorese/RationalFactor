@@ -187,38 +187,50 @@ class PositiveParameters(TrainableParameters):
         return self._normalization_dim
 
 
-class IdentityParameters(Parameters):
+class IdentityParameters(Parameters, torch.nn.Module):
+    """Structured identity; empty buffer tracks dtype/device through ``Module.to``."""
+
     def __init__(self, n: int, dtype: torch.dtype = torch.float32, device: torch.device = torch.device("cpu")):
-        super().__init__(shape=(n, n))
+        torch.nn.Module.__init__(self)
+        Parameters.__init__(self, shape=(n, n))
         self._n = n
-        self._dtype = dtype
-        self._device = device
+        # Anchor buffer so model.to(device/dtype) relocates structured identity params.
+        self.register_buffer("_anchor", torch.empty((), dtype=dtype, device=device))
 
     def __call__(self, **context):
-        return Identity(self._n, self.batch_shape(), self._dtype, self._device)
+        return Identity(self._n, self.batch_shape(), self._anchor.dtype, self._anchor.device)
+
+    def dtype_device(self):
+        return self._anchor.dtype, self._anchor.device
 
     def is_trainable(self):
         return False
 
     def is_module(self):
-        return False
+        return True
 
 
-class OneVectorParameters(Parameters):
+class OneVectorParameters(Parameters, torch.nn.Module):
+    """All-ones vector; empty buffer tracks dtype/device through ``Module.to``."""
+
     def __init__(self, n: int, dtype: torch.dtype = torch.float32, device: torch.device = torch.device("cpu")):
-        super().__init__(shape=(n,))
+        torch.nn.Module.__init__(self)
+        Parameters.__init__(self, shape=(n,))
         self._n = n
-        self._dtype = dtype
-        self._device = device
+        # Anchor buffer so model.to(device/dtype) relocates default ones-coeffs.
+        self.register_buffer("_anchor", torch.empty((), dtype=dtype, device=device))
 
     def __call__(self, **context) -> OneVector:
-        return OneVector(self._n, self.batch_shape(), self._dtype, self._device)
+        return OneVector(self._n, self.batch_shape(), self._anchor.dtype, self._anchor.device)
+
+    def dtype_device(self):
+        return self._anchor.dtype, self._anchor.device
 
     def is_trainable(self):
         return False
 
     def is_module(self):
-        return False
+        return True
 
 
 class DenseMatrixParameters(Parameters):

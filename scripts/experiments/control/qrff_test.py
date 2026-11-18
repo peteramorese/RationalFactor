@@ -179,13 +179,13 @@ if __name__ == "__main__":
     # Q0 / LQ0 are (n_basis**2, n_basis**2); keep smaller than the linear test.
     n_basis = 12
     pd_jitter = 1e-6
-    gaussian_std_epsilon = 1e-3
+    gaussian_std_epsilon = 1e-6
     action_features = problem.system.control_dim()
     hidden_features = 64
     num_hidden_layers = 2
 
     tran_params = {
-        "epochs": 25,
+        "epochs": 10,
         "basis_iterations": 2,
         "neural_iterations": 3,
         "weights_iterations": 3,
@@ -200,7 +200,7 @@ if __name__ == "__main__":
         "basis_iterations": 2,
         "lr_basis": 1e-3,
     }
-    batch_size = 128
+    batch_size = 256
     u_bandwidth = 0.25
     n_plot_slices = 20
     n_controllers = 5

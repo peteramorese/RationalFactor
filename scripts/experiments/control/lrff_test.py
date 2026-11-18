@@ -176,7 +176,7 @@ if __name__ == "__main__":
 
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    n_basis = 40
+    n_basis = 400
     gaussian_std_epsilon = 1e-3
     action_features = problem.system.control_dim()
     hidden_features = 64
