@@ -1,5 +1,7 @@
 import torch
 
+from rational_factor.tools.misc import Hyperrectangle
+
 class DensityModel(torch.nn.Module):
     def __init__(self, features: int, batch_shape: tuple[int, ...] | int = 1):
         super().__init__()
@@ -36,8 +38,14 @@ class DensityModel(torch.nn.Module):
     def valid(self):
         return True
     
-    def marginal(self, marginal_dims : tuple[int, ...]):
-        raise NotImplementedError("marginal not implemented")
+    def log_marginal_density(self, x : torch.Tensor, marginal_dims : tuple[int, ...]):
+        raise NotImplementedError("log_marginal_density not implemented")
+    
+    def marginal_density(self, x : torch.Tensor, marginal_dims : tuple[int, ...]):
+        return torch.exp(self.log_marginal_density(x, marginal_dims))
+    
+    def integrate(self, region : Hyperrectangle):
+        raise NotImplementedError("integrate not implemented")
     
     def sample(self, n_samples : int, **contexts : torch.Tensor):
         raise NotImplementedError("sample not implemented")

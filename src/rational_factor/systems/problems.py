@@ -175,7 +175,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
         ),
         prev_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
-            covariance=torch.diag(6.0*torch.ones(4, dtype=torch.float32)),
+            covariance=torch.diag(7.0*torch.ones(4, dtype=torch.float32)),
         ),
         n_timesteps=10,
         n_trajectories_test=5000,

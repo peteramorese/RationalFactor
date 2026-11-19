@@ -20,7 +20,7 @@ import rational_factor.models.loss as loss
 
 
 if __name__ == "__main__":
-    problem_name = "quadcopter"
+    problem_name = "cartpole"
     problem = FULLY_OBSERVABLE_PROBLEMS[problem_name]
 
     ###
