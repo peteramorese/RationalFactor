@@ -311,6 +311,40 @@ FULLY_OBSERVABLE_PROBLEMS = {
 }
 
 OPEN_LOOP_OBSERVABLE_PROBLEMS = {
+    "icy_road_car": ControlledProblem(
+        system=controlled_systems.ControlledIcyRoadCar(
+            dt=0.3,
+            road_width=6.0,
+            road_length=30.0,
+        ),
+        # Small independent Gaussian initial uncertainties, with the car
+        # traveling along +y in the right-hand lane (x approximately 1.5).
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([1.5, 1.0, 0.0, 6.8, 0.0, 0.0]),
+            covariance=torch.diag(
+                torch.tensor([0.12, 0.10, 0.025, 0.25, 0.08, 0.035]) ** 2
+            ),
+        ),
+        # Cover the full road in position; remaining states are sampled over
+        # a practical range for a small ground vehicle.
+        prev_state_sampler=make_uniform_state_sampler(
+            low=torch.tensor([0.0, 0.0, -0.55, 1.0, -1.5, -0.65]),
+            high=torch.tensor([6.0, 30.0, 0.55, 9.5, 1.5, 0.65]),
+        ),
+        control_sampler=make_uniform_state_sampler(
+            low=torch.tensor([-0.30, -3.0]),
+            high=torch.tensor([0.30, 2.0]),
+        ),
+        n_timesteps=32,
+        n_trajectories_test=2000,
+        n_data_tran=30000,
+        n_data_init=3000,
+        seed=42,
+        numerical_tolerance=1e-10,
+        plot_bounds_low=torch.tensor([0.0, 0.0, -3.14, -3.0, -5.0, -4.0]),
+        plot_bounds_high=torch.tensor([6.0, 30.0, 3.14, 13.0, 5.0, 4.0]),
+        plot_marginals_list=[(0, 1), (3, 4), (2, 5)],
+    ),
     "scalar_nonlinear_drift": ControlledProblem(
         system=controlled_systems.ControlledScalarNonlinearDrift(
             sigma=0.1,
