@@ -475,3 +475,244 @@ class BSpline1D(DensityModel):
             eps=self.eps,
         )
 
+
+
+class SmoothBox(DensityModel):
+    """Gaussian-smoothed uniform density on a trainable axis-aligned box.
+
+    A draw is ``U + sigma * epsilon``, where ``U`` is uniform on
+    ``[lower, upper]`` and ``epsilon`` is standard normal. This is a properly
+    normalized density on R^d, with strictly positive tails. As ``sigma``
+    approaches zero it converges to the box-uniform density.
+
+    ``lower``, ``upper``, and ``sigma`` may be scalars, ``(features,)`` tensors,
+    or tensors broadcastable to ``(*batch_shape, features)``. Every box has
+    separately trainable center, side lengths and per-coordinate sigmas.
+    ``bounds()`` and ``sigmas()`` retain the autograd computation graph.
+    """
+
+    def __init__(
+        self,
+        features: int,
+        lower: torch.Tensor | float | None = None,
+        upper: torch.Tensor | float | None = None,
+        sigma: torch.Tensor | float = 0.1,
+        batch_shape: tuple[int, ...] | int = (1,),
+        min_width: float = 1e-5,
+        min_sigma: float = 1e-6,
+    ):
+        super().__init__(features=features, batch_shape=batch_shape)
+        if min_width < 0 or min_sigma < 0:
+            raise ValueError("min_width and min_sigma must be nonnegative")
+        self.min_width = float(min_width)
+        self.min_sigma = float(min_sigma)
+
+        values = (lower, upper, sigma)
+        reference = next((v for v in values if isinstance(v, torch.Tensor)), None)
+        dtype = reference.dtype if reference is not None else torch.get_default_dtype()
+        device = reference.device if reference is not None else torch.device("cpu")
+        shape = self.batch_shape + (features,)
+
+        def broadcast(value, name):
+            t = torch.as_tensor(value, dtype=dtype, device=device)
+            try:
+                return torch.broadcast_to(t, shape).clone()
+            except RuntimeError as exc:
+                raise ValueError(f"{name} must broadcast to shape {shape}") from exc
+
+        lower = broadcast(-1.0 if lower is None else lower, "lower")
+        upper = broadcast(1.0 if upper is None else upper, "upper")
+        sigma = broadcast(sigma, "sigma")
+        width = upper - lower
+        if not torch.isfinite(lower).all() or not torch.isfinite(upper).all():
+            raise ValueError("box bounds must be finite")
+        if not torch.isfinite(sigma).all():
+            raise ValueError("sigma must be finite")
+        if torch.any(width <= self.min_width):
+            raise ValueError("each box width must exceed min_width")
+        if torch.any(sigma <= self.min_sigma):
+            raise ValueError("sigma must exceed min_sigma")
+
+        # Inverse softplus: numerically stable even for large initialization.
+        def inverse_softplus(y):
+            return y + torch.log(-torch.expm1(-y))
+
+        self.center = torch.nn.Parameter((lower + upper) / 2)
+        self.raw_width = torch.nn.Parameter(inverse_softplus(width - self.min_width))
+        self.raw_sigma = torch.nn.Parameter(inverse_softplus(sigma - self.min_sigma))
+
+    def widths(self) -> torch.Tensor:
+        return torch.nn.functional.softplus(self.raw_width) + self.min_width
+
+    def bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        half_width = self.widths() / 2
+        return self.center - half_width, self.center + half_width
+
+    def sigmas(self) -> torch.Tensor:
+        return torch.nn.functional.softplus(self.raw_sigma) + self.min_sigma
+
+    @staticmethod
+    def _log_ndtr_stable(z: torch.Tensor) -> torch.Tensor:
+        """Log Gaussian CDF with stable gradients far into the left tail.
+
+        PyTorch's log_ndtr backward can lose accuracy for very large negative
+        arguments in float32. Use the standard Mills-ratio asymptotic expansion
+        below -10, where the relative error is negligible.
+        """
+        tail = z < -10.0
+        z_regular = torch.where(tail, -10.0, z)
+        z_tail = torch.where(tail, z, -10.0)
+        inv_sq = z_tail.reciprocal().square()
+        correction = 1 - inv_sq + 3 * inv_sq.square() - 15 * inv_sq.pow(3) + 105 * inv_sq.pow(4)
+        log_tail = (
+            -0.5 * z_tail.square()
+            - (-z_tail).log()
+            - 0.5 * math.log(2 * math.pi)
+            + correction.log()
+        )
+        return torch.where(tail, log_tail, torch.special.log_ndtr(z_regular))
+
+    @staticmethod
+    def _log_cdf_difference(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Stable log(Phi(a) - Phi(b)) for a > b, including distant tails.
+
+        For arguments in the positive tail, use Gaussian survival functions
+        to avoid subtracting CDF values that both round to one.
+        """
+        # Switch *arguments* before evaluating the logarithms. Computing both
+        # branches and selecting afterward would create -inf in the inactive
+        # branch for distant tails, which can cause NaN gradients.
+        upper_tail = b > 0
+        hi = torch.where(upper_tail, -b, a)
+        lo = torch.where(upper_tail, -a, b)
+        log_hi = SmoothBox._log_ndtr_stable(hi)
+        log_lo = SmoothBox._log_ndtr_stable(lo)
+        return log_hi + torch.log(-torch.expm1(log_lo - log_hi))
+
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2 or x.shape[1] != self.features:
+            raise ValueError(f"x must have shape (n_data, {self.features})")
+        lower, upper = self.bounds()
+        sigma = self.sigmas()
+        # Data: (n_data, 1, ..., 1, features). Params: (*batch_shape, features).
+        x = x.reshape(x.shape[0], *((1,) * len(self.batch_shape)), self.features)
+        a = (x - lower) / sigma
+        b = (x - upper) / sigma
+        log_p = (self._log_cdf_difference(a, b) - self.widths().log()).sum(dim=-1)
+        # Intentionally do not clip: tail penalties must keep growing when
+        # sigma decreases, so particles outside the box remain detectable.
+        return log_p
+
+    def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
+        lower, upper = self.bounds()
+        shape = (n_samples, *self.batch_shape, self.features)
+        uniform = torch.rand(shape, device=self.center.device, dtype=self.center.dtype)
+        noise = torch.randn(shape, device=self.center.device, dtype=self.center.dtype)
+        return lower + self.widths() * uniform + self.sigmas() * noise
+
+    def supremum_bound(self) -> torch.Tensor:
+        """Exact maximum, attained at the box center."""
+        t = self.widths() / (2 * self.sigmas())
+        log_peak = (self._log_cdf_difference(t, -t) - self.widths().log()).sum(-1)
+        return log_peak.exp()
+
+    def dtype_device(self):
+        return self.center.dtype, self.center.device
+
+
+class SmoothBoxMixture(DensityModel):
+    """Trainable mixture of Gaussian-smoothed rectangular uniform densities.
+
+    ``lower``, ``upper``, and ``sigma`` broadcast to
+    ``(*batch_shape, n_components, features)``. With unspecified bounds, boxes
+    initialize as nonoverlapping slabs of [-1, 1]^d. Component logits broadcast to
+    ``(*batch_shape, n_components)`` and are converted to weights by softmax.
+
+    The geometry is stored in ``components`` (a :class:`SmoothBox`). The
+    convenience methods ``bounds()`` and ``sigmas()`` expose its parameters.
+    """
+
+    def __init__(
+        self,
+        features: int,
+        n_components: int,
+        lower: torch.Tensor | float | None = None,
+        upper: torch.Tensor | float | None = None,
+        sigma: torch.Tensor | float = 0.1,
+        logits: torch.Tensor | None = None,
+        batch_shape: tuple[int, ...] | int = (1,),
+        min_width: float = 1e-5,
+        min_sigma: float = 1e-6,
+    ):
+        super().__init__(features=features, batch_shape=batch_shape)
+        if n_components < 1:
+            raise ValueError("n_components must be positive")
+        self.n_components = n_components
+        if lower is None and upper is None:
+            # Initialize disjoint slabs of [-1, 1]^d rather than identical
+            # overlapping boxes (a symmetric configuration can be hard to
+            # escape using gradient-based overlap penalties).
+            ref = sigma if isinstance(sigma, torch.Tensor) else None
+            opts = ({"dtype": ref.dtype, "device": ref.device} if ref is not None else {})
+            lower = torch.full((n_components, features), -1.0, **opts)
+            upper = torch.full((n_components, features), 1.0, **opts)
+            edges = torch.linspace(-1.0, 1.0, n_components + 1, **opts)
+            lower[:, 0] = edges[:-1]
+            upper[:, 0] = edges[1:]
+        self.components = SmoothBox(
+            features=features,
+            lower=lower,
+            upper=upper,
+            sigma=sigma,
+            batch_shape=self.batch_shape + (n_components,),
+            min_width=min_width,
+            min_sigma=min_sigma,
+        )
+        shape = self.batch_shape + (n_components,)
+        if logits is None:
+            initial_logits = torch.zeros(
+                shape, device=self.components.center.device, dtype=self.components.center.dtype
+            )
+        else:
+            initial_logits = torch.as_tensor(
+                logits, device=self.components.center.device, dtype=self.components.center.dtype
+            )
+            try:
+                initial_logits = torch.broadcast_to(initial_logits, shape).clone()
+            except RuntimeError as exc:
+                raise ValueError(f"logits must broadcast to shape {shape}") from exc
+        self.logits = torch.nn.Parameter(initial_logits)
+
+    def weights(self) -> torch.Tensor:
+        return torch.softmax(self.logits, dim=-1)
+
+    def bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.components.bounds()
+
+    def sigmas(self) -> torch.Tensor:
+        return self.components.sigmas()
+
+    def log_density(self, x: torch.Tensor, **contexts: torch.Tensor) -> torch.Tensor:
+        log_components = self.components.log_density(x, **contexts)
+        return torch.logsumexp(log_components + torch.log_softmax(self.logits, dim=-1), dim=-1)
+
+    def sample(self, n_samples: int, **contexts: torch.Tensor) -> torch.Tensor:
+        # Sample one categorical component per sample and batch entry.
+        idx = torch.distributions.Categorical(logits=self.logits).sample((n_samples,))
+        lower, upper = self.bounds()
+        sigma = self.sigmas()
+        shape = (n_samples, *self.batch_shape, self.n_components, self.features)
+        gather_index = idx[..., None, None].expand(*idx.shape, 1, self.features)
+        lower = lower.expand(shape).gather(-2, gather_index).squeeze(-2)
+        upper = upper.expand(shape).gather(-2, gather_index).squeeze(-2)
+        sigma = sigma.expand(shape).gather(-2, gather_index).squeeze(-2)
+        uniform = torch.rand_like(lower)
+        noise = torch.randn_like(lower)
+        return lower + (upper - lower) * uniform + sigma * noise
+
+    def supremum_bound(self) -> torch.Tensor:
+        """Differentiable upper bound: weighted sum of component maxima."""
+        return (self.weights() * self.components.supremum_bound()).sum(dim=-1)
+
+    def dtype_device(self):
+        return self.logits.dtype, self.logits.device
