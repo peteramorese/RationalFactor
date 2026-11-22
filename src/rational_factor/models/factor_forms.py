@@ -6,6 +6,7 @@ from .density_model import DensityModel, ConditionalDensityModel, MarkovTransiti
 from .parameters import Parameters, FixedParameters
 from .structured_matrices import Matrix, DenseMatrix, as_matrix
 from .structured_vectors import as_vector
+from rational_factor.tools.misc import Hyperrectangle
 
 
 # Linear models #
@@ -91,8 +92,8 @@ class LinearRFF(MarkovTransitionModel):
         psi_xp = as_vector(self.psi(xp, **context), numerical_tolerance=tol)
 
         B = self.B(**context)
-        Omega2 = as_matrix(self.phi.Omega2(self.psi, **context))
-        q = as_vector(Omega2.rev_matvec(a), numerical_tolerance=tol)
+        Omega2 = as_matrix(self.psi.Omega2(self.phi, **context))
+        q = as_vector(Omega2.matvec(a), numerical_tolerance=tol)
 
         # Q @ psi = a * (B @ (psi / q))
         Q_psi_xp = a * B.matvec(psi_xp / q)
@@ -103,7 +104,7 @@ class LinearRFF(MarkovTransitionModel):
         return (torch.log(g_xp * f + eps) - torch.log(g_x + eps)).reshape(-1)
 
 
-    def propagate(self, belief: "LinearFF") -> "LinearFF":
+    def propagate(self, belief: "LinearFF", starting_region: Hyperrectangle = None) -> "LinearFF":
         r"""Propagate a LinearFF for one Markov step using base vector/matrix APIs.
 
         Omega_current[i,j] = integral phi_i(x) belief.psi_j(x) dx
@@ -123,19 +124,25 @@ class LinearRFF(MarkovTransitionModel):
         tol = self.numerical_tolerance
         a = as_vector(self.a(), numerical_tolerance=tol)
         B = as_matrix(self.B())
-        omega_current = as_matrix(self.phi.Omega2(belief.psi))
-        omega_next = as_matrix(self.phi.Omega2(self.psi))
-        q = as_vector(omega_next.rev_matvec(a), numerical_tolerance=tol)
+        
+        # Omega2 between RFF bases used for normalization
+        Omega2_normalization = as_matrix(self.psi.Omega2(self.phi))
 
-        c = as_vector(belief.c(), numerical_tolerance=tol)
-        log_scale = torch.as_tensor(belief.log_norm_constant(), dtype=a.dtype, device=a.device)
-        c = c * torch.exp(log_scale)
-        overlap = as_vector(omega_current.matvec(c), numerical_tolerance=tol)
-        c_next = as_vector(B.rev_matvec(a * overlap), numerical_tolerance=tol) / q
+        # Omega2 between RFF input basis and belief basis for transition
+        Omega2_transition = as_matrix(belief.psi.Omega2(self.phi))
+        q = as_vector(Omega2_normalization.matvec(a), numerical_tolerance=tol)
+
+        c = as_vector(belief.norm_constant() * belief.c(), numerical_tolerance=tol)
+
+        # v = c^T Omega2_transition diag(a)
+        v = a * Omega2_transition.rev_matvec(c)
+
+        # c' = v^T B diag(q)^{-1}
+        cp = B.rev_matvec(v) / q
 
         return LinearFF(
             self.a, self.phi,
-            FixedParameters(c_next.to_dense()),
+            FixedParameters(cp.to_dense()),
             self.psi,
             numerical_tolerance=belief.numerical_tolerance,
             renormalize_h=False, register_modules=False,
@@ -197,16 +204,16 @@ class LinearFF(DensityModel):
                    renormalize_h=renormalize_h,
                    register_modules=register_modules)
 
-    def log_norm_constant(self, Omega2=None):
+    def norm_constant(self, Omega2=None, log=False):
         if not self._renormalize_h:
-            return 0.0
+            return 0.0 if log else 1.0
         if Omega2 is None:
             Omega2 = self.phi.Omega2(self.psi)
         tol = self.numerical_tolerance
         a = as_vector(self.a(), numerical_tolerance=tol)
         c = as_vector(self.c(), numerical_tolerance=tol)
         overlap = as_vector(as_matrix(Omega2).matvec(c), numerical_tolerance=tol)
-        return -torch.log((a * overlap).sum() + tol)
+        return -torch.log((a * overlap).sum() + tol) if log else torch.exp(-torch.log((a * overlap).sum() + tol))
 
     def log_density(self, x: torch.Tensor):
         tol = self.numerical_tolerance
@@ -218,7 +225,7 @@ class LinearFF(DensityModel):
         h_sum = (c * psi_x).sum().clamp_min(0)
         # Avoid a coarse numerical_tolerance floor when taking the logarithm.
         eps = torch.finfo(g_sum.dtype).tiny
-        return self.log_norm_constant() + torch.log(g_sum + eps) + torch.log(h_sum + eps)
+        return self.norm_constant(log=True) + torch.log(g_sum + eps) + torch.log(h_sum + eps)
 
     def integrate(self, region):
         """Integral of the (possibly normalized) belief over a Hyperrectangle."""
@@ -234,7 +241,7 @@ class LinearFF(DensityModel):
         a = as_vector(self.a(), numerical_tolerance=tol)
         c = as_vector(self.c(), numerical_tolerance=tol)
         unnormalized_mass = (a * as_vector(gram.matvec(c), numerical_tolerance=tol)).sum()
-        return unnormalized_mass * torch.exp(torch.as_tensor(self.log_norm_constant(), dtype=dtype, device=device))
+        return unnormalized_mass * torch.exp(torch.as_tensor(self.norm_constant(log=True), dtype=dtype, device=device))
 
     def log_marginal_density(self, x: torch.Tensor, marginal_dims: tuple[int, ...]):
         """Log p(x_remaining), integrating out the coordinates in marginal_dims.

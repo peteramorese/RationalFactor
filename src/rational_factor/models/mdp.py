@@ -15,7 +15,6 @@ from rational_factor.models.factor_forms import (
     LinearRFF,
     QuadraticFF,
     QuadraticRFF,
-    _fixed_vector_parameters,
 )
 from rational_factor.models.basis_functions import Basis, BetaBasis, GaussianBasis, GaussianKernelBasis
 from rational_factor.models.structured_matrices import DenseMatrix, as_matrix

@@ -209,7 +209,7 @@ def smooth_box_sigma_loss(model, power: float = 1.0) -> torch.Tensor:
     """
     if power <= 0:
         raise ValueError("power must be positive")
-    return model.sigmas().pow(power).mean()
+    return model.sigmas().pow(power).max()
 
 
 def smooth_box_overlap_loss(
