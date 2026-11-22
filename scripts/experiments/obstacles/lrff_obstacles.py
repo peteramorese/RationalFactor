@@ -70,12 +70,32 @@ def make_hyperrectangle_obstacles(
     return Hyperrectangle(box_low, box_high)
 
 
+def survival_probability(belief, obstacles: Hyperrectangle) -> float:
+    """Free-space mass: total integral minus mass on ``obstacles``.
+
+    For an unnormalized belief (``renormalize_h=False``), total mass is
+    ``1 / norm_constant()``. Batched obstacle boxes are summed (union under
+    a disjoint-box assumption, matching set-complement propagation).
+    """
+    Z = belief.norm_constant()
+    Z_val = float(Z.detach().cpu()) if torch.is_tensor(Z) else float(Z)
+    total_mass = 1.0 / Z_val
+    obstacle_mass = belief.integrate(obstacles)
+    if torch.is_tensor(obstacle_mass):
+        obstacle_mass = float(obstacle_mass.sum().detach().cpu())
+    else:
+        obstacle_mass = float(obstacle_mass)
+    return total_mass - obstacle_mass
+
+
 def plot_marginal_mc_vs_belief(
     problem,
     beliefs,
     traj_data,
     *,
     obstacles: Hyperrectangle | None = None,
+    survival_belief: list[float] | None = None,
+    survival_mc: list[float] | None = None,
     n_points: int = 50,
     contour_levels: int = 10,
     scatter_kwargs: dict | None = None,
@@ -94,6 +114,10 @@ def plot_marginal_mc_vs_belief(
     n_marginals = len(marginals_list)
     assert len(beliefs) == n_slices, "beliefs must have length n_timesteps + 1"
     assert len(traj_data) == n_slices, "traj_data must have length n_timesteps + 1"
+    if survival_belief is not None:
+        assert len(survival_belief) == n_slices
+    if survival_mc is not None:
+        assert len(survival_mc) == n_slices
 
     scatter_kwargs = {"s": 1, "alpha": 0.5, **(scatter_kwargs or {})}
     fig, axes = plt.subplots(
@@ -181,7 +205,14 @@ def plot_marginal_mc_vs_belief(
                 ax_mc.set_ylabel(f"{pair_label}\nMC (no collision)")
                 ax_b.set_ylabel(f"{pair_label}\nbelief (set complement)")
             if m_idx == 0:
-                ax_mc.set_title(f"t={t} (n={samples.shape[0]})")
+                if survival_belief is not None and survival_mc is not None:
+                    ax_mc.set_title(
+                        f"t={t}\n"
+                        f"P_surv belief={survival_belief[t]:.3f}\n"
+                        f"P_surv MC={survival_mc[t]:.3f}"
+                    )
+                else:
+                    ax_mc.set_title(f"t={t} (n={samples.shape[0]})")
             if m_idx == n_marginals - 1:
                 ax_b.set_xlabel(problem.system.state_label(x_dim))
             ax_mc.set_xticks([])
@@ -375,13 +406,22 @@ if __name__ == "__main__":
         )
     belief_seq = [belief.eval() for belief in belief_seq]
 
-    print("Belief integral (1 / norm_constant) over time:")
-    for t, belief in enumerate(belief_seq):
-        Z = belief.norm_constant()
-        Z_val = float(Z.detach().cpu()) if torch.is_tensor(Z) else float(Z)
-        integral = 1.0 / Z_val
-        n_alive = traj_data[t].shape[0]
-        print(f"  t={t}: integral={integral:.6e}  (MC alive={n_alive})")
+    # 1-to-1 survival: free-space mass of belief_t vs MC remaining / n_test.
+    n_test_particles = problem.n_trajectories_test
+    survival_belief = []
+    survival_mc = []
+    print("Survival probability (belief free-space mass vs MC remaining/total):")
+    with torch.no_grad():
+        for t, belief in enumerate(belief_seq):
+            p_surv_belief = survival_probability(belief, obstacles_dev)
+            p_surv_mc = traj_data[t].shape[0] / n_test_particles
+            survival_belief.append(p_surv_belief)
+            survival_mc.append(p_surv_mc)
+            print(
+                f"  t={t}: belief={p_surv_belief:.6f}  "
+                f"MC={p_surv_mc:.6f}  "
+                f"(alive={traj_data[t].shape[0]}/{n_test_particles})"
+            )
 
     out_dir = Path("figures/obstacles")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -392,6 +432,8 @@ if __name__ == "__main__":
         belief_seq,
         traj_data,
         obstacles=obstacles,
+        survival_belief=survival_belief,
+        survival_mc=survival_mc,
         n_points=50,
         scatter_kwargs={"s": 1, "alpha": 0.5},
     )
@@ -399,7 +441,7 @@ if __name__ == "__main__":
         f"{problem_name} — LRFF set-complement marginals "
         f"(MC without collisions vs belief)\n"
         f"n_obstacles={n_obstacles}, relative_width={obstacle_relative_width}",
-        y=1.02,
+        y=1.04,
     )
     fig.savefig(marg_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
