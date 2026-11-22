@@ -5,8 +5,8 @@ from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel, MarkovTransitionModel
 from .parameters import Parameters, FixedParameters
 from .structured_matrices import Matrix, DenseMatrix, as_matrix
-from .structured_vectors import as_vector
-from rational_factor.tools.misc import Hyperrectangle
+from .structured_vectors import as_vector, Vector
+from rational_factor.tools.set import Hyperrectangle
 
 
 # Linear models #
@@ -103,8 +103,11 @@ class LinearRFF(MarkovTransitionModel):
         eps = torch.finfo(g_x.dtype).tiny
         return (torch.log(g_xp * f + eps) - torch.log(g_x + eps)).reshape(-1)
 
+    def _propagate_c(self, B: Matrix, Omega2_normalization: Matrix, Omega2_transition: Matrix, a: Vector, c: Vector) -> torch.Tensor:
+        q = as_vector(Omega2_normalization.matvec(a), numerical_tolerance=self.numerical_tolerance)
+        return B.rev_matvec(a * Omega2_transition.rev_matvec(c)) / q
 
-    def propagate(self, belief: "LinearFF", starting_region: Hyperrectangle = None) -> "LinearFF":
+    def propagate(self, belief: "LinearFF") -> "LinearFF":
         r"""Propagate a LinearFF for one Markov step using base vector/matrix APIs.
 
         Omega_current[i,j] = integral phi_i(x) belief.psi_j(x) dx
@@ -124,29 +127,53 @@ class LinearRFF(MarkovTransitionModel):
         tol = self.numerical_tolerance
         a = as_vector(self.a(), numerical_tolerance=tol)
         B = as_matrix(self.B())
+        # Apply Z only when the belief renormalizes; otherwise ``c`` already
+        # carries the intended (possibly unnormalized) scale.
+        c = as_vector(belief.c(), numerical_tolerance=tol)
+        if belief._renormalize_h:
+            c = belief.norm_constant() * c
         
         # Omega2 between RFF bases used for normalization
         Omega2_normalization = as_matrix(self.psi.Omega2(self.phi))
 
         # Omega2 between RFF input basis and belief basis for transition
         Omega2_transition = as_matrix(belief.psi.Omega2(self.phi))
-        q = as_vector(Omega2_normalization.matvec(a), numerical_tolerance=tol)
 
-        c = as_vector(belief.norm_constant() * belief.c(), numerical_tolerance=tol)
+        cp = self._propagate_c(B, Omega2_normalization, Omega2_transition, a, c)
 
-        # v = c^T Omega2_transition diag(a)
-        v = a * Omega2_transition.rev_matvec(c)
+        return LinearFF(self.a, self.phi, FixedParameters(cp.to_dense()), self.psi, numerical_tolerance=belief.numerical_tolerance,
+            renormalize_h=False, register_modules=False)
 
-        # c' = v^T B diag(q)^{-1}
-        cp = B.rev_matvec(v) / q
+    def propagate_set_complement(self, belief: "LinearFF", set: Hyperrectangle) -> "LinearFF":
+        if not isinstance(belief, LinearFF):
+            raise TypeError(
+                "LinearRFF.propagate_set_complement expects a LinearFF belief, got "
+                f"{type(belief).__name__}"
+            )
+        
+        tol = self.numerical_tolerance
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        B = as_matrix(self.B())
+        c = as_vector(belief.c(), numerical_tolerance=tol)
+        if belief._renormalize_h:
+            c = belief.norm_constant() * c
+        
+        # Omega2 between RFF bases used for normalization
+        Omega2_normalization = as_matrix(self.psi.Omega2(self.phi))
 
-        return LinearFF(
-            self.a, self.phi,
-            FixedParameters(cp.to_dense()),
-            self.psi,
-            numerical_tolerance=belief.numerical_tolerance,
-            renormalize_h=False, register_modules=False,
-        )
+        # Omega2 between RFF input basis and belief basis for transition
+        Omega2_transition = as_matrix(belief.psi.Omega2(self.phi))
+
+        # Omega2 for each
+        Omega2_set_transition = as_matrix(belief.psi.Omega2(self.phi, domain=set))
+
+        full_prop_cp = self._propagate_c(B, Omega2_normalization, Omega2_transition, a, c)
+        set_prop_cp = self._propagate_c(B, Omega2_normalization, Omega2_set_transition, a, c)
+
+        cp = full_prop_cp.to_dense() - set_prop_cp.to_dense().sum(dim=0)
+
+        return LinearFF(self.a, self.phi, FixedParameters(cp), self.psi, numerical_tolerance=belief.numerical_tolerance,
+            renormalize_h=False, register_modules=False)
 
 
 class LinearFF(DensityModel):
@@ -205,8 +232,6 @@ class LinearFF(DensityModel):
                    register_modules=register_modules)
 
     def norm_constant(self, Omega2=None, log=False):
-        if not self._renormalize_h:
-            return 0.0 if log else 1.0
         if Omega2 is None:
             Omega2 = self.phi.Omega2(self.psi)
         tol = self.numerical_tolerance
@@ -214,6 +239,28 @@ class LinearFF(DensityModel):
         c = as_vector(self.c(), numerical_tolerance=tol)
         overlap = as_vector(as_matrix(Omega2).matvec(c), numerical_tolerance=tol)
         return -torch.log((a * overlap).sum() + tol) if log else torch.exp(-torch.log((a * overlap).sum() + tol))
+
+    def absorb_norm_constant(self) -> "LinearFF":
+        """Return a unit-mass copy with ``Z`` folded into ``c`` and ``renormalize_h=False``.
+
+        Same density as ``self`` when ``_renormalize_h`` was True, but
+        ``norm_constant() ≈ 1`` so the unnormalized integral ``a Ω c`` is 1.
+        """
+        tol = self.numerical_tolerance
+        Z = self.norm_constant()
+        c = as_vector(self.c(), numerical_tolerance=tol)
+        c_scaled = (Z * c).to_dense()
+        if c_scaled.shape != self.c().shape:
+            c_scaled = c_scaled.reshape(self.c().shape)
+        return LinearFF(
+            self.a,
+            self.phi,
+            FixedParameters(c_scaled),
+            self.psi,
+            numerical_tolerance=tol,
+            renormalize_h=False,
+            register_modules=False,
+        )
 
     def log_density(self, x: torch.Tensor):
         tol = self.numerical_tolerance
@@ -225,23 +272,37 @@ class LinearFF(DensityModel):
         h_sum = (c * psi_x).sum().clamp_min(0)
         # Avoid a coarse numerical_tolerance floor when taking the logarithm.
         eps = torch.finfo(g_sum.dtype).tiny
-        return self.norm_constant(log=True) + torch.log(g_sum + eps) + torch.log(h_sum + eps)
+        if self._renormalize_h:
+            return self.norm_constant(log=True) + torch.log(g_sum + eps) + torch.log(h_sum + eps)
+        else:
+            return torch.log(g_sum + eps) + torch.log(h_sum + eps)
 
-    def integrate(self, region):
-        """Integral of the (possibly normalized) belief over a Hyperrectangle."""
+    def integrate(self, region: Hyperrectangle):
+        """Integral of the (possibly normalized) belief over a Hyperrectangle.
+
+        For a batched ``region`` of shape ``(batch, dim)``, returns a tensor of
+        shape ``(batch,)`` with one mass per box.
+        """
         dtype, device = self.dtype_device()
-        lows = torch.as_tensor(region.low, dtype=dtype, device=device).reshape(-1)
-        highs = torch.as_tensor(region.high, dtype=dtype, device=device).reshape(-1)
-        if lows.numel() != self.features or highs.numel() != self.features:
-            raise ValueError(f"region bounds must each have {self.features} entries")
+        lows = torch.as_tensor(region.low, dtype=dtype, device=device)
+        highs = torch.as_tensor(region.high, dtype=dtype, device=device)
+        if lows.shape != highs.shape or lows.shape[-1] != self.features:
+            raise ValueError(
+                f"region bounds must have shape ({self.features},) or "
+                f"(batch, {self.features}), got low={tuple(lows.shape)}"
+            )
         if bool((lows > highs).any()):
             raise ValueError("region.low must not exceed region.high")
         tol = self.numerical_tolerance
-        gram = as_matrix(self.phi.Omega2(self.psi, lows=lows, highs=highs))
+        gram = as_matrix(self.phi.Omega2(self.psi, domain=region))
         a = as_vector(self.a(), numerical_tolerance=tol)
         c = as_vector(self.c(), numerical_tolerance=tol)
         unnormalized_mass = (a * as_vector(gram.matvec(c), numerical_tolerance=tol)).sum()
-        return unnormalized_mass * torch.exp(torch.as_tensor(self.norm_constant(log=True), dtype=dtype, device=device))
+        if self._renormalize_h:
+            Z = torch.as_tensor(self.norm_constant(log=True), dtype=dtype, device=device)
+            return unnormalized_mass * torch.exp(Z)
+        else:
+            return unnormalized_mass
 
     def log_marginal_density(self, x: torch.Tensor, marginal_dims: tuple[int, ...]):
         """Log p(x_remaining), integrating out the coordinates in marginal_dims.
@@ -283,7 +344,10 @@ class LinearFF(DensityModel):
                                 gram * a[..., :, None] * c[..., None, :],
                                 phi_remaining, psi_remaining)
         eps = torch.finfo(marginal.dtype).tiny
-        return (torch.log(marginal.clamp_min(0) + eps) + self.log_norm_constant()).reshape(-1)
+        log_p = torch.log(marginal.clamp_min(0) + eps)
+        if self._renormalize_h:
+            log_p = log_p + self.norm_constant(log=True)
+        return log_p.reshape(-1)
 
 
 # Quadratic models #
@@ -590,11 +654,13 @@ class QuadraticFF(DensityModel):
                                        self.psi.batch_size(), 'V_fixed')
         else:
             V = self._spd_matrix(self.LV, self.psi.n_basis_functions(), 'LV')
+        # ``normalized`` requests a unit-mass Gram; ``_renormalize_h`` decides
+        # whether that request is honored (same gate as density / integrate).
         if normalized and self._renormalize_h:
+            tol = self.numerical_tolerance
             mass = self._mass(V)
-            if bool((mass <= 0).any()):
-                raise ValueError('belief has zero or negative integral')
-            V = DenseMatrix(V.to_dense() / mass[..., None, None])
+            Z = torch.exp(-torch.log(mass + tol))
+            V = DenseMatrix(V.to_dense() * Z[..., None, None])
         return V
 
     def _mass(self, V: Matrix, omega=None):
@@ -602,13 +668,12 @@ class QuadraticFF(DensityModel):
         C = omega.contract_batch_matrix(self.get_A())
         return C.frobenius_inner(V)
 
-    def log_norm_constant(self, Omega22=None):
-        if not self._renormalize_h:
-            return 0.0
+    def norm_constant(self, Omega22=None, log=False):
+        """Always return Z = 1 / mass(V); ``_renormalize_h`` gates applying it."""
+        tol = self.numerical_tolerance
         mass = self._mass(self.get_V(), omega=Omega22)
-        if bool((mass <= 0).any()):
-            raise ValueError('belief has zero or negative integral')
-        return -torch.log(mass)
+        safe = mass + tol
+        return -torch.log(safe) if log else torch.exp(-torch.log(safe))
 
     def log_density(self, x: torch.Tensor, **contexts):
         phi = self.phi(x)
@@ -618,7 +683,10 @@ class QuadraticFF(DensityModel):
         eps = torch.finfo(phi.dtype).tiny
         g = torch.einsum('...i,...ij,...j->...', phi, self.get_A().to_dense(), phi).clamp_min(eps)
         h = torch.einsum('...i,...ij,...j->...', psi, self.get_V().to_dense(), psi).clamp_min(eps)
-        return (torch.log(g) + torch.log(h) + self.log_norm_constant()).reshape(-1)
+        log_p = torch.log(g) + torch.log(h)
+        if self._renormalize_h:
+            log_p = log_p + self.norm_constant(log=True)
+        return log_p.reshape(-1)
 
     def weight_params(self):
         if self.LV is None:
@@ -628,17 +696,29 @@ class QuadraticFF(DensityModel):
     def basis_params(self):
         return self.psi.parameters()
 
-    def integrate(self, region):
-        """Integral over a Hyperrectangle via the restricted fourth-order Gram."""
+    def integrate(self, region: Hyperrectangle):
+        """Integral over a Hyperrectangle via the restricted fourth-order Gram.
+
+        For a batched ``region`` of shape ``(batch, dim)``, returns a tensor of
+        shape ``(batch,)`` with one mass per box. When ``_renormalize_h`` is
+        False the unnormalized mass is returned (mirrors ``LinearFF``).
+        """
         dtype, device = self.dtype_device()
-        lows = torch.as_tensor(region.low, dtype=dtype, device=device).reshape(-1)
-        highs = torch.as_tensor(region.high, dtype=dtype, device=device).reshape(-1)
-        if lows.numel() != self.features or highs.numel() != self.features:
-            raise ValueError(f"region bounds must each have {self.features} entries")
+        lows = torch.as_tensor(region.low, dtype=dtype, device=device)
+        highs = torch.as_tensor(region.high, dtype=dtype, device=device)
+        if lows.shape != highs.shape or lows.shape[-1] != self.features:
+            raise ValueError(
+                f"region bounds must have shape ({self.features},) or "
+                f"(batch, {self.features}), got low={tuple(lows.shape)}"
+            )
         if bool((lows > highs).any()):
             raise ValueError("region.low must not exceed region.high")
-        omega = self.phi.Omega22(self.psi, lows=lows, highs=highs)
-        return self._mass(self.get_V(normalized=True), omega=omega)
+        omega = self.phi.Omega22(self.psi, domain=region)
+        unnormalized_mass = self._mass(self.get_V(), omega=omega)
+        if self._renormalize_h:
+            Z = self.norm_constant()
+            return unnormalized_mass * Z
+        return unnormalized_mass
 
     def log_marginal_density(self, x: torch.Tensor, marginal_dims: tuple[int, ...]):
         """Exact SOS marginal using per-coordinate fourth-order Gram tensors."""

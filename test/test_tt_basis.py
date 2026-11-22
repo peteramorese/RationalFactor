@@ -129,12 +129,12 @@ class FakePrimitives(SeparableBasis):
             vals.append(torch.stack((1.0 + y[:, k], 2.0 - 0.5 * y[:, k]), dim=-1))
         return torch.stack(vals, dim=1)
 
-    def Omega1_dim(self, lows=None, highs=None, return_log=False):
+    def Omega1_dim(self, domain=None, return_log=False):
         vals = torch.tensor([[[1.1, 0.7], [0.9, 1.3]]], dtype=self.dtype)
         vals = vals[:, : self.d, : self.n]
         return vals.log() if return_log else vals
 
-    def Omega2_dim(self, other, lows=None, highs=None, return_log=False):
+    def Omega2_dim(self, other, domain=None, return_log=False):
         gram = self._gram[None]
         return gram.log() if return_log else gram
 

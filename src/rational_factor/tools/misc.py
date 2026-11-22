@@ -1,18 +1,6 @@
 import torch
 
 
-class Hyperrectangle:
-    def __init__(self, low: torch.Tensor, high: torch.Tensor):
-        self.low = low
-        self.high = high
-    
-    def __contains__(self, x: torch.Tensor):
-        return torch.all(x >= self.low) and torch.all(x <= self.high)
-    
-    def __str__(self):
-        return f"Hyperrectangle(low={self.low}, high={self.high})"
-
-
 def make_mvnormal_state_sampler(mean: torch.Tensor, covariance: torch.Tensor):
     mean = torch.as_tensor(mean, dtype=torch.float32)
     covariance = torch.as_tensor(covariance, dtype=torch.float32)

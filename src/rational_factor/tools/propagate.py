@@ -8,7 +8,7 @@ from rational_factor.models.density_model import (
 )
 from rational_factor.models.factor_forms import LinearFF, Linear2FF, LinearRF
 import torch
-
+from rational_factor.tools.set import Hyperrectangle
 
 def propagate(belief: DensityModel, transition_model: MarkovTransitionModel) -> DensityModel:
     """Backward-compatible one-step alias; no type dispatch or time loop."""

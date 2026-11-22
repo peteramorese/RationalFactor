@@ -154,10 +154,13 @@ class NeuralActionLRFF(MarkovDecisionProcess, LinearRFF):
         q = as_vector(omega_next.rev_matvec(a), numerical_tolerance=tol)
 
         c = as_vector(belief.c(), numerical_tolerance=tol)
-        log_scale = torch.as_tensor(
-            belief.log_norm_constant(), dtype=a.dtype, device=a.device
-        )
-        c = c * torch.exp(log_scale)
+        # Apply Z only when the belief renormalizes; otherwise ``c`` already
+        # carries the intended (possibly unnormalized) scale.
+        if belief._renormalize_h:
+            Z = torch.as_tensor(
+                belief.norm_constant(), dtype=a.dtype, device=a.device
+            )
+            c = c * Z
         overlap = as_vector(omega_current.matvec(c), numerical_tolerance=tol)
         c_next = as_vector(B.rev_matvec(a * overlap), numerical_tolerance=tol) / q
 

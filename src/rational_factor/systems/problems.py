@@ -14,8 +14,10 @@ from rational_factor.systems.base import (
     sample_uio_tuples,
     sample_observation_pairs,
     sample_trajectories,
+    sample_trajectories_without_collisions,
 )
 from rational_factor.tools.misc import make_mvnormal_state_sampler, make_uniform_state_sampler
+from rational_factor.tools.set import Hyperrectangle
 
 
 @dataclass
@@ -53,6 +55,23 @@ class FullyObservableProblem:
                 torch.manual_seed(self.seed + 1)
             traj_data = sample_trajectories(self.system, self.initial_state_sampler, n_timesteps=self.n_timesteps, n_trajectories=self.n_trajectories_test)
             return traj_data
+    
+    def test_data_without_collisions(self, set: Hyperrectangle):
+        """Test trajectories with particles removed upon entering ``set``.
+
+        ``set`` may be a single box or a batched ``Hyperrectangle`` of obstacles.
+        Only non-colliding particles are propagated at each step.
+        """
+        with torch.random.fork_rng():
+            if self.seed is not None:
+                torch.manual_seed(self.seed + 1)
+            return sample_trajectories_without_collisions(
+                self.system,
+                self.initial_state_sampler,
+                set,
+                n_timesteps=self.n_timesteps,
+                n_trajectories=self.n_trajectories_test,
+            )
 
 @dataclass
 class ControlledProblem(FullyObservableProblem):
@@ -76,6 +95,20 @@ class ControlledProblem(FullyObservableProblem):
                 controller=controller,
                 n_timesteps=self.n_timesteps,
                 n_trajectories=self.n_trajectories_test,
+            )
+    
+    def test_data_without_collisions(self, controller, set: Hyperrectangle):
+        """Like ``FullyObservableProblem.test_data_without_collisions``, under ``controller``."""
+        with torch.random.fork_rng():
+            if self.seed is not None:
+                torch.manual_seed(self.seed + 1)
+            return sample_trajectories_without_collisions(
+                self.system,
+                self.initial_state_sampler,
+                set,
+                n_timesteps=self.n_timesteps,
+                n_trajectories=self.n_trajectories_test,
+                controller=controller,
             )
 
     def random_test_controllers(self, n_controllers : int):

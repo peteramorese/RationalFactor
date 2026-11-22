@@ -1,6 +1,6 @@
 import torch
 
-from rational_factor.tools.misc import Hyperrectangle
+from rational_factor.tools.set import Hyperrectangle
 
 class DensityModel(torch.nn.Module):
     def __init__(self, features: int, batch_shape: tuple[int, ...] | int = 1):
@@ -55,6 +55,7 @@ class DensityModel(torch.nn.Module):
 
     def supremum_bound(self):
         raise NotImplementedError("supremum_bound not implemented")
+
 
 class ConditionalDensityModel(torch.nn.Module):
     def __init__(self, features : int, context_features : int, batch_shape: tuple[int, ...] | int = (1,)):
@@ -125,6 +126,9 @@ class MarkovTransitionModel(ConditionalDensityModel):
     def propagate(self, belief: DensityModel) -> DensityModel:
         """Return the next-step belief; iterate by calling this again."""
         raise NotImplementedError("propagate not implemented")
+    
+    def propagate_set_complement(self, belief: DensityModel, set: Hyperrectangle) -> DensityModel:
+        raise NotImplementedError("propagate_set_complement not implemented")
 
 
 class MarkovDecisionProcess(MarkovTransitionModel):
@@ -135,3 +139,6 @@ class MarkovDecisionProcess(MarkovTransitionModel):
     def propagate(self, belief: DensityModel, action: torch.Tensor) -> DensityModel:
         """Return the next-step belief; iterate by calling this again."""
         raise NotImplementedError("propagate not implemented")
+    
+    def propagate_set_complement(self, belief: DensityModel, action: torch.Tensor, set: Hyperrectangle) -> DensityModel:
+        raise NotImplementedError("propagate_set_complement not implemented")
