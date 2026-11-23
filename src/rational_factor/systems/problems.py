@@ -118,6 +118,7 @@ class ControlledProblem(FullyObservableProblem):
     system: ControllableStochasticSystem
     goal: Hyperrectangle
     obstacles: Hyperrectangle
+    control_limits: Hyperrectangle
     control_sampler: Callable[[int], torch.Tensor]
 
     def train_state_transition_data(self):
@@ -180,11 +181,31 @@ class ControlledProblem(FullyObservableProblem):
             active = active & ~(in_goal | in_obs)
         return torch.stack(probs)
 
-    def random_test_controllers(self, n_controllers : int):
+    def random_test_controllers(self, n_controllers: int):
+        """Open-loop controllers with actions drawn uniformly in ``control_limits``.
+
+        Each controller is a fixed length-``n_timesteps`` sequence
+        ``u[0], ..., u[T-1]`` with every ``u[t]`` in the control box.
+        """
+        if self.control_limits.is_batched:
+            raise ValueError("control_limits must be a single Hyperrectangle")
+        if self.control_limits.dim != self.system.control_dim():
+            raise ValueError(
+                f"control_limits.dim ({self.control_limits.dim}) must match "
+                f"control_dim ({self.system.control_dim()})"
+            )
         with torch.random.fork_rng():
             if self.seed is not None:
                 torch.manual_seed(self.seed + 1)
-            return [lambda k: torch.randn(self.system.control_dim()) for _ in range(n_controllers)]
+            low = self.control_limits.low
+            high = self.control_limits.high
+            controllers = []
+            for _ in range(n_controllers):
+                u_seq = low + (high - low) * torch.rand(
+                    self.n_timesteps, self.system.control_dim()
+                )
+                controllers.append(lambda k, u_seq=u_seq: u_seq[k])
+            return controllers
 
 @dataclass
 class PartiallyObservableProblem(FullyObservableProblem):
@@ -454,6 +475,8 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             low=torch.tensor([-8.0, -8.0, -3.141593]),
             high=torch.tensor([8.0, 8.0, 3.141593]),
         ),
+        # Per-step heading change (rad); matches training sampler support.
+        control_limits=Hyperrectangle(torch.tensor([-0.5]), torch.tensor([0.5])),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-0.5]),
             high=torch.tensor([0.5]),
@@ -497,6 +520,11 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             low=torch.tensor([0.0, 0.0, -0.55, 1.0, -1.5, -0.65]),
             high=torch.tensor([6.0, 30.0, 0.55, 9.5, 1.5, 0.65]),
         ),
+        # Steering (rad) and longitudinal accel (m/s^2); within plant clamps.
+        control_limits=Hyperrectangle(
+            torch.tensor([-0.30, -3.0]),
+            torch.tensor([0.30, 2.0]),
+        ),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-0.30, -3.0]),
             high=torch.tensor([0.30, 2.0]),
@@ -533,6 +561,7 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             mean=torch.tensor([0.0]),
             covariance=torch.diag(torch.tensor([4.0])),
         ),
+        control_limits=Hyperrectangle(torch.tensor([-4.0]), torch.tensor([4.0])),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-4.0]),
             high=torch.tensor([4.0]),
@@ -562,6 +591,11 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         prev_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.0, 0.0]),
             covariance=torch.diag(2.0 * torch.ones(2)),
+        ),
+        # Additive forcing on both VdP channels.
+        control_limits=Hyperrectangle(
+            torch.tensor([-2.0, -2.0]),
+            torch.tensor([2.0, 2.0]),
         ),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-2.0, -2.0]),
@@ -602,6 +636,8 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
             covariance=torch.diag(6.0 * torch.ones(4, dtype=torch.float32)),
         ),
+        # Horizontal cart force (N).
+        control_limits=Hyperrectangle(torch.tensor([-15.0]), torch.tensor([15.0])),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-15.0]),
             high=torch.tensor([15.0]),
@@ -646,6 +682,11 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             mean=torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
             covariance=torch.diag(torch.tensor([3.0, 3.0, 1.8, 1.8, 1.2, 2.0], dtype=torch.float32)),
         ),
+        # Tractor longitudinal accel and yaw rate command.
+        control_limits=Hyperrectangle(
+            torch.tensor([-4.0, -6.0]),
+            torch.tensor([4.0, 6.0]),
+        ),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-4.0, -6.0]),
             high=torch.tensor([4.0, 6.0]),
@@ -686,6 +727,11 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             mean=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             covariance=torch.diag(torch.tensor([5.0, 5.0, 3.0, 15.0, 15.0, 20.0], dtype=torch.float32)),
         ),
+        # Rotor thrusts (N); matches plant thrust_min/max defaults.
+        control_limits=Hyperrectangle(
+            torch.tensor([0.0, 0.0]),
+            torch.tensor([20.0, 20.0]),
+        ),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([0.0, 0.0]),
             high=torch.tensor([20.0, 20.0]),
@@ -724,6 +770,11 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         prev_state_sampler=make_mvnormal_state_sampler(
             mean=torch.zeros(12),
             covariance=torch.diag(5.0 * torch.ones(12, dtype=torch.float32)),
+        ),
+        # Collective thrust and body torques.
+        control_limits=Hyperrectangle(
+            torch.tensor([0.0, -1.0, -1.0, -0.5]),
+            torch.tensor([20.0, 1.0, 1.0, 0.5]),
         ),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([0.0, -1.0, -1.0, -0.5]),
@@ -765,6 +816,11 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         prev_state_sampler=make_mvnormal_state_sampler(
             mean=systems.Aircraft.PREV_MEAN,
             covariance=torch.diag(systems.Aircraft.PREV_STD_NORM**2),
+        ),
+        # Thrust (N) and surface deflections (rad).
+        control_limits=Hyperrectangle(
+            torch.tensor([50.0, -0.35, -0.35, -0.35]),
+            torch.tensor([400.0, 0.35, 0.35, 0.35]),
         ),
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([50.0, -0.35, -0.35, -0.35]),

@@ -94,12 +94,20 @@ class TrainableController(TrainableParameters):
         high = limits.high.to(dtype=p.dtype, device=p.device)
         return low + (high - low) * torch.sigmoid(p)
 
-    def forward(self, timestep: int, **context) -> torch.Tensor:
+    def forward(self, timestep: int | None = None, **context) -> torch.Tensor:
+        """Return control at ``timestep``, or the full ``(T, action_features)`` sequence."""
+        if timestep is None:
+            if self._trainable and self.action_feature_limits is not None:
+                return self._bound(self._p)
+            return self._p
         if self._trainable:
             if self.action_feature_limits is not None:
                 return self._bound(self._p[timestep])
             return self._p[timestep]
         return self._p[timestep]
+
+    def __call__(self, timestep: int | None = None, **context) -> torch.Tensor:
+        return torch.nn.Module.__call__(self, timestep, **context)
 
     def n_timesteps(self):
         return self._p.shape[0]

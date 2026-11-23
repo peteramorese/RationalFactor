@@ -5,19 +5,29 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from motion_planning.controller import TrainableController
+from motion_planning.mdp import NeuralActionLRFF
+from motion_planning.objectives import (
+    probability_of_reach_avoid,
+    reach_avoid_probabilities,
+)
 from rational_factor.models.basis_functions import GaussianBasis
-from rational_factor.tools.misc import init_gaussian_basis_params_gmm
-from rational_factor.models.factor_forms import LinearRFF, LinearFF
+from rational_factor.models.factor_forms import LinearFF
 from rational_factor.models.parameters import (
+    NeuralParameters,
     PositiveParameters,
-    TrainableParameters,
     param_group_iter,
-    RowStochasticDenseMatrixParameters,
 )
 from rational_factor.models.train import Trainer
-from rational_factor.systems.problems import FULLY_OBSERVABLE_PROBLEMS
+from rational_factor.systems.base import sample_trajectories_without_collisions
+from rational_factor.systems.problems import OPEN_LOOP_OBSERVABLE_PROBLEMS
+from rational_factor.tools.misc import init_gaussian_basis_params_gmm
 from rational_factor.tools.set import Hyperrectangle
 import rational_factor.models.loss as loss
+
+
+def _action_conditional_mle_loss(model, xp, conditioner, action):
+    return loss.conditional_mle_loss(model, xp, conditioner, action=action)
 
 
 def _square_ranges(
@@ -70,22 +80,23 @@ def make_hyperrectangle_obstacles(
     return Hyperrectangle(box_low, box_high)
 
 
-def survival_probability(belief, obstacles: Hyperrectangle) -> float:
-    """Free-space mass: total integral minus mass on ``obstacles``.
-
-    For an unnormalized belief (``renormalize_h=False``), total mass is
-    ``1 / norm_constant()``. Batched obstacle boxes are summed (union under
-    a disjoint-box assumption, matching set-complement propagation).
-    """
-    Z = belief.norm_constant()
-    Z_val = float(Z.detach().cpu()) if torch.is_tensor(Z) else float(Z)
-    total_mass = 1.0 / Z_val
-    obstacle_mass = belief.integrate(obstacles)
-    if torch.is_tensor(obstacle_mass):
-        obstacle_mass = float(obstacle_mass.sum().detach().cpu())
-    else:
-        obstacle_mass = float(obstacle_mass)
-    return total_mass - obstacle_mass
+def _draw_boxes(ax, region: Hyperrectangle | None, x_dim: int, y_dim: int, **rect_kw):
+    if region is None:
+        return
+    lows = region.low.detach().cpu().numpy()
+    highs = region.high.detach().cpu().numpy()
+    if lows.ndim == 1:
+        lows, highs = lows[None, :], highs[None, :]
+    for lo, hi in zip(lows, highs):
+        ax.add_patch(
+            plt.Rectangle(
+                (lo[x_dim], lo[y_dim]),
+                hi[x_dim] - lo[x_dim],
+                hi[y_dim] - lo[y_dim],
+                fill=False,
+                **rect_kw,
+            )
+        )
 
 
 def plot_marginal_mc_vs_belief(
@@ -94,8 +105,9 @@ def plot_marginal_mc_vs_belief(
     traj_data,
     *,
     obstacles: Hyperrectangle | None = None,
-    survival_belief: list[float] | None = None,
-    survival_mc: list[float] | None = None,
+    goal: Hyperrectangle | None = None,
+    reach_belief: list[float] | None = None,
+    reach_mc: list[float] | None = None,
     n_points: int = 50,
     contour_levels: int = 10,
     scatter_kwargs: dict | None = None,
@@ -114,10 +126,10 @@ def plot_marginal_mc_vs_belief(
     n_marginals = len(marginals_list)
     assert len(beliefs) == n_slices, "beliefs must have length n_timesteps + 1"
     assert len(traj_data) == n_slices, "traj_data must have length n_timesteps + 1"
-    if survival_belief is not None:
-        assert len(survival_belief) == n_slices
-    if survival_mc is not None:
-        assert len(survival_mc) == n_slices
+    if reach_belief is not None:
+        assert len(reach_belief) == n_slices
+    if reach_mc is not None:
+        assert len(reach_mc) == n_slices
 
     scatter_kwargs = {"s": 1, "alpha": 0.5, **(scatter_kwargs or {})}
     fig, axes = plt.subplots(
@@ -182,34 +194,32 @@ def plot_marginal_mc_vs_belief(
             ax_b.set_ylim(*y_range)
             ax_b.set_aspect("equal")
 
-            if obstacles is not None:
-                # Project each obstacle box onto this 2D marginal as a rectangle.
-                lows = obstacles.low.detach().cpu().numpy()
-                highs = obstacles.high.detach().cpu().numpy()
-                if lows.ndim == 1:
-                    lows, highs = lows[None, :], highs[None, :]
-                for lo, hi in zip(lows, highs):
-                    rect_kw = dict(
-                        xy=(lo[x_dim], lo[y_dim]),
-                        width=hi[x_dim] - lo[x_dim],
-                        height=hi[y_dim] - lo[y_dim],
-                        fill=False,
-                        edgecolor="crimson",
-                        linewidth=1.0,
-                        linestyle="--",
-                    )
-                    ax_mc.add_patch(plt.Rectangle(**rect_kw))
-                    ax_b.add_patch(plt.Rectangle(**rect_kw))
+            _draw_boxes(
+                ax_mc, obstacles, x_dim, y_dim,
+                edgecolor="crimson", linewidth=1.0, linestyle="--",
+            )
+            _draw_boxes(
+                ax_b, obstacles, x_dim, y_dim,
+                edgecolor="crimson", linewidth=1.0, linestyle="--",
+            )
+            _draw_boxes(
+                ax_mc, goal, x_dim, y_dim,
+                edgecolor="limegreen", linewidth=1.5, linestyle="-",
+            )
+            _draw_boxes(
+                ax_b, goal, x_dim, y_dim,
+                edgecolor="limegreen", linewidth=1.5, linestyle="-",
+            )
 
             if t == 0:
-                ax_mc.set_ylabel(f"{pair_label}\nMC (no collision)")
+                ax_mc.set_ylabel(f"{pair_label}\nMC (free)")
                 ax_b.set_ylabel(f"{pair_label}\nbelief (set complement)")
             if m_idx == 0:
-                if survival_belief is not None and survival_mc is not None:
+                if reach_belief is not None and reach_mc is not None:
                     ax_mc.set_title(
                         f"t={t}\n"
-                        f"P_surv belief={survival_belief[t]:.3f}\n"
-                        f"P_surv MC={survival_mc[t]:.3f}"
+                        f"P_reach belief={reach_belief[t]:.3f}\n"
+                        f"P_reach MC={reach_mc[t]:.3f}"
                     )
                 else:
                     ax_mc.set_title(f"t={t} (n={samples.shape[0]})")
@@ -224,30 +234,77 @@ def plot_marginal_mc_vs_belief(
     return fig, axes
 
 
+def plot_reach_avoid_comparison(
+    reach_belief: torch.Tensor | list[float],
+    reach_mc: torch.Tensor | list[float],
+    *,
+    out_path: Path,
+    title: str,
+):
+    """Incremental and cumulative reach-avoid probability: belief vs MC."""
+    rb = torch.as_tensor(reach_belief, dtype=torch.float64).detach().cpu()
+    rm = torch.as_tensor(reach_mc, dtype=torch.float64).detach().cpu()
+    t = torch.arange(rb.numel())
+    fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.6), squeeze=False)
+
+    ax = axes[0, 0]
+    ax.plot(t.numpy(), rb.numpy(), "o-", label="belief", color="C0")
+    ax.plot(t.numpy(), rm.numpy(), "s--", label="MC", color="C1")
+    ax.set_xlabel("t")
+    ax.set_ylabel("first-hit P(goal)")
+    ax.set_title("Per-timestep")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    ax = axes[0, 1]
+    ax.plot(t.numpy(), torch.cumsum(rb, 0).numpy(), "o-", label="belief", color="C0")
+    ax.plot(t.numpy(), torch.cumsum(rm, 0).numpy(), "s--", label="MC", color="C1")
+    ax.set_xlabel("t")
+    ax.set_ylabel("cumulative P(reach-avoid)")
+    ax.set_title("Cumulative")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved reach-avoid comparison to {out_path}")
+
+
 if __name__ == "__main__":
-    problem_name = "van_der_pol"
-    problem = FULLY_OBSERVABLE_PROBLEMS[problem_name]
+    problem_name = "kinematic_unicycle"
+    problem = OPEN_LOOP_OBSERVABLE_PROBLEMS[problem_name]
 
     ###
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    n_basis = 500
-    n_obstacles = 15
-    obstacle_relative_width = 0.06
-    obstacle_seed = 0
+    n_basis = 300
+    gaussian_std_epsilon = 1e-3
+    hidden_features = 64
+    num_hidden_layers = 2
+    action_features = problem.system.control_dim()
+
     tran_params = {
         "epochs": 20,
-        "basis_iterations": 3,
+        "basis_iterations": 2,
+        "neural_iterations": 3,
         "weights_iterations": 3,
         "lr_basis": 3e-3,
+        "lr_neural": 2e-3,
         "lr_weights": 5e-2,
     }
     init_params = {
-        "epochs": 50,
-        "coeff_iterations": 10,
+        "epochs": 40,
+        "coeff_iterations": 8,
         "lr_coeffs": 1e-2,
         "basis_iterations": 2,
         "lr_basis": 1e-3,
+    }
+    ctrl_params = {
+        "epochs": 80,
+        "lr": 5e-2,
     }
 
     batch_size = 256
@@ -256,193 +313,296 @@ if __name__ == "__main__":
     ###
 
     device = torch.device("cuda" if use_gpu else "cpu")
-    print(f"device={device}, dtype={dtype}")
+    print(f"device={device}, dtype={dtype}, n_basis={n_basis}")
 
     system = problem.system
     dim = system.dim()
 
-    obstacles = make_hyperrectangle_obstacles(
-        n_obstacles,
-        problem.plot_bounds_low,
-        problem.plot_bounds_high,
-        relative_width=obstacle_relative_width,
-        seed=obstacle_seed,
-        dtype=dtype,
+    obstacles = problem.obstacles
+    goal = problem.goal
+    n_obstacle_boxes = (
+        obstacles.low.shape[0] if obstacles.is_batched else 1
     )
-    print(f"obstacles ({n_obstacles}):\n  low={obstacles.low}\n  high={obstacles.high}")
+    print(
+        f"obstacles ({n_obstacle_boxes}):\n  low={obstacles.low}\n  high={obstacles.high}"
+    )
+    print(f"goal:\n  low={goal.low}\n  high={goal.high}")
+    print(
+        f"control_limits:\n  low={problem.control_limits.low}\n  "
+        f"high={problem.control_limits.high}"
+    )
 
+    u, x_k, x_kp1 = problem.train_state_transition_data()
+    u = u.to(dtype=dtype)
+    x_k = x_k.to(dtype=dtype)
+    x_kp1 = x_kp1.to(dtype=dtype)
     x0 = problem.train_initial_state_data().to(dtype=dtype)
-    x_k, x_kp1 = problem.train_state_transition_data()
-    x_k, x_kp1 = x_k.to(dtype=dtype), x_kp1.to(dtype=dtype)
-    traj_data = [
-        x.to(dtype=dtype) for x in problem.test_data_without_collisions(obstacles)
-    ]
+    print(
+        f"transition data: u={tuple(u.shape)}, x={tuple(x_k.shape)}, "
+        f"xp={tuple(x_kp1.shape)}; x0={tuple(x0.shape)}"
+    )
 
+    xp_dataloader = DataLoader(
+        TensorDataset(x_kp1, x_k, u),
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=use_gpu,
+    )
     x0_dataloader = DataLoader(
         TensorDataset(x0), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
     )
-    xp_dataloader = DataLoader(
-        TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
-    )
 
-    # Fit independent EM dictionaries to each training marginal.
     phi_means, phi_stds = init_gaussian_basis_params_gmm(
-        x_k, dim, n_basis, epsilon=0.0, device=device,
+        x_k, dim, n_basis, epsilon=gaussian_std_epsilon, device=device, dtype=dtype,
     )
-    psi_means, psi_stds = init_gaussian_basis_params_gmm(
-        x_kp1, dim, n_basis, epsilon=0.0, device=device,
-    )
-    phi_basis = GaussianBasis(mean_params=phi_means, std_params=phi_stds, coeffs=None)
-    psi_basis = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=None)
+    phi = GaussianBasis(mean_params=phi_means, std_params=phi_stds, coeffs=None)
 
-    g_coeffs = PositiveParameters.random_init(
+    mlp_kw = dict(
+        in_features=action_features,
+        out_features=(dim, n_basis),
+        batch_shape=(1,),
+        context_key="action",
+        hidden_features=hidden_features,
+        num_hidden_layers=num_hidden_layers,
+        activation=torch.nn.Tanh,
+        zero_init_last=False,
+    )
+    psi_means = NeuralParameters(**mlp_kw, positive=False)
+    psi_stds = NeuralParameters(**mlp_kw, positive=True)
+    psi = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=None)
+
+    a = PositiveParameters.random_init(
         shape=(1, n_basis), mean=1.0, std=1.0, epsilon=1e-3
     ).to(device=device, dtype=dtype)
-    h0_coeffs = PositiveParameters.random_init(
-        shape=(1, n_basis), mean=1.0, std=1.0, epsilon=1e-3
+
+    tran_model = NeuralActionLRFF(
+        a,
+        phi,
+        psi,
+        action_features=action_features,
+        numerical_tolerance=problem.numerical_tolerance,
+        hidden_features=hidden_features,
+        num_hidden_layers=num_hidden_layers,
+        zero_init_last=False,
+        positive=False,
     ).to(device=device, dtype=dtype)
 
-    # LinearRFF is normalized iff B @ 1 = 1.
-    B_logits = TrainableParameters.random_init(
-        shape=(1, n_basis, n_basis),
-        mean=0.0,
-        std=0.1,
-    ).to(device=device, dtype=dtype)
-    B = RowStochasticDenseMatrixParameters(B_logits)
-
-    tran_model = LinearRFF(
-        g_coeffs, phi_basis, psi_basis, B, numerical_tolerance=problem.numerical_tolerance
-    )
-
-    print("Training transition model")
-    transition_trainer = Trainer(tran_model, device=device)
-    transition_trainer.add_dataset(xp_dataloader, "transitions")
-    transition_trainer.add_optimizer(
+    print("Training NeuralActionLRFF transition model")
+    trainer = Trainer(tran_model, device=device)
+    trainer.add_dataset(xp_dataloader, "transitions")
+    trainer.add_optimizer(
         torch.optim.Adam(
-            param_group_iter((phi_means, phi_stds, psi_means, psi_stds)),
-            lr=tran_params["lr_basis"],
+            param_group_iter((phi_means, phi_stds)), lr=tran_params["lr_basis"]
         ),
-        "basis",
+        "phi_basis",
         n_iterations=tran_params["basis_iterations"],
     )
-    transition_trainer.add_optimizer(
+    trainer.add_optimizer(
         torch.optim.Adam(
-            param_group_iter((g_coeffs, B_logits)),
-            lr=tran_params["lr_weights"],
+            list(psi_means.parameters())
+            + list(psi_stds.parameters())
+            + list(tran_model.B.parameter_modules()[0].parameters()),
+            lr=tran_params["lr_neural"],
         ),
+        "neural",
+        n_iterations=tran_params["neural_iterations"],
+    )
+    trainer.add_optimizer(
+        torch.optim.Adam(param_group_iter((a,)), lr=tran_params["lr_weights"]),
         "weights",
         n_iterations=tran_params["weights_iterations"],
     )
-    transition_trainer.add_loss_function(loss.conditional_mle_loss, "mle", "transitions")
-    tran_model, best_loss_tran, training_time_tran = transition_trainer.train(
+    trainer.add_loss_function(_action_conditional_mle_loss, "mle", "transitions")
+    tran_model, best_loss_tran, train_time_tran = trainer.train(
         epochs=tran_params["epochs"],
         use_best="mle",
         verbose=True,
     )
     if tran_model is None:
         raise SystemExit("No stable transition checkpoint was found.")
-    print("Done! \n")
+    print(f"Done. best mle={best_loss_tran:.4f}, time={train_time_tran:.1f}s")
 
     for parameter in tran_model.parameters():
         parameter.requires_grad_(False)
 
     psi0_means, psi0_stds = init_gaussian_basis_params_gmm(
-        x0, dim, n_basis, epsilon=0.0, device=device,
+        x0, dim, n_basis, epsilon=gaussian_std_epsilon, device=device, dtype=dtype,
     )
-    psi0_basis = GaussianBasis(mean_params=psi0_means, std_params=psi0_stds, coeffs=None)
-    init_model = LinearFF.from_rff(tran_model, h0_coeffs, psi0_basis).to(device)
+    psi0 = GaussianBasis(mean_params=psi0_means, std_params=psi0_stds, coeffs=None)
+    h0 = PositiveParameters.random_init(
+        shape=(1, n_basis), mean=1.0, std=1.0, epsilon=1e-3
+    ).to(device=device, dtype=dtype)
+    init_model = LinearFF.from_rff(tran_model, h0, psi0).to(device=device, dtype=dtype)
 
-    print("Training initial model")
-    initial_trainer = Trainer(init_model, device=device)
-    initial_trainer.add_dataset(x0_dataloader, "initial")
-
-    initial_trainer.add_optimizer(
-        torch.optim.Adam(
-            param_group_iter((h0_coeffs,)),
-            lr=init_params["lr_coeffs"],
-        ),
+    print("Training initial LinearFF belief")
+    init_trainer = Trainer(init_model, device=device)
+    init_trainer.add_dataset(x0_dataloader, "initial")
+    init_trainer.add_optimizer(
+        torch.optim.Adam(param_group_iter((h0,)), lr=init_params["lr_coeffs"]),
         "coeffs",
         n_iterations=init_params["coeff_iterations"],
     )
-    initial_trainer.add_optimizer(
-        torch.optim.Adam(param_group_iter((psi0_means, psi0_stds)), lr=1e-3),
-        "psi0_basis", n_iterations=2,
+    init_trainer.add_optimizer(
+        torch.optim.Adam(
+            param_group_iter((psi0_means, psi0_stds)), lr=init_params["lr_basis"]
+        ),
+        "psi0_basis",
+        n_iterations=init_params["basis_iterations"],
     )
-    initial_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
-    init_model, best_loss_init, training_time_init = initial_trainer.train(
+    init_trainer.add_loss_function(loss.mle_loss, "mle", "initial")
+    init_model, best_loss_init, train_time_init = init_trainer.train(
         epochs=init_params["epochs"],
         use_best="mle",
         verbose=True,
     )
     if init_model is None:
         raise SystemExit("No stable initial-density checkpoint was found.")
-    print("Done! \n")
+    print(f"Done. best init mle={best_loss_init:.4f}, time={train_time_init:.1f}s")
 
-    # Fold Z into c so the unnormalized belief already has unit mass. With
-    # renormalize_h=True, Z only entered log_density and could be << 1 even
-    # though the *normalized* density integrated to 1.
+    # Unit-mass unnormalized belief; freeze all density-model parameters.
     init_model = init_model.absorb_norm_constant().eval()
+    for parameter in init_model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in tran_model.parameters():
+        parameter.requires_grad_(False)
 
-    print(
-        f"Transition model loss: {best_loss_tran:.4f}, "
-        f"training time: {training_time_tran:.2f} seconds"
-    )
-    print(
-        f"Initial model loss: {best_loss_init:.4f}, "
-        f"training time: {training_time_init:.2f} seconds"
-    )
-
-    n_slices = n_timesteps_prop + 1
-
-    # Propagate with set-complement obstacles instead of the full belief.
     obstacles_dev = Hyperrectangle(
         obstacles.low.to(device=device, dtype=dtype),
         obstacles.high.to(device=device, dtype=dtype),
     )
-    belief_seq = [init_model]
-    for _ in range(n_timesteps_prop):
-        belief_seq.append(
-            tran_model.propagate_set_complement(belief_seq[-1], obstacles_dev)
-        )
-    belief_seq = [belief.eval() for belief in belief_seq]
+    goal_dev = Hyperrectangle(
+        goal.low.to(device=device, dtype=dtype),
+        goal.high.to(device=device, dtype=dtype),
+    )
+    forbidden_dev = obstacles_dev.union(goal_dev)
 
-    # 1-to-1 survival: free-space mass of belief_t vs MC remaining / n_test.
-    n_test_particles = problem.n_trajectories_test
-    survival_belief = []
-    survival_mc = []
-    print("Survival probability (belief free-space mass vs MC remaining/total):")
+    action_limits = Hyperrectangle(
+        problem.control_limits.low.to(device=device, dtype=dtype),
+        problem.control_limits.high.to(device=device, dtype=dtype),
+    )
+
+    controller = TrainableController.random_init(
+        action_features=action_features,
+        timesteps=n_timesteps_prop,
+        mean=0.0,
+        std=0.1,
+        action_feature_limits=action_limits,
+    ).to(device=device, dtype=dtype)
+
+    # Sanity: only controller params should be trainable.
+    assert all(not p.requires_grad for p in tran_model.parameters())
+    assert all(not p.requires_grad for p in init_model.parameters())
+    assert any(p.requires_grad for p in controller.parameters())
+
+    print("Training open-loop controller (maximize reach-avoid probability)")
+    ctrl_opt = torch.optim.Adam(controller.parameters(), lr=ctrl_params["lr"])
+    best_pra = None
+    best_ctrl_state = None
+    for epoch in range(ctrl_params["epochs"]):
+        ctrl_opt.zero_grad()
+        pra = probability_of_reach_avoid(
+            init_model, tran_model, controller, obstacles_dev, goal_dev
+        )
+        loss_ctrl = -pra
+        loss_ctrl.backward()
+        ctrl_opt.step()
+        pra_val = float(pra.detach().cpu())
+        if best_pra is None or pra_val > best_pra:
+            best_pra = pra_val
+            best_ctrl_state = {
+                k: v.detach().clone() for k, v in controller.state_dict().items()
+            }
+        if epoch % 10 == 0 or epoch == ctrl_params["epochs"] - 1:
+            print(f"  epoch {epoch:3d}: P_reach-avoid={pra_val:.6f}")
+
+    if best_ctrl_state is not None:
+        controller.load_state_dict(best_ctrl_state)
+    print(f"Best controller P_reach-avoid (belief)={best_pra:.6f}")
+    print(
+        "controls=\n"
+        + "\n".join(
+            f"  t={t}: {controller(t).detach().cpu().numpy()}"
+            for t in range(controller.n_timesteps())
+        )
+    )
+
+    # --- Evaluate / visualize under the trained controller ---
+    def _ctrl_k(k, ctrl=controller):
+        return ctrl(k).detach()
+
     with torch.no_grad():
-        for t, belief in enumerate(belief_seq):
-            p_surv_belief = survival_probability(belief, obstacles_dev)
-            p_surv_mc = traj_data[t].shape[0] / n_test_particles
-            survival_belief.append(p_surv_belief)
-            survival_mc.append(p_surv_mc)
-            print(
-                f"  t={t}: belief={p_surv_belief:.6f}  "
-                f"MC={p_surv_mc:.6f}  "
-                f"(alive={traj_data[t].shape[0]}/{n_test_particles})"
+        reach_belief = reach_avoid_probabilities(
+            init_model, tran_model, controller, obstacles_dev, goal_dev
+        ).detach().cpu()
+
+        belief_seq = [init_model]
+        for t in range(n_timesteps_prop):
+            belief_seq.append(
+                tran_model.propagate_set_complement(
+                    belief_seq[-1], controller(t), forbidden_dev
+                )
             )
+        belief_seq = [b.eval() for b in belief_seq]
+
+    reach_mc = problem.test_reach_avoid_probabilities(_ctrl_k).cpu()
+    traj_free = [
+        x.to(dtype=dtype)
+        for x in sample_trajectories_without_collisions(
+            system,
+            problem.initial_state_sampler,
+            obstacles.union(goal),
+            n_timesteps=n_timesteps_prop,
+            n_trajectories=problem.n_trajectories_test,
+            controller=_ctrl_k,
+        )
+    ]
+
+    print("Reach-avoid probabilities (incremental first-hit goal mass):")
+    for t in range(n_timesteps_prop + 1):
+        print(
+            f"  t={t}: belief={float(reach_belief[t]):.6f}  "
+            f"MC={float(reach_mc[t]):.6f}"
+        )
+    print(
+        f"Total P_reach-avoid: belief={float(reach_belief.sum()):.6f}  "
+        f"MC={float(reach_mc.sum()):.6f}"
+    )
 
     out_dir = Path("figures/obstacles")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    marg_path = out_dir / f"{problem_name}_lrff__set_complement_marginals.png"
+    cum_belief = torch.cumsum(reach_belief, 0).tolist()
+    cum_mc = torch.cumsum(reach_mc, 0).tolist()
+
+    marg_path = out_dir / f"{problem_name}_lrff_reach_avoid_marginals.png"
     fig, _ = plot_marginal_mc_vs_belief(
         problem,
         belief_seq,
-        traj_data,
+        traj_free,
         obstacles=obstacles,
-        survival_belief=survival_belief,
-        survival_mc=survival_mc,
+        goal=goal,
+        reach_belief=cum_belief,
+        reach_mc=cum_mc,
         n_points=50,
         scatter_kwargs={"s": 1, "alpha": 0.5},
     )
     fig.suptitle(
-        f"{problem_name} — LRFF set-complement marginals "
-        f"(MC without collisions vs belief)\n"
-        f"n_obstacles={n_obstacles}, relative_width={obstacle_relative_width}",
+        f"{problem_name} — NeuralActionLRFF reach-avoid set-complement "
+        f"(goal ∪ obstacles)\n"
+        f"n_obstacles={n_obstacle_boxes}, P_ra belief={float(reach_belief.sum()):.3f}, "
+        f"MC={float(reach_mc.sum()):.3f}",
         y=1.04,
     )
     fig.savefig(marg_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved marginal comparison plot to {marg_path}")
+
+    plot_reach_avoid_comparison(
+        reach_belief,
+        reach_mc,
+        out_path=out_dir / f"{problem_name}_lrff_reach_avoid_probs.png",
+        title=(
+            f"{problem_name} — reach-avoid probabilities "
+            f"(belief vs MC under trained controller)"
+        ),
+    )
