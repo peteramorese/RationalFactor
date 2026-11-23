@@ -65,6 +65,21 @@ class Hyperrectangle:
             return inside.all(dim=-1).any(dim=-1)
         inside = (x >= self.low) & (x <= self.high)
         return inside.all(dim=-1)
+    
+    def union(self, other: "Hyperrectangle") -> "Hyperrectangle":
+        """Stack boxes along the batch axis into a single batched hyperrectangle."""
+        if self.dim != other.dim:
+            raise ValueError(
+                f"union requires matching dim, got {self.dim} and {other.dim}"
+            )
+        low_a = self.low if self.is_batched else self.low.unsqueeze(0)
+        high_a = self.high if self.is_batched else self.high.unsqueeze(0)
+        low_b = other.low if other.is_batched else other.low.unsqueeze(0)
+        high_b = other.high if other.is_batched else other.high.unsqueeze(0)
+        return Hyperrectangle(
+            torch.cat([low_a, low_b], dim=0),
+            torch.cat([high_a, high_b], dim=0),
+        )
 
     def __str__(self):
         return f"Hyperrectangle(low={self.low}, high={self.high})"

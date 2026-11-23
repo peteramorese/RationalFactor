@@ -130,7 +130,7 @@ class LinearRFF(MarkovTransitionModel):
         # Apply Z only when the belief renormalizes; otherwise ``c`` already
         # carries the intended (possibly unnormalized) scale.
         c = as_vector(belief.c(), numerical_tolerance=tol)
-        if belief._renormalize_h:
+        if belief.is_auto_normalized():
             c = belief.norm_constant() * c
         
         # Omega2 between RFF bases used for normalization
@@ -155,7 +155,7 @@ class LinearRFF(MarkovTransitionModel):
         a = as_vector(self.a(), numerical_tolerance=tol)
         B = as_matrix(self.B())
         c = as_vector(belief.c(), numerical_tolerance=tol)
-        if belief._renormalize_h:
+        if belief.is_auto_normalized():
             c = belief.norm_constant() * c
         
         # Omega2 between RFF bases used for normalization
@@ -217,6 +217,9 @@ class LinearFF(DensityModel):
                         seen.add(id(module))
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
+
+    def is_auto_normalized(self) -> bool:
+        return self._renormalize_h
 
     def dtype_device(self):
         return self.phi.dtype_device()
@@ -507,31 +510,83 @@ class QuadraticRFF(MarkovTransitionModel):
         f = torch.einsum('...i,...ij,...j->...', u, Q.to_dense(), u).clamp_min(eps)
         return (torch.log(g_y) + torch.log(f) - torch.log(g_x)).reshape(-1)
 
-    def propagate(self, belief: 'QuadraticFF') -> 'QuadraticFF':
-        """Exact one-step dense SOS propagation, preserving PSD and total mass.
+    def _propagate_V(self, Q0: Matrix, T: Matrix, Omega22_transition: Matrix, V: Matrix) -> Matrix:
+        r"""Core SOS coefficient update.
 
         D(V)[i,j] = integral phi_i(x) phi_j(x) psi0(x)^T V psi0(x) dx.
         V_next = sum_kl [T D(V) T^T]_kl Q0[k,:,l,:].
+        """
+        D = DenseMatrix(Omega22_transition.frobenius_inner(
+            DenseMatrix(V.to_dense()[..., None, None, :, :])
+        ))
+        weighted_D = (T @ D) @ T.T
+        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
+        q0 = Q0.to_dense()
+        qb = q0.reshape(*q0.shape[:-2], m, n, m, n).movedim(-3, -2)  # (..., m, m, n, n)
+        return DenseMatrix(qb).contract_batch_matrix(weighted_D)
+
+    def propagate(self, belief: 'QuadraticFF') -> 'QuadraticFF':
+        """Exact one-step dense SOS propagation, preserving PSD and total mass.
+
+        Normalization (Q0, T) uses Omega22 between the RFF bases; the transition
+        Gram uses Omega22 between the RFF input basis and the belief basis.
+        Apply Z only when the belief renormalizes; otherwise V already carries
+        the intended (possibly unnormalized) scale.
         """
         if not isinstance(belief, QuadraticFF):
             raise TypeError(f'QuadraticRFF.propagate expects QuadraticFF, got {type(belief).__name__}')
         if belief.LA is not self.LA or belief.phi is not self.phi:
             raise ValueError('belief must share LA and phi with transition (use QuadraticFF.from_rff)')
+
         _, _, Q0, _, T = self.get_normalization()
-        V = belief.get_V(normalized=True)
-        omega = as_matrix(self.phi.Omega22(belief.psi))
-        D = DenseMatrix(omega.frobenius_inner(
-            DenseMatrix(V.to_dense()[..., None, None, :, :])
-        ))
-        weighted_D = (T @ D) @ T.T
-        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
-        qb = Q0.to_dense().reshape(self.phi.batch_size(), m, n, m, n)
-        qb = qb.movedim(-3, -2)  # (batch, m, m, n, n)
-        Vnext = DenseMatrix(qb).contract_batch_matrix(weighted_D)
+        V = belief.get_V()
+        if belief.is_auto_normalized():
+            Z = belief.norm_constant()
+            V = DenseMatrix(V.to_dense() * Z[..., None, None])
+
+        # Omega22 between RFF input basis and belief basis for transition
+        Omega22_transition = as_matrix(self.phi.Omega22(belief.psi))
+
+        Vnext = self._propagate_V(Q0, T, Omega22_transition, V)
+
         # Use the already normalized, positive result, not a newly learned factor.
         return QuadraticFF(
             self.LA, self.phi, None, self.psi,
             V_fixed=FixedParameters(Vnext.to_dense()),
+            numerical_tolerance=belief.numerical_tolerance,
+            pd_jitter=self.pd_jitter, renormalize_h=False,
+            register_modules=False,
+        )
+
+    def propagate_set_complement(self, belief: 'QuadraticFF', set: Hyperrectangle) -> 'QuadraticFF':
+        if not isinstance(belief, QuadraticFF):
+            raise TypeError(
+                'QuadraticRFF.propagate_set_complement expects QuadraticFF, got '
+                f'{type(belief).__name__}'
+            )
+        if belief.LA is not self.LA or belief.phi is not self.phi:
+            raise ValueError('belief must share LA and phi with transition (use QuadraticFF.from_rff)')
+
+        _, _, Q0, _, T = self.get_normalization()
+        V = belief.get_V()
+        if belief.is_auto_normalized():
+            Z = belief.norm_constant()
+            V = DenseMatrix(V.to_dense() * Z[..., None, None])
+
+        # Omega22 between RFF input basis and belief basis for transition
+        Omega22_transition = as_matrix(self.phi.Omega22(belief.psi))
+
+        # Omega22 restricted to the obstacle set
+        Omega22_set_transition = as_matrix(self.phi.Omega22(belief.psi, domain=set))
+
+        full_prop_V = self._propagate_V(Q0, T, Omega22_transition, V)
+        set_prop_V = self._propagate_V(Q0, T, Omega22_set_transition, V)
+
+        Vnext = full_prop_V.to_dense() - set_prop_V.to_dense().sum(dim=0)
+
+        return QuadraticFF(
+            self.LA, self.phi, None, self.psi,
+            V_fixed=FixedParameters(Vnext),
             numerical_tolerance=belief.numerical_tolerance,
             pd_jitter=self.pd_jitter, renormalize_h=False,
             register_modules=False,
@@ -667,6 +722,9 @@ class QuadraticFF(DensityModel):
         omega = as_matrix(self.phi.Omega22(self.psi)) if omega is None else as_matrix(omega)
         C = omega.contract_batch_matrix(self.get_A())
         return C.frobenius_inner(V)
+
+    def is_auto_normalized(self) -> bool:
+        return self._renormalize_h
 
     def norm_constant(self, Omega22=None, log=False):
         """Always return Z = 1 / mass(V); ``_renormalize_h`` gates applying it."""

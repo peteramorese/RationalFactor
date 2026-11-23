@@ -20,6 +20,46 @@ from rational_factor.tools.misc import make_mvnormal_state_sampler, make_uniform
 from rational_factor.tools.set import Hyperrectangle
 
 
+def _ambient_box(
+    dim: int,
+    constraints: dict[int, tuple[float, float]],
+    *,
+    free_bound: float = 1e6,
+) -> Hyperrectangle:
+    """Axis-aligned box in ``R^{dim}`` with tight bounds only on selected axes.
+
+    Unconstrained axes use ``[-free_bound, free_bound]`` so containment is
+    effectively decided by the listed coordinates (positions, etc.).
+    """
+    low = torch.full((dim,), -free_bound, dtype=torch.float32)
+    high = torch.full((dim,), free_bound, dtype=torch.float32)
+    for axis, (lo, hi) in constraints.items():
+        if not (0 <= axis < dim):
+            raise ValueError(f"axis {axis} out of range for dim={dim}")
+        if lo > hi:
+            raise ValueError(f"low > high on axis {axis}: {(lo, hi)}")
+        low[axis] = float(lo)
+        high[axis] = float(hi)
+    return Hyperrectangle(low, high)
+
+
+def _ambient_boxes(
+    dim: int,
+    boxes: list[dict[int, tuple[float, float]]],
+    *,
+    free_bound: float = 1e6,
+) -> Hyperrectangle:
+    """Batched ``Hyperrectangle`` from a list of per-axis constraint dicts."""
+    if not boxes:
+        raise ValueError("boxes must be non-empty")
+    lows, highs = [], []
+    for constraints in boxes:
+        box = _ambient_box(dim, constraints, free_bound=free_bound)
+        lows.append(box.low)
+        highs.append(box.high)
+    return Hyperrectangle(torch.stack(lows), torch.stack(highs))
+
+
 @dataclass
 class FullyObservableProblem:
     system: DiscreteTimeStochasticSystem
@@ -76,6 +116,8 @@ class FullyObservableProblem:
 @dataclass
 class ControlledProblem(FullyObservableProblem):
     system: ControllableStochasticSystem
+    goal: Hyperrectangle
+    obstacles: Hyperrectangle
     control_sampler: Callable[[int], torch.Tensor]
 
     def train_state_transition_data(self):
@@ -97,7 +139,7 @@ class ControlledProblem(FullyObservableProblem):
                 n_trajectories=self.n_trajectories_test,
             )
     
-    def test_data_without_collisions(self, controller, set: Hyperrectangle):
+    def test_data_without_collisions(self, controller):
         """Like ``FullyObservableProblem.test_data_without_collisions``, under ``controller``."""
         with torch.random.fork_rng():
             if self.seed is not None:
@@ -105,11 +147,38 @@ class ControlledProblem(FullyObservableProblem):
             return sample_trajectories_without_collisions(
                 self.system,
                 self.initial_state_sampler,
-                set,
+                self.obstacles,
                 n_timesteps=self.n_timesteps,
                 n_trajectories=self.n_trajectories_test,
                 controller=controller,
             )
+
+    def test_reach_avoid_probabilities(self, controller) -> torch.Tensor:
+        """Per-timestep first-hit goal probabilities under reach-avoid semantics.
+
+        Samples ``test_data(controller)``, then walks the horizon while removing
+        any particle that has entered ``obstacles`` or ``goal``. At time ``t``
+        the returned entry is
+        ``(# still-active particles that lie in the goal) / n_trajectories_test``.
+        Particles that land in an obstacle (even if also in the goal) are
+        treated as collisions and do not contribute. Summing the returned
+        length-``(n_timesteps + 1)`` tensor gives the Monte Carlo reach-avoid
+        probability.
+        """
+        traj_data = self.test_data(controller)
+        n = traj_data[0].shape[0]
+        if n == 0:
+            return torch.zeros(len(traj_data), dtype=torch.float32)
+
+        active = torch.ones(n, dtype=torch.bool, device=traj_data[0].device)
+        probs = []
+        for x_t in traj_data:
+            in_goal = self.goal.contains_any(x_t)
+            in_obs = self.obstacles.contains_any(x_t)
+            reached = active & in_goal & ~in_obs
+            probs.append(reached.to(dtype=torch.float32).sum() / float(n))
+            active = active & ~(in_goal | in_obs)
+        return torch.stack(probs)
 
     def random_test_controllers(self, n_controllers : int):
         with torch.random.fork_rng():
@@ -139,6 +208,32 @@ class PartiallyObservableProblem(FullyObservableProblem):
 
 
 FULLY_OBSERVABLE_PROBLEMS = {
+    "kinematic_unicycle": FullyObservableProblem(
+        system=systems.KinematicUnicycle(
+            dt=0.5,
+            speed=1.0,
+            angular_displacement=0.12,
+            angle_noise_bound=0.2,
+            position_noise_std=0.05,
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.0]),
+            covariance=torch.diag(torch.tensor([0.12, 0.12, 0.08]) ** 2),
+        ),
+        prev_state_sampler=make_uniform_state_sampler(
+            low=torch.tensor([-8.0, -8.0, -3.141593]),
+            high=torch.tensor([8.0, 8.0, 3.141593]),
+        ),
+        n_timesteps=15,
+        n_trajectories_test=5000,
+        n_data_tran=30000,
+        n_data_init=3000,
+        seed=42,
+        numerical_tolerance=1e-10,
+        plot_bounds_low=torch.tensor([-8.0, -8.0, -3.5]),
+        plot_bounds_high=torch.tensor([8.0, 8.0, 5.5]),
+        plot_marginals_list=[(0, 1), (0, 2), (1, 2)],
+    ),
     "scalar_nonlinear_drift": FullyObservableProblem(
         system=systems.ScalarNonlinearDrift(
             sigma=0.1,
@@ -344,6 +439,44 @@ FULLY_OBSERVABLE_PROBLEMS = {
 }
 
 OPEN_LOOP_OBSERVABLE_PROBLEMS = {
+    "kinematic_unicycle": ControlledProblem(
+        system=controlled_systems.ControlledKinematicUnicycle(
+            dt=0.5,
+            speed=1.0,
+            angle_noise_bound=0.2,
+            position_noise_std=0.05,
+        ),
+        initial_state_sampler=make_mvnormal_state_sampler(
+            mean=torch.tensor([0.0, 0.0, 0.0]),
+            covariance=torch.diag(torch.tensor([0.12, 0.12, 0.08]) ** 2),
+        ),
+        prev_state_sampler=make_uniform_state_sampler(
+            low=torch.tensor([-8.0, -8.0, -3.141593]),
+            high=torch.tensor([8.0, 8.0, 3.141593]),
+        ),
+        control_sampler=make_uniform_state_sampler(
+            low=torch.tensor([-0.5]),
+            high=torch.tensor([0.5]),
+        ),
+        # Start near origin; goal in the far quadrant; obstacles block direct paths.
+        goal=_ambient_box(3, {0: (5.0, 7.0), 1: (5.0, 7.0)}),
+        obstacles=_ambient_boxes(
+            3,
+            [
+                {0: (1.5, 3.0), 1: (-1.0, 1.0)},
+                {0: (-1.0, 1.0), 1: (1.5, 3.0)},
+            ],
+        ),
+        n_timesteps=15,
+        n_trajectories_test=5000,
+        n_data_tran=30000,
+        n_data_init=3000,
+        seed=42,
+        numerical_tolerance=1e-10,
+        plot_bounds_low=torch.tensor([-8.0, -8.0, -4.0]),
+        plot_bounds_high=torch.tensor([8.0, 8.0, 4.0]),
+        plot_marginals_list=[(0, 1), (0, 2), (1, 2)],
+    ),
     "icy_road_car": ControlledProblem(
         system=controlled_systems.ControlledIcyRoadCar(
             dt=0.3,
@@ -367,6 +500,16 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-0.30, -3.0]),
             high=torch.tensor([0.30, 2.0]),
+        ),
+        # Goal at the far end of the road; obstacles from the default ice patches.
+        goal=_ambient_box(6, {0: (1.0, 2.5), 1: (27.0, 30.0)}),
+        obstacles=_ambient_boxes(
+            6,
+            [
+                {0: (0.35, 2.85), 1: (6.5, 11.8)},
+                {0: (2.30, 5.70), 1: (13.8, 18.7)},
+                {0: (0.65, 3.45), 1: (21.0, 25.7)},
+            ],
         ),
         n_timesteps=32,
         n_trajectories_test=2000,
@@ -394,6 +537,8 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             low=torch.tensor([-4.0]),
             high=torch.tensor([4.0]),
         ),
+        goal=Hyperrectangle(torch.tensor([2.0]), torch.tensor([3.0])),
+        obstacles=Hyperrectangle(torch.tensor([0.6]), torch.tensor([1.2])),
         n_timesteps=10,
         n_trajectories_test=5000,
         n_data_tran=30000,
@@ -421,6 +566,14 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-2.0, -2.0]),
             high=torch.tensor([2.0, 2.0]),
+        ),
+        goal=Hyperrectangle(torch.tensor([2.5, 2.5]), torch.tensor([3.5, 3.5])),
+        obstacles=_ambient_boxes(
+            2,
+            [
+                {0: (-1.5, -0.5), 1: (0.5, 1.5)},
+                {0: (0.8, 1.6), 1: (-1.2, -0.2)},
+            ],
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
@@ -452,6 +605,17 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([-15.0]),
             high=torch.tensor([15.0]),
+        ),
+        # Reach a cart position with the pole still near upright; avoid rails / tip-over.
+        goal=_ambient_box(4, {0: (2.0, 3.0), 2: (-0.35, 0.35)}),
+        obstacles=_ambient_boxes(
+            4,
+            [
+                {0: (-6.0, -3.5)},
+                {0: (4.5, 6.0)},
+                {2: (1.2, 6.0)},
+                {2: (-6.0, -1.2)},
+            ],
         ),
         n_timesteps=10,
         n_trajectories_test=5000,
@@ -486,6 +650,14 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             low=torch.tensor([-4.0, -6.0]),
             high=torch.tensor([4.0, 6.0]),
         ),
+        goal=_ambient_box(6, {0: (3.0, 4.5), 1: (3.0, 4.5)}),
+        obstacles=_ambient_boxes(
+            6,
+            [
+                {0: (1.0, 2.2), 1: (-0.8, 0.8)},
+                {0: (-0.8, 0.8), 1: (1.0, 2.2)},
+            ],
+        ),
         n_timesteps=15,
         n_trajectories_test=5000,
         n_data_tran=30000,
@@ -518,6 +690,15 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             low=torch.tensor([0.0, 0.0]),
             high=torch.tensor([20.0, 20.0]),
         ),
+        # Goal in the upper-right of the (px, pz) plane; mid-air obstacles.
+        goal=_ambient_box(6, {0: (2.5, 4.0), 1: (2.5, 4.0)}),
+        obstacles=_ambient_boxes(
+            6,
+            [
+                {0: (0.8, 1.8), 1: (-0.5, 1.2)},
+                {0: (-1.5, -0.3), 1: (1.0, 2.5)},
+            ],
+        ),
         n_timesteps=10,
         n_trajectories_test=5000,
         n_data_tran=30000,
@@ -547,6 +728,14 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([0.0, -1.0, -1.0, -0.5]),
             high=torch.tensor([20.0, 1.0, 1.0, 0.5]),
+        ),
+        goal=_ambient_box(12, {0: (3.0, 5.0), 1: (3.0, 5.0), 2: (1.5, 3.5)}),
+        obstacles=_ambient_boxes(
+            12,
+            [
+                {0: (1.0, 2.2), 1: (-0.8, 0.8), 2: (0.0, 2.5)},
+                {0: (-0.8, 0.8), 1: (1.0, 2.2), 2: (0.0, 2.5)},
+            ],
         ),
         n_timesteps=15,
         n_trajectories_test=5000,
@@ -580,6 +769,22 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         control_sampler=make_uniform_state_sampler(
             low=torch.tensor([50.0, -0.35, -0.35, -0.35]),
             high=torch.tensor([400.0, 0.35, 0.35, 0.35]),
+        ),
+        # Normalized-state goal near DEFAULT_WAYPOINT; mid-course position obstacles.
+        goal=_ambient_box(
+            12,
+            {
+                0: (5.0, 6.5),   # ~700–910 m
+                1: (3.0, 4.5),   # ~330–495 m
+                2: (3.5, 5.5),   # ~91–143 m
+            },
+        ),
+        obstacles=_ambient_boxes(
+            12,
+            [
+                {0: (1.5, 3.0), 1: (-1.0, 1.0), 2: (2.0, 6.0)},
+                {0: (3.5, 4.5), 1: (1.5, 3.0), 2: (2.0, 6.0)},
+            ],
         ),
         n_timesteps=10,
         n_trajectories_test=5000,

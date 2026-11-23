@@ -130,15 +130,3 @@ class MarkovTransitionModel(ConditionalDensityModel):
     def propagate_set_complement(self, belief: DensityModel, set: Hyperrectangle) -> DensityModel:
         raise NotImplementedError("propagate_set_complement not implemented")
 
-
-class MarkovDecisionProcess(MarkovTransitionModel):
-    def __init__(self, features: int, action_features: int, batch_shape: tuple[int, ...] = (1,)):
-        super().__init__(features, batch_shape)
-        self.action_features = action_features
-
-    def propagate(self, belief: DensityModel, action: torch.Tensor) -> DensityModel:
-        """Return the next-step belief; iterate by calling this again."""
-        raise NotImplementedError("propagate not implemented")
-    
-    def propagate_set_complement(self, belief: DensityModel, action: torch.Tensor, set: Hyperrectangle) -> DensityModel:
-        raise NotImplementedError("propagate_set_complement not implemented")

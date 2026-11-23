@@ -4,6 +4,120 @@ import torch
 from .base import DiscreteTimeStochasticSystem
 
 
+
+
+class UnicycleProcessNoise(torch.distributions.Distribution):
+    """Independent [Uniform(-1, 1), Normal(0, 1), Normal(0, 1)] noise.
+
+    The bounded first component perturbs heading displacement, while the
+    last two components generate Gaussian additive position disturbances.
+    Standard deviations / angular bounds are applied by the vehicle model.
+    """
+
+    arg_constraints = {}
+    support = torch.distributions.constraints.real_vector
+    has_rsample = False
+
+    def __init__(self, validate_args=None):
+        super().__init__(batch_shape=torch.Size(), event_shape=torch.Size([3]),
+                         validate_args=validate_args)
+
+    def sample(self, sample_shape=torch.Size()):
+        sample_shape = torch.Size(sample_shape)
+        angle = 2.0 * torch.rand(sample_shape + (1,)) - 1.0
+        positions = torch.randn(sample_shape + (2,))
+        return torch.cat([angle, positions], dim=-1)
+
+    def log_prob(self, value):
+        if value.shape[-1] != 3:
+            raise ValueError("Unicycle noise must have shape (..., 3)")
+        normal_logp = -0.5 * (
+            value[..., 1:].square().sum(dim=-1) + 2.0 * math.log(2.0 * math.pi)
+        )
+        logp = normal_logp - math.log(2.0)
+        return torch.where(value[..., 0].abs() <= 1.0, logp,
+                           torch.full_like(logp, -torch.inf))
+
+
+class KinematicUnicycle(DiscreteTimeStochasticSystem):
+    """3D fixed-speed stochastic kinematic unicycle (autonomous).
+
+    State: [px, py, theta]. The nominal heading displacement per timestep is
+    ``angular_displacement``. The forward speed is constant.
+
+    Noise v = [eta_theta, xi_x, xi_y] with eta_theta ~ Uniform(-1, 1),
+    xi_x, xi_y ~ N(0, 1) independently. The applied displacement is
+    dtheta = angular_displacement + angle_noise_bound * eta_theta.
+    Additive position noise is position_noise_std * (xi_x, xi_y).
+
+    Position updates use the exact circular-arc solution for constant speed
+    and constant angular rate during each time step (stable at dtheta=0).
+    Heading is left unwrapped for a continuous Euclidean state representation.
+    """
+
+    def __init__(
+        self,
+        dt: float = 0.3,
+        speed: float = 1.0,
+        angular_displacement: float = 0.0,
+        angle_noise_bound: float = 0.2,
+        position_noise_std: float | tuple[float, float] = 0.05,
+    ):
+        std = self._check_parameters(dt, speed, angle_noise_bound,
+                                     position_noise_std)
+        super().__init__(
+            dim=3,
+            state_labels=["px", "py", "theta"],
+            v_dist=UnicycleProcessNoise(),
+        )
+        self.dt = float(dt)
+        self.speed = float(speed)
+        if not math.isfinite(float(angular_displacement)):
+            raise ValueError("angular_displacement must be finite")
+        self.angular_displacement = float(angular_displacement)
+        self.angle_noise_bound = float(angle_noise_bound)
+        self.register_buffer("position_noise_std", std)
+
+    @staticmethod
+    def _check_parameters(dt, speed, angle_noise_bound, position_noise_std):
+        if not math.isfinite(float(dt)) or dt <= 0:
+            raise ValueError("dt must be finite and positive")
+        if not math.isfinite(float(speed)) or speed < 0:
+            raise ValueError("speed must be finite and nonnegative")
+        if not math.isfinite(float(angle_noise_bound)) or angle_noise_bound < 0:
+            raise ValueError("angle_noise_bound must be finite and nonnegative")
+        std = torch.as_tensor(position_noise_std, dtype=torch.float32)
+        if std.numel() == 1:
+            std = std.expand(2).clone()
+        if std.shape != (2,) or not torch.isfinite(std).all() or (std < 0).any():
+            raise ValueError("position_noise_std must be a nonnegative scalar or length-2 vector")
+        return std
+
+    def _step(self, x: torch.Tensor, angle_cmd: torch.Tensor | float,
+              v: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != 3 or v.shape[-1] != 3:
+            raise ValueError("Expected state and noise with shape (..., 3)")
+        theta = x[..., 2]
+        dtheta = angle_cmd + self.angle_noise_bound * v[..., 0]
+        # torch.sinc(z) = sin(pi*z) / (pi*z), including the limit at zero.
+        chord = self.speed * self.dt * torch.sinc(dtheta / (2.0 * math.pi))
+        mid_angle = theta + 0.5 * dtheta
+        noise_xy = v[..., 1:] * self.position_noise_std
+        return torch.stack([
+            x[..., 0] + chord * torch.cos(mid_angle) + noise_xy[..., 0],
+            x[..., 1] + chord * torch.sin(mid_angle) + noise_xy[..., 1],
+            theta + dtheta,
+        ], dim=-1)
+
+    def next_state(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return self._step(x, self.angular_displacement, v)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Independent random innovations for every state in a batch.
+        noise = self._v_dist.sample(x.shape[:-1]).to(device=x.device, dtype=x.dtype)
+        return self.next_state(x, noise)
+
+
 class ScalarNonlinearDrift(DiscreteTimeStochasticSystem):
     """
     One-dimensional state with a fixed nonlinear drift f(x) and additive Gaussian noise:

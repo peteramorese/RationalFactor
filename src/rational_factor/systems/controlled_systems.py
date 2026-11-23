@@ -14,6 +14,52 @@ from .base import ControllableStochasticSystem
 from . import systems
 
 
+
+
+class ControlledKinematicUnicycle(ControllableStochasticSystem, systems.KinematicUnicycle):
+    """3D kinematic unicycle with one control: angle displacement per step.
+
+    State [px, py, theta], control [dtheta]. Forward speed is fixed.
+    Actual angular displacement = u[0] + angle_noise_bound * eta_theta,
+    with eta_theta ~ Uniform(-1, 1). Position noise is independent Gaussian.
+    See ``systems.KinematicUnicycle`` for the exact-arc position update.
+    """
+
+    def __init__(
+        self,
+        dt: float = 0.3,
+        speed: float = 1.0,
+        angle_noise_bound: float = 0.2,
+        position_noise_std: float | tuple[float, float] = 0.05,
+    ):
+        std = systems.KinematicUnicycle._check_parameters(
+            dt, speed, angle_noise_bound, position_noise_std
+        )
+        ControllableStochasticSystem.__init__(
+            self,
+            state_dim=3,
+            control_dim=1,
+            state_labels=["px", "py", "theta"],
+            control_labels=["dtheta"],
+            v_dist=systems.UnicycleProcessNoise(),
+        )
+        self.dt = float(dt)
+        self.speed = float(speed)
+        self.angle_noise_bound = float(angle_noise_bound)
+        self.register_buffer("position_noise_std", std)
+
+    def next_state(self, x: torch.Tensor, u: torch.Tensor,
+                   v: torch.Tensor) -> torch.Tensor:
+        if u.shape[-1] != 1:
+            raise ValueError("Expected angle displacement control with shape (..., 1)")
+        return self._step(x, u[..., 0], v)
+
+    def forward(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        # Independent random innovations for every state in a batch.
+        noise = self._v_dist.sample(x.shape[:-1]).to(device=x.device, dtype=x.dtype)
+        return self.next_state(x, u, noise)
+
+
 class ControlledScalarNonlinearDrift(ControllableStochasticSystem, systems.ScalarNonlinearDrift):
     """x_{k+1} = f(x_k) + u + v,  u is additive scalar forcing."""
 
