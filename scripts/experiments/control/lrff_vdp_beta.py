@@ -114,10 +114,10 @@ if __name__ == "__main__":
     n_basis = 100
     action_features = problem.system.control_dim()
     hidden_features = 32
-    num_hidden_layers = 2
+    num_hidden_layers = 3
 
     tran_params = {
-        "epochs": 30,
+        "epochs": 100,
         "basis_iterations": 2,
         "neural_iterations": 3,
         "weights_iterations": 3,
