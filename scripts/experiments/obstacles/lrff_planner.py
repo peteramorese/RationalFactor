@@ -280,14 +280,14 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    n_basis = 300
+    n_basis = 200
     gaussian_std_epsilon = 1e-3
-    hidden_features = 64
+    hidden_features = 32
     num_hidden_layers = 2
     action_features = problem.system.control_dim()
 
     tran_params = {
-        "epochs": 20,
+        "epochs": 10,
         "basis_iterations": 2,
         "neural_iterations": 3,
         "weights_iterations": 3,
@@ -303,8 +303,8 @@ if __name__ == "__main__":
         "lr_basis": 1e-3,
     }
     ctrl_params = {
-        "epochs": 80,
-        "lr": 5e-2,
+        "epochs": 200,
+        "lr": 5e-1,
     }
 
     batch_size = 256
@@ -459,12 +459,16 @@ if __name__ == "__main__":
         raise SystemExit("No stable initial-density checkpoint was found.")
     print(f"Done. best init mle={best_loss_init:.4f}, time={train_time_init:.1f}s")
 
-    # Unit-mass unnormalized belief; freeze all density-model parameters.
-    init_model = init_model.absorb_norm_constant().eval()
+    # Freeze all density-model parameters before absorbing norm constant
+    # (absorb_norm_constant uses register_modules=False and FixedParameters(c_scaled),
+    # so freezing afterwards would leave psi0 params trainable and c_scaled attached
+    # to a graph that gets freed on the first backward pass).
     for parameter in init_model.parameters():
         parameter.requires_grad_(False)
     for parameter in tran_model.parameters():
         parameter.requires_grad_(False)
+    with torch.no_grad():
+        init_model = init_model.absorb_norm_constant().eval()
 
     obstacles_dev = Hyperrectangle(
         obstacles.low.to(device=device, dtype=dtype),
@@ -528,7 +532,7 @@ if __name__ == "__main__":
 
     # --- Evaluate / visualize under the trained controller ---
     def _ctrl_k(k, ctrl=controller):
-        return ctrl(k).detach()
+        return ctrl(k).detach().cpu()
 
     with torch.no_grad():
         reach_belief = reach_avoid_probabilities(
