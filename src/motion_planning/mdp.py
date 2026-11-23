@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from rational_factor.models.density_model import DensityModel, MarkovDecisionProcess
+from rational_factor.models.density_model import DensityModel, MarkovTransitionModel
 from rational_factor.models.parameters import (
     DenseMatrixParameters,
     FixedParameters,
@@ -15,11 +15,24 @@ from rational_factor.models.factor_forms import (
     LinearRFF,
     QuadraticFF,
     QuadraticRFF,
-    _fixed_vector_parameters,
 )
 from rational_factor.models.basis_functions import Basis, BetaBasis, GaussianBasis, GaussianKernelBasis
 from rational_factor.models.structured_matrices import DenseMatrix, as_matrix
 from rational_factor.models.structured_vectors import as_vector
+from rational_factor.tools.set import Hyperrectangle
+
+
+class MarkovDecisionProcess(MarkovTransitionModel):
+    def __init__(self, features: int, action_features: int, batch_shape: tuple[int, ...] = (1,)):
+        super().__init__(features, batch_shape)
+        self.action_features = action_features
+
+    def propagate(self, belief: DensityModel, action: torch.Tensor) -> DensityModel:
+        """Return the next-step belief; iterate by calling this again."""
+        raise NotImplementedError("propagate not implemented")
+    
+    def propagate_set_complement(self, belief: DensityModel, action: torch.Tensor, set: Hyperrectangle) -> DensityModel:
+        raise NotImplementedError("propagate_set_complement not implemented")
 
 
 def _batched_action(action: torch.Tensor, action_features: int) -> torch.Tensor:
@@ -40,9 +53,15 @@ def _batched_action(action: torch.Tensor, action_features: int) -> torch.Tensor:
     return action
 
 
-def _freeze_basis_at_context(basis: Basis, **context: torch.Tensor) -> Basis:
-    """Snap context-dependent basis parameters to FixedParameters (single action)."""
-    frozen = []
+def _basis_at_context(basis: Basis, **context: torch.Tensor) -> Basis:
+    """Materialize context-dependent basis params as FixedParameters (keep autograd).
+
+    Neural ``psi`` needs ``action`` at call time; the next ``LinearFF`` /
+    ``QuadraticFF`` must evaluate without that context. Same pattern as wrapping
+    propagated coefficients in ``FixedParameters(cp)``: store the evaluated
+    tensors (still attached to the controller graph), do not ``detach``.
+    """
+    materialized = []
     for p in basis.params():
         vals = p(**context)
         # Unbatched action yields intrinsic shape only; restore ensemble leading 1.
@@ -50,19 +69,19 @@ def _freeze_basis_at_context(basis: Basis, **context: torch.Tensor) -> Basis:
             vals = vals.unsqueeze(0)
         if vals.shape[0] != 1:
             raise ValueError(
-                f"freeze expects a single context batch, got leading size {vals.shape[0]}"
+                f"basis_at_context expects a single context batch, got leading size {vals.shape[0]}"
             )
-        frozen.append(FixedParameters(vals.detach().clone()))
+        materialized.append(FixedParameters(vals))
 
     cls = type(basis)
     if cls is GaussianBasis:
-        return GaussianBasis(frozen[0], frozen[1])
+        return GaussianBasis(materialized[0], materialized[1])
     if cls is GaussianKernelBasis:
-        return GaussianKernelBasis(frozen[0], frozen[1])
+        return GaussianKernelBasis(materialized[0], materialized[1])
     if cls is BetaBasis:
-        return BetaBasis(frozen[0], frozen[1], eps=getattr(basis, "eps", 1e-6))
+        return BetaBasis(materialized[0], materialized[1], eps=getattr(basis, "eps", 1e-6))
     raise TypeError(
-        f"cannot freeze action-conditioned basis of type {cls.__name__}; "
+        f"cannot materialize action-conditioned basis of type {cls.__name__}; "
         "expected GaussianBasis, GaussianKernelBasis, or BetaBasis"
     )
 
@@ -135,9 +154,9 @@ class NeuralActionLRFF(MarkovDecisionProcess, LinearRFF):
     def propagate(self, belief: DensityModel, action: torch.Tensor) -> LinearFF:
         r"""One-step LinearFF propagation at a fixed action.
 
-        Instantiates ``B(action)`` and ``Omega2(phi, psi(action))``, updates
-        coefficients, and returns a LinearFF that reuses ``a`` / ``phi`` with a
-        frozen ``psi`` at ``action``.
+        Instantiates ``B(action)`` and ``Omega2(psi(action), phi)``, updates
+        coefficients, and returns a LinearFF that reuses ``a`` / ``phi`` with
+        ``psi`` materialized at ``action`` (autograd retained).
         """
         if not isinstance(belief, LinearFF):
             raise TypeError(
@@ -150,23 +169,66 @@ class NeuralActionLRFF(MarkovDecisionProcess, LinearRFF):
         tol = self.numerical_tolerance
         a = as_vector(self.a(), numerical_tolerance=tol)
         B = as_matrix(self.B(action=action))
-        omega_current = as_matrix(self.phi.Omega2(belief.psi))
-        omega_next = as_matrix(self.phi.Omega2(self.psi, action=action))
-        q = as_vector(omega_next.rev_matvec(a), numerical_tolerance=tol)
-
         c = as_vector(belief.c(), numerical_tolerance=tol)
-        log_scale = torch.as_tensor(
-            belief.log_norm_constant(), dtype=a.dtype, device=a.device
-        )
-        c = c * torch.exp(log_scale)
-        overlap = as_vector(omega_current.matvec(c), numerical_tolerance=tol)
-        c_next = as_vector(B.rev_matvec(a * overlap), numerical_tolerance=tol) / q
+        if belief.is_auto_normalized():
+            c = belief.norm_constant() * c
 
-        psi_next = _freeze_basis_at_context(self.psi, action=action)
+        # Omega2 between RFF bases used for normalization (at action)
+        Omega2_normalization = as_matrix(self.psi.Omega2(self.phi, action=action))
+
+        # Omega2 between RFF input basis and belief basis for transition
+        Omega2_transition = as_matrix(belief.psi.Omega2(self.phi))
+
+        cp = self._propagate_c(B, Omega2_normalization, Omega2_transition, a, c)
+
+        psi_next = _basis_at_context(self.psi, action=action)
         return LinearFF(
             self.a,
             self.phi,
-            _fixed_vector_parameters(c_next, modes=getattr(psi_next, "modes", None)),
+            FixedParameters(cp.to_dense()),
+            psi_next,
+            numerical_tolerance=belief.numerical_tolerance,
+            renormalize_h=False,
+            register_modules=False,
+        )
+
+    def propagate_set_complement(
+        self, belief: DensityModel, action: torch.Tensor, set: Hyperrectangle
+    ) -> LinearFF:
+        if not isinstance(belief, LinearFF):
+            raise TypeError(
+                "NeuralActionLRFF.propagate_set_complement expects a LinearFF belief, got "
+                f"{type(belief).__name__}"
+            )
+        action = _batched_action(action, self.action_features)
+        action = action.to(dtype=self.dtype_device()[0], device=self.dtype_device()[1])
+
+        tol = self.numerical_tolerance
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        B = as_matrix(self.B(action=action))
+        c = as_vector(belief.c(), numerical_tolerance=tol)
+        if belief.is_auto_normalized():
+            c = belief.norm_constant() * c
+
+        # Omega2 between RFF bases used for normalization (at action)
+        Omega2_normalization = as_matrix(self.psi.Omega2(self.phi, action=action))
+
+        # Omega2 between RFF input basis and belief basis for transition
+        Omega2_transition = as_matrix(belief.psi.Omega2(self.phi))
+
+        # Omega2 restricted to the obstacle set
+        Omega2_set_transition = as_matrix(belief.psi.Omega2(self.phi, domain=set))
+
+        full_prop_cp = self._propagate_c(B, Omega2_normalization, Omega2_transition, a, c)
+        set_prop_cp = self._propagate_c(B, Omega2_normalization, Omega2_set_transition, a, c)
+
+        cp = full_prop_cp.to_dense() - set_prop_cp.to_dense().sum(dim=0)
+
+        psi_next = _basis_at_context(self.psi, action=action)
+        return LinearFF(
+            self.a,
+            self.phi,
+            FixedParameters(cp),
             psi_next,
             numerical_tolerance=belief.numerical_tolerance,
             renormalize_h=False,
@@ -242,7 +304,7 @@ class NeuralActionQRFF(MarkovDecisionProcess, QuadraticRFF):
 
         Uses ``get_normalization(action=...)`` so ``T`` / ``Q0`` match the
         action-conditioned gram, then returns a QuadraticFF with the same
-        ``LA`` / ``phi`` and a frozen ``psi`` at ``action``.
+        ``LA`` / ``phi`` and ``psi`` materialized at ``action`` (autograd retained).
         """
         if not isinstance(belief, QuadraticFF):
             raise TypeError(
@@ -257,24 +319,68 @@ class NeuralActionQRFF(MarkovDecisionProcess, QuadraticRFF):
         action = action.to(dtype=self.dtype_device()[0], device=self.dtype_device()[1])
 
         _, _, Q0, _, T = self.get_normalization(action=action)
-        V = belief.get_V(normalized=True)
-        omega = as_matrix(self.phi.Omega22(belief.psi))
-        D = DenseMatrix(
-            omega.frobenius_inner(DenseMatrix(V.to_dense()[..., None, None, :, :]))
-        )
-        weighted_D = (T @ D) @ T.T
-        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
-        qb = Q0.to_dense().reshape(self.phi.batch_size(), m, n, m, n)
-        qb = qb.movedim(-3, -2)  # (batch, m, m, n, n)
-        Vnext = DenseMatrix(qb).contract_batch_matrix(weighted_D)
+        V = belief.get_V()
+        if belief.is_auto_normalized():
+            Z = belief.norm_constant()
+            V = DenseMatrix(V.to_dense() * Z[..., None, None])
 
-        psi_next = _freeze_basis_at_context(self.psi, action=action)
+        # Omega22 between RFF input basis and belief basis for transition
+        Omega22_transition = as_matrix(self.phi.Omega22(belief.psi))
+
+        Vnext = self._propagate_V(Q0, T, Omega22_transition, V)
+
+        psi_next = _basis_at_context(self.psi, action=action)
         return QuadraticFF(
             self.LA,
             self.phi,
             None,
             psi_next,
-            V_fixed=Vnext.to_dense().detach().clone(),
+            V_fixed=FixedParameters(Vnext.to_dense()),
+            numerical_tolerance=belief.numerical_tolerance,
+            pd_jitter=self.pd_jitter,
+            renormalize_h=False,
+            register_modules=False,
+        )
+
+    def propagate_set_complement(
+        self, belief: DensityModel, action: torch.Tensor, set: Hyperrectangle
+    ) -> QuadraticFF:
+        if not isinstance(belief, QuadraticFF):
+            raise TypeError(
+                "NeuralActionQRFF.propagate_set_complement expects QuadraticFF, got "
+                f"{type(belief).__name__}"
+            )
+        if belief.LA is not self.LA or belief.phi is not self.phi:
+            raise ValueError(
+                "belief must share LA and phi with transition (use QuadraticFF.from_rff)"
+            )
+        action = _batched_action(action, self.action_features)
+        action = action.to(dtype=self.dtype_device()[0], device=self.dtype_device()[1])
+
+        _, _, Q0, _, T = self.get_normalization(action=action)
+        V = belief.get_V()
+        if belief.is_auto_normalized():
+            Z = belief.norm_constant()
+            V = DenseMatrix(V.to_dense() * Z[..., None, None])
+
+        # Omega22 between RFF input basis and belief basis for transition
+        Omega22_transition = as_matrix(self.phi.Omega22(belief.psi))
+
+        # Omega22 restricted to the obstacle set
+        Omega22_set_transition = as_matrix(self.phi.Omega22(belief.psi, domain=set))
+
+        full_prop_V = self._propagate_V(Q0, T, Omega22_transition, V)
+        set_prop_V = self._propagate_V(Q0, T, Omega22_set_transition, V)
+
+        Vnext = full_prop_V.to_dense() - set_prop_V.to_dense().sum(dim=0)
+
+        psi_next = _basis_at_context(self.psi, action=action)
+        return QuadraticFF(
+            self.LA,
+            self.phi,
+            None,
+            psi_next,
+            V_fixed=FixedParameters(Vnext),
             numerical_tolerance=belief.numerical_tolerance,
             pd_jitter=self.pd_jitter,
             renormalize_h=False,

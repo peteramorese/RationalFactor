@@ -197,3 +197,51 @@ def cbl_positivity_loss(
         state = torch.einsum('sa,asb->sb', state, selected)
     penalty = torch.relu(-state[:, 0]).square()
     return penalty.mean() if reduction == 'mean' else penalty.sum()
+
+#### Smooth box distributions ####
+
+def smooth_box_sigma_loss(model, power: float = 1.0) -> torch.Tensor:
+    """Encourage the Gaussian tails of a SmoothBox or SmoothBoxMixture to vanish.
+
+    Penalizes the actual positive standard deviations, not raw parameters.
+    ``power=1`` gives a nonvanishing shrinkage incentive near zero; ``power=2``
+    gives a quadratic penalty. The returned scalar retains all gradients.
+    """
+    if power <= 0:
+        raise ValueError("power must be positive")
+    return model.sigmas().pow(power).max()
+
+
+def smooth_box_overlap_loss(
+    model,
+    margin: float = 0.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Penalize overlaps between distinct boxes in a SmoothBoxMixture.
+
+    For each pair, the minimum coordinatewise penetration depth is positive
+    exactly when the interiors overlap. ``margin > 0`` additionally promotes
+    a gap of at least ``margin`` along one coordinate. Overlap of Gaussian
+    tails is not penalized (tails have infinite support).
+
+    Pairwise complexity: O(n_components**2 * features), per batch entry.
+    """
+    if margin < 0:
+        raise ValueError("margin must be nonnegative")
+    if reduction not in ("mean", "sum"):
+        raise ValueError("reduction must be 'mean' or 'sum'")
+    lower, upper = model.bounds()  # (*batch_shape, n_components, features)
+    if lower.ndim < 2 or not hasattr(model, "n_components"):
+        raise TypeError("smooth_box_overlap_loss requires a SmoothBoxMixture")
+    k = model.n_components
+    if k < 2:
+        return lower.sum() * 0.0
+    i, j = torch.triu_indices(k, k, offset=1, device=lower.device)
+    center = (lower + upper) / 2
+    radius = (upper - lower) / 2
+    penetration = radius[..., i, :] + radius[..., j, :] - (
+        center[..., i, :] - center[..., j, :]
+    ).abs()
+    slack = penetration.amin(dim=-1)
+    penalty = torch.relu(slack + margin).square()
+    return penalty.mean() if reduction == "mean" else penalty.sum()

@@ -1,5 +1,7 @@
 import torch
 
+from rational_factor.tools.set import Hyperrectangle
+
 class DensityModel(torch.nn.Module):
     def __init__(self, features: int, batch_shape: tuple[int, ...] | int = 1):
         super().__init__()
@@ -36,8 +38,14 @@ class DensityModel(torch.nn.Module):
     def valid(self):
         return True
     
-    def marginal(self, marginal_dims : tuple[int, ...]):
-        raise NotImplementedError("marginal not implemented")
+    def log_marginal_density(self, x : torch.Tensor, marginal_dims : tuple[int, ...]):
+        raise NotImplementedError("log_marginal_density not implemented")
+    
+    def marginal_density(self, x : torch.Tensor, marginal_dims : tuple[int, ...]):
+        return torch.exp(self.log_marginal_density(x, marginal_dims))
+    
+    def integrate(self, region : Hyperrectangle):
+        raise NotImplementedError("integrate not implemented")
     
     def sample(self, n_samples : int, **contexts : torch.Tensor):
         raise NotImplementedError("sample not implemented")
@@ -47,6 +55,7 @@ class DensityModel(torch.nn.Module):
 
     def supremum_bound(self):
         raise NotImplementedError("supremum_bound not implemented")
+
 
 class ConditionalDensityModel(torch.nn.Module):
     def __init__(self, features : int, context_features : int, batch_shape: tuple[int, ...] | int = (1,)):
@@ -117,13 +126,7 @@ class MarkovTransitionModel(ConditionalDensityModel):
     def propagate(self, belief: DensityModel) -> DensityModel:
         """Return the next-step belief; iterate by calling this again."""
         raise NotImplementedError("propagate not implemented")
+    
+    def propagate_set_complement(self, belief: DensityModel, set: Hyperrectangle) -> DensityModel:
+        raise NotImplementedError("propagate_set_complement not implemented")
 
-
-class MarkovDecisionProcess(MarkovTransitionModel):
-    def __init__(self, features: int, action_features: int, batch_shape: tuple[int, ...] = (1,)):
-        super().__init__(features, batch_shape)
-        self.action_features = action_features
-
-    def propagate(self, belief: DensityModel, action: torch.Tensor) -> DensityModel:
-        """Return the next-step belief; iterate by calling this again."""
-        raise NotImplementedError("propagate not implemented")

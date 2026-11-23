@@ -3,8 +3,10 @@ from __future__ import annotations
 import torch
 
 from rational_factor.models.basis_functions import Basis, SeparableBasis
+from rational_factor.models.structured_matrices import DenseMatrix
 from rational_factor.models.tt.tt import MPO, TTVector
 from rational_factor.models.parameters import OneVectorParameters
+from rational_factor.tools.set import Hyperrectangle
 
 
 class TTBasis(Basis):
@@ -84,31 +86,55 @@ class TTBasis(Basis):
 
     __call__ = forward
 
-    def Omega1(self, lows: torch.Tensor = None, highs: torch.Tensor = None) -> TTVector:
-        """Tensor-product basis integrals as an unbatched rank-one TT."""
-        values = self._primitives.Omega1_dim(lows, highs, return_log=False)
-        out = self._tt_factors(values, batched=False)
+    def Omega1(self, domain: Hyperrectangle = None) -> TTVector:
+        """Tensor-product basis integrals as a rank-one TT.
+
+        A batched ``domain`` yields a batched ``TTVector`` whose leading batch
+        matches the hyperrectangle batch.
+        """
+        values = self._primitives.Omega1_dim(domain, return_log=False)
+        out = self._tt_factors(values, batched=values.shape[0] != 1)
         return out * self._coeff_tt() if self._tt_has_coeffs else out
 
     def Omega2(
-        self, other: "TTBasis", lows: torch.Tensor = None, highs: torch.Tensor = None,
-    ) -> MPO:
-        """Tensor-product Gram as an exact bond-rank-one MPO, including signed entries."""
+        self, other: "TTBasis", domain: Hyperrectangle = None,
+    ) -> MPO | DenseMatrix:
+        """Tensor-product Gram as an exact bond-rank-one MPO, including signed entries.
+
+        A single box (or leading size 1) returns an ``MPO``. A batched domain
+        densifies the Kronecker product of local grams into a ``DenseMatrix`` of
+        shape ``(batch, N, N)``, since ``MPO`` cores are unbatched.
+        """
         if not isinstance(other, TTBasis) or self.dim() != other.dim():
             raise ValueError("other must be a TTBasis of the same dimension")
         grams = self._primitives.Omega2_dim(
-            other._primitives, lows, highs, return_log=False,
-        )  # (1, dim, n_self, n_other)
-        if not self._tt_has_coeffs and not other._tt_has_coeffs:
-            return MPO([g[None, :, :, None] for g in grams[0].unbind(dim=0)])
-        left, right = self._coeff_tt(), other._coeff_tt()
-        cores = []
-        for a, g, b in zip(left.cores, grams[0].unbind(dim=0), right.cores):
-            # diag(left) @ gram @ diag(right), with TT bond products.
-            c = torch.einsum('aib,ij,cjd->acijbd', a, g, b)
-            cores.append(c.reshape(a.shape[0] * b.shape[0], g.shape[0],
-                                   g.shape[1], a.shape[-1] * b.shape[-1]))
-        return MPO(cores)
+            other._primitives, domain, return_log=False,
+        )  # (batch, dim, n_self, n_other)
+        batch = grams.shape[0]
+        if batch == 1:
+            if not self._tt_has_coeffs and not other._tt_has_coeffs:
+                return MPO([g[None, :, :, None] for g in grams[0].unbind(dim=0)])
+            left, right = self._coeff_tt(), other._coeff_tt()
+            cores = []
+            for a, g, b in zip(left.cores, grams[0].unbind(dim=0), right.cores):
+                # diag(left) @ gram @ diag(right), with TT bond products.
+                c = torch.einsum('aib,ij,cjd->acijbd', a, g, b)
+                cores.append(c.reshape(a.shape[0] * b.shape[0], g.shape[0],
+                                       g.shape[1], a.shape[-1] * b.shape[-1]))
+            return MPO(cores)
+
+        # Batched domain → DenseMatrix via successive Kronecker products.
+        dense = grams[:, 0]
+        for k in range(1, grams.shape[1]):
+            g = grams[:, k]
+            dense = torch.einsum('bij,bkl->bikjl', dense, g).reshape(
+                batch, dense.shape[1] * g.shape[1], dense.shape[2] * g.shape[2]
+            )
+        if self._tt_has_coeffs or other._tt_has_coeffs:
+            left = self._coeff_tt().to_dense()
+            right = other._coeff_tt().to_dense()
+            dense = left.unsqueeze(-1) * dense * right.unsqueeze(-2)
+        return DenseMatrix(dense)
 
     def __repr__(self) -> str:
         return f"TTBasis(dim={self.dim()}, modes={self.modes}, ranks={self.ranks})"

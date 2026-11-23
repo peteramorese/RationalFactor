@@ -1,101 +1,26 @@
 import torch
 import copy
 import itertools
-import math
 from .basis_functions import Basis, SeparableBasis, NonnegativeBasis
 from .density_model import DensityModel, ConditionalDensityModel, MarkovTransitionModel
 from .parameters import Parameters, FixedParameters
 from .structured_matrices import Matrix, DenseMatrix, as_matrix
-from .structured_vectors import as_vector
-from rational_factor.models.tt.tt import TTVector
-
-
-def _is_parameters_like(obj) -> bool:
-    """Duck-type check for Parameters / NestedTT parameter objects."""
-    return callable(obj) and hasattr(obj, "is_trainable") and hasattr(
-        obj, "parameter_modules"
-    )
-
-
-def _fixed_vector_parameters(values, *, modes=None):
-    """Wrap detached propagated coefficients, preserving structured TT storage.
-
-    A structured Matrix.rev_matvec yields TT coefficients directly. When a
-    *dense* Matrix instead yields a dense vector, tensor-product coefficient
-    storage with ``modes`` requires a TT: convert it via exact TT-SVD.
-    This dense fallback is not intended for exponentially large spaces.
-    """
-    values = as_vector(values)
-    if isinstance(values, TTVector):
-        from rational_factor.models.tt.tt_parameters import TTVectorParameters
-        return TTVectorParameters.from_cores([
-            FixedParameters(core.detach().clone()) for core in values.cores
-        ])
-    dense = values.to_dense().detach().clone()
-    if modes is None:
-        return FixedParameters(dense)
-    modes = tuple(int(n) for n in modes)
-    if dense.ndim != 1 or dense.numel() != math.prod(modes):
-        raise ValueError("dense-to-TT coefficient conversion requires an unbatched vector")
-    from rational_factor.models.tt.tt_parameters import TTVectorParameters
-    cores = []
-    tensor = dense.reshape(*modes)
-    left_rank = 1
-    for n in modes[:-1]:
-        matrix = tensor.reshape(left_rank * n, -1)
-        u, singular, vh = torch.linalg.svd(matrix, full_matrices=False)
-        rank = singular.numel()
-        cores.append(FixedParameters(u.reshape(left_rank, n, rank)))
-        tensor = singular[:, None] * vh
-        left_rank = rank
-    cores.append(FixedParameters(tensor.reshape(left_rank, modes[-1], 1)))
-    return TTVectorParameters.from_cores(cores)
+from .structured_vectors import as_vector, Vector
+from rational_factor.tools.set import Hyperrectangle
 
 
 # Linear models #
-
-class LinearForm(DensityModel):
-    def __init__(self, w : SeparableBasis, numerical_tolerance : float = 1e-20, register_modules : bool = True):
-        super().__init__(w.dim())
-
-        self.w = w
-
-        if register_modules:
-            # Register the parameter modules to use parameters() and to() methods
-            param_modules, coeff_modules = Basis.get_deduplicated_module_list([w])
-            self._param_modules = torch.nn.ModuleList(param_modules)
-            self._coeff_modules = torch.nn.ModuleList(coeff_modules)
-
-        self.numerical_tolerance = numerical_tolerance
-
-    def log_norm_constant(self, Omega : torch.Tensor = None):
-        if Omega is None:
-            Omega = self.w.Omega1()
-
-        return -torch.log(torch.sum(Omega) + self.numerical_tolerance)
-    
-    def log_density(self, x : torch.Tensor):
-        log_norm_constant = self.log_norm_constant()
-        log_g_x = torch.log(self.w(x) + self.numerical_tolerance) # (n_data)
-
-        return log_norm_constant + log_g_x
-    
-    def marginal(self, marginal_dims : tuple[int, ...]):
-        w_marginal = self.w.marginal(marginal_dims)
-        return LinearForm(w_marginal, numerical_tolerance=self.numerical_tolerance)
-
 
 class LinearRFF(MarkovTransitionModel):
     def __init__(self, a : Parameters, phi : Basis, psi : Basis, B : Parameters,
                 numerical_tolerance : float = 1e-20, register_modules : bool = True):
         assert phi.dim() == psi.dim(), "phi and psi must have the same dimension"
-        assert _is_parameters_like(a), "a must be a Parameters-like object"
+        assert (callable(a) and hasattr(a, "is_trainable") and
+                hasattr(a, "parameter_modules")), "a must be a Parameters-like object"
         assert isinstance(phi, Basis), "phi must be a Basis"
         assert isinstance(psi, Basis), "psi must be a Basis"
         a_vals = a()
         a_shape = tuple(a_vals.shape) if hasattr(a_vals, "shape") else tuple(a_vals.size())
-        if isinstance(a_vals, TTVector) and not a_vals.is_rank_one:
-            raise ValueError("LinearRFF requires rank-one TT coefficients a for structured q scaling")
         batch_size = phi.batch_size()
         n_basis = phi.n_basis_functions()
         a_ok = a_shape == (batch_size, n_basis) or (
@@ -114,8 +39,6 @@ class LinearRFF(MarkovTransitionModel):
         self.psi = psi
         
         expected = (batch_size, n_basis, n_basis)
-        # Unbatched structured matrices (e.g. LowRankFactorizationMPO) expose shape (n, n);
-        # that is accepted when the basis batch size is 1.
         expected_unbatched = (n_basis, n_basis)
 
         B_m = B()
@@ -169,8 +92,8 @@ class LinearRFF(MarkovTransitionModel):
         psi_xp = as_vector(self.psi(xp, **context), numerical_tolerance=tol)
 
         B = self.B(**context)
-        Omega2 = as_matrix(self.phi.Omega2(self.psi, **context))
-        q = as_vector(Omega2.rev_matvec(a), numerical_tolerance=tol)
+        Omega2 = as_matrix(self.psi.Omega2(self.phi, **context))
+        q = as_vector(Omega2.matvec(a), numerical_tolerance=tol)
 
         # Q @ psi = a * (B @ (psi / q))
         Q_psi_xp = a * B.matvec(psi_xp / q)
@@ -180,6 +103,9 @@ class LinearRFF(MarkovTransitionModel):
         eps = torch.finfo(g_x.dtype).tiny
         return (torch.log(g_xp * f + eps) - torch.log(g_x + eps)).reshape(-1)
 
+    def _propagate_c(self, B: Matrix, Omega2_normalization: Matrix, Omega2_transition: Matrix, a: Vector, c: Vector) -> torch.Tensor:
+        q = as_vector(Omega2_normalization.matvec(a), numerical_tolerance=self.numerical_tolerance)
+        return B.rev_matvec(a * Omega2_transition.rev_matvec(c)) / q
 
     def propagate(self, belief: "LinearFF") -> "LinearFF":
         r"""Propagate a LinearFF for one Markov step using base vector/matrix APIs.
@@ -201,163 +127,53 @@ class LinearRFF(MarkovTransitionModel):
         tol = self.numerical_tolerance
         a = as_vector(self.a(), numerical_tolerance=tol)
         B = as_matrix(self.B())
-        omega_current = as_matrix(self.phi.Omega2(belief.psi))
-        omega_next = as_matrix(self.phi.Omega2(self.psi))
-        q = as_vector(omega_next.rev_matvec(a), numerical_tolerance=tol)
-
+        # Apply Z only when the belief renormalizes; otherwise ``c`` already
+        # carries the intended (possibly unnormalized) scale.
         c = as_vector(belief.c(), numerical_tolerance=tol)
-        log_scale = torch.as_tensor(belief.log_norm_constant(), dtype=a.dtype, device=a.device)
-        c = c * torch.exp(log_scale)
-        overlap = as_vector(omega_current.matvec(c), numerical_tolerance=tol)
-        c_next = as_vector(B.rev_matvec(a * overlap), numerical_tolerance=tol) / q
-
-        return LinearFF(
-            self.a, self.phi,
-            _fixed_vector_parameters(c_next, modes=getattr(self.psi, "modes", None)),
-            self.psi,
-            numerical_tolerance=belief.numerical_tolerance,
-            renormalize_h=False, register_modules=False,
-        )
-
-class LinearRF(ConditionalDensityModel):
-    """
-    Linear Rational Form
-
-    Used for time-invariant observation distribution for filtering models
-    """
-    def __init__(self, xi_basis : SeparableBasis, zeta_basis : Basis, numerical_tolerance : float = 1e-20):
-        assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
-        assert isinstance(zeta_basis, Basis), "zeta_basis must be a Basis"
-        assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
-        assert isinstance(zeta_basis, NonnegativeBasis), "zeta_basis must be a NonnegativeBasis"
-        super().__init__(xi_basis.dim(), zeta_basis.dim())
-
-        self.xi_basis = xi_basis
-        self.zeta_basis = zeta_basis
-
-        assert xi_basis.n_basis_functions() == zeta_basis.n_basis_functions(), "xi_basis and zeta_basis must have the same number of basis functions"
-
-        self.__du = torch.nn.Parameter(torch.ones(xi_basis.n_basis_functions()))
-
-        self.numerical_tolerance = numerical_tolerance
-    
-    def get_d(self):
-        return torch.nn.functional.softmax(self.__du, dim=0)
-    
-    def get_e(self, d : torch.Tensor = None):
-        if d is None:
-            d = self.get_d()
-
-        if not self.zeta_basis.normalized():
-            Omega = self.zeta_basis.Omega1()
-            return d / (Omega + self.numerical_tolerance)
-        return d
-
-    def log_density(self, o : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
-        x = conditioner
-        xi_x = self.xi_basis(x)
-        zeta_o = self.zeta_basis(o)
-
-        d = self.get_d()
-        e = self.get_e(d=d)
-
-        log_r_x = torch.log(xi_x @ d + self.numerical_tolerance) # (n_data)
-        log_l_o_x = torch.log((zeta_o * xi_x) @ e + self.numerical_tolerance) # (n_data)
-
-        return log_l_o_x - log_r_x
-    
-    def weight_params(self):
-        return [self.__du]
-    
-    def basis_params(self):
-        return itertools.chain(self.xi_basis.parameters(), self.zeta_basis.parameters())
-
-
-class LinearR2FF(ConditionalDensityModel):
-    """
-    Linear Rational Two-Factor Form 
-
-    Used for Markov transition distribution for filtering models
-    """
-    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-20):
-        assert phi_basis.dim() == psi_basis.dim(), "Input bases must have the same dimension"
-        assert phi_basis.dim() == xi_basis.dim(), "Input bases must have the same dimension"
-        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
-        assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
-        assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
-        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
-        assert isinstance(psi_basis, NonnegativeBasis), "psi_basis must be a NonnegativeBasis"
-        assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
-        super().__init__(phi_basis.dim(), psi_basis.dim())
-
-
-        assert phi_basis.n_basis_functions() == psi_basis.n_basis_functions(), "phi_basis and psi_basis must have the same number of basis functions"
-
-        self.xi_basis = xi_basis.freeze_params()
-        self.phi_basis = phi_basis
-        self.psi_basis = psi_basis
-
-        self.register_buffer("d", d)
-        self.__au = torch.nn.Parameter(torch.ones(phi_basis.n_basis_functions())) # g
-
-        self.numerical_tolerance = numerical_tolerance
-    
-    @classmethod
-    def from_rf(cls, rf : LinearRF, phi_basis : SeparableBasis, psi_basis : SeparableBasis):
-        xi_basis = rf.xi_basis.freeze_params()
-        d = rf.get_d().detach().clone()
-        return cls(d, xi_basis, phi_basis, psi_basis, rf.numerical_tolerance)
-    
-    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
-        x = conditioner
-        phi_x = self.phi_basis(x) # (n_data, n_phi)
-        xi_xp = self.xi_basis(xp)  # (n_data, n_xi)
-        phi_xp = self.phi_basis(xp) # (n_data, n_phi)
-        psi_xp = self.psi_basis(xp) # (n_data, n_psi)
+        if belief.is_auto_normalized():
+            c = belief.norm_constant() * c
         
-        a = self.get_a()
-        b = self.get_b(a=a)
-        d = self.get_d()
+        # Omega2 between RFF bases used for normalization
+        Omega2_normalization = as_matrix(self.psi.Omega2(self.phi))
+
+        # Omega2 between RFF input basis and belief basis for transition
+        Omega2_transition = as_matrix(belief.psi.Omega2(self.phi))
+
+        cp = self._propagate_c(B, Omega2_normalization, Omega2_transition, a, c)
+
+        return LinearFF(self.a, self.phi, FixedParameters(cp.to_dense()), self.psi, numerical_tolerance=belief.numerical_tolerance,
+            renormalize_h=False, register_modules=False)
+
+    def propagate_set_complement(self, belief: "LinearFF", set: Hyperrectangle) -> "LinearFF":
+        if not isinstance(belief, LinearFF):
+            raise TypeError(
+                "LinearRFF.propagate_set_complement expects a LinearFF belief, got "
+                f"{type(belief).__name__}"
+            )
         
-        # Calculate g(x)
-        log_g_x = torch.log(phi_x @ a + self.numerical_tolerance) # (n_data)
-        log_g_xp = torch.log(phi_xp @ a + self.numerical_tolerance) # (n_data)
+        tol = self.numerical_tolerance
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        B = as_matrix(self.B())
+        c = as_vector(belief.c(), numerical_tolerance=tol)
+        if belief.is_auto_normalized():
+            c = belief.norm_constant() * c
+        
+        # Omega2 between RFF bases used for normalization
+        Omega2_normalization = as_matrix(self.psi.Omega2(self.phi))
 
-        # Calculate r(x')
-        log_r_xp = torch.log(xi_xp @ d + self.numerical_tolerance) # (n_data)
+        # Omega2 between RFF input basis and belief basis for transition
+        Omega2_transition = as_matrix(belief.psi.Omega2(self.phi))
 
-        # Calculate f(x, x')
-        log_f = torch.log((phi_x * psi_xp) @ b + self.numerical_tolerance) # (n_data)
+        # Omega2 for each
+        Omega2_set_transition = as_matrix(belief.psi.Omega2(self.phi, domain=set))
 
-        return log_r_xp + log_g_xp + log_f - log_g_x
+        full_prop_cp = self._propagate_c(B, Omega2_normalization, Omega2_transition, a, c)
+        set_prop_cp = self._propagate_c(B, Omega2_normalization, Omega2_set_transition, a, c)
 
-    def get_a(self):
-        return torch.nn.functional.softmax(self.__au, dim=0)
+        cp = full_prop_cp.to_dense() - set_prop_cp.to_dense().sum(dim=0)
 
-    def get_b(self, a : torch.Tensor = None, d : torch.Tensor = None, Omega : torch.Tensor = None):
-        if a is None:
-            a = self.get_a()
-
-        if d is None:
-            d = self.get_d()
-
-        if Omega is not None:
-            denom = torch.einsum('i,j,ijk->k', d, a, Omega)
-        else:
-            denom = self.xi_basis.Omega3_contract(self.phi_basis, self.psi_basis, d, a)
-
-        b = a / (denom + self.numerical_tolerance)
-
-        return b
-    
-    def get_d(self):
-        return self.d
-
-    def weight_params(self):
-        return [self.__au]
-    
-    def basis_params(self):
-        return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
+        return LinearFF(self.a, self.phi, FixedParameters(cp), self.psi, numerical_tolerance=belief.numerical_tolerance,
+            renormalize_h=False, register_modules=False)
 
 
 class LinearFF(DensityModel):
@@ -369,7 +185,8 @@ class LinearFF(DensityModel):
         if phi.dim() != psi.dim():
             raise ValueError("phi and psi must have the same dimension")
         for name, provider, basis in (("a", a, phi), ("c", c, psi)):
-            if not _is_parameters_like(provider):
+            if not (callable(provider) and hasattr(provider, "is_trainable")
+                    and hasattr(provider, "parameter_modules")):
                 raise TypeError(f"{name} must be a Parameters-like provider")
             values = provider()
             actual = tuple(values.shape)
@@ -388,8 +205,6 @@ class LinearFF(DensityModel):
 
         if register_modules:
             param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
-            # Register every provider (including TTVectorParameters' leaf modules)
-            # exactly once. Bases themselves remain coefficient-free.
             seen = {id(m) for m in (*param_modules, *coeff_modules)}
             coeff_modules = list(coeff_modules)
             for provider in (a, c):
@@ -402,6 +217,9 @@ class LinearFF(DensityModel):
                         seen.add(id(module))
             self._param_modules = torch.nn.ModuleList(param_modules)
             self._coeff_modules = torch.nn.ModuleList(coeff_modules)
+
+    def is_auto_normalized(self) -> bool:
+        return self._renormalize_h
 
     def dtype_device(self):
         return self.phi.dtype_device()
@@ -416,16 +234,36 @@ class LinearFF(DensityModel):
                    renormalize_h=renormalize_h,
                    register_modules=register_modules)
 
-    def log_norm_constant(self, Omega2=None):
-        if not self._renormalize_h:
-            return 0.0
+    def norm_constant(self, Omega2=None, log=False):
         if Omega2 is None:
             Omega2 = self.phi.Omega2(self.psi)
         tol = self.numerical_tolerance
         a = as_vector(self.a(), numerical_tolerance=tol)
         c = as_vector(self.c(), numerical_tolerance=tol)
         overlap = as_vector(as_matrix(Omega2).matvec(c), numerical_tolerance=tol)
-        return -torch.log((a * overlap).sum() + tol)
+        return -torch.log((a * overlap).sum() + tol) if log else torch.exp(-torch.log((a * overlap).sum() + tol))
+
+    def absorb_norm_constant(self) -> "LinearFF":
+        """Return a unit-mass copy with ``Z`` folded into ``c`` and ``renormalize_h=False``.
+
+        Same density as ``self`` when ``_renormalize_h`` was True, but
+        ``norm_constant() ≈ 1`` so the unnormalized integral ``a Ω c`` is 1.
+        """
+        tol = self.numerical_tolerance
+        Z = self.norm_constant()
+        c = as_vector(self.c(), numerical_tolerance=tol)
+        c_scaled = (Z * c).to_dense()
+        if c_scaled.shape != self.c().shape:
+            c_scaled = c_scaled.reshape(self.c().shape)
+        return LinearFF(
+            self.a,
+            self.phi,
+            FixedParameters(c_scaled),
+            self.psi,
+            numerical_tolerance=tol,
+            renormalize_h=False,
+            register_modules=False,
+        )
 
     def log_density(self, x: torch.Tensor):
         tol = self.numerical_tolerance
@@ -437,335 +275,85 @@ class LinearFF(DensityModel):
         h_sum = (c * psi_x).sum().clamp_min(0)
         # Avoid a coarse numerical_tolerance floor when taking the logarithm.
         eps = torch.finfo(g_sum.dtype).tiny
-        return self.log_norm_constant() + torch.log(g_sum + eps) + torch.log(h_sum + eps)
-
-    def marginal(self, marginal_dims: tuple[int, ...]):
-        raise NotImplementedError("LinearFF.marginal is not implemented")
-
-class Linear2FF(DensityModel):
-    """
-    Linear Two-Factor Form 
-
-    Used for belief representation for filtering models
-    """
-    def __init__(self, d : torch.Tensor, xi_basis : SeparableBasis, a : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis, c0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-20, renormalize_c0_fixed : bool = True):
-        assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
-        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
-        assert isinstance(xi_basis, SeparableBasis), "xi_basis must be a SeparableBasis"
-        assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
-        assert isinstance(phi_basis, NonnegativeBasis), "phi_basis must be a NonnegativeBasis"
-        assert isinstance(psi0_basis, NonnegativeBasis), "psi0_basis must be a NonnegativeBasis"
-        assert isinstance(xi_basis, NonnegativeBasis), "xi_basis must be a NonnegativeBasis"
-        assert a.shape[0] == phi_basis.n_basis_functions(), "a must have n_phi elements"
-        super().__init__(phi_basis.dim())
-
-        self.xi_basis = xi_basis.freeze_params()
-        self.phi_basis = phi_basis.freeze_params()
-        self.psi0_basis = psi0_basis
-        
-        self.register_buffer("d", d) 
-        self.register_buffer("a", a) 
-        
-        self.numerical_tolerance = numerical_tolerance
-        if c0_fixed is not None:
-            if renormalize_c0_fixed:
-                # Renormalize for numerical stability
-                denom_vec = self.xi_basis.Omega3_contract(self.phi_basis, self.psi0_basis, self.d, self.a)
-                norm_denom = denom_vec @ c0_fixed
-                norm_constant = 1.0 / (norm_denom + self.numerical_tolerance)
-                c0_fixed = norm_constant * c0_fixed
-            self.register_buffer("c0_fixed", c0_fixed)
+        if self._renormalize_h:
+            return self.norm_constant(log=True) + torch.log(g_sum + eps) + torch.log(h_sum + eps)
         else:
-            self.__c0u = torch.nn.Parameter(torch.ones(psi0_basis.n_basis_functions()))
-    
-    @classmethod
-    def from_r2ff(cls, r2ff : "LinearR2FF", psi0_basis : SeparableBasis):
-        # g(x)
-        phi_basis = r2ff.phi_basis.freeze_params()
-        a = r2ff.get_a().detach().clone()
+            return torch.log(g_sum + eps) + torch.log(h_sum + eps)
 
-        # r(x)
-        xi_basis = r2ff.xi_basis.freeze_params()
-        d = r2ff.d.detach().clone() if isinstance(r2ff, LinearR2FF) else r2ff.get_d().detach().clone()
+    def integrate(self, region: Hyperrectangle):
+        """Integral of the (possibly normalized) belief over a Hyperrectangle.
 
-        return cls(d, xi_basis, a, phi_basis, psi0_basis, numerical_tolerance=r2ff.numerical_tolerance)
-
-    def get_c0(self, Omega3_0 : torch.Tensor = None):
-        if hasattr(self, "c0_fixed"):
-            return self.c0_fixed
-
-        c0_unnormalized = torch.nn.functional.softplus(self.__c0u)
-
-        if Omega3_0 is not None:
-            norm_denom = torch.einsum("i,j,k,ijk->", self.d, self.a, c0_unnormalized, Omega3_0)
+        For a batched ``region`` of shape ``(batch, dim)``, returns a tensor of
+        shape ``(batch,)`` with one mass per box.
+        """
+        dtype, device = self.dtype_device()
+        lows = torch.as_tensor(region.low, dtype=dtype, device=device)
+        highs = torch.as_tensor(region.high, dtype=dtype, device=device)
+        if lows.shape != highs.shape or lows.shape[-1] != self.features:
+            raise ValueError(
+                f"region bounds must have shape ({self.features},) or "
+                f"(batch, {self.features}), got low={tuple(lows.shape)}"
+            )
+        if bool((lows > highs).any()):
+            raise ValueError("region.low must not exceed region.high")
+        tol = self.numerical_tolerance
+        gram = as_matrix(self.phi.Omega2(self.psi, domain=region))
+        a = as_vector(self.a(), numerical_tolerance=tol)
+        c = as_vector(self.c(), numerical_tolerance=tol)
+        unnormalized_mass = (a * as_vector(gram.matvec(c), numerical_tolerance=tol)).sum()
+        if self._renormalize_h:
+            Z = torch.as_tensor(self.norm_constant(log=True), dtype=dtype, device=device)
+            return unnormalized_mass * torch.exp(Z)
         else:
-            denom_vec = self.xi_basis.Omega3_contract(self.phi_basis, self.psi0_basis, self.d, self.a)
-            norm_denom = denom_vec @ c0_unnormalized
+            return unnormalized_mass
 
-        norm_constant = 1.0 / (norm_denom + self.numerical_tolerance)
+    def log_marginal_density(self, x: torch.Tensor, marginal_dims: tuple[int, ...]):
+        """Log p(x_remaining), integrating out the coordinates in marginal_dims.
 
-        return norm_constant * c0_unnormalized
-        
-    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
-        xi_x = self.xi_basis(x) # (n_data, n_xi)
-        phi_x = self.phi_basis(x) # (n_data, n_phi)
-        psi0_x = self.psi0_basis(x) # (n_data, n_psi)
+        The marginal generally cannot be factorized into independent g and h
+        factors. Its exact expression uses their cross-Gram on removed axes.
+        """
+        if not isinstance(self.phi, SeparableBasis) or not isinstance(self.psi, SeparableBasis):
+            raise TypeError("marginal density requires SeparableBasis for phi and psi")
+        marginal_dims = tuple(int(d) for d in marginal_dims)
+        if len(set(marginal_dims)) != len(marginal_dims) or any(
+            d < 0 or d >= self.features for d in marginal_dims
+        ):
+            raise ValueError("marginal_dims must contain distinct indices in [0, dim)")
+        remaining = tuple(d for d in range(self.features) if d not in marginal_dims)
+        if x.ndim != 2 or x.shape[1] != len(remaining):
+            raise ValueError(f"x must have shape (n_data, {len(remaining)})")
+        if not marginal_dims:
+            return self.log_density(x)
 
-        c0 = self.get_c0()
+        logged = isinstance(self.phi, NonnegativeBasis) and isinstance(self.psi, NonnegativeBasis)
+        gram_dim = self.phi.Omega2_dim(self.psi, return_log=logged)
+        selected = gram_dim[:, list(marginal_dims)]
+        gram = selected.sum(dim=1).exp() if logged else selected.prod(dim=1)
 
-        log_r_x = torch.log(xi_x @ self.d + self.numerical_tolerance) # (n_data)
-        log_g_x = torch.log(phi_x @ self.a + self.numerical_tolerance) # (n_data)
-        log_h0_x = torch.log(psi0_x @ c0 + self.numerical_tolerance)
-
-        return log_r_x + log_g_x + log_h0_x
-
-    def marginal(self, marginal_dims : tuple[int, ...]):
-        xi_basis_copy = self.xi_basis.freeze_params()
-        phi_basis_copy = self.phi_basis.freeze_params()
-        psi0_basis_copy = self.psi0_basis.freeze_params()
-        xi_basis_copy.set_coeffs(self.d)
-        phi_basis_copy.set_coeffs(self.a)
-        psi0_basis_copy.set_coeffs(self.get_c0())
-        expanded_basis_marginal = xi_basis_copy.product_basis([phi_basis_copy, psi0_basis_copy]).marginal(marginal_dims)
-        dtype, device = expanded_basis_marginal.param_dtype_device()
-        w_fixed = torch.ones(
-            expanded_basis_marginal.n_basis_functions(),
-            device=device,
-            dtype=dtype,
-        )
-        return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
-
-    def weight_params(self):
-        if hasattr(self, "c0_fixed"):
-            return [self.c0_fixed]
-        else:
-            return [self.__c0u]
-    
-    def basis_params(self):
-        return self.psi0_basis.parameters()
+        # Evaluate only the retained coordinate factors. The remaining entries
+        # are interior placeholders required by the full-dimensional eval_dim API.
+        full_x = x.new_full((x.shape[0], self.features), 0.5)
+        index = torch.tensor(remaining, dtype=torch.long, device=x.device)
+        full_x = full_x.index_copy(1, index, x)
+        phi_remaining = (self.phi.eval_dim(full_x)[:, list(remaining)].prod(dim=1)
+                         * Basis._coeff_tensor(self.phi.coeffs()))
+        psi_remaining = (self.psi.eval_dim(full_x)[:, list(remaining)].prod(dim=1)
+                         * Basis._coeff_tensor(self.psi.coeffs()))
+        a = Basis._coeff_tensor(self.a())
+        c = Basis._coeff_tensor(self.c())
+        # (n_data,): a_i*c_j*Omega_ij(marginal_dims)*phi_i(x_R)*psi_j(x_R)
+        marginal = torch.einsum('...ij,...i,...j->...',
+                                gram * a[..., :, None] * c[..., None, :],
+                                phi_remaining, psi_remaining)
+        eps = torch.finfo(marginal.dtype).tiny
+        log_p = torch.log(marginal.clamp_min(0) + eps)
+        if self._renormalize_h:
+            log_p = log_p + self.norm_constant(log=True)
+        return log_p.reshape(-1)
 
 
 # Quadratic models #
-    
-class OldQuadraticRFF(ConditionalDensityModel):
-    def __init__(self, phi_basis : SeparableBasis, psi_basis : SeparableBasis, numerical_tolerance : float = 1e-8):
-        assert phi_basis.dim() == psi_basis.dim(), "phi_basis and psi_basis must have the same dimension"
-        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
-        assert isinstance(psi_basis, SeparableBasis), "psi_basis must be a SeparableBasis"
-        super().__init__(phi_basis.dim(), psi_basis.dim())
-
-        assert phi_basis.n_basis_functions() == psi_basis.n_basis_functions(), "phi_basis and psi_basis must have the same number of basis functions"
-
-        self.phi_basis = phi_basis
-        self.psi_basis = psi_basis
-
-        self.__LAu = torch.nn.Parameter(torch.randn(phi_basis.n_basis_functions(), phi_basis.n_basis_functions())) # g
-
-        self.numerical_tolerance = numerical_tolerance
-    
-    def get_A(self):
-        bounded_A = torch.tanh(self.__LAu)
-        return bounded_A @ bounded_A.T
-    
-    def get_B(self, A : torch.Tensor = None, Omega : torch.Tensor = None):
-        if Omega is None:
-            Omega = as_matrix(self.phi_basis.Omega22(self.psi_basis)).to_dense()
-        
-        if A is None:
-            A = self.get_A()
-
-        den = torch.einsum('ij,ijkl->kl', A, Omega) 
-
-        #print("den min max: ", den.min(), den.max())
-
-        B = A / (den + self.numerical_tolerance)
-
-        return B
-
-    def log_density(self, xp : torch.Tensor, *, conditioner : torch.Tensor, **contexts : torch.Tensor):
-        x = conditioner
-        phi_x = self.phi_basis(x) # (n_data, n_phi)
-        phi_xp = self.phi_basis(xp) # (n_data, n_phi)
-        psi_xp = self.psi_basis(xp) # (n_data, n_psi)
-        
-        A = self.get_A()
-        B = self.get_B(A=A)
-
-        log_g_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", phi_x, A, phi_x)) + self.numerical_tolerance) # (n_data)
-        log_g_xp = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", phi_xp, A, phi_xp)) + self.numerical_tolerance) # (n_data)
-
-        f_quad = torch.einsum("pi,ij,pj->p", phi_x * psi_xp, B, phi_x * psi_xp)
-        log_f = torch.log(torch.relu(f_quad - self.numerical_tolerance) + self.numerical_tolerance) # (n_data)
-
-        return log_g_xp + log_f - log_g_x
-    
-    def valid(self):
-        return self.is_psd()
-    
-    def is_psd(self):
-        B = self.get_B()
-        #if not torch.all(torch.linalg.eigvalsh(B) > 0):
-        #    print("Min eigval: ", torch.min(torch.linalg.eigvalsh(B)))
-        return torch.all(torch.linalg.eigvalsh(B) > 0)
-
-    def weight_params(self):
-        return [self.__LAu]
-    
-    def basis_params(self):
-        return itertools.chain(self.phi_basis.parameters(), self.psi_basis.parameters())
-
-
-class OldQuadraticFF(DensityModel):
-    def __init__(self, A : torch.Tensor, phi_basis : SeparableBasis, psi0_basis : SeparableBasis = None, C0_fixed : torch.Tensor = None, numerical_tolerance : float = 1e-10):
-        assert phi_basis.dim() == psi0_basis.dim(), "phi_basis and psi0_basis must have the same dimension"
-        assert isinstance(phi_basis, SeparableBasis), "phi_basis must be a SeparableBasis"
-        assert isinstance(psi0_basis, SeparableBasis), "psi0_basis must be a SeparableBasis"
-        assert A.shape[0] == phi_basis.n_basis_functions(), "A must have n_phi rows"
-        assert A.shape[1] == phi_basis.n_basis_functions(), "A must have n_phi columns"
-        super().__init__(phi_basis.dim())
-
-        self.phi_basis = phi_basis.freeze_params()
-        self.psi0_basis = psi0_basis
-        
-        self.register_buffer("A", A) 
-        if C0_fixed is not None:
-            self.register_buffer("C0_fixed", C0_fixed)
-        else:
-            self.__LC0u = torch.nn.Parameter(torch.randn(psi0_basis.n_basis_functions(), psi0_basis.n_basis_functions()))
-        
-        self.numerical_tolerance = numerical_tolerance
-
-    @classmethod
-    def from_rff(cls, rff : OldQuadraticRFF, psi0_basis : SeparableBasis = None):
-        phi_basis = rff.phi_basis.freeze_params()
-        A = rff.get_A().detach().clone()
-        return cls(A, phi_basis, psi0_basis, numerical_tolerance=rff.numerical_tolerance)
-
-    def get_C0(self, Omega_0 : torch.Tensor = None):
-        if hasattr(self, "C0_fixed"):
-            return self.C0_fixed
-
-        if Omega_0 is None:
-            Omega_0 = as_matrix(self.phi_basis.Omega22(self.psi0_basis)).to_dense()
-        
-        C0_unnormalized = torch.tanh(self.__LC0u) @ torch.tanh(self.__LC0u).T
-        
-        norm_constant = 1.0 / torch.einsum('ij,ijkl,kl->', self.A, Omega_0, C0_unnormalized)
-        
-        return norm_constant * C0_unnormalized
-    
-    def log_density(self, x : torch.Tensor, **contexts : torch.Tensor):
-        phi_x = self.phi_basis(x)
-        psi0_x = self.psi0_basis(x) # (n_data, n_psi)
-
-        C0 = self.get_C0()
-
-        log_g_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", phi_x, self.A, phi_x)) + self.numerical_tolerance) # (n_data)
-        log_h0_x = torch.log(torch.relu(torch.einsum("pi,ij,pj->p", psi0_x, C0, psi0_x)) + self.numerical_tolerance)
-
-        return log_g_x + log_h0_x
-
-    def marginal(self, marginal_dims : tuple[int, ...]):
-        phi_basis_1 = self.phi_basis.freeze_params()
-        phi_basis_2 = self.phi_basis.freeze_params()
-        psi0_basis_1 = self.psi0_basis.freeze_params()
-        psi0_basis_2 = self.psi0_basis.freeze_params()
-
-        phi_quad_basis = phi_basis_1.product_basis([phi_basis_2])
-        psi0_quad_basis = psi0_basis_1.product_basis([psi0_basis_2])
-
-        phi_quad_basis.set_coeffs(self.A.reshape(-1))
-        psi0_quad_basis.set_coeffs(self.get_C0().reshape(-1))
-
-        expanded_basis_marginal = phi_quad_basis.product_basis([psi0_quad_basis]).marginal(marginal_dims)
-        dtype, device = expanded_basis_marginal.param_dtype_device()
-        w_fixed = torch.ones(
-            expanded_basis_marginal.n_basis_functions(),
-            device=device,
-            dtype=dtype,
-        )
-        return LinearForm(expanded_basis_marginal, w_fixed=w_fixed, numerical_tolerance=self.numerical_tolerance)
-
-    def weight_params(self):
-        if hasattr(self, "C0_fixed"):
-            return [self.C0_fixed]
-        else:
-            return [self.__LC0u]
-    
-    def basis_params(self):
-        return self.psi0_basis.parameters()
-
-# New QRFF
-
-def _quadratic_parameter_matrix(provider, size: int, batch_size: int, name: str, **context) -> DenseMatrix:
-    """Read a dense matrix parameter provider; retain its autograd graph.
-
-    ``batch_size`` is the static ensemble size used at construction. At
-    evaluation, any leading batch ``dense.shape[:-2]`` is accepted as long as
-    the trailing block is ``(size, size)`` (context may prepend a data batch).
-    """
-    if not _is_parameters_like(provider):
-        raise TypeError(f"{name} must be a Parameters-like matrix provider")
-    value = as_matrix(provider(**context))
-    if not isinstance(value, DenseMatrix):
-        raise TypeError(f"{name} must return a DenseMatrix or a dense torch.Tensor")
-    dense = value.to_dense()
-    if dense.shape[-2:] != (size, size):
-        raise ValueError(
-            f"{name} trailing shape must be ({size}, {size}), got {tuple(dense.shape)}"
-        )
-    if dense.dim() == 2:
-        if batch_size != 1 and not context:
-            raise ValueError(
-                f"{name} has shape {tuple(dense.shape)}; expected "
-                f"({batch_size}, {size}, {size})"
-            )
-        return DenseMatrix(dense.unsqueeze(0))
-    return value
-
-
-def _quadratic_register_modules(model, bases, providers):
-    param_modules, coeff_modules = Basis.get_deduplicated_module_list(bases)
-    param_modules = list(param_modules)
-    coeff_modules = list(coeff_modules)
-    seen = {id(mod) for mod in (*param_modules, *coeff_modules)}
-    for provider in providers:
-        if provider is None:
-            continue
-        if getattr(provider, 'is_module', lambda: False)() and id(provider) not in seen:
-            coeff_modules.append(provider)
-            seen.add(id(provider))
-        for mod in provider.parameter_modules():
-            if id(mod) not in seen:
-                coeff_modules.append(mod)
-                seen.add(id(mod))
-    model._param_modules = torch.nn.ModuleList(param_modules)
-    model._coeff_modules = torch.nn.ModuleList(coeff_modules)
-
-
-def _quadratic_spd_from_factor(factor: DenseMatrix, jitter: float) -> DenseMatrix:
-    """Make SPD (rather than merely PSD) to ensure the inverse sqrt exists."""
-    x = factor.to_dense()
-    result = factor @ factor.T
-    if jitter:
-        n = x.shape[-1]
-        result = DenseMatrix(
-            result.to_dense() + jitter * torch.eye(n, dtype=x.dtype, device=x.device)
-        )
-    return result
-
-
-def _quadratic_evaluate(basis, x: torch.Tensor, **context):
-    result = basis(x, **context)
-    if hasattr(result, 'to_dense'):
-        result = result.to_dense()
-    return result
-
-
-def _quadratic_form(features: torch.Tensor, coeff: Matrix) -> torch.Tensor:
-    matrix = coeff.to_dense()
-    return torch.einsum('...i,...ij,...j->...', features, matrix, features)
-
 
 class QuadraticRFF(MarkovTransitionModel):
     r"""Normalized, positive quadratic rational Markov transition.
@@ -794,8 +382,8 @@ class QuadraticRFF(MarkovTransitionModel):
         if pd_jitter <= 0:
             raise ValueError('pd_jitter must be strictly positive')
         m, n, batch = phi.n_basis_functions(), psi.n_basis_functions(), phi.batch_size()
-        _quadratic_parameter_matrix(LA, m, batch, 'LA')
-        _quadratic_parameter_matrix(LQ0, m*n, batch, 'LQ0')
+        self._parameter_matrix(LA, m, batch, 'LA')
+        self._parameter_matrix(LQ0, m*n, batch, 'LQ0')
         super().__init__(phi.dim())
         self.LA, self.LQ0 = LA, LQ0
         self.phi, self.psi = phi, psi
@@ -804,21 +392,62 @@ class QuadraticRFF(MarkovTransitionModel):
         self.numerical_tolerance = numerical_tolerance
         self.pd_jitter = pd_jitter
         if register_modules:
-            _quadratic_register_modules(self, (phi, psi), (LA, LQ0))
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
+            seen = {id(mod) for mod in (*param_modules, *coeff_modules)}
+            coeff_modules = list(coeff_modules)
+            for provider in (LA, LQ0):
+                if provider is None:
+                    continue
+                if getattr(provider, 'is_module', lambda: False)() and id(provider) not in seen:
+                    coeff_modules.append(provider)
+                    seen.add(id(provider))
+                for mod in provider.parameter_modules():
+                    if id(mod) not in seen:
+                        coeff_modules.append(mod)
+                        seen.add(id(mod))
+            self._param_modules = torch.nn.ModuleList(param_modules)
+            self._coeff_modules = torch.nn.ModuleList(coeff_modules)
 
     def dtype_device(self):
         return self.phi.dtype_device()
 
+    @staticmethod
+    def _parameter_matrix(provider, size: int, batch_size: int, name: str, **context) -> DenseMatrix:
+        """Read a dense matrix parameter, checking its trailing dimensions."""
+        if not (callable(provider) and hasattr(provider, 'is_trainable')
+                and hasattr(provider, 'parameter_modules')):
+            raise TypeError(f"{name} must be a Parameters-like matrix provider")
+        value = as_matrix(provider(**context))
+        if not isinstance(value, DenseMatrix):
+            raise TypeError(f"{name} must return a dense matrix")
+        dense = value.to_dense()
+        if dense.shape[-2:] != (size, size):
+            raise ValueError(
+                f"{name} trailing shape must be ({size}, {size}), got {tuple(dense.shape)}"
+            )
+        if dense.ndim == 2:
+            if batch_size != 1 and not context:
+                raise ValueError(
+                    f"{name} has shape {tuple(dense.shape)}; expected ({batch_size}, {size}, {size})"
+                )
+            return DenseMatrix(dense.unsqueeze(0))
+        return value
+
+    def _spd_matrix(self, provider, size: int, name: str, **context) -> DenseMatrix:
+        """Build A, Q0, or V as L L^T + jitter I with full autograd support."""
+        factor = self._parameter_matrix(provider, size, self.phi.batch_size(), name, **context)
+        dense = factor.to_dense()
+        spd = factor @ factor.T
+        return DenseMatrix(spd.to_dense() + self.pd_jitter * torch.eye(
+            size, dtype=dense.dtype, device=dense.device
+        ))
+
     def get_A(self, **context) -> Matrix:
-        return _quadratic_spd_from_factor(
-            _quadratic_parameter_matrix(self.LA, self.phi.n_basis_functions(),
-                                        self.phi.batch_size(), 'LA', **context), self.pd_jitter)
+        return self._spd_matrix(self.LA, self.phi.n_basis_functions(), 'LA', **context)
 
     def get_Q0(self, **context) -> Matrix:
         m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
-        return _quadratic_spd_from_factor(
-            _quadratic_parameter_matrix(self.LQ0, m*n, self.phi.batch_size(), 'LQ0', **context),
-            self.pd_jitter)
+        return self._spd_matrix(self.LQ0, m*n, 'LQ0', **context)
 
     def get_C(self, A: Matrix = None, **context) -> Matrix:
         """C(A)[a,b] = integral g(y) psi_a(y) psi_b(y) dy."""
@@ -868,40 +497,96 @@ class QuadraticRFF(MarkovTransitionModel):
     def log_density(self, xp: torch.Tensor, *, conditioner: torch.Tensor, **context : torch.Tensor):
         A, _, Q0, _, T = self.get_normalization(**context)
         Q = self.get_Q(Q0, T)
-        phi_x = _quadratic_evaluate(self.phi, conditioner, **context)
-        phi_y = _quadratic_evaluate(self.phi, xp, **context)
-        psi_y = _quadratic_evaluate(self.psi, xp, **context)
+        phi_x = self.phi(conditioner, **context)
+        phi_y = self.phi(xp, **context)
+        psi_y = self.psi(xp, **context)
+        phi_x = phi_x.to_dense() if hasattr(phi_x, 'to_dense') else phi_x
+        phi_y = phi_y.to_dense() if hasattr(phi_y, 'to_dense') else phi_y
+        psi_y = psi_y.to_dense() if hasattr(psi_y, 'to_dense') else psi_y
         u = torch.einsum('bi,bj->bij', phi_x, psi_y).reshape(phi_x.shape[0], -1)
-        g_x = _quadratic_form(phi_x, A).clamp_min(torch.finfo(phi_x.dtype).tiny)
-        g_y = _quadratic_form(phi_y, A).clamp_min(torch.finfo(phi_x.dtype).tiny)
-        f = _quadratic_form(u, Q).clamp_min(torch.finfo(phi_x.dtype).tiny)
+        eps = torch.finfo(phi_x.dtype).tiny
+        g_x = torch.einsum('...i,...ij,...j->...', phi_x, A.to_dense(), phi_x).clamp_min(eps)
+        g_y = torch.einsum('...i,...ij,...j->...', phi_y, A.to_dense(), phi_y).clamp_min(eps)
+        f = torch.einsum('...i,...ij,...j->...', u, Q.to_dense(), u).clamp_min(eps)
         return (torch.log(g_y) + torch.log(f) - torch.log(g_x)).reshape(-1)
+
+    def _propagate_V(self, Q0: Matrix, T: Matrix, Omega22_transition: Matrix, V: Matrix) -> Matrix:
+        r"""Core SOS coefficient update.
+
+        D(V)[i,j] = integral phi_i(x) phi_j(x) psi0(x)^T V psi0(x) dx.
+        V_next = sum_kl [T D(V) T^T]_kl Q0[k,:,l,:].
+        """
+        D = DenseMatrix(Omega22_transition.frobenius_inner(
+            DenseMatrix(V.to_dense()[..., None, None, :, :])
+        ))
+        weighted_D = (T @ D) @ T.T
+        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
+        q0 = Q0.to_dense()
+        qb = q0.reshape(*q0.shape[:-2], m, n, m, n).movedim(-3, -2)  # (..., m, m, n, n)
+        return DenseMatrix(qb).contract_batch_matrix(weighted_D)
 
     def propagate(self, belief: 'QuadraticFF') -> 'QuadraticFF':
         """Exact one-step dense SOS propagation, preserving PSD and total mass.
 
-        D(V)[i,j] = integral phi_i(x) phi_j(x) psi0(x)^T V psi0(x) dx.
-        V_next = sum_kl [T D(V) T^T]_kl Q0[k,:,l,:].
+        Normalization (Q0, T) uses Omega22 between the RFF bases; the transition
+        Gram uses Omega22 between the RFF input basis and the belief basis.
+        Apply Z only when the belief renormalizes; otherwise V already carries
+        the intended (possibly unnormalized) scale.
         """
         if not isinstance(belief, QuadraticFF):
             raise TypeError(f'QuadraticRFF.propagate expects QuadraticFF, got {type(belief).__name__}')
         if belief.LA is not self.LA or belief.phi is not self.phi:
             raise ValueError('belief must share LA and phi with transition (use QuadraticFF.from_rff)')
+
         _, _, Q0, _, T = self.get_normalization()
-        V = belief.get_V(normalized=True)
-        omega = as_matrix(self.phi.Omega22(belief.psi))
-        D = DenseMatrix(omega.frobenius_inner(
-            DenseMatrix(V.to_dense()[..., None, None, :, :])
-        ))
-        weighted_D = (T @ D) @ T.T
-        m, n = self.phi.n_basis_functions(), self.psi.n_basis_functions()
-        qb = Q0.to_dense().reshape(self.phi.batch_size(), m, n, m, n)
-        qb = qb.movedim(-3, -2)  # (batch, m, m, n, n)
-        Vnext = DenseMatrix(qb).contract_batch_matrix(weighted_D)
+        V = belief.get_V()
+        if belief.is_auto_normalized():
+            Z = belief.norm_constant()
+            V = DenseMatrix(V.to_dense() * Z[..., None, None])
+
+        # Omega22 between RFF input basis and belief basis for transition
+        Omega22_transition = as_matrix(self.phi.Omega22(belief.psi))
+
+        Vnext = self._propagate_V(Q0, T, Omega22_transition, V)
+
         # Use the already normalized, positive result, not a newly learned factor.
         return QuadraticFF(
             self.LA, self.phi, None, self.psi,
-            V_fixed=Vnext.to_dense().detach().clone(),
+            V_fixed=FixedParameters(Vnext.to_dense()),
+            numerical_tolerance=belief.numerical_tolerance,
+            pd_jitter=self.pd_jitter, renormalize_h=False,
+            register_modules=False,
+        )
+
+    def propagate_set_complement(self, belief: 'QuadraticFF', set: Hyperrectangle) -> 'QuadraticFF':
+        if not isinstance(belief, QuadraticFF):
+            raise TypeError(
+                'QuadraticRFF.propagate_set_complement expects QuadraticFF, got '
+                f'{type(belief).__name__}'
+            )
+        if belief.LA is not self.LA or belief.phi is not self.phi:
+            raise ValueError('belief must share LA and phi with transition (use QuadraticFF.from_rff)')
+
+        _, _, Q0, _, T = self.get_normalization()
+        V = belief.get_V()
+        if belief.is_auto_normalized():
+            Z = belief.norm_constant()
+            V = DenseMatrix(V.to_dense() * Z[..., None, None])
+
+        # Omega22 between RFF input basis and belief basis for transition
+        Omega22_transition = as_matrix(self.phi.Omega22(belief.psi))
+
+        # Omega22 restricted to the obstacle set
+        Omega22_set_transition = as_matrix(self.phi.Omega22(belief.psi, domain=set))
+
+        full_prop_V = self._propagate_V(Q0, T, Omega22_transition, V)
+        set_prop_V = self._propagate_V(Q0, T, Omega22_set_transition, V)
+
+        Vnext = full_prop_V.to_dense() - set_prop_V.to_dense().sum(dim=0)
+
+        return QuadraticFF(
+            self.LA, self.phi, None, self.psi,
+            V_fixed=FixedParameters(Vnext),
             numerical_tolerance=belief.numerical_tolerance,
             pd_jitter=self.pd_jitter, renormalize_h=False,
             register_modules=False,
@@ -918,30 +603,33 @@ class QuadraticFF(DensityModel):
     r"""SOS belief: p(x) = (phi^T A phi)(psi^T V psi).
 
     LA is the *same* provider used by QuadraticRFF. LV is a learned dense
-    factor (batch, n, n). For propagated beliefs, pass V_fixed instead.
+    factor (batch, n, n). Propagated beliefs hold their computed Gram matrix
+    in a FixedParameters provider, retaining the autograd graph.
     Trainable V is automatically normalized by its exact fourth-order moment.
     """
 
     def __init__(self, LA: Parameters, phi: Basis, LV: Parameters | None, psi: Basis,
                  numerical_tolerance: float = 1e-20, pd_jitter: float = 1e-6,
                  renormalize_h: bool = True, register_modules: bool = True,
-                 V_fixed: torch.Tensor | Matrix | None = None):
+                 V_fixed: Parameters | torch.Tensor | Matrix | None = None):
         if not isinstance(phi, Basis) or not isinstance(psi, Basis):
             raise TypeError('phi and psi must be Basis instances')
         if phi.dim() != psi.dim() or phi.batch_size() != psi.batch_size():
             raise ValueError('phi and psi must have matching dimension and parameter batch')
         m, n, batch = phi.n_basis_functions(), psi.n_basis_functions(), phi.batch_size()
-        _quadratic_parameter_matrix(LA, m, batch, 'LA')
+        self._parameter_matrix(LA, m, batch, 'LA')
         if (LV is None) == (V_fixed is None):
             raise ValueError('provide exactly one of LV (trainable) or V_fixed')
         if LV is not None:
-            _quadratic_parameter_matrix(LV, n, batch, 'LV')
+            self._parameter_matrix(LV, n, batch, 'LV')
         else:
-            fixed = as_matrix(V_fixed).to_dense()
-            if fixed.shape == (n, n) and batch == 1:
-                fixed = fixed.unsqueeze(0)
+            # A fixed provider holds the computed Gram matrix, not its factor.
+            # FixedParameters stores the tensor unchanged, preserving autograd.
+            if not isinstance(V_fixed, Parameters):
+                V_fixed = FixedParameters(as_matrix(V_fixed).to_dense())
+            fixed = self._parameter_matrix(V_fixed, n, batch, 'V_fixed').to_dense()
             if fixed.shape != (batch, n, n):
-                raise ValueError(f'V_fixed has shape {tuple(fixed.shape)}, expected {(batch,n,n)}')
+                raise ValueError(f'V_fixed has shape {tuple(fixed.shape)}, expected {(batch, n, n)}')
         super().__init__(phi.dim())
         self.LA, self.LV = LA, LV
         self.phi, self.psi = phi, psi
@@ -949,10 +637,23 @@ class QuadraticFF(DensityModel):
         self.numerical_tolerance = numerical_tolerance
         self.pd_jitter = pd_jitter
         self._renormalize_h = renormalize_h
-        if V_fixed is not None:
-            self.register_buffer('V_fixed', fixed)
+        self.V_fixed = V_fixed
         if register_modules:
-            _quadratic_register_modules(self, (phi, psi), (LA, LV))
+            param_modules, coeff_modules = Basis.get_deduplicated_module_list([phi, psi])
+            seen = {id(mod) for mod in (*param_modules, *coeff_modules)}
+            coeff_modules = list(coeff_modules)
+            for provider in (LA, LV, V_fixed):
+                if provider is None:
+                    continue
+                if getattr(provider, 'is_module', lambda: False)() and id(provider) not in seen:
+                    coeff_modules.append(provider)
+                    seen.add(id(provider))
+                for mod in provider.parameter_modules():
+                    if id(mod) not in seen:
+                        coeff_modules.append(mod)
+                        seen.add(id(mod))
+            self._param_modules = torch.nn.ModuleList(param_modules)
+            self._coeff_modules = torch.nn.ModuleList(coeff_modules)
 
     @classmethod
     def from_rff(cls, rff: QuadraticRFF, LV: Parameters, psi0_basis: Basis,
@@ -968,23 +669,53 @@ class QuadraticFF(DensityModel):
     def dtype_device(self):
         return self.phi.dtype_device()
 
+    @staticmethod
+    def _parameter_matrix(provider, size: int, batch_size: int, name: str, **context) -> DenseMatrix:
+        """Read a dense matrix parameter, checking its trailing dimensions."""
+        if not (callable(provider) and hasattr(provider, 'is_trainable')
+                and hasattr(provider, 'parameter_modules')):
+            raise TypeError(f"{name} must be a Parameters-like matrix provider")
+        value = as_matrix(provider(**context))
+        if not isinstance(value, DenseMatrix):
+            raise TypeError(f"{name} must return a dense matrix")
+        dense = value.to_dense()
+        if dense.shape[-2:] != (size, size):
+            raise ValueError(
+                f"{name} trailing shape must be ({size}, {size}), got {tuple(dense.shape)}"
+            )
+        if dense.ndim == 2:
+            if batch_size != 1 and not context:
+                raise ValueError(
+                    f"{name} has shape {tuple(dense.shape)}; expected ({batch_size}, {size}, {size})"
+                )
+            return DenseMatrix(dense.unsqueeze(0))
+        return value
+
+    def _spd_matrix(self, provider, size: int, name: str, **context) -> DenseMatrix:
+        """Build A, Q0, or V as L L^T + jitter I with full autograd support."""
+        factor = self._parameter_matrix(provider, size, self.phi.batch_size(), name, **context)
+        dense = factor.to_dense()
+        spd = factor @ factor.T
+        return DenseMatrix(spd.to_dense() + self.pd_jitter * torch.eye(
+            size, dtype=dense.dtype, device=dense.device
+        ))
+
     def get_A(self) -> Matrix:
-        return _quadratic_spd_from_factor(
-            _quadratic_parameter_matrix(self.LA, self.phi.n_basis_functions(),
-                                        self.phi.batch_size(), 'LA'), self.pd_jitter)
+        return self._spd_matrix(self.LA, self.phi.n_basis_functions(), 'LA')
 
     def get_V(self, normalized: bool = False) -> Matrix:
         if self.LV is None:
-            V = DenseMatrix(self.V_fixed)
+            V = self._parameter_matrix(self.V_fixed, self.psi.n_basis_functions(),
+                                       self.psi.batch_size(), 'V_fixed')
         else:
-            V = _quadratic_spd_from_factor(
-                _quadratic_parameter_matrix(self.LV, self.psi.n_basis_functions(),
-                                            self.psi.batch_size(), 'LV'), self.pd_jitter)
+            V = self._spd_matrix(self.LV, self.psi.n_basis_functions(), 'LV')
+        # ``normalized`` requests a unit-mass Gram; ``_renormalize_h`` decides
+        # whether that request is honored (same gate as density / integrate).
         if normalized and self._renormalize_h:
+            tol = self.numerical_tolerance
             mass = self._mass(V)
-            if bool((mass <= 0).any()):
-                raise ValueError('belief has zero or negative integral')
-            V = DenseMatrix(V.to_dense() / mass[..., None, None])
+            Z = torch.exp(-torch.log(mass + tol))
+            V = DenseMatrix(V.to_dense() * Z[..., None, None])
         return V
 
     def _mass(self, V: Matrix, omega=None):
@@ -992,20 +723,28 @@ class QuadraticFF(DensityModel):
         C = omega.contract_batch_matrix(self.get_A())
         return C.frobenius_inner(V)
 
-    def log_norm_constant(self, Omega22=None):
-        if not self._renormalize_h:
-            return 0.0
+    def is_auto_normalized(self) -> bool:
+        return self._renormalize_h
+
+    def norm_constant(self, Omega22=None, log=False):
+        """Always return Z = 1 / mass(V); ``_renormalize_h`` gates applying it."""
+        tol = self.numerical_tolerance
         mass = self._mass(self.get_V(), omega=Omega22)
-        if bool((mass <= 0).any()):
-            raise ValueError('belief has zero or negative integral')
-        return -torch.log(mass)
+        safe = mass + tol
+        return -torch.log(safe) if log else torch.exp(-torch.log(safe))
 
     def log_density(self, x: torch.Tensor, **contexts):
-        phi = _quadratic_evaluate(self.phi, x)
-        psi = _quadratic_evaluate(self.psi, x)
-        g = _quadratic_form(phi, self.get_A()).clamp_min(torch.finfo(phi.dtype).tiny)
-        h = _quadratic_form(psi, self.get_V()).clamp_min(torch.finfo(phi.dtype).tiny)
-        return (torch.log(g) + torch.log(h) + self.log_norm_constant()).reshape(-1)
+        phi = self.phi(x)
+        psi = self.psi(x)
+        phi = phi.to_dense() if hasattr(phi, 'to_dense') else phi
+        psi = psi.to_dense() if hasattr(psi, 'to_dense') else psi
+        eps = torch.finfo(phi.dtype).tiny
+        g = torch.einsum('...i,...ij,...j->...', phi, self.get_A().to_dense(), phi).clamp_min(eps)
+        h = torch.einsum('...i,...ij,...j->...', psi, self.get_V().to_dense(), psi).clamp_min(eps)
+        log_p = torch.log(g) + torch.log(h)
+        if self._renormalize_h:
+            log_p = log_p + self.norm_constant(log=True)
+        return log_p.reshape(-1)
 
     def weight_params(self):
         if self.LV is None:
@@ -1015,5 +754,63 @@ class QuadraticFF(DensityModel):
     def basis_params(self):
         return self.psi.parameters()
 
-    def marginal(self, marginal_dims: tuple[int, ...]):
-        raise NotImplementedError('QuadraticFF.marginal requires a product-basis implementation')
+    def integrate(self, region: Hyperrectangle):
+        """Integral over a Hyperrectangle via the restricted fourth-order Gram.
+
+        For a batched ``region`` of shape ``(batch, dim)``, returns a tensor of
+        shape ``(batch,)`` with one mass per box. When ``_renormalize_h`` is
+        False the unnormalized mass is returned (mirrors ``LinearFF``).
+        """
+        dtype, device = self.dtype_device()
+        lows = torch.as_tensor(region.low, dtype=dtype, device=device)
+        highs = torch.as_tensor(region.high, dtype=dtype, device=device)
+        if lows.shape != highs.shape or lows.shape[-1] != self.features:
+            raise ValueError(
+                f"region bounds must have shape ({self.features},) or "
+                f"(batch, {self.features}), got low={tuple(lows.shape)}"
+            )
+        if bool((lows > highs).any()):
+            raise ValueError("region.low must not exceed region.high")
+        omega = self.phi.Omega22(self.psi, domain=region)
+        unnormalized_mass = self._mass(self.get_V(), omega=omega)
+        if self._renormalize_h:
+            Z = self.norm_constant()
+            return unnormalized_mass * Z
+        return unnormalized_mass
+
+    def log_marginal_density(self, x: torch.Tensor, marginal_dims: tuple[int, ...]):
+        """Exact SOS marginal using per-coordinate fourth-order Gram tensors."""
+        if not isinstance(self.phi, SeparableBasis) or not isinstance(self.psi, SeparableBasis):
+            raise TypeError('marginal density requires SeparableBasis for phi and psi')
+        marginal_dims = tuple(int(d) for d in marginal_dims)
+        if len(set(marginal_dims)) != len(marginal_dims) or any(
+            d < 0 or d >= self.features for d in marginal_dims
+        ):
+            raise ValueError("marginal_dims must contain distinct indices in [0, dim)")
+        remaining = tuple(d for d in range(self.features) if d not in marginal_dims)
+        if x.ndim != 2 or x.shape[1] != len(remaining):
+            raise ValueError(f"x must have shape (n_data, {len(remaining)})")
+        if not marginal_dims:
+            return self.log_density(x)
+
+        logged = isinstance(self.phi, NonnegativeBasis) and isinstance(self.psi, NonnegativeBasis)
+        gram_dim = self.phi.Omega22_dim(self.psi, return_log=logged)
+        selected = gram_dim[:, list(marginal_dims)]
+        gram = selected.sum(dim=1).exp() if logged else selected.prod(dim=1)
+
+        full_x = x.new_full((x.shape[0], self.features), 0.5)
+        index = torch.tensor(remaining, dtype=torch.long, device=x.device)
+        full_x = full_x.index_copy(1, index, x)
+        phi_remaining = (self.phi.eval_dim(full_x)[:, list(remaining)].prod(dim=1)
+                         * Basis._coeff_tensor(self.phi.coeffs()))
+        psi_remaining = (self.psi.eval_dim(full_x)[:, list(remaining)].prod(dim=1)
+                         * Basis._coeff_tensor(self.psi.coeffs()))
+        A = self.get_A().to_dense()
+        V = self.get_V(normalized=True).to_dense()
+        # Contract phi_i*phi_j and psi_k*psi_l on retained coordinates,
+        # and Omega22_dim over all marginalized coordinates.
+        p = torch.einsum('...ijkl,...ij,...kl->...', gram,
+                         A * phi_remaining[..., :, None] * phi_remaining[..., None, :],
+                         V * psi_remaining[..., :, None] * psi_remaining[..., None, :])
+        eps = torch.finfo(p.dtype).tiny
+        return torch.log(p.clamp_min(0) + eps).reshape(-1)

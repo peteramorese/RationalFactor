@@ -1,5 +1,6 @@
 import torch
 from rational_factor.models.density_model import ConditionalDensityModel
+from rational_factor.tools.set import Hyperrectangle
 
 class DiscreteTimeStochasticSystem(torch.nn.Module):
     def __init__(self, dim : int, state_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None):
@@ -200,6 +201,66 @@ def sample_trajectories(system : DiscreteTimeStochasticSystem | ControllableStoc
                 u_k = controller(k)
                 xkp1 = system(xk, u_k)
             traj_data[k + 1][i, :] = xkp1
+
+    return traj_data
+
+
+def sample_trajectories_without_collisions(
+    system: DiscreteTimeStochasticSystem | ControllableStochasticSystem,
+    initial_state_sampler,
+    obstacles,
+    n_timesteps: int,
+    n_trajectories: int,
+    controller=None,
+):
+    """Sample trajectories, dropping any particle that enters ``obstacles``.
+
+    At each time index, only particles that do not lie in any hyperrectangle
+    are retained and (for non-terminal steps) propagated. Particles that
+    collide are removed from all subsequent marginals, so each entry of the
+    returned list may have a different leading size.
+
+    Args:
+        system : system model
+        initial_state_sampler : callable ``n -> (n, dim)`` initial states
+        obstacles : ``Hyperrectangle`` (single or batched boxes)
+        n_timesteps : time horizon of each trajectory
+        n_trajectories : number of trajectories to attempt from the initial sampler
+        controller : optional ``k -> u_k`` control law for controllable systems
+
+    Returns:
+        traj_data (list) : length ``n_timesteps + 1`` of ``(n_alive_t, dim)`` tensors
+    """
+    if not isinstance(obstacles, Hyperrectangle):
+        raise TypeError(
+            f"obstacles must be a Hyperrectangle, got {type(obstacles).__name__}"
+        )
+    if controller is not None:
+        assert isinstance(system, ControllableStochasticSystem), (
+            "System must be a ControllableStochasticSystem if controller is not None"
+        )
+
+    dim = system.dim()
+    x = initial_state_sampler(n_trajectories)
+    free = ~obstacles.contains_any(x)
+    x = x[free]
+    traj_data = [x.clone()]
+
+    for k in range(n_timesteps):
+        n_alive = x.shape[0]
+        if n_alive == 0:
+            traj_data.append(torch.zeros((0, dim), dtype=x.dtype, device=x.device))
+            continue
+
+        if controller is None:
+            x_next = torch.stack([system(x[i]) for i in range(n_alive)], dim=0)
+        else:
+            u_k = controller(k)
+            x_next = torch.stack([system(x[i], u_k) for i in range(n_alive)], dim=0)
+
+        free = ~obstacles.contains_any(x_next)
+        x = x_next[free]
+        traj_data.append(x.clone())
 
     return traj_data
 
