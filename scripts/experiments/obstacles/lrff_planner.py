@@ -274,20 +274,20 @@ def plot_reach_avoid_comparison(
 
 
 if __name__ == "__main__":
-    problem_name = "kinematic_unicycle"
+    problem_name = "van_der_pol"
     problem = OPEN_LOOP_OBSERVABLE_PROBLEMS[problem_name]
 
     ###
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    n_basis = 200
+    n_basis = 100
     gaussian_std_epsilon = 1e-3
-    hidden_features = 32
+    hidden_features = 64
     num_hidden_layers = 2
     action_features = problem.system.control_dim()
 
     tran_params = {
-        "epochs": 10,
+        "epochs": 40,
         "basis_iterations": 2,
         "neural_iterations": 3,
         "weights_iterations": 3,
@@ -307,7 +307,7 @@ if __name__ == "__main__":
         "lr": 5e-1,
     }
 
-    batch_size = 256
+    batch_size = 128
     n_timesteps_prop = problem.n_timesteps
 
     ###

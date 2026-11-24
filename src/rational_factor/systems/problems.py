@@ -235,7 +235,7 @@ FULLY_OBSERVABLE_PROBLEMS = {
             speed=1.0,
             angular_displacement=0.12,
             angle_noise_bound=0.2,
-            position_noise_std=0.05,
+            position_noise_std=0.15,
         ),
         initial_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.0, 0.0, 0.0]),
@@ -465,7 +465,7 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             dt=0.5,
             speed=1.0,
             angle_noise_bound=0.2,
-            position_noise_std=0.05,
+            position_noise_std=0.15,
         ),
         initial_state_sampler=make_mvnormal_state_sampler(
             mean=torch.tensor([0.0, 0.0, 0.0]),
@@ -482,12 +482,12 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             high=torch.tensor([0.5]),
         ),
         # Start near origin; goal in the far quadrant; obstacles block direct paths.
-        goal=_ambient_box(3, {0: (3.0, 4.0), 1: (3.0, 4.0)}),
+        goal=_ambient_box(3, {0: (3.0, 4.0), 1: (2.0, 3.0)}),
         obstacles=_ambient_boxes(
             3,
             [
                 {0: (1.5, 2.0), 1: (-1.0, 1.0)},
-                {0: (-1.0, 1.0), 1: (1.5, 3.0)},
+                {0: (-1.5, -1.0), 1: (1.5, 3.0)},
             ],
         ),
         n_timesteps=15,
@@ -539,7 +539,7 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
                 {0: (0.65, 3.45), 1: (21.0, 25.7)},
             ],
         ),
-        n_timesteps=32,
+        n_timesteps=15,
         n_trajectories_test=2000,
         n_data_tran=30000,
         n_data_init=3000,
