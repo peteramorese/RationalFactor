@@ -1,10 +1,19 @@
 import torch
 from .base import PartiallyObservableSystem
 from . import systems
+from rational_factor.tools.set import Hyperrectangle
 
 
 class PartiallyObservableVanDerPol(PartiallyObservableSystem):
-    def __init__(self, dt: float, mu: float = 1.0, process_covariance: torch.Tensor = None, observation_covariance: torch.Tensor = None):
+    def __init__(
+        self,
+        dt: float,
+        mu: float = 1.0,
+        process_covariance: torch.Tensor = None,
+        observation_covariance: torch.Tensor = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
+    ):
         """
         Van der Pol oscillator with additive Gaussian noise.
 
@@ -23,6 +32,11 @@ class PartiallyObservableVanDerPol(PartiallyObservableSystem):
         else:
             observation_covariance = torch.as_tensor(observation_covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(
+                systems.VanDerPol.DEFAULT_SUPPORT_LOW.clone(),
+                systems.VanDerPol.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         process_dist = torch.distributions.MultivariateNormal(torch.zeros(2), process_covariance)
         observation_dist = torch.distributions.MultivariateNormal(torch.zeros(2), observation_covariance)
 
@@ -31,6 +45,9 @@ class PartiallyObservableVanDerPol(PartiallyObservableSystem):
             observation_dim=2,
             v_dist=process_dist,
             w_dist=observation_dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.VanDerPol.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -46,7 +63,7 @@ class PartiallyObservableVanDerPol(PartiallyObservableSystem):
         x1_next = x1 + self.dt * dx1
         x2_next = x2 + self.dt * dx2
 
-        return torch.stack([x1_next, x2_next]) + v
+        return self._apply_support(x, torch.stack([x1_next, x2_next]) + v)
 
     def observe(self, x : torch.Tensor):
         w = self._sample_w()
@@ -60,7 +77,15 @@ class PartiallyObservableVanDerPol(PartiallyObservableSystem):
         return torch.exp(self.log_observation_likelihood(x, o))
 
 class BadSensorVanDerPol(PartiallyObservableSystem):
-    def __init__(self, dt: float, mu: float = 1.0, process_covariance: torch.Tensor = None, observation_covariance: torch.Tensor = None):
+    def __init__(
+        self,
+        dt: float,
+        mu: float = 1.0,
+        process_covariance: torch.Tensor = None,
+        observation_covariance: torch.Tensor = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
+    ):
         """
         Van der Pol oscillator with additive Gaussian noise.
 
@@ -79,6 +104,11 @@ class BadSensorVanDerPol(PartiallyObservableSystem):
         else:
             observation_covariance = torch.as_tensor(observation_covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(
+                systems.VanDerPol.DEFAULT_SUPPORT_LOW.clone(),
+                systems.VanDerPol.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         process_dist = torch.distributions.MultivariateNormal(torch.zeros(2), process_covariance)
         observation_dist = torch.distributions.MultivariateNormal(torch.zeros(2), observation_covariance)
 
@@ -87,6 +117,9 @@ class BadSensorVanDerPol(PartiallyObservableSystem):
             observation_dim=2,
             v_dist=process_dist,
             w_dist=observation_dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.VanDerPol.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -102,7 +135,7 @@ class BadSensorVanDerPol(PartiallyObservableSystem):
         x1_next = x1 + self.dt * dx1
         x2_next = x2 + self.dt * dx2
 
-        return torch.stack([x1_next, x2_next]) + v
+        return self._apply_support(x, torch.stack([x1_next, x2_next]) + v)
 
     def _observation_mode_means(self, x: torch.Tensor):
         x1 = x[..., 0]
@@ -168,6 +201,8 @@ class PartiallyObservableCartPole(PartiallyObservableSystem):
         g: float = 9.81,
         process_covariance: torch.Tensor = None,
         observation_covariance: torch.Tensor = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         if process_covariance is None:
             process_covariance = 0.1 * torch.eye(4)
@@ -186,6 +221,8 @@ class PartiallyObservableCartPole(PartiallyObservableSystem):
             l=l,
             g=g,
             covariance=process_covariance,
+            bounded_support=bounded_support,
+            support=support,
         )
         observation_dist = torch.distributions.MultivariateNormal(torch.zeros(4), observation_covariance)
 
@@ -194,6 +231,9 @@ class PartiallyObservableCartPole(PartiallyObservableSystem):
             observation_dim=4,
             v_dist=state_system._v_dist,
             w_dist=observation_dist,
+            support=state_system.support,
+            bounded_support=bounded_support,
+            wrap_dims=state_system._wrap_dims,
         )
         self.state_system = state_system
         self.observation_cov = observation_covariance
@@ -241,6 +281,8 @@ class PartiallyObservableDubinsTrailer(PartiallyObservableSystem):
         sigma_speed_state: float = 0.1,
         cov_scale: float = 0.01,
         observation_covariance: torch.Tensor = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         state_system = systems.SecondOrderDubinsTrailer(
             dt=dt,
@@ -252,6 +294,8 @@ class PartiallyObservableDubinsTrailer(PartiallyObservableSystem):
             sigma_omega=sigma_omega,
             sigma_speed_state=sigma_speed_state,
             cov_scale=cov_scale,
+            bounded_support=bounded_support,
+            support=support,
         )
 
         if observation_covariance is None:
@@ -266,6 +310,9 @@ class PartiallyObservableDubinsTrailer(PartiallyObservableSystem):
             observation_dim=6,
             v_dist=state_system._v_dist,
             w_dist=observation_dist,
+            support=state_system.support,
+            bounded_support=bounded_support,
+            wrap_dims=state_system._wrap_dims,
         )
         self.state_system = state_system
         self.observation_cov = observation_covariance
@@ -317,6 +364,8 @@ class PartiallyObservableAircraft(PartiallyObservableSystem):
         noise_cov_scale: float = 1.0,
         state_scale: torch.Tensor | None = None,
         observation_covariance: torch.Tensor = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         state_system = systems.Aircraft(
             dt=dt,
@@ -328,6 +377,8 @@ class PartiallyObservableAircraft(PartiallyObservableSystem):
             sigma_CM=sigma_CM,
             noise_cov_scale=noise_cov_scale,
             state_scale=state_scale,
+            bounded_support=bounded_support,
+            support=support,
         )
 
         if observation_covariance is None:
@@ -341,6 +392,9 @@ class PartiallyObservableAircraft(PartiallyObservableSystem):
             observation_dim=12,
             v_dist=state_system._v_dist,
             w_dist=observation_dist,
+            support=state_system.support,
+            bounded_support=bounded_support,
+            wrap_dims=state_system._wrap_dims,
         )
         self.state_system = state_system
         self.observation_cov = observation_covariance

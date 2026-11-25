@@ -69,8 +69,8 @@ def plot_marginal_mc_vs_belief(
         remaining = tuple(d for d in range(dim) if d not in integrate_out)
 
         x_range, y_range = _square_ranges(
-            (problem.plot_bounds_low[x_dim].item(), problem.plot_bounds_high[x_dim].item()),
-            (problem.plot_bounds_low[y_dim].item(), problem.plot_bounds_high[y_dim].item()),
+            (problem.plot_region().low[x_dim].item(), problem.plot_region().high[x_dim].item()),
+            (problem.plot_region().low[y_dim].item(), problem.plot_region().high[y_dim].item()),
         )
         x_lin = np.linspace(x_range[0], x_range[1], n_points)
         y_lin = np.linspace(y_range[0], y_range[1], n_points)

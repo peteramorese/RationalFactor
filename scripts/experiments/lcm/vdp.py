@@ -475,8 +475,8 @@ def main() -> None:
         ll_per_step.append(ll.detach().cpu().reshape(()))
         print(f"Avg log-likelihood at time {i}: {float(ll_per_step[-1]):.6f}")
     prop_ll_vector = torch.stack(ll_per_step).to(dtype=torch.float32)
-    box_lows = tuple(problem.plot_bounds_low.tolist())
-    box_highs = tuple(problem.plot_bounds_high.tolist())
+    box_lows = tuple(problem.plot_region().low.tolist())
+    box_highs = tuple(problem.plot_region().high.tolist())
 
     out_dir = Path("figures")
     out_dir.mkdir(parents=True, exist_ok=True)

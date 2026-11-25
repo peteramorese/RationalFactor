@@ -805,8 +805,8 @@ if __name__ == "__main__":
     print(f"Saved psi product-term grid to {psi_product_out}")
     print(f"Saved psi b-term grid to {psi_b_term_out}")
 
-    box_lows = tuple(problem.plot_bounds_low.tolist())
-    box_highs = tuple(problem.plot_bounds_high.tolist())
+    box_lows = tuple(problem.plot_region().low.tolist())
+    box_highs = tuple(problem.plot_region().high.tolist())
 
     cond_slice_out_path = output_dir / "conditional_slices_model_vs_data.png"
     _plot_conditional_slices_model_vs_data(

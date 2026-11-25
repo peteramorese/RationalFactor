@@ -269,12 +269,12 @@ if __name__ == "__main__":
     # Several fixed open-loop controllers (2D u_k shared across particles at step k).
     rollouts = []
     x_range = (
-        float(problem.plot_bounds_low[0]),
-        float(problem.plot_bounds_high[0]),
+        float(problem.plot_region().low[0]),
+        float(problem.plot_region().high[0]),
     )
     y_range = (
-        float(problem.plot_bounds_low[1]),
-        float(problem.plot_bounds_high[1]),
+        float(problem.plot_region().low[1]),
+        float(problem.plot_region().high[1]),
     )
     for ctrl_i in range(n_controllers):
         with torch.random.fork_rng():

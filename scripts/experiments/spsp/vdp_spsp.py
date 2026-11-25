@@ -109,8 +109,8 @@ if __name__ == "__main__":
     print("Done! \n")
 
 
-    #box_lows = tuple(problem.plot_bounds_low.tolist())
-    #box_highs = tuple(problem.plot_bounds_high.tolist())
+    #box_lows = tuple(problem.plot_region().low.tolist())
+    #box_highs = tuple(problem.plot_region().high.tolist())
     #check_conditional_pdf_valid(tran_model, (box_lows, box_highs), (box_lows, box_highs), n_samples=1000, n_conditioner_samples=10, device=device)
 
     #input("...")
@@ -155,8 +155,8 @@ if __name__ == "__main__":
     init_model = init_model.to(analysis_device).eval()
     tran_model = tran_model.to(analysis_device).eval()
 
-    box_lows = tuple(problem.plot_bounds_low.tolist())
-    box_highs = tuple(problem.plot_bounds_high.tolist())
+    box_lows = tuple(problem.plot_region().low.tolist())
+    box_highs = tuple(problem.plot_region().high.tolist())
 
     belief_seq = [belief.to(analysis_device).eval() for belief in propagate.propagate(init_model, tran_model, n_steps=n_timesteps_prop)]
 

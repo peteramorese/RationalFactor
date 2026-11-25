@@ -167,8 +167,8 @@ if __name__ == "__main__":
     )
 
     domain_bounds = (
-        problem.plot_bounds_low.to(device=device, dtype=dtype),
-        problem.plot_bounds_high.to(device=device, dtype=dtype),
+        problem.plot_region().low.to(device=device, dtype=dtype),
+        problem.plot_region().high.to(device=device, dtype=dtype),
     )
 
     belief_seq = [init_model]

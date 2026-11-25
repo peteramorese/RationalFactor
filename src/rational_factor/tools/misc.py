@@ -29,6 +29,42 @@ def make_uniform_state_sampler(low: torch.Tensor, high: torch.Tensor):
 
     return sampler
 
+
+def make_beta_state_sampler(
+    low: torch.Tensor,
+    high: torch.Tensor,
+    alpha: torch.Tensor | float = 2.0,
+    beta: torch.Tensor | float = 2.0,
+):
+    """Independent per-coordinate Beta distribution affinely mapped to ``[low, high]``."""
+    low = torch.as_tensor(low, dtype=torch.float32)
+    high = torch.as_tensor(high, dtype=torch.float32)
+
+    if low.shape != high.shape:
+        raise ValueError("low and high must have the same shape")
+    if not torch.all(high > low):
+        raise ValueError("all high entries must be strictly greater than low entries")
+
+    alpha_t = torch.as_tensor(alpha, dtype=low.dtype, device=low.device)
+    beta_t = torch.as_tensor(beta, dtype=low.dtype, device=low.device)
+    if alpha_t.ndim == 0:
+        alpha_t = alpha_t.expand_as(low)
+    if beta_t.ndim == 0:
+        beta_t = beta_t.expand_as(low)
+    if alpha_t.shape != low.shape or beta_t.shape != low.shape:
+        raise ValueError("alpha and beta must be scalars or match the shape of low/high")
+    if not (torch.all(alpha_t > 0) and torch.all(beta_t > 0)):
+        raise ValueError("alpha and beta must be strictly positive")
+
+    dist = torch.distributions.Beta(alpha_t, beta_t)
+    span = high - low
+
+    def sampler(n_samples: int) -> torch.Tensor:
+        u = dist.sample((n_samples,))
+        return low + u * span
+
+    return sampler
+
 def data_bounds(data: torch.Tensor, mode: str = "center_lengths") -> tuple[torch.Tensor, torch.Tensor]:
     """Smallest axis-aligned box containing all rows of ``data`` (shape ``(n, d)``).
 

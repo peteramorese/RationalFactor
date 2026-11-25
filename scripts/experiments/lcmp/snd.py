@@ -32,8 +32,8 @@ def _plot_snd_conditional_true_vs_learned(
     title: str = "",
 ) -> None:
     """Compare true and learned p(x'|x) on a 2D grid (conditioner vs next state)."""
-    lo = float(problem.plot_bounds_low[0].item())
-    hi = float(problem.plot_bounds_high[0].item())
+    lo = float(problem.plot_region().low[0].item())
+    hi = float(problem.plot_region().high[0].item())
 
     param = next(iter(tran_model.parameters()), None)
     buffer = next(iter(tran_model.buffers()), None)
@@ -120,8 +120,8 @@ def _plot_snd_1d_belief_trajectory(
     if len(beliefs) != n_slices:
         raise ValueError(f"Expected {n_slices} beliefs, got {len(beliefs)}")
 
-    lo = float(problem.plot_bounds_low[0].item())
-    hi = float(problem.plot_bounds_high[0].item())
+    lo = float(problem.plot_region().low[0].item())
+    hi = float(problem.plot_region().high[0].item())
     x_grid = torch.linspace(lo, hi, n_grid).unsqueeze(1)
 
     param = next(iter(beliefs[0].parameters()), None)
@@ -334,8 +334,8 @@ def main() -> None:
     out_dir = Path("figures")
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(__file__).stem
-    lo = float(problem.plot_bounds_low[0].item())
-    hi = float(problem.plot_bounds_high[0].item())
+    lo = float(problem.plot_region().low[0].item())
+    hi = float(problem.plot_region().high[0].item())
 
     ll_out_path = out_dir / f"{stem}__ll.png"
     plt.figure(figsize=(8, 4))

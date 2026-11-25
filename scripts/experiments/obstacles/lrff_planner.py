@@ -26,6 +26,11 @@ from rational_factor.tools.set import Hyperrectangle
 import rational_factor.models.loss as loss
 
 
+def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
+    y = y.clamp_min(1e-6)
+    return torch.where(y > 20.0, y, torch.log(torch.expm1(y)))
+
+
 def _action_conditional_mle_loss(model, xp, conditioner, action):
     return loss.conditional_mle_loss(model, xp, conditioner, action=action)
 
@@ -147,8 +152,8 @@ def plot_marginal_mc_vs_belief(
         remaining = tuple(d for d in range(dim) if d not in integrate_out)
 
         x_range, y_range = _square_ranges(
-            (problem.plot_bounds_low[x_dim].item(), problem.plot_bounds_high[x_dim].item()),
-            (problem.plot_bounds_low[y_dim].item(), problem.plot_bounds_high[y_dim].item()),
+            (problem.plot_region().low[x_dim].item(), problem.plot_region().high[x_dim].item()),
+            (problem.plot_region().low[y_dim].item(), problem.plot_region().high[y_dim].item()),
         )
         x_lin = np.linspace(x_range[0], x_range[1], n_points)
         y_lin = np.linspace(y_range[0], y_range[1], n_points)
@@ -274,40 +279,40 @@ def plot_reach_avoid_comparison(
 
 
 if __name__ == "__main__":
-    problem_name = "van_der_pol"
+    problem_name = "icy_road_car"
     problem = OPEN_LOOP_OBSERVABLE_PROBLEMS[problem_name]
 
     ###
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    n_basis = 100
+    n_basis = 500
     gaussian_std_epsilon = 1e-3
-    hidden_features = 64
+    hidden_features = 32
     num_hidden_layers = 2
     action_features = problem.system.control_dim()
 
     tran_params = {
-        "epochs": 40,
+        "epochs": 10,
         "basis_iterations": 2,
         "neural_iterations": 3,
         "weights_iterations": 3,
-        "lr_basis": 3e-3,
+        "lr_basis": 1e-2,
         "lr_neural": 2e-3,
         "lr_weights": 5e-2,
     }
     init_params = {
-        "epochs": 40,
+        "epochs": 100,
         "coeff_iterations": 8,
         "lr_coeffs": 1e-2,
         "basis_iterations": 2,
         "lr_basis": 1e-3,
     }
     ctrl_params = {
-        "epochs": 200,
+        "epochs": 100,
         "lr": 5e-1,
     }
 
-    batch_size = 128
+    batch_size = 16
     n_timesteps_prop = problem.n_timesteps
 
     ###
@@ -367,8 +372,20 @@ if __name__ == "__main__":
         activation=torch.nn.Tanh,
         zero_init_last=False,
     )
-    psi_means = NeuralParameters(**mlp_kw, positive=False)
-    psi_stds = NeuralParameters(**mlp_kw, positive=True)
+    psi_means = NeuralParameters(**mlp_kw, positive=False).to(device=device, dtype=dtype)
+    psi_stds = NeuralParameters(**mlp_kw, positive=True, epsilon=gaussian_std_epsilon).to(
+        device=device, dtype=dtype
+    )
+    psi_init_means, psi_init_stds = init_gaussian_basis_params_gmm(
+        x_kp1, dim, n_basis, epsilon=gaussian_std_epsilon, device=device, dtype=dtype,
+    )
+    with torch.no_grad():
+        psi_means.net[-1].weight.mul_(0.05)
+        psi_means.net[-1].bias.copy_(psi_init_means().reshape(-1))
+        psi_stds.net[-1].weight.mul_(0.05)
+        psi_stds.net[-1].bias.copy_(
+            _inv_softplus((psi_init_stds() - gaussian_std_epsilon).clamp_min(1e-6)).reshape(-1)
+        )
     psi = GaussianBasis(mean_params=psi_means, std_params=psi_stds, coeffs=None)
 
     a = PositiveParameters.random_init(

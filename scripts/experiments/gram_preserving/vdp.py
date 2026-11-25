@@ -703,8 +703,8 @@ if __name__ == "__main__":
         TensorDataset(x_kp1, x_k), batch_size=batch_size, shuffle=True, pin_memory=use_gpu
     )
 
-    box_lows = problem.plot_bounds_low.to(device=device)
-    box_highs = problem.plot_bounds_high.to(device=device)
+    box_lows = problem.plot_region().low.to(device=device)
+    box_highs = problem.plot_region().high.to(device=device)
     plot_x_range = (float(box_lows[0]), float(box_highs[0]))
     plot_y_range = (float(box_lows[1]), float(box_highs[1]))
 

@@ -2,6 +2,7 @@ import math
 
 import torch
 from .base import DiscreteTimeStochasticSystem
+from rational_factor.tools.set import Hyperrectangle
 
 
 
@@ -55,6 +56,10 @@ class KinematicUnicycle(DiscreteTimeStochasticSystem):
     Heading is left unwrapped for a continuous Euclidean state representation.
     """
 
+    DEFAULT_SUPPORT_LOW = torch.tensor([-8.0, -8.0, -math.pi], dtype=torch.float32)
+    DEFAULT_SUPPORT_HIGH = torch.tensor([8.0, 8.0, math.pi], dtype=torch.float32)
+    WRAP_DIMS = (2,)
+
     def __init__(
         self,
         dt: float = 0.3,
@@ -62,13 +67,20 @@ class KinematicUnicycle(DiscreteTimeStochasticSystem):
         angular_displacement: float = 0.0,
         angle_noise_bound: float = 0.2,
         position_noise_std: float | tuple[float, float] = 0.05,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         std = self._check_parameters(dt, speed, angle_noise_bound,
                                      position_noise_std)
+        if support is None:
+            support = Hyperrectangle(self.DEFAULT_SUPPORT_LOW.clone(), self.DEFAULT_SUPPORT_HIGH.clone())
         super().__init__(
             dim=3,
             state_labels=["px", "py", "theta"],
             v_dist=UnicycleProcessNoise(),
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=self.WRAP_DIMS,
         )
         self.dt = float(dt)
         self.speed = float(speed)
@@ -103,11 +115,12 @@ class KinematicUnicycle(DiscreteTimeStochasticSystem):
         chord = self.speed * self.dt * torch.sinc(dtheta / (2.0 * math.pi))
         mid_angle = theta + 0.5 * dtheta
         noise_xy = v[..., 1:] * self.position_noise_std
-        return torch.stack([
+        x_next = torch.stack([
             x[..., 0] + chord * torch.cos(mid_angle) + noise_xy[..., 0],
             x[..., 1] + chord * torch.sin(mid_angle) + noise_xy[..., 1],
             theta + dtheta,
         ], dim=-1)
+        return self._apply_support(x, x_next)
 
     def next_state(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         return self._step(x, self.angular_displacement, v)
@@ -127,15 +140,34 @@ class ScalarNonlinearDrift(DiscreteTimeStochasticSystem):
     The transition density is p(x' | x) = N(x' | f(x), Sigma).
     """
 
-    def __init__(self, sigma: float = 0.1, covariance: torch.Tensor | None = None):
+    DEFAULT_SUPPORT_LOW = torch.tensor([-4.0], dtype=torch.float32)
+    DEFAULT_SUPPORT_HIGH = torch.tensor([4.0], dtype=torch.float32)
+    WRAP_DIMS = ()
+
+    def __init__(
+        self,
+        sigma: float = 0.1,
+        covariance: torch.Tensor | None = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
+    ):
         if covariance is None:
             covariance = torch.tensor([[sigma**2]], dtype=torch.float32)
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
         assert covariance.shape == (1, 1), "covariance must be 1x1"
 
+        if support is None:
+            support = Hyperrectangle(self.DEFAULT_SUPPORT_LOW.clone(), self.DEFAULT_SUPPORT_HIGH.clone())
         dist = torch.distributions.MultivariateNormal(torch.zeros(1), covariance)
-        super().__init__(dim=1, state_labels=["x"], v_dist=dist)
+        super().__init__(
+            dim=1,
+            state_labels=["x"],
+            v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=self.WRAP_DIMS,
+        )
         self.cov = covariance
 
     @staticmethod
@@ -154,7 +186,7 @@ class ScalarNonlinearDrift(DiscreteTimeStochasticSystem):
 
     def next_state(self, x: torch.Tensor, v: torch.Tensor):
         mean = self._drift(x)
-        return mean + v.reshape(-1)
+        return self._apply_support(x, mean + v.reshape(-1))
 
     def predict(self, x: torch.Tensor):
         mean = self._drift(x)
@@ -178,7 +210,18 @@ class ScalarNonlinearDrift(DiscreteTimeStochasticSystem):
 
 
 class VanDerPol(DiscreteTimeStochasticSystem):
-    def __init__(self, dt: float, mu: float = 1.0, covariance: torch.Tensor | None = None):
+    DEFAULT_SUPPORT_LOW = torch.tensor([-5.0, -5.0], dtype=torch.float32)
+    DEFAULT_SUPPORT_HIGH = torch.tensor([5.0, 5.0], dtype=torch.float32)
+    WRAP_DIMS = ()
+
+    def __init__(
+        self,
+        dt: float,
+        mu: float = 1.0,
+        covariance: torch.Tensor | None = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
+    ):
         """
         Van der Pol oscillator with additive Gaussian noise.
         State x = [x1, x2] (first-order realization of the oscillator).
@@ -193,11 +236,16 @@ class VanDerPol(DiscreteTimeStochasticSystem):
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(self.DEFAULT_SUPPORT_LOW.clone(), self.DEFAULT_SUPPORT_HIGH.clone())
         dist = torch.distributions.MultivariateNormal(torch.zeros(2), covariance)
         super().__init__(
             dim=2,
             state_labels=["x1", "x2"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=self.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -212,7 +260,7 @@ class VanDerPol(DiscreteTimeStochasticSystem):
         x1_next = x1 + self.dt * dx1
         x2_next = x2 + self.dt * dx2
 
-        return torch.stack([x1_next, x2_next]) + v
+        return self._apply_support(x, torch.stack([x1_next, x2_next]) + v)
 
     def predict(self, x: torch.Tensor):
         x_flat = x.flatten()
@@ -265,6 +313,10 @@ class CartPole(DiscreteTimeStochasticSystem):
     term 4/3 in the angular equation); see e.g. Barto/Sutton cart-pole.
     """
 
+    DEFAULT_SUPPORT_LOW = torch.tensor([-6.0, -6.0, -math.pi, -6.0], dtype=torch.float32)
+    DEFAULT_SUPPORT_HIGH = torch.tensor([6.0, 6.0, math.pi, 6.0], dtype=torch.float32)
+    WRAP_DIMS = (2,)
+
     def __init__(
         self,
         dt: float,
@@ -273,6 +325,8 @@ class CartPole(DiscreteTimeStochasticSystem):
         l: float = 0.5,
         g: float = 9.81,
         covariance: torch.Tensor | None = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         """
         Args:
@@ -288,11 +342,16 @@ class CartPole(DiscreteTimeStochasticSystem):
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(self.DEFAULT_SUPPORT_LOW.clone(), self.DEFAULT_SUPPORT_HIGH.clone())
         dist = torch.distributions.MultivariateNormal(torch.zeros(4), covariance)
         super().__init__(
             dim=4,
             state_labels=["p", "p_dot", "theta", "theta_dot"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=self.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -334,7 +393,8 @@ class CartPole(DiscreteTimeStochasticSystem):
         theta_next = theta + self.dt * theta_dot
         theta_dot_next = theta_dot + self.dt * theta_acc
 
-        return torch.stack([p_next, p_dot_next, theta_next, theta_dot_next]) + v.flatten()
+        x_next = torch.stack([p_next, p_dot_next, theta_next, theta_dot_next]) + v.flatten()
+        return self._apply_support(x_flat, x_next)
 
     def predict(self, x: torch.Tensor):
         """Mean and additive noise covariance under forward Euler (no noise in mean)."""
@@ -353,6 +413,10 @@ class CartPole(DiscreteTimeStochasticSystem):
 
 
 class PlanarQuadrotor(DiscreteTimeStochasticSystem):
+    DEFAULT_SUPPORT_LOW = torch.tensor([-5.0, -5.0, -math.pi, -15.0, -15.0, -20.0], dtype=torch.float32)
+    DEFAULT_SUPPORT_HIGH = torch.tensor([5.0, 5.0, math.pi, 15.0, 15.0, 20.0], dtype=torch.float32)
+    WRAP_DIMS = (2,)
+
     def __init__(
         self,
         dt: float,
@@ -366,6 +430,8 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
         covariance: torch.Tensor | None = None,
         thrust_min: float = 0.0,
         thrust_max: float = 20.0,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         """
         Planar quadrotor with state-feedback waypoint tracking (6D autonomous system).
@@ -378,11 +444,16 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(self.DEFAULT_SUPPORT_LOW.clone(), self.DEFAULT_SUPPORT_HIGH.clone())
         dist = torch.distributions.MultivariateNormal(torch.zeros(6), covariance)
         super().__init__(
             dim=6,
             state_labels=["px", "pz", "theta", "vx", "vz", "omega"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=self.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -468,7 +539,7 @@ class PlanarQuadrotor(DiscreteTimeStochasticSystem):
         u = self._state_feedback(x)
         dx = self._dynamics(x, u)
         x_next = x + self.dt * dx  # Euler step (matches style of your other systems)
-        return x_next + v
+        return self._apply_support(x, x_next + v)
 
     def predict(self, x: torch.Tensor):
         """
@@ -486,6 +557,10 @@ class SecondOrderDubinsTrailer(DiscreteTimeStochasticSystem):
     6D second-order Dubins tractor–trailer with multiplicative noise in steering control, speed control, and the speed state itself 
     State x = [px, py, theta_c, theta_t, v, omega].
     """
+    DEFAULT_SUPPORT_LOW = torch.tensor([-5.0, -5.0, -math.pi, -math.pi, -5.0, -10.0], dtype=torch.float32)
+    DEFAULT_SUPPORT_HIGH = torch.tensor([5.0, 5.0, math.pi, math.pi, 5.0, 10.0], dtype=torch.float32)
+    WRAP_DIMS = (2, 3)
+
     def __init__(
         self,
         dt: float,
@@ -497,6 +572,8 @@ class SecondOrderDubinsTrailer(DiscreteTimeStochasticSystem):
         sigma_omega: float = 0.1,
         sigma_speed_state: float = 0.1,
         cov_scale: float = 0.01,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         # Mixture-of-Gaussians non-Gaussian noise (2D): xi = [xi_v, xi_omega]
         cov1 = cov_scale * torch.tensor([[1.0, 0.2], [0.2, 1.0]], dtype=torch.float32)
@@ -509,10 +586,15 @@ class SecondOrderDubinsTrailer(DiscreteTimeStochasticSystem):
         )
         v_dist = torch.distributions.MixtureSameFamily(mix, comp)
 
+        if support is None:
+            support = Hyperrectangle(self.DEFAULT_SUPPORT_LOW.clone(), self.DEFAULT_SUPPORT_HIGH.clone())
         super().__init__(
             dim=6,
             state_labels=["px", "py", "theta_c", "theta_t", "v", "omega"],
             v_dist=v_dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=self.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -570,10 +652,11 @@ class SecondOrderDubinsTrailer(DiscreteTimeStochasticSystem):
         # --- Steering rate update ---
         omega_next = omega + dt * u_omega_noisy
 
-        return torch.stack(
+        x_next = torch.stack(
             [px_next, py_next, theta_c_next, theta_t_next, speed_next, omega_next],
             dim=0,
         )
+        return self._apply_support(x, x_next)
 
 
 class Quadcopter(DiscreteTimeStochasticSystem):
@@ -586,6 +669,16 @@ class Quadcopter(DiscreteTimeStochasticSystem):
     Control (internal): total thrust T and body torques tau = [tau_x, tau_y, tau_z].
     Noise: additive Gaussian (12D).
     """
+
+    DEFAULT_SUPPORT_LOW = torch.tensor(
+        [-10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -math.pi, -math.pi, -math.pi, -10.0, -10.0, -10.0],
+        dtype=torch.float32,
+    )
+    DEFAULT_SUPPORT_HIGH = torch.tensor(
+        [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, math.pi, math.pi, math.pi, 10.0, 10.0, 10.0],
+        dtype=torch.float32,
+    )
+    WRAP_DIMS = (6, 7, 8)
 
     def __init__(
         self,
@@ -602,12 +695,16 @@ class Quadcopter(DiscreteTimeStochasticSystem):
         torque_limits: torch.Tensor | None = None,
         covariance: torch.Tensor | None = None,
         rate_filter_alpha: float = 0.3,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         if covariance is None:
             covariance = 0.001 * torch.eye(12)
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(self.DEFAULT_SUPPORT_LOW.clone(), self.DEFAULT_SUPPORT_HIGH.clone())
         dist = torch.distributions.MultivariateNormal(torch.zeros(12), covariance)
         super().__init__(
             dim=12,
@@ -626,6 +723,9 @@ class Quadcopter(DiscreteTimeStochasticSystem):
                 "r",
             ],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=self.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -820,7 +920,7 @@ class Quadcopter(DiscreteTimeStochasticSystem):
         x_next[7] = torch.remainder(x_next[7] + math.pi, 2 * math.pi) - math.pi
         x_next[8] = torch.remainder(x_next[8] + math.pi, 2 * math.pi) - math.pi
 
-        return x_next + v
+        return self._apply_support(x, x_next + v)
 
     def predict(self, x: torch.Tensor):
         """
@@ -892,13 +992,14 @@ class Aircraft(DiscreteTimeStochasticSystem):
         dtype=torch.float32,
     )
     PLOT_BOUNDS_LOW_PHYS = torch.tensor(
-        [-300.0, -300.0, 10.0, 5.0, -25.0, -25.0, -1.0, -0.75, -3.2, -3.5, -3.5, -3.5],
+        [-300.0, -300.0, 10.0, 5.0, -25.0, -25.0, -1.0, -0.75, -math.pi, -3.5, -3.5, -3.5],
         dtype=torch.float32,
     )
     PLOT_BOUNDS_HIGH_PHYS = torch.tensor(
-        [1400.0, 1100.0, 260.0, 42.0, 25.0, 25.0, 1.0, 0.75, 3.2, 3.5, 3.5, 3.5],
+        [1400.0, 1100.0, 260.0, 42.0, 25.0, 25.0, 1.0, 0.75, math.pi, 3.5, 3.5, 3.5],
         dtype=torch.float32,
     )
+    WRAP_DIMS = (8,)
     DEFAULT_WAYPOINT = torch.tensor([800.0, 400.0, 120.0], dtype=torch.float32)
 
     INIT_MEAN = INIT_MEAN_PHYS / STATE_SCALE
@@ -942,7 +1043,17 @@ class Aircraft(DiscreteTimeStochasticSystem):
         kp_V: float = 45.0,
         phi_cmd_limit: float = 0.65,
         theta_cmd_limit: float = 0.42,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
+        if state_scale is None:
+            state_scale = torch.ones(12, dtype=torch.float32)
+        state_scale = torch.as_tensor(state_scale, dtype=torch.float32).reshape(12).clamp_min(1e-6)
+        if support is None:
+            support = Hyperrectangle(
+                (self.PLOT_BOUNDS_LOW_PHYS / state_scale).clone(),
+                (self.PLOT_BOUNDS_HIGH_PHYS / state_scale).clone(),
+            )
         cov = noise_cov_scale * torch.eye(6, dtype=torch.float32)
         dist = torch.distributions.MultivariateNormal(torch.zeros(6), cov)
         super().__init__(
@@ -962,6 +1073,9 @@ class Aircraft(DiscreteTimeStochasticSystem):
                 "r",
             ],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=self.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -981,9 +1095,6 @@ class Aircraft(DiscreteTimeStochasticSystem):
         self.sigma_CL = sigma_CL
         self.sigma_CM = sigma_CM
 
-        if state_scale is None:
-            state_scale = torch.ones(12, dtype=torch.float32)
-        state_scale = torch.as_tensor(state_scale, dtype=torch.float32).reshape(12).clamp_min(1e-6)
         self.register_buffer("state_scale", state_scale)
 
         self.kp_xy = kp_xy
@@ -1306,4 +1417,5 @@ class Aircraft(DiscreteTimeStochasticSystem):
         x_next_phys[7] = torch.remainder(x_next_phys[7] + math.pi, 2 * math.pi) - math.pi
         x_next_phys[8] = torch.remainder(x_next_phys[8] + math.pi, 2 * math.pi) - math.pi
 
-        return self._to_normalized(x_next_phys)
+        x_next = self._to_normalized(x_next_phys)
+        return self._apply_support(x.flatten(), x_next)

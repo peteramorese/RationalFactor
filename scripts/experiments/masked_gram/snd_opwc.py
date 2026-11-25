@@ -71,8 +71,8 @@ def _plot_snd_conditional_true_vs_learned(
     title: str = "",
 ) -> None:
     """Compare true and learned p(x'|x) on a 2D grid (conditioner vs next state)."""
-    lo = float(problem.plot_bounds_low[0].item())
-    hi = float(problem.plot_bounds_high[0].item())
+    lo = float(problem.plot_region().low[0].item())
+    hi = float(problem.plot_region().high[0].item())
 
     param = next(iter(tran_model.parameters()), None)
     buffer = next(iter(tran_model.buffers()), None)
@@ -223,8 +223,8 @@ def _plot_snd_1d_belief_trajectory(
     if len(beliefs) != n_slices:
         raise ValueError(f"Expected {n_slices} beliefs, got {len(beliefs)}")
 
-    lo = float(problem.plot_bounds_low[0].item())
-    hi = float(problem.plot_bounds_high[0].item())
+    lo = float(problem.plot_region().low[0].item())
+    hi = float(problem.plot_region().high[0].item())
     x_grid = torch.linspace(lo, hi, n_grid).unsqueeze(1)
 
     param = next(iter(beliefs[0].parameters()), None)
@@ -464,8 +464,8 @@ if __name__ == "__main__":
     tran_model = tran_model.to(analysis_device).eval()
     trained_wrap_tf = trained_wrap_tf.to(analysis_device).eval()
 
-    box_lows = tuple(problem.plot_bounds_low.tolist())
-    box_highs = tuple(problem.plot_bounds_high.tolist())
+    box_lows = tuple(problem.plot_region().low.tolist())
+    box_highs = tuple(problem.plot_region().high.tolist())
     n_slices = n_timesteps_prop + 1
 
     base_belief_seq = propagate.propagate(

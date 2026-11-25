@@ -498,11 +498,11 @@ def main() -> None:
         data_i = test_traj_data[i].to(analysis_device)
         ll = avg_log_likelihood(belief_seq[i], data_i)
         print(f"Log likelihood at time {i}: {ll:.4f}")
-        plot_belief(axes[1, i], belief_seq[i], x_range=(problem.plot_bounds_low[0], problem.plot_bounds_high[0]), y_range=(problem.plot_bounds_low[1], problem.plot_bounds_high[1]))
+        plot_belief(axes[1, i], belief_seq[i], x_range=(problem.plot_region().low[0], problem.plot_region().high[0]), y_range=(problem.plot_region().low[1], problem.plot_region().high[1]))
         axes[0, i].scatter(test_traj_data[i][:, 0], test_traj_data[i][:, 1], s=1)
         axes[0, i].set_aspect("equal")
-        axes[0, i].set_xlim(problem.plot_bounds_low[0], problem.plot_bounds_high[0])
-        axes[0, i].set_ylim(problem.plot_bounds_low[1], problem.plot_bounds_high[1])
+        axes[0, i].set_xlim(problem.plot_region().low[0], problem.plot_region().high[0])
+        axes[0, i].set_ylim(problem.plot_region().low[1], problem.plot_region().high[1])
     
 
     plt.savefig("figures/vdp_lcmp_beliefs.png", dpi=1000)

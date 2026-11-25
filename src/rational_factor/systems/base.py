@@ -3,7 +3,18 @@ from rational_factor.models.density_model import ConditionalDensityModel
 from rational_factor.tools.set import Hyperrectangle
 
 class DiscreteTimeStochasticSystem(torch.nn.Module):
-    def __init__(self, dim : int, state_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None):
+    def __init__(
+        self,
+        dim: int,
+        state_labels: list[str] = None,
+        v_dist: torch.distributions.Distribution | None = None,
+        support: Hyperrectangle | None = None,
+        bounded_support: bool = False,
+        wrap_dims: tuple[int, ...] = (),
+        boundary_margin_frac: float = 0.1,
+        boundary_min_scale: float = 0.25,
+        boundary_restitution: float = 0.5,
+    ):
         super().__init__()
         self._dim = dim
         if state_labels is not None:
@@ -19,6 +30,72 @@ class DiscreteTimeStochasticSystem(torch.nn.Module):
                 low=torch.zeros(self._dim),
                 high=torch.ones(self._dim),
             )
+
+        if support is not None:
+            if not isinstance(support, Hyperrectangle) or support.is_batched or support.dim != dim:
+                raise ValueError(f"support must be a single {dim}D Hyperrectangle")
+        if bounded_support and support is None:
+            raise ValueError("support must be provided when bounded_support=True")
+        self.support = support
+        self.bounded_support = bool(bounded_support)
+        self._wrap_dims = tuple(int(d) for d in wrap_dims)
+        self._boundary_margin_frac = float(boundary_margin_frac)
+        self._boundary_min_scale = float(boundary_min_scale)
+        self._boundary_restitution = float(boundary_restitution)
+
+    def _apply_support(self, x: torch.Tensor, x_next: torch.Tensor) -> torch.Tensor:
+        """Project ``x_next`` onto ``self.support`` when ``self.bounded_support`` is True.
+
+        Interior transitions are untouched. Near the walls of non-angular
+        coordinates, outward steps are damped and any overshoot is reflected
+        back into ``self.support`` with damped magnitude. Angular coordinates
+        in ``self._wrap_dims`` wrap periodically over their support interval.
+        """
+        if not self.bounded_support:
+            return x_next
+        if self.support is None:
+            raise ValueError("support must be defined when bounded_support=True")
+
+        lo = self.support.low.to(device=x_next.device, dtype=x_next.dtype)
+        hi = self.support.high.to(device=x_next.device, dtype=x_next.dtype)
+        span = hi - lo
+
+        x_prev = x.reshape_as(x_next)
+        dx = x_next - x_prev
+        margin = self._boundary_margin_frac * span
+
+        dist_hi = (hi - x_prev).clamp(min=0.0)
+        dist_lo = (x_prev - lo).clamp(min=0.0)
+        near_hi = (dx > 0) & (dist_hi < margin)
+        near_lo = (dx < 0) & (dist_lo < margin)
+
+        min_scale = self._boundary_min_scale
+        scale = torch.ones_like(dx)
+        scale = torch.where(near_hi, min_scale + (1.0 - min_scale) * (dist_hi / margin), scale)
+        scale = torch.where(near_lo, min_scale + (1.0 - min_scale) * (dist_lo / margin), scale)
+        y = x_prev + scale * dx
+
+        restitution = self._boundary_restitution
+        over_hi = (y - hi).clamp(min=0.0)
+        over_lo = (lo - y).clamp(min=0.0)
+        y_refl = torch.where(
+            y > hi,
+            hi - 0.5 * span * torch.tanh(2.0 * restitution * over_hi / span),
+            torch.where(
+                y < lo,
+                lo + 0.5 * span * torch.tanh(2.0 * restitution * over_lo / span),
+                y,
+            ),
+        )
+        y_refl = torch.clamp(y_refl, min=lo, max=hi)
+
+        if len(self._wrap_dims) > 0:
+            y_wrap = torch.clamp(lo + torch.remainder(x_next - lo, span), min=lo, max=hi)
+            wrap_mask = torch.zeros(self._dim, dtype=torch.bool, device=x_next.device)
+            wrap_mask[list(self._wrap_dims)] = True
+            return torch.where(wrap_mask, y_wrap, y_refl)
+
+        return y_refl
 
     def _sample_v(self):
         if isinstance(self._v_dist, torch.distributions.Distribution):
@@ -46,10 +123,28 @@ class DiscreteTimeStochasticSystem(torch.nn.Module):
         return self._state_labels[i]
 
 class ControllableStochasticSystem(DiscreteTimeStochasticSystem):
-    def __init__(self, state_dim : int, control_dim : int, state_labels : list[str] = None, control_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None):
+    def __init__(
+        self,
+        state_dim: int,
+        control_dim: int,
+        state_labels: list[str] = None,
+        control_labels: list[str] = None,
+        v_dist: torch.distributions.Distribution | None = None,
+        support: Hyperrectangle | None = None,
+        bounded_support: bool = False,
+        wrap_dims: tuple[int, ...] = (),
+    ):
         # Call DiscreteTimeStochasticSystem directly: cooperative subclasses also inherit
         # a passive plant (e.g. VanDerPol) whose __init__ signature differs from ours.
-        DiscreteTimeStochasticSystem.__init__(self, state_dim, state_labels, v_dist)
+        DiscreteTimeStochasticSystem.__init__(
+            self,
+            state_dim,
+            state_labels,
+            v_dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=wrap_dims,
+        )
         self._control_dim = control_dim
         if control_labels is not None:
             assert len(control_labels) == control_dim, "control_labels must be a list of length control_dim"
@@ -77,8 +172,26 @@ class ControllableStochasticSystem(DiscreteTimeStochasticSystem):
         return self._control_labels[i]
 
 class PartiallyObservableSystem(DiscreteTimeStochasticSystem):
-    def __init__(self, state_dim : int, observation_dim : int, state_labels : list[str] = None, observation_labels : list[str] = None, v_dist : torch.distributions.Distribution | None = None, w_dist : torch.distributions.Distribution | None = None):
-        super().__init__(state_dim, state_labels, v_dist)
+    def __init__(
+        self,
+        state_dim: int,
+        observation_dim: int,
+        state_labels: list[str] = None,
+        observation_labels: list[str] = None,
+        v_dist: torch.distributions.Distribution | None = None,
+        w_dist: torch.distributions.Distribution | None = None,
+        support: Hyperrectangle | None = None,
+        bounded_support: bool = False,
+        wrap_dims: tuple[int, ...] = (),
+    ):
+        super().__init__(
+            state_dim,
+            state_labels,
+            v_dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=wrap_dims,
+        )
         self._observation_dim = observation_dim
         if observation_labels is not None:
             assert len(observation_labels) == observation_dim, "observation_labels must be a list of length observation_dim"

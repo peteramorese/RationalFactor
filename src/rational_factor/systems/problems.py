@@ -16,8 +16,31 @@ from rational_factor.systems.base import (
     sample_trajectories,
     sample_trajectories_without_collisions,
 )
-from rational_factor.tools.misc import make_mvnormal_state_sampler, make_uniform_state_sampler
+from rational_factor.tools.misc import (
+    make_beta_state_sampler,
+    make_mvnormal_state_sampler,
+    make_uniform_state_sampler,
+)
 from rational_factor.tools.set import Hyperrectangle
+
+
+def _beta_sampler_from_moments(
+    support: Hyperrectangle,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> Callable[[int], torch.Tensor]:
+    """Build a ``make_beta_state_sampler`` on ``support`` matching ``(mean, std)``."""
+    low = support.low.to(dtype=torch.float32)
+    high = support.high.to(dtype=torch.float32)
+    span = high - low
+    mu = ((torch.as_tensor(mean, dtype=torch.float32) - low) / span).clamp(1e-3, 1.0 - 1e-3)
+    var = (torch.as_tensor(std, dtype=torch.float32) / span) ** 2
+    max_var = 0.5 * mu * (1.0 - mu)
+    var = torch.minimum(var, max_var).clamp_min(1e-8)
+    kappa = (mu * (1.0 - mu) / var - 1.0).clamp_min(2.0)
+    alpha = (mu * kappa).clamp_min(1.01)
+    beta = ((1.0 - mu) * kappa).clamp_min(1.01)
+    return make_beta_state_sampler(low, high, alpha=alpha, beta=beta)
 
 
 def _ambient_box(
@@ -71,9 +94,10 @@ class FullyObservableProblem:
     n_data_init: int
     seed: int
     numerical_tolerance: float
-    plot_bounds_low: torch.Tensor
-    plot_bounds_high: torch.Tensor
     plot_marginals_list: list[tuple[int, int]]
+
+    def plot_region(self) -> Hyperrectangle:
+        return self.system.support
 
     def train_initial_state_data(self):
         with torch.random.fork_rng():
@@ -251,8 +275,6 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-8.0, -8.0, -3.5]),
-        plot_bounds_high=torch.tensor([8.0, 8.0, 5.5]),
         plot_marginals_list=[(0, 1), (0, 2), (1, 2)],
     ),
     "scalar_nonlinear_drift": FullyObservableProblem(
@@ -277,8 +299,6 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-4.0]),
-        plot_bounds_high=torch.tensor([4.0]),
         plot_marginals_list=[],
     ),
     "van_der_pol": FullyObservableProblem(
@@ -305,8 +325,6 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-5.0, -5.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0]),
         plot_marginals_list=[(0, 1)],
     ),
     "cartpole": FullyObservableProblem(
@@ -332,8 +350,6 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-6.0, -6.0, -6.0, -6.0]),
-        plot_bounds_high=torch.tensor([6.0, 6.0, 6.0, 6.0]),
         plot_marginals_list=[(0, 1), (2, 3)],
     ),
     "dubins_trailer": FullyObservableProblem(
@@ -364,8 +380,6 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -10.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 10.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5)],
     ),
     "planar_quadrotor": FullyObservableProblem(
@@ -393,10 +407,6 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-5.0, -5.0, -4.0, -15.0, -15.0, -20.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0, 4.0, 15.0, 15.0, 20.0]),
-        #plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -5.0]),
-        #plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 5.0]),
         plot_marginals_list=[(0, 1), (3, 4), (2, 5)],
     ),
     "quadcopter": FullyObservableProblem(
@@ -423,8 +433,6 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=5000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0]),
-        plot_bounds_high=torch.tensor([10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
     ),
     "aircraft": FullyObservableProblem(
@@ -453,8 +461,6 @@ FULLY_OBSERVABLE_PROBLEMS = {
         n_data_init=5000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=systems.Aircraft.PLOT_BOUNDS_LOW,
-        plot_bounds_high=systems.Aircraft.PLOT_BOUNDS_HIGH,
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
     ),
 }
@@ -496,8 +502,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-8.0, -8.0, -4.0]),
-        plot_bounds_high=torch.tensor([8.0, 8.0, 4.0]),
         plot_marginals_list=[(0, 1), (0, 2), (1, 2)],
     ),
     "icy_road_car": ControlledProblem(
@@ -517,8 +521,8 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         # Cover the full road in position; remaining states are sampled over
         # a practical range for a small ground vehicle.
         prev_state_sampler=make_uniform_state_sampler(
-            low=torch.tensor([0.0, 0.0, -0.55, 1.0, -1.5, -0.65]),
-            high=torch.tensor([6.0, 30.0, 0.55, 9.5, 1.5, 0.65]),
+            low=torch.tensor([-4.0, -1.0, -0.55, 1.0, -1.5, -0.65]),
+            high=torch.tensor([10.0, 30.0, 0.55, 9.5, 1.5, 0.65]),
         ),
         # Steering (rad) and longitudinal accel (m/s^2); within plant clamps.
         control_limits=Hyperrectangle(
@@ -529,14 +533,14 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             low=torch.tensor([-0.30, -3.0]),
             high=torch.tensor([0.30, 2.0]),
         ),
-        # Goal at the far end of the road; obstacles from the default ice patches.
-        goal=_ambient_box(6, {0: (1.0, 2.5), 1: (27.0, 30.0)}),
+        # Goal at the far end of the road; obstacles include off-road regions (x < 0, x > 6).
+        goal=_ambient_box(6, {0: (1.0, 2.5), 1: (20.0, 25.0)}),
         obstacles=_ambient_boxes(
             6,
             [
-                {0: (0.35, 2.85), 1: (6.5, 11.8)},
-                {0: (2.30, 5.70), 1: (13.8, 18.7)},
-                {0: (0.65, 3.45), 1: (21.0, 25.7)},
+                {0: (0.3, 0.7), 1: (8.0, 9.0)},
+                {0: (-1e6, 0.0)},
+                {0: (6.0, 1e6)},
             ],
         ),
         n_timesteps=15,
@@ -545,8 +549,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([0.0, 0.0, -3.14, -3.0, -5.0, -4.0]),
-        plot_bounds_high=torch.tensor([6.0, 30.0, 3.14, 13.0, 5.0, 4.0]),
         plot_marginals_list=[(0, 1), (3, 4), (2, 5)],
     ),
     "scalar_nonlinear_drift": ControlledProblem(
@@ -574,8 +576,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-3.5]),
-        plot_bounds_high=torch.tensor([3.5]),
         plot_marginals_list=[],
     ),
     "van_der_pol": ControlledProblem(
@@ -601,7 +601,7 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
             low=torch.tensor([-2.0, -2.0]),
             high=torch.tensor([2.0, 2.0]),
         ),
-        goal=Hyperrectangle(torch.tensor([2.5, 2.5]), torch.tensor([3.5, 3.5])),
+        goal=Hyperrectangle(torch.tensor([-1.5, 2.0]), torch.tensor([-0.5, 2.5])),
         obstacles=_ambient_boxes(
             2,
             [
@@ -615,8 +615,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-5.0, -5.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0]),
         plot_marginals_list=[(0, 1)],
     ),
     "cartpole": ControlledProblem(
@@ -659,8 +657,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=1000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-6.0, -6.0, -6.0, -6.0]),
-        plot_bounds_high=torch.tensor([6.0, 6.0, 6.0, 6.0]),
         plot_marginals_list=[(0, 1), (2, 3)],
     ),
     "dubins_trailer": ControlledProblem(
@@ -705,8 +701,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -10.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 10.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5)],
     ),
     "planar_quadrotor": ControlledProblem(
@@ -751,8 +745,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=3000,
         seed=42,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-5.0, -5.0, -4.0, -15.0, -15.0, -20.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0, 4.0, 15.0, 15.0, 20.0]),
         plot_marginals_list=[(0, 1), (3, 4), (2, 5)],
     ),
     "quadcopter": ControlledProblem(
@@ -794,8 +786,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=5000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0]),
-        plot_bounds_high=torch.tensor([10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
     ),
     "aircraft": ControlledProblem(
@@ -848,8 +838,6 @@ OPEN_LOOP_OBSERVABLE_PROBLEMS = {
         n_data_init=5000,
         seed=42,
         numerical_tolerance=1e-10,
-        plot_bounds_low=systems.Aircraft.PLOT_BOUNDS_LOW,
-        plot_bounds_high=systems.Aircraft.PLOT_BOUNDS_HIGH,
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
     ),
 }
@@ -881,8 +869,6 @@ PARTIALLY_OBSERVABLE_PROBLEMS = {
         n_data_obs=10000,
         seed=0,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-5.0, -5.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0]),
         plot_marginals_list=[(0, 1)],
     ),
     "bad_sensor_van_der_pol": PartiallyObservableProblem(
@@ -911,8 +897,6 @@ PARTIALLY_OBSERVABLE_PROBLEMS = {
         n_data_obs=10000,
         seed=0,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-5.0, -5.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0]),
         plot_marginals_list=[(0, 1)],
     ),
     "cartpole": PartiallyObservableProblem(
@@ -944,8 +928,6 @@ PARTIALLY_OBSERVABLE_PROBLEMS = {
         n_data_obs=10000,
         seed=0,
         numerical_tolerance=1e-20,
-        plot_bounds_low=torch.tensor([-6.0, -6.0, -6.0, -6.0]),
-        plot_bounds_high=torch.tensor([6.0, 6.0, 6.0, 6.0]),
         plot_marginals_list=[(0, 1), (2, 3)],
     ),
     "dubins_trailer": PartiallyObservableProblem(
@@ -982,8 +964,6 @@ PARTIALLY_OBSERVABLE_PROBLEMS = {
         n_data_obs=30000,
         seed=0,
         numerical_tolerance=1e-10,
-        plot_bounds_low=torch.tensor([-5.0, -5.0, -5.0, -5.0, -5.0, -10.0]),
-        plot_bounds_high=torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 10.0]),
         plot_marginals_list=[(0, 1), (2, 3), (4, 5)],
     ),
     "aircraft": PartiallyObservableProblem(
@@ -1018,8 +998,274 @@ PARTIALLY_OBSERVABLE_PROBLEMS = {
         n_data_obs=50000,
         seed=0,
         numerical_tolerance=1e-10,
-        plot_bounds_low=systems.Aircraft.PLOT_BOUNDS_LOW,
-        plot_bounds_high=systems.Aircraft.PLOT_BOUNDS_HIGH,
         plot_marginals_list=[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)],
+    ),
+}
+
+
+def _make_bounded_fo_problem(
+    system: DiscreteTimeStochasticSystem,
+    init_mean: torch.Tensor,
+    init_std: torch.Tensor,
+    base: FullyObservableProblem,
+) -> FullyObservableProblem:
+    return FullyObservableProblem(
+        system=system,
+        initial_state_sampler=_beta_sampler_from_moments(system.support, init_mean, init_std),
+        prev_state_sampler=make_uniform_state_sampler(system.support.low, system.support.high),
+        n_timesteps=base.n_timesteps,
+        n_trajectories_test=base.n_trajectories_test,
+        n_data_tran=base.n_data_tran,
+        n_data_init=base.n_data_init,
+        seed=base.seed,
+        numerical_tolerance=base.numerical_tolerance,
+        plot_marginals_list=list(base.plot_marginals_list),
+    )
+
+
+def _make_bounded_ol_problem(
+    system: ControllableStochasticSystem,
+    init_mean: torch.Tensor,
+    init_std: torch.Tensor,
+    base: ControlledProblem,
+) -> ControlledProblem:
+    return ControlledProblem(
+        system=system,
+        initial_state_sampler=_beta_sampler_from_moments(system.support, init_mean, init_std),
+        prev_state_sampler=make_uniform_state_sampler(system.support.low, system.support.high),
+        control_limits=base.control_limits,
+        control_sampler=base.control_sampler,
+        goal=base.goal,
+        obstacles=base.obstacles,
+        n_timesteps=base.n_timesteps,
+        n_trajectories_test=base.n_trajectories_test,
+        n_data_tran=base.n_data_tran,
+        n_data_init=base.n_data_init,
+        seed=base.seed,
+        numerical_tolerance=base.numerical_tolerance,
+        plot_marginals_list=list(base.plot_marginals_list),
+    )
+
+
+BOUNDED_FULLY_OBSERVABLE_PROBLEMS = {
+    "kinematic_unicycle": _make_bounded_fo_problem(
+        system=systems.KinematicUnicycle(
+            dt=0.5,
+            speed=1.0,
+            angular_displacement=0.12,
+            angle_noise_bound=0.2,
+            position_noise_std=0.15,
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0, 0.0, 0.0]),
+        init_std=torch.tensor([0.12, 0.12, 0.08]),
+        base=FULLY_OBSERVABLE_PROBLEMS["kinematic_unicycle"],
+    ),
+    "scalar_nonlinear_drift": _make_bounded_fo_problem(
+        system=systems.ScalarNonlinearDrift(
+            sigma=0.1,
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0]),
+        init_std=torch.tensor([0.5]).sqrt(),
+        base=FULLY_OBSERVABLE_PROBLEMS["scalar_nonlinear_drift"],
+    ),
+    "van_der_pol": _make_bounded_fo_problem(
+        system=systems.VanDerPol(
+            dt=0.3,
+            mu=0.9,
+            covariance=0.1 * torch.eye(2),
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.2, 0.1]),
+        init_std=torch.tensor([0.2, 0.2]).sqrt(),
+        base=FULLY_OBSERVABLE_PROBLEMS["van_der_pol"],
+    ),
+    "cartpole": _make_bounded_fo_problem(
+        system=systems.CartPole(
+            dt=0.2,
+            m_c=1.0,
+            m_p=0.5,
+            l=1.5,
+            g=9.81,
+            covariance=0.1 * torch.eye(4),
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
+        init_std=torch.tensor([0.2, 0.2, 0.2, 0.2]).sqrt(),
+        base=FULLY_OBSERVABLE_PROBLEMS["cartpole"],
+    ),
+    "dubins_trailer": _make_bounded_fo_problem(
+        system=systems.SecondOrderDubinsTrailer(
+            dt=0.3,
+            L_t=0.5,
+            v_ref=1.0,
+            k_v=1.0,
+            k_theta=2.2,
+            sigma_v=0.12,
+            sigma_omega=0.15,
+            sigma_speed_state=0.08,
+            cov_scale=0.1,
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0, 0.0, 0.35, 0.2, -0.85, 1.0]),
+        init_std=torch.tensor([0.4, 0.4, 0.25, 0.35, 0.6, 0.4]),
+        base=FULLY_OBSERVABLE_PROBLEMS["dubins_trailer"],
+    ),
+    "planar_quadrotor": _make_bounded_fo_problem(
+        system=systems.PlanarQuadrotor(
+            dt=0.08,
+            waypoint=torch.tensor([2.2, 1.4]),
+            m=1.0,
+            I=0.02,
+            ell=0.22,
+            covariance=0.1 * torch.eye(6),
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.15, 0.35, -0.08, 0.0, 0.0, 0.0]),
+        init_std=torch.tensor([1.0, 1.0, 0.5, 0.35, 0.35, 1.5]),
+        base=FULLY_OBSERVABLE_PROBLEMS["planar_quadrotor"],
+    ),
+    "quadcopter": _make_bounded_fo_problem(
+        system=systems.Quadcopter(
+            dt=0.1,
+            waypoint=torch.tensor([3.0, -1.5, 2.0]),
+            yaw_ref=0.4,
+            covariance=0.08 * torch.eye(12),
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0]),
+        init_std=torch.tensor([0.15, 0.15, 0.12, 0.25, 0.25, 0.25, 0.08, 0.08, 0.2, 0.35, 0.35, 0.35]),
+        base=FULLY_OBSERVABLE_PROBLEMS["quadcopter"],
+    ),
+    "aircraft": _make_bounded_fo_problem(
+        system=systems.Aircraft(
+            dt=0.1,
+            waypoint=systems.Aircraft.DEFAULT_WAYPOINT,
+            V_ref=22.0,
+            sigma_thrust=0.04,
+            sigma_surface=0.05,
+            sigma_CL=0.03,
+            sigma_CM=0.04,
+            noise_cov_scale=5.0,
+            state_scale=systems.Aircraft.STATE_SCALE,
+            bounded_support=True,
+        ),
+        init_mean=systems.Aircraft.INIT_MEAN,
+        init_std=systems.Aircraft.INIT_STD_NORM,
+        base=FULLY_OBSERVABLE_PROBLEMS["aircraft"],
+    ),
+}
+
+BOUNDED_OPEN_LOOP_OBSERVABLE_PROBLEMS = {
+    "kinematic_unicycle": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledKinematicUnicycle(
+            dt=0.5,
+            speed=1.0,
+            angle_noise_bound=0.2,
+            position_noise_std=0.15,
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0, 0.0, 0.0]),
+        init_std=torch.tensor([0.12, 0.12, 0.08]),
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["kinematic_unicycle"],
+    ),
+    "icy_road_car": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledIcyRoadCar(
+            dt=0.3,
+            road_width=6.0,
+            road_length=30.0,
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([1.5, 1.0, 0.0, 6.8, 0.0, 0.0]),
+        init_std=torch.tensor([0.12, 0.10, 0.025, 0.25, 0.08, 0.035]),
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["icy_road_car"],
+    ),
+    "scalar_nonlinear_drift": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledScalarNonlinearDrift(
+            sigma=0.1,
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0]),
+        init_std=torch.tensor([0.5]).sqrt(),
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["scalar_nonlinear_drift"],
+    ),
+    "van_der_pol": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledVanDerPol(
+            dt=0.3,
+            mu=0.9,
+            covariance=0.1 * torch.eye(2),
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.2, 0.1]),
+        init_std=torch.tensor([0.2, 0.2]).sqrt(),
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["van_der_pol"],
+    ),
+    "cartpole": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledCartPole(
+            dt=0.2,
+            m_c=1.0,
+            m_p=0.5,
+            l=1.5,
+            g=9.81,
+            covariance=0.1 * torch.eye(4),
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0, 0.0, 0.0, 0.0]),
+        init_std=torch.tensor([0.2, 0.2, 0.2, 0.2]).sqrt(),
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["cartpole"],
+    ),
+    "dubins_trailer": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledSecondOrderDubinsTrailer(
+            dt=0.3,
+            L_t=0.5,
+            sigma_v=0.12,
+            sigma_omega=0.15,
+            sigma_speed_state=0.08,
+            cov_scale=0.1,
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0, 0.0, 0.35, 0.2, -0.85, 1.0]),
+        init_std=torch.tensor([0.4, 0.4, 0.25, 0.35, 0.6, 0.4]),
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["dubins_trailer"],
+    ),
+    "planar_quadrotor": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledPlanarQuadrotor(
+            dt=0.08,
+            m=1.0,
+            I=0.02,
+            ell=0.22,
+            covariance=0.1 * torch.eye(6),
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.15, 0.35, -0.08, 0.0, 0.0, 0.0]),
+        init_std=torch.tensor([1.0, 1.0, 0.5, 0.35, 0.35, 1.5]),
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["planar_quadrotor"],
+    ),
+    "quadcopter": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledQuadcopter(
+            dt=0.1,
+            covariance=0.08 * torch.eye(12),
+            bounded_support=True,
+        ),
+        init_mean=torch.tensor([0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0]),
+        init_std=torch.tensor([0.15, 0.15, 0.12, 0.25, 0.25, 0.25, 0.08, 0.08, 0.2, 0.35, 0.35, 0.35]),
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["quadcopter"],
+    ),
+    "aircraft": _make_bounded_ol_problem(
+        system=controlled_systems.ControlledAircraft(
+            dt=0.1,
+            V_ref=22.0,
+            sigma_thrust=0.04,
+            sigma_surface=0.05,
+            sigma_CL=0.03,
+            sigma_CM=0.04,
+            noise_cov_scale=5.0,
+            state_scale=systems.Aircraft.STATE_SCALE,
+            bounded_support=True,
+        ),
+        init_mean=systems.Aircraft.INIT_MEAN,
+        init_std=systems.Aircraft.INIT_STD_NORM,
+        base=OPEN_LOOP_OBSERVABLE_PROBLEMS["aircraft"],
     ),
 }

@@ -12,6 +12,7 @@ import torch
 
 from .base import ControllableStochasticSystem
 from . import systems
+from rational_factor.tools.set import Hyperrectangle
 
 
 
@@ -31,10 +32,17 @@ class ControlledKinematicUnicycle(ControllableStochasticSystem, systems.Kinemati
         speed: float = 1.0,
         angle_noise_bound: float = 0.2,
         position_noise_std: float | tuple[float, float] = 0.05,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         std = systems.KinematicUnicycle._check_parameters(
             dt, speed, angle_noise_bound, position_noise_std
         )
+        if support is None:
+            support = Hyperrectangle(
+                systems.KinematicUnicycle.DEFAULT_SUPPORT_LOW.clone(),
+                systems.KinematicUnicycle.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         ControllableStochasticSystem.__init__(
             self,
             state_dim=3,
@@ -42,6 +50,9 @@ class ControlledKinematicUnicycle(ControllableStochasticSystem, systems.Kinemati
             state_labels=["px", "py", "theta"],
             control_labels=["dtheta"],
             v_dist=systems.UnicycleProcessNoise(),
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.KinematicUnicycle.WRAP_DIMS,
         )
         self.dt = float(dt)
         self.speed = float(speed)
@@ -67,12 +78,19 @@ class ControlledScalarNonlinearDrift(ControllableStochasticSystem, systems.Scala
         self,
         sigma: float = 0.1,
         covariance: torch.Tensor | None = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         if covariance is None:
             covariance = torch.tensor([[sigma**2]], dtype=torch.float32)
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(
+                systems.ScalarNonlinearDrift.DEFAULT_SUPPORT_LOW.clone(),
+                systems.ScalarNonlinearDrift.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         dist = torch.distributions.MultivariateNormal(torch.zeros(1), covariance)
         ControllableStochasticSystem.__init__(
             self,
@@ -81,12 +99,15 @@ class ControlledScalarNonlinearDrift(ControllableStochasticSystem, systems.Scala
             state_labels=["x"],
             control_labels=["u"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.ScalarNonlinearDrift.WRAP_DIMS,
         )
         self.cov = covariance
 
     def next_state(self, x: torch.Tensor, u: torch.Tensor, v: torch.Tensor):
         mean = self._drift(x) + u.reshape(-1)
-        return mean + v.reshape(-1)
+        return self._apply_support(x, mean + v.reshape(-1))
 
 
 class ControlledVanDerPol(ControllableStochasticSystem, systems.VanDerPol):
@@ -101,12 +122,19 @@ class ControlledVanDerPol(ControllableStochasticSystem, systems.VanDerPol):
         dt: float,
         mu: float = 1.0,
         covariance: torch.Tensor | None = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         if covariance is None:
             covariance = torch.eye(2)
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(
+                systems.VanDerPol.DEFAULT_SUPPORT_LOW.clone(),
+                systems.VanDerPol.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         dist = torch.distributions.MultivariateNormal(torch.zeros(2), covariance)
         ControllableStochasticSystem.__init__(
             self,
@@ -115,6 +143,9 @@ class ControlledVanDerPol(ControllableStochasticSystem, systems.VanDerPol):
             state_labels=["x1", "x2"],
             control_labels=["u_x1", "u_x2"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.VanDerPol.WRAP_DIMS,
         )
         self.dt = dt
         self.mu = mu
@@ -128,7 +159,7 @@ class ControlledVanDerPol(ControllableStochasticSystem, systems.VanDerPol):
 
         x1_next = x1 + self.dt * dx1
         x2_next = x2 + self.dt * dx2
-        return torch.stack([x1_next, x2_next]) + v.flatten()
+        return self._apply_support(x, torch.stack([x1_next, x2_next]) + v.flatten())
 
 
 class ControlledCartPole(ControllableStochasticSystem, systems.CartPole):
@@ -142,12 +173,19 @@ class ControlledCartPole(ControllableStochasticSystem, systems.CartPole):
         l: float = 0.5,
         g: float = 9.81,
         covariance: torch.Tensor | None = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         if covariance is None:
             covariance = 0.001 * torch.eye(4)
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(
+                systems.CartPole.DEFAULT_SUPPORT_LOW.clone(),
+                systems.CartPole.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         dist = torch.distributions.MultivariateNormal(torch.zeros(4), covariance)
         ControllableStochasticSystem.__init__(
             self,
@@ -156,6 +194,9 @@ class ControlledCartPole(ControllableStochasticSystem, systems.CartPole):
             state_labels=["p", "p_dot", "theta", "theta_dot"],
             control_labels=["F"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.CartPole.WRAP_DIMS,
         )
         self.dt = dt
         self.m_c = m_c
@@ -176,7 +217,8 @@ class ControlledCartPole(ControllableStochasticSystem, systems.CartPole):
         theta_next = theta + self.dt * theta_dot
         theta_dot_next = theta_dot + self.dt * theta_acc
 
-        return torch.stack([p_next, p_dot_next, theta_next, theta_dot_next]) + v.flatten()
+        x_next = torch.stack([p_next, p_dot_next, theta_next, theta_dot_next]) + v.flatten()
+        return self._apply_support(x_flat, x_next)
 
 
 class ControlledPlanarQuadrotor(ControllableStochasticSystem, systems.PlanarQuadrotor):
@@ -194,12 +236,19 @@ class ControlledPlanarQuadrotor(ControllableStochasticSystem, systems.PlanarQuad
         covariance: torch.Tensor | None = None,
         thrust_min: float = 0.0,
         thrust_max: float = 20.0,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         if covariance is None:
             covariance = 0.01 * torch.eye(6)
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(
+                systems.PlanarQuadrotor.DEFAULT_SUPPORT_LOW.clone(),
+                systems.PlanarQuadrotor.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         dist = torch.distributions.MultivariateNormal(torch.zeros(6), covariance)
         ControllableStochasticSystem.__init__(
             self,
@@ -208,6 +257,9 @@ class ControlledPlanarQuadrotor(ControllableStochasticSystem, systems.PlanarQuad
             state_labels=["px", "pz", "theta", "vx", "vz", "omega"],
             control_labels=["u1", "u2"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.PlanarQuadrotor.WRAP_DIMS,
         )
         self.dt = dt
         self.m = m
@@ -223,7 +275,8 @@ class ControlledPlanarQuadrotor(ControllableStochasticSystem, systems.PlanarQuad
     def next_state(self, x: torch.Tensor, u: torch.Tensor, v: torch.Tensor):
         u = torch.clamp(u.flatten(), min=self.thrust_min, max=self.thrust_max)
         dx = self._dynamics(x, u)
-        return x.flatten() + self.dt * dx + v.flatten()
+        x_next = x.flatten() + self.dt * dx + v.flatten()
+        return self._apply_support(x.flatten(), x_next)
 
 
 class ControlledSecondOrderDubinsTrailer(
@@ -243,6 +296,8 @@ class ControlledSecondOrderDubinsTrailer(
         sigma_omega: float = 0.1,
         sigma_speed_state: float = 0.1,
         cov_scale: float = 0.01,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         cov1 = cov_scale * torch.tensor([[1.0, 0.2], [0.2, 1.0]], dtype=torch.float32)
         cov2 = cov_scale * torch.tensor([[1.0, -0.2], [-0.2, 1.0]], dtype=torch.float32)
@@ -254,6 +309,11 @@ class ControlledSecondOrderDubinsTrailer(
         )
         v_dist = torch.distributions.MixtureSameFamily(mix, comp)
 
+        if support is None:
+            support = Hyperrectangle(
+                systems.SecondOrderDubinsTrailer.DEFAULT_SUPPORT_LOW.clone(),
+                systems.SecondOrderDubinsTrailer.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         ControllableStochasticSystem.__init__(
             self,
             state_dim=6,
@@ -261,6 +321,9 @@ class ControlledSecondOrderDubinsTrailer(
             state_labels=["px", "py", "theta_c", "theta_t", "v", "omega"],
             control_labels=["u_v", "u_omega"],
             v_dist=v_dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.SecondOrderDubinsTrailer.WRAP_DIMS,
         )
         self.dt = dt
         self.L_t = L_t
@@ -286,10 +349,11 @@ class ControlledSecondOrderDubinsTrailer(
         speed_next = speed + dt * u_v_noisy + self.sigma_speed_state * speed * xi_v
         omega_next = omega + dt * u_omega_noisy
 
-        return torch.stack(
+        x_next = torch.stack(
             [px_next, py_next, theta_c_next, theta_t_next, speed_next, omega_next],
             dim=0,
         )
+        return self._apply_support(x, x_next)
 
 
 class ControlledQuadcopter(ControllableStochasticSystem, systems.Quadcopter):
@@ -307,12 +371,19 @@ class ControlledQuadcopter(ControllableStochasticSystem, systems.Quadcopter):
         thrust_max: float = 20.0,
         torque_limits: torch.Tensor | None = None,
         covariance: torch.Tensor | None = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         if covariance is None:
             covariance = 0.001 * torch.eye(12)
         else:
             covariance = torch.as_tensor(covariance, dtype=torch.float32)
 
+        if support is None:
+            support = Hyperrectangle(
+                systems.Quadcopter.DEFAULT_SUPPORT_LOW.clone(),
+                systems.Quadcopter.DEFAULT_SUPPORT_HIGH.clone(),
+            )
         dist = torch.distributions.MultivariateNormal(torch.zeros(12), covariance)
         ControllableStochasticSystem.__init__(
             self,
@@ -334,6 +405,9 @@ class ControlledQuadcopter(ControllableStochasticSystem, systems.Quadcopter):
             ],
             control_labels=["T", "tau_x", "tau_y", "tau_z"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.Quadcopter.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -369,7 +443,7 @@ class ControlledQuadcopter(ControllableStochasticSystem, systems.Quadcopter):
         x_next[7] = torch.remainder(x_next[7] + math.pi, 2 * math.pi) - math.pi
         x_next[8] = torch.remainder(x_next[8] + math.pi, 2 * math.pi) - math.pi
 
-        return x_next + v
+        return self._apply_support(x, x_next + v)
 
 
 class ControlledAircraft(ControllableStochasticSystem, systems.Aircraft):
@@ -398,7 +472,17 @@ class ControlledAircraft(ControllableStochasticSystem, systems.Aircraft):
         sigma_CM: float = 0.04,
         noise_cov_scale: float = 1.0,
         state_scale: torch.Tensor | None = None,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
+        if state_scale is None:
+            state_scale = torch.ones(12, dtype=torch.float32)
+        state_scale = torch.as_tensor(state_scale, dtype=torch.float32).reshape(12).clamp_min(1e-6)
+        if support is None:
+            support = Hyperrectangle(
+                (systems.Aircraft.PLOT_BOUNDS_LOW_PHYS / state_scale).clone(),
+                (systems.Aircraft.PLOT_BOUNDS_HIGH_PHYS / state_scale).clone(),
+            )
         cov = noise_cov_scale * torch.eye(6, dtype=torch.float32)
         dist = torch.distributions.MultivariateNormal(torch.zeros(6), cov)
         ControllableStochasticSystem.__init__(
@@ -421,6 +505,9 @@ class ControlledAircraft(ControllableStochasticSystem, systems.Aircraft):
             ],
             control_labels=["T", "de", "da", "dr"],
             v_dist=dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=systems.Aircraft.WRAP_DIMS,
         )
 
         self.dt = dt
@@ -440,9 +527,6 @@ class ControlledAircraft(ControllableStochasticSystem, systems.Aircraft):
         self.sigma_CL = sigma_CL
         self.sigma_CM = sigma_CM
 
-        if state_scale is None:
-            state_scale = torch.ones(12, dtype=torch.float32)
-        state_scale = torch.as_tensor(state_scale, dtype=torch.float32).reshape(12).clamp_min(1e-6)
         self.register_buffer("state_scale", state_scale)
 
         if J is None:
@@ -499,7 +583,8 @@ class ControlledAircraft(ControllableStochasticSystem, systems.Aircraft):
         x_next_phys[7] = torch.remainder(x_next_phys[7] + math.pi, 2 * math.pi) - math.pi
         x_next_phys[8] = torch.remainder(x_next_phys[8] + math.pi, 2 * math.pi) - math.pi
 
-        return self._to_normalized(x_next_phys)
+        x_next = self._to_normalized(x_next_phys)
+        return self._apply_support(x.flatten(), x_next)
 
 
 class ControlledIcyRoadCar(ControllableStochasticSystem):
@@ -561,6 +646,8 @@ class ControlledIcyRoadCar(ControllableStochasticSystem):
         steering_max: float = 0.35,
         acceleration_min: float = -3.0,
         acceleration_max: float = 2.0,
+        bounded_support: bool = False,
+        support: Hyperrectangle | None = None,
     ):
         if dt <= 0 or substeps < 1 or int(substeps) != substeps:
             raise ValueError("dt must be positive and substeps a positive integer")
@@ -586,6 +673,11 @@ class ControlledIcyRoadCar(ControllableStochasticSystem):
             if not (0 <= x0 < x1 <= road_width and 0 <= y0 < y1 <= road_length):
                 raise ValueError("Ice patches must be inside the road, with ordered bounds")
 
+        if support is None:
+            support = Hyperrectangle(
+                torch.tensor([0.0, 0.0, -math.pi, -3.0, -5.0, -4.0], dtype=torch.float32),
+                torch.tensor([float(road_width), float(road_length), math.pi, 13.0, 5.0, 4.0], dtype=torch.float32),
+            )
         v_dist = torch.distributions.Independent(
             torch.distributions.Normal(torch.zeros(8), torch.ones(8)), 1
         )
@@ -595,6 +687,9 @@ class ControlledIcyRoadCar(ControllableStochasticSystem):
             state_labels=["x", "y", "theta", "vx", "vy", "r"],
             control_labels=["steering", "acceleration"],
             v_dist=v_dist,
+            support=support,
+            bounded_support=bounded_support,
+            wrap_dims=(2,),
         )
         self.dt = float(dt)
         self.substeps = int(substeps)
@@ -701,7 +796,8 @@ class ControlledIcyRoadCar(ControllableStochasticSystem):
         for _ in range(self.substeps):
             state = state + h * self._derivatives(state, effective_u)
         # Optional independent additive Gaussian state noise (zero std disables it).
-        return state + v[..., 2:] * self.additive_state_noise_std
+        x_next = state + v[..., 2:] * self.additive_state_noise_std
+        return self._apply_support(x, x_next)
 
     def forward(self, x: torch.Tensor, u: torch.Tensor):
         """Draw independent steering, acceleration, and additive state noise."""

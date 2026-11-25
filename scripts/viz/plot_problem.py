@@ -56,8 +56,8 @@ def main() -> None:
                 ax.set_xlabel(problem.system.state_label(x_dim))
                 ax.set_ylabel(problem.system.state_label(y_dim))
                 x_range, y_range = _square_ranges(
-                    (problem.plot_bounds_low[x_dim].item(), problem.plot_bounds_high[x_dim].item()),
-                    (problem.plot_bounds_low[y_dim].item(), problem.plot_bounds_high[y_dim].item()),
+                    (problem.plot_region().low[x_dim].item(), problem.plot_region().high[x_dim].item()),
+                    (problem.plot_region().low[y_dim].item(), problem.plot_region().high[y_dim].item()),
                 )
                 ax.set_xlim(*x_range)
                 ax.set_ylim(*y_range)

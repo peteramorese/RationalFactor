@@ -427,7 +427,7 @@ if __name__ == "__main__":
     rff.eval()
     init_model.eval()
     ranges = tuple(
-        (float(lo), float(hi)) for lo, hi in zip(problem.plot_bounds_low, problem.plot_bounds_high)
+        (float(lo), float(hi)) for lo, hi in zip(problem.plot_region().low, problem.plot_region().high)
     )
     _plot_gaussian_primitives(rff.phi.primitives, output_dir / "phi_gaussians.png",
                               ranges, "Phi: local Gaussian factors")

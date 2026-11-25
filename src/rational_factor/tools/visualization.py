@@ -96,9 +96,10 @@ def plot_problem_test_trajectories(problem: FullyObservableProblem, marginals_li
             axes[t, i].scatter(traj_data[t][:, x_dim].detach().cpu().numpy(), traj_data[t][:, y_dim].detach().cpu().numpy(), **scatter_kwargs)
             axes[t, i].set_xlabel(problem.system.state_label(x_dim))
             axes[t, i].set_ylabel(problem.system.state_label(y_dim))
+            region = problem.plot_region()
             x_range, y_range = _square_ranges(
-                (problem.plot_bounds_low[x_dim].item(), problem.plot_bounds_high[x_dim].item()),
-                (problem.plot_bounds_low[y_dim].item(), problem.plot_bounds_high[y_dim].item()),
+                (region.low[x_dim].item(), region.high[x_dim].item()),
+                (region.low[y_dim].item(), region.high[y_dim].item()),
             )
             axes[t, i].set_xlim(*x_range)
             axes[t, i].set_ylim(*y_range)
@@ -135,9 +136,10 @@ def plot_marginal_trajectory_comparison(problem: FullyObservableProblem, beliefs
             print(f"Creating figure {fig_i + 1} of {n_slices * n_marginals}")
             fig_i += 1
             x_dim, y_dim = marginal_dims
+            region = problem.plot_region()
             x_range, y_range = _square_ranges(
-                (problem.plot_bounds_low[x_dim].item(), problem.plot_bounds_high[x_dim].item()),
-                (problem.plot_bounds_low[y_dim].item(), problem.plot_bounds_high[y_dim].item()),
+                (region.low[x_dim].item(), region.high[x_dim].item()),
+                (region.low[y_dim].item(), region.high[y_dim].item()),
             )
 
             traj_ax = axes[t, 2 * i]

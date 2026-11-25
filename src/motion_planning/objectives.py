@@ -37,9 +37,10 @@ def reach_avoid_probabilities(
 ) -> torch.Tensor:
     """Per-timestep first-hit goal mass under reach-avoid absorbing semantics.
 
-    At ``t = 0`` this is ``init_belief`` mass on ``goal``. For each later step the
-    current free belief is fully propagated, goal mass is recorded, and
-    propagation continues from the set complement of ``goal ∪ obstacles``.
+    At ``t = 0`` this is ``init_belief`` mass on ``goal``. For each later step
+    ``t -> t + 1``, ``propagate_set_complement`` propagates only the mass
+    outside ``goal ∪ obstacles`` at time ``t``, and the first-hit goal mass at
+    ``t + 1`` is the resulting belief's integral over ``goal``.
     Length is ``controller.n_timesteps() + 1``.
     """
     forbidden = obstacles.union(goal)
@@ -47,9 +48,8 @@ def reach_avoid_probabilities(
     belief = init_belief
     for t in range(controller.n_timesteps()):
         u = controller(t)
-        full = mdp.propagate(belief, u)
-        probs.append(_mass(full.integrate(goal)))
         belief = mdp.propagate_set_complement(belief, u, forbidden)
+        probs.append(_mass(belief.integrate(goal)))
     return torch.stack(probs)
 
 

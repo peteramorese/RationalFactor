@@ -889,15 +889,15 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
 
     plot_x_range = (
-        float(problem.plot_bounds_low[0]),
-        float(problem.plot_bounds_high[0]),
+        float(problem.plot_region().low[0]),
+        float(problem.plot_region().high[0]),
     )
     plot_y_range = (
-        float(problem.plot_bounds_low[1]),
-        float(problem.plot_bounds_high[1]),
+        float(problem.plot_region().low[1]),
+        float(problem.plot_region().high[1]),
     )
-    box_lows = tuple(problem.plot_bounds_low.tolist())
-    box_highs = tuple(problem.plot_bounds_high.tolist())
+    box_lows = tuple(problem.plot_region().low.tolist())
+    box_highs = tuple(problem.plot_region().high.tolist())
 
     mutual_phi_out = output_dir / "mutual_basis_phi_2d.png"
     _plot_2d_pair_member_grid(

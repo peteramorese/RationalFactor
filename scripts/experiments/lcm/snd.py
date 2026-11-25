@@ -33,8 +33,8 @@ def _plot_snd_1d_marginal_trajectory_comparison(
     """1D-only: learned marginal pdf vs normalized histogram of test trajectories per timestep."""
     n_slices = problem.n_timesteps + 1
     assert len(beliefs) == n_slices
-    lo = float(problem.plot_bounds_low[0].item())
-    hi = float(problem.plot_bounds_high[0].item())
+    lo = float(problem.plot_region().low[0].item())
+    hi = float(problem.plot_region().high[0].item())
     x_grid = torch.linspace(lo, hi, n_grid).unsqueeze(1)
 
     param = next(iter(beliefs[0].parameters()), None)
@@ -83,8 +83,8 @@ def _plot_snd_conditional_true_vs_learned(
     2D heatmaps of p(x'|x): horizontal axis = conditioner x, vertical axis = next state x'.
     Left: true (Gaussian around drift); right: learned LinearRFF (+ domain transforms).
     """
-    lo = float(problem.plot_bounds_low[0].item())
-    hi = float(problem.plot_bounds_high[0].item())
+    lo = float(problem.plot_region().low[0].item())
+    hi = float(problem.plot_region().high[0].item())
 
     param = next(iter(tran_model.parameters()), None)
     buffer = next(iter(tran_model.buffers()), None)
@@ -414,7 +414,7 @@ def main() -> None:
     for i in range(problem.n_timesteps):
         data_i = test_traj_data[i].to(device)
         ll = avg_log_likelihood(belief_seq[i], data_i)
-        check_pdf_valid(belief_seq[i], domain_bounds=(tuple(problem.plot_bounds_low.tolist()), tuple(problem.plot_bounds_high.tolist())), n_samples=10000, device=device)
+        check_pdf_valid(belief_seq[i], domain_bounds=(tuple(problem.plot_region().low.tolist()), tuple(problem.plot_region().high.tolist())), n_samples=10000, device=device)
         ll_per_step.append(ll.detach().cpu().reshape(()))
         print(f"Avg log-likelihood at time {i}: {float(ll_per_step[-1]):.6f}")
     prop_ll_vector = torch.stack(ll_per_step).to(dtype=torch.float32)

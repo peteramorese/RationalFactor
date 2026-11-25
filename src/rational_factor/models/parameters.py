@@ -490,6 +490,7 @@ class NeuralParameters(MLP, Parameters):
         activation=torch.nn.Tanh,
         zero_init_last: bool = True,
         positive: bool = False,
+        epsilon: float = 0.0,
     ):
         MLP.__init__(
             self,
@@ -503,6 +504,7 @@ class NeuralParameters(MLP, Parameters):
         Parameters.__init__(self, shape=self.out_shape, batch_shape=batch_shape)
         self.context_key = context_key
         self.positive = positive
+        self.epsilon = float(epsilon)
 
     def __call__(self, **context) -> torch.Tensor:
         if self.context_key in context:
@@ -517,7 +519,7 @@ class NeuralParameters(MLP, Parameters):
             )
         out = MLP.forward(self, x)
         if self.positive:
-            out = torch.nn.functional.softplus(out)
+            out = self.epsilon + torch.nn.functional.softplus(out)
         return out
 
     def is_trainable(self) -> bool:

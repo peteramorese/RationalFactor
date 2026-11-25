@@ -26,17 +26,17 @@ if __name__ == "__main__":
     ###
     use_gpu = torch.cuda.is_available()
     dtype = torch.float64
-    n_basis = 500
+    n_basis = 100
     gaussian_std_epsilon = 1e-3
     tran_params = {
-        "epochs": 20,
+        "epochs": 100,
         "basis_iterations": 3,
         "weights_iterations": 3,
         "lr_basis": 3e-3,
         "lr_weights": 5e-2,
     }
     init_params = {
-        "epochs": 50,
+        "epochs": 100,
         "coeff_iterations": 10,
         "lr_coeffs": 1e-2,
         "basis_iterations": 2,

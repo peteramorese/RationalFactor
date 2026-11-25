@@ -25,6 +25,7 @@ from nflows.transforms.permutations import RandomPermutation, ReversePermutation
 from nflows.transforms.lu import LULinear
 
 from rational_factor.models.mlp import MLP
+from rational_factor.tools.set import Hyperrectangle
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +181,80 @@ class ErfSeparableTransform(Transform):
         return x, ladj
 
 
+class AffineTransform(Transform):
+    """Per-dimension affine map ``z = scale * x + shift``."""
+
+    def __init__(
+        self,
+        features: int,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        trainable: bool = False,
+    ):
+        super().__init__()
+        scale = torch.as_tensor(scale, dtype=torch.float32).reshape(-1)
+        shift = torch.as_tensor(shift, dtype=scale.dtype, device=scale.device).reshape(-1)
+        if scale.shape != (features,) or shift.shape != (features,):
+            raise ValueError(
+                f"scale and shift must have shape ({features},), "
+                f"got {tuple(scale.shape)} and {tuple(shift.shape)}"
+            )
+        if not bool((scale != 0).all()):
+            raise ValueError("scale entries must be non-zero")
+        self.features = int(features)
+        self.trainable = bool(trainable)
+        if self.trainable:
+            self.scale = torch.nn.Parameter(scale.clone())
+            self.shift = torch.nn.Parameter(shift.clone())
+        else:
+            self.register_buffer("scale", scale.clone())
+            self.register_buffer("shift", shift.clone())
+
+    @classmethod
+    def from_hyperrectangles(
+        cls,
+        start: Hyperrectangle,
+        end: Hyperrectangle,
+        trainable: bool = False,
+    ) -> AffineTransform:
+        """Construct the coordinate-wise affine bijection mapping ``start`` to ``end``."""
+        if not isinstance(start, Hyperrectangle) or not isinstance(end, Hyperrectangle):
+            raise TypeError("start and end must be Hyperrectangle instances")
+        if start.is_batched or end.is_batched:
+            raise ValueError("start and end must be single (unbatched) Hyperrectangles")
+        if start.dim != end.dim:
+            raise ValueError(
+                f"start.dim ({start.dim}) must match end.dim ({end.dim})"
+            )
+        start_low = start.low.to(dtype=torch.float32)
+        start_high = start.high.to(dtype=torch.float32)
+        end_low = end.low.to(dtype=start_low.dtype, device=start_low.device)
+        end_high = end.high.to(dtype=start_low.dtype, device=start_low.device)
+        start_span = start_high - start_low
+        end_span = end_high - end_low
+        if not bool((start_span > 0).all()) or not bool((end_span > 0).all()):
+            raise ValueError(
+                "start and end hyperrectangles must have strictly positive side lengths"
+            )
+        scale = end_span / start_span
+        shift = end_low - scale * start_low
+        return cls(features=start.dim, scale=scale, shift=shift, trainable=trainable)
+
+    def forward(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        scale = self.scale.to(device=inputs.device, dtype=inputs.dtype)
+        shift = self.shift.to(device=inputs.device, dtype=inputs.dtype)
+        z = inputs * scale + shift
+        ladj = torch.log(torch.abs(scale)).sum()
+        return z, ladj.expand(inputs.shape[:-1])
+
+    def inverse(self, inputs: torch.Tensor, context: torch.Tensor | None = None):
+        scale = self.scale.to(device=inputs.device, dtype=inputs.dtype)
+        shift = self.shift.to(device=inputs.device, dtype=inputs.dtype)
+        x = (inputs - shift) / scale
+        ladj = -torch.log(torch.abs(scale)).sum()
+        return x, ladj.expand(inputs.shape[:-1])
+
+
 class ClampInputsTransform(Transform):
     """Clamp into a closed interval; log-det contribution is zero."""
 
@@ -304,6 +379,7 @@ class Transforms:
             "stacked": Transforms.stacked,
             "erf": Transforms.erf,
             "erf_separable": Transforms.erf,
+            "affine": Transforms.affine,
             "maf": Transforms.maf,
             "nsf": Transforms.nsf,
             "masked_rqs": Transforms.nsf,
@@ -369,6 +445,27 @@ class Transforms:
             min_scale=min_scale,
             numerical_tolerance=numerical_tolerance,
         )
+
+    @staticmethod
+    def affine(
+        *,
+        features: int | None = None,
+        scale: torch.Tensor | None = None,
+        shift: torch.Tensor | None = None,
+        start: Hyperrectangle | None = None,
+        end: Hyperrectangle | None = None,
+        trainable: bool = False,
+        **_unused,
+    ) -> AffineTransform:
+        if start is not None and end is not None:
+            return AffineTransform.from_hyperrectangles(
+                start, end, trainable=trainable
+            )
+        if scale is None or shift is None:
+            raise ValueError("affine requires scale/shift, or start/end hyperrectangles")
+        if features is None:
+            features = torch.as_tensor(scale).numel()
+        return AffineTransform(features, scale, shift, trainable=trainable)
 
     @staticmethod
     def clamp(

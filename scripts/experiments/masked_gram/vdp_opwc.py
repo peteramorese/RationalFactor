@@ -202,8 +202,8 @@ if __name__ == "__main__":
     tran_model = tran_model.to(analysis_device).eval()
     trained_wrap_tf = trained_wrap_tf.to(analysis_device).eval()
 
-    box_lows = tuple(problem.plot_bounds_low.tolist())
-    box_highs = tuple(problem.plot_bounds_high.tolist())
+    box_lows = tuple(problem.plot_region().low.tolist())
+    box_highs = tuple(problem.plot_region().high.tolist())
 
     base_belief_seq = propagate.propagate(
         init_model.density_model,
